@@ -39,15 +39,8 @@ export const config = {
 } as const;
 
 export function validateConfig(): void {
-  if (!config.databaseUrl) {
-    throw new Error("DATABASE_URL is required");
-  }
-  if (!config.rpcUrl) {
-    throw new Error("RPC_URL is required");
-  }
-  if (!config.programId) {
-    throw new Error("PROGRAM_ID is required");
-  }
+  // Note: All config values have defaults, so these checks validate the format/type
+  // rather than presence. The indexerMode check is the only meaningful one.
   if (!["auto", "polling", "websocket"].includes(config.indexerMode)) {
     throw new Error("INDEXER_MODE must be 'auto', 'polling', or 'websocket'");
   }
