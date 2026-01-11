@@ -36,7 +36,7 @@ A lightweight, self-hosted Solana indexer for the [8004 Agent Registry](https://
 ### Prerequisites
 
 - Node.js 20+
-- PostgreSQL 14+
+- **PostgreSQL 14+** (local install) OR **Docker** (recommended for easy setup)
 - A Solana RPC endpoint (devnet/mainnet)
 
 ### Installation
@@ -51,15 +51,41 @@ npm install
 
 # Generate Prisma client
 npm run db:generate
+
+# Copy environment file
+cp .env.example .env
+```
+
+### Database Setup
+
+**Option A: Using Docker (Recommended)**
+
+```bash
+# Make sure Docker Desktop is running first!
+# Then start PostgreSQL:
+docker run -d \
+  --name indexer8004-db \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=indexer8004 \
+  -p 5432:5432 \
+  postgres:16-alpine
+
+# Wait a few seconds for PostgreSQL to start, then run migrations:
+npm run db:push
+```
+
+**Option B: Using local PostgreSQL**
+
+```bash
+# If you have PostgreSQL installed locally:
+createdb indexer8004
+npm run db:push
 ```
 
 ### Configuration
 
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
+The `.env` file contains all configuration options:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -69,16 +95,6 @@ cp .env.example .env
 | `PROGRAM_ID` | 8004 Agent Registry program ID | `3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC` |
 | `INDEXER_MODE` | `auto`, `polling`, or `websocket` | `auto` |
 | `GRAPHQL_PORT` | GraphQL server port | `4000` |
-
-### Database Setup
-
-```bash
-# Run migrations
-npm run db:migrate
-
-# Or push schema directly (development)
-npm run db:push
-```
 
 ### Running
 
@@ -259,15 +275,49 @@ npm run db:migrate
 npx prisma migrate reset
 ```
 
-## Docker
+## Docker Compose
+
+For running the full stack with Docker Compose:
 
 ```bash
-# Start PostgreSQL only
-docker-compose up -d postgres
+# Start PostgreSQL only (use 'docker compose' or 'docker-compose' depending on your setup)
+docker compose up -d postgres
+# or: docker-compose up -d postgres
 
-# Start full stack
-docker-compose up -d
+# Start full stack (indexer + PostgreSQL)
+docker compose up -d
+# or: docker-compose up -d
+
+# View logs
+docker compose logs -f indexer
+
+# Stop all services
+docker compose down
 ```
+
+> **Note**: Make sure Docker Desktop is running before executing these commands.
+
+## Troubleshooting
+
+### Database connection errors
+
+**Error: `P1010: User was denied access on the database`**
+- This usually means PostgreSQL is not running
+- If using Docker: make sure Docker Desktop is running, then start the container
+- If using local PostgreSQL: check that the service is running (`pg_isready -h localhost -p 5432`)
+
+**Error: `Cannot connect to the Docker daemon`**
+- Open Docker Desktop application and wait for it to start
+- On macOS, look for the Docker icon in the menu bar
+
+### Port already in use
+
+**Error: `Port 5432 is already in use`**
+- Another PostgreSQL instance is running
+- Stop it with: `docker stop indexer8004-db` or stop your local PostgreSQL service
+
+**Error: `Port 4000 is already in use`**
+- Change `GRAPHQL_PORT` in your `.env` file to a different port
 
 ## RPC Provider Compatibility
 
