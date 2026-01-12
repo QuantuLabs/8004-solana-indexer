@@ -47,7 +47,67 @@ export class Poller {
     logger.info({ programId: this.programId.toBase58() }, "Starting poller");
 
     await this.loadState();
+
+    // If no saved state, do backfill first
+    if (!this.lastSignature) {
+      logger.info("No saved state - starting backfill from beginning");
+      await this.backfill();
+    }
+
     this.poll();
+  }
+
+  /**
+   * Backfill all historical transactions from the program
+   * Paginates backwards from most recent to oldest
+   */
+  private async backfill(): Promise<void> {
+    logger.info("Starting historical backfill...");
+    let beforeSignature: string | undefined = undefined;
+    let totalProcessed = 0;
+
+    while (this.isRunning) {
+      const options: { limit: number; before?: string } = {
+        limit: this.batchSize,
+      };
+      if (beforeSignature) {
+        options.before = beforeSignature;
+      }
+
+      const signatures = await this.connection.getSignaturesForAddress(
+        this.programId,
+        options
+      );
+
+      const validSigs = signatures.filter((sig) => sig.err === null);
+
+      if (validSigs.length === 0) {
+        logger.info({ totalProcessed }, "Backfill complete - no more transactions");
+        break;
+      }
+
+      logger.info({ count: validSigs.length, totalProcessed }, "Backfill batch");
+
+      // Process oldest first (reverse order)
+      for (const sig of validSigs.reverse()) {
+        try {
+          await this.processTransaction(sig);
+          this.lastSignature = sig.signature;
+          await this.saveState(sig.signature, BigInt(sig.slot));
+          totalProcessed++;
+        } catch (error) {
+          logger.error({ error, signature: sig.signature }, "Error processing backfill transaction");
+        }
+      }
+
+      // Use the oldest signature from this batch to get the next older batch
+      beforeSignature = validSigs[validSigs.length - 1].signature;
+
+      // Small delay to avoid rate limiting
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    logger.info({ totalProcessed }, "Backfill finished, switching to live polling");
   }
 
   async stop(): Promise<void> {

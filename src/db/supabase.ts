@@ -470,6 +470,11 @@ export interface IndexerState {
   lastSlot: bigint | null;
 }
 
+// Fallback: first transaction signature of the new program deployment
+// Kept for reference - backfill mode will fetch all transactions anyway
+// DEPLOYMENT_SIGNATURE = "6PXQkP5ihC2UMHD3xbm1Z9Ry8HXxSuKFAaVNGNktLBKXsgCQcqi7CM74SgoGkxvaiMVPMEP8REtGVbZK92Wsigt"
+// DEPLOYMENT_SLOT = 434717355
+
 /**
  * Load indexer state (cursor) from Supabase
  */
@@ -482,16 +487,22 @@ export async function loadIndexerState(): Promise<IndexerState> {
     );
     if (result.rows.length > 0) {
       const row = result.rows[0];
+      // If signature is null in DB, use deployment fallback
+      if (!row.last_signature) {
+        logger.info("DB has null signature, using deployment fallback");
+        return { lastSignature: null, lastSlot: null };
+      }
       logger.info({ lastSignature: row.last_signature, lastSlot: row.last_slot }, "Loaded indexer state");
       return {
         lastSignature: row.last_signature,
         lastSlot: row.last_slot ? BigInt(row.last_slot) : null,
       };
     }
-    logger.info("No saved indexer state found");
+    logger.info("No saved indexer state found, will start from beginning");
   } catch (error: any) {
-    logger.warn({ error: error.message }, "Failed to load indexer state (table may not exist)");
+    logger.warn({ error: error.message }, "Failed to load indexer state, using deployment fallback");
   }
+  // Fallback: return null to start from beginning (fetches all transactions)
   return { lastSignature: null, lastSlot: null };
 }
 
