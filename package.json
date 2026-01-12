@@ -1,13 +1,14 @@
 {
   "name": "8004-solana-indexer",
-  "version": "1.0.0",
-  "description": "Custom Solana indexer for 8004 Agent Registry with GraphQL API",
+  "version": "1.1.0",
+  "description": "Custom Solana indexer for 8004 Agent Registry v0.4.0",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "start:tsx": "npx tsx src/index.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
@@ -23,9 +24,9 @@
   "keywords": [
     "solana",
     "indexer",
-    "graphql",
     "8004",
-    "agent-registry"
+    "agent-registry",
+    "supabase"
   ],
   "author": "",
   "license": "MIT",
@@ -33,10 +34,9 @@
     "@coral-xyz/anchor": "^0.30.1",
     "@prisma/client": "^6.2.0",
     "@solana/web3.js": "^1.98.0",
+    "@supabase/supabase-js": "^2.49.0",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
-    "graphql": "^16.10.0",
-    "graphql-yoga": "^5.10.10",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0"
   },

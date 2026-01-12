@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python3", "gcc", "gnumake"]
+
+[phases.build]
+cmds = ["npm install", "npx prisma generate"]
+
+[start]
+cmd = "npx tsx src/index.ts"

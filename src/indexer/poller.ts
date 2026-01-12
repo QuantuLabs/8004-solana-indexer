@@ -13,7 +13,7 @@ const logger = createChildLogger("poller");
 
 export interface PollerOptions {
   connection: Connection;
-  prisma: PrismaClient;
+  prisma: PrismaClient | null;
   programId: PublicKey;
   pollingInterval?: number;
   batchSize?: number;
@@ -21,7 +21,7 @@ export interface PollerOptions {
 
 export class Poller {
   private connection: Connection;
-  private prisma: PrismaClient;
+  private prisma: PrismaClient | null;
   private programId: PublicKey;
   private pollingInterval: number;
   private batchSize: number;
@@ -55,6 +55,12 @@ export class Poller {
   }
 
   private async loadState(): Promise<void> {
+    // Only load state from Prisma in local mode
+    if (!this.prisma) {
+      logger.info("Supabase mode: starting from latest transactions");
+      return;
+    }
+
     const state = await this.prisma.indexerState.findUnique({
       where: { id: "main" },
     });
@@ -68,6 +74,9 @@ export class Poller {
   }
 
   private async saveState(signature: string, slot: bigint): Promise<void> {
+    // Only save state to Prisma in local mode
+    if (!this.prisma) return;
+
     await this.prisma.indexerState.upsert({
       where: { id: "main" },
       create: {
@@ -177,16 +186,19 @@ export class Poller {
 
       await handleEvent(this.prisma, typedEvent, ctx);
 
-      await this.prisma.eventLog.create({
-        data: {
-          eventType: typedEvent.type,
-          signature: sig.signature,
-          slot: BigInt(sig.slot),
-          blockTime: ctx.blockTime,
-          data: event.data as object,
-          processed: true,
-        },
-      });
+      // Only log to Prisma in local mode
+      if (this.prisma) {
+        await this.prisma.eventLog.create({
+          data: {
+            eventType: typedEvent.type,
+            signature: sig.signature,
+            slot: BigInt(sig.slot),
+            blockTime: ctx.blockTime,
+            data: event.data as object,
+            processed: true,
+          },
+        });
+      }
     }
   }
 
@@ -194,6 +206,9 @@ export class Poller {
     sig: ConfirmedSignatureInfo,
     error: unknown
   ): Promise<void> {
+    // Only log errors to Prisma in local mode
+    if (!this.prisma) return;
+
     await this.prisma.eventLog.create({
       data: {
         eventType: "PROCESSING_FAILED",

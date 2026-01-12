@@ -2,7 +2,6 @@ import { PrismaClient } from "@prisma/client";
 import { config, validateConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
-import { createGraphQLServer } from "./api/server.js";
 
 async function main() {
   try {
@@ -17,24 +16,32 @@ async function main() {
       programId: config.programId,
       rpcUrl: config.rpcUrl,
       indexerMode: config.indexerMode,
+      dbMode: config.dbMode,
     },
     "Starting 8004 Solana Indexer"
   );
 
-  const prisma = new PrismaClient();
+  // Initialize Prisma only for local mode
+  let prisma: PrismaClient | null = null;
 
-  try {
-    await prisma.$connect();
-    logger.info("Database connected");
-  } catch (error) {
-    logger.fatal({ error }, "Failed to connect to database");
-    process.exit(1);
+  if (config.dbMode === "local") {
+    prisma = new PrismaClient();
+    try {
+      await prisma.$connect();
+      logger.info("Database connected (SQLite via Prisma)");
+    } catch (error) {
+      logger.fatal({ error }, "Failed to connect to database");
+      process.exit(1);
+    }
+  } else {
+    logger.info(
+      { supabaseUrl: config.supabaseUrl },
+      "Using Supabase for database (API via REST)"
+    );
   }
 
   const processor = new Processor(prisma);
-  const graphqlServer = await createGraphQLServer({ prisma, processor });
 
-  await graphqlServer.start();
   await processor.start();
 
   const shutdown = async (signal: string) => {
@@ -42,8 +49,9 @@ async function main() {
 
     try {
       await processor.stop();
-      await graphqlServer.stop();
-      await prisma.$disconnect();
+      if (prisma) {
+        await prisma.$disconnect();
+      }
       logger.info("Shutdown complete");
       process.exit(0);
     } catch (error) {
@@ -56,6 +64,7 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   logger.info("8004 Solana Indexer is running");
+  logger.info("API available via Supabase REST: " + (config.supabaseUrl || "N/A"));
 }
 
 main().catch((error) => {

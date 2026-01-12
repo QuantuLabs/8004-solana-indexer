@@ -63,17 +63,31 @@ export interface NewFeedback {
   clientAddress: PublicKey;
   feedbackIndex: bigint;
   score: number;
+  feedbackHash: Uint8Array;
+  // ATOM enriched fields (v0.4.0)
+  newTrustTier: number;       // u8 (0-4)
+  newQualityScore: number;    // u16 (0-10000)
+  newConfidence: number;      // u16 (0-10000)
+  newRiskScore: number;       // u8 (0-100)
+  newDiversityRatio: number;  // u8 (0-255)
+  isUniqueClient: boolean;
+  // Variable-size fields
   tag1: string;
   tag2: string;
   endpoint: string;
   feedbackUri: string;
-  feedbackHash: Uint8Array;
 }
 
 export interface FeedbackRevoked {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
+  // ATOM enriched fields (v0.4.0)
+  originalScore: number;      // u8
+  hadImpact: boolean;
+  newTrustTier: number;       // u8 (0-4)
+  newQualityScore: number;    // u16 (0-10000)
+  newConfidence: number;      // u16 (0-10000)
 }
 
 export interface ResponseAppended {

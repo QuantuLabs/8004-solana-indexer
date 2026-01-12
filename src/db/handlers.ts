@@ -16,6 +16,8 @@ import {
   ValidationResponded,
 } from "../parser/types.js";
 import { createChildLogger } from "../logger.js";
+import { config } from "../config.js";
+import * as supabaseHandlers from "./supabase.js";
 
 const logger = createChildLogger("db-handlers");
 
@@ -25,11 +27,25 @@ export interface EventContext {
   blockTime: Date;
 }
 
+/**
+ * Dual-mode event handler
+ * Routes to Supabase or Prisma (SQLite) based on DB_MODE config
+ */
 export async function handleEvent(
-  prisma: PrismaClient,
+  prisma: PrismaClient | null,
   event: ProgramEvent,
   ctx: EventContext
 ): Promise<void> {
+  // Route to Supabase handlers if in supabase mode
+  if (config.dbMode === "supabase") {
+    return supabaseHandlers.handleEvent(event, ctx);
+  }
+
+  // Local mode - use Prisma/SQLite
+  if (!prisma) {
+    throw new Error("PrismaClient required for local mode");
+  }
+
   switch (event.type) {
     case "AgentRegisteredInRegistry":
       await handleAgentRegistered(prisma, event.data, ctx);

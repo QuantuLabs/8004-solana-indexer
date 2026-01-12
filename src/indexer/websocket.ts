@@ -14,7 +14,7 @@ const logger = createChildLogger("websocket");
 
 export interface WebSocketIndexerOptions {
   connection: Connection;
-  prisma: PrismaClient;
+  prisma: PrismaClient | null;
   programId: PublicKey;
   reconnectInterval?: number;
   maxRetries?: number;
@@ -22,7 +22,7 @@ export interface WebSocketIndexerOptions {
 
 export class WebSocketIndexer {
   private connection: Connection;
-  private prisma: PrismaClient;
+  private prisma: PrismaClient | null;
   private programId: PublicKey;
   private reconnectInterval: number;
   private maxRetries: number;
@@ -110,44 +110,53 @@ export class WebSocketIndexer {
 
         await handleEvent(this.prisma, typedEvent, eventCtx);
 
-        await this.prisma.eventLog.create({
-          data: {
-            eventType: typedEvent.type,
-            signature: logs.signature,
-            slot: BigInt(ctx.slot),
-            blockTime,
-            data: event.data as object,
-            processed: true,
+        // Only log to Prisma if in local mode
+        if (this.prisma) {
+          await this.prisma.eventLog.create({
+            data: {
+              eventType: typedEvent.type,
+              signature: logs.signature,
+              slot: BigInt(ctx.slot),
+              blockTime,
+              data: event.data as object,
+              processed: true,
+            },
+          });
+        }
+      }
+
+      // Update state only in local mode
+      if (this.prisma) {
+        await this.prisma.indexerState.upsert({
+          where: { id: "main" },
+          create: {
+            id: "main",
+            lastSignature: logs.signature,
+            lastSlot: BigInt(ctx.slot),
+          },
+          update: {
+            lastSignature: logs.signature,
+            lastSlot: BigInt(ctx.slot),
           },
         });
       }
-
-      await this.prisma.indexerState.upsert({
-        where: { id: "main" },
-        create: {
-          id: "main",
-          lastSignature: logs.signature,
-          lastSlot: BigInt(ctx.slot),
-        },
-        update: {
-          lastSignature: logs.signature,
-          lastSlot: BigInt(ctx.slot),
-        },
-      });
     } catch (error) {
       logger.error({ error, signature: logs.signature }, "Error handling logs");
 
-      await this.prisma.eventLog.create({
-        data: {
-          eventType: "PROCESSING_FAILED",
-          signature: logs.signature,
-          slot: BigInt(ctx.slot),
-          blockTime: new Date(),
-          data: { logs: logs.logs },
-          processed: false,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
+      // Log errors only in local mode
+      if (this.prisma) {
+        await this.prisma.eventLog.create({
+          data: {
+            eventType: "PROCESSING_FAILED",
+            signature: logs.signature,
+            slot: BigInt(ctx.slot),
+            blockTime: new Date(),
+            data: { logs: logs.logs },
+            processed: false,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
     }
   }
 

@@ -98,8 +98,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "AgentOwnerSynced",
           data: {
             asset: new PublicKey(data.asset as string),
-            oldOwner: new PublicKey(data.oldOwner as string),
-            newOwner: new PublicKey(data.newOwner as string),
+            oldOwner: new PublicKey(data.old_owner as string),   // snake_case from IDL
+            newOwner: new PublicKey(data.new_owner as string),   // snake_case from IDL
           },
         };
 
@@ -108,8 +108,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "UriUpdated",
           data: {
             asset: new PublicKey(data.asset as string),
-            newUri: data.newUri as string,
-            updatedBy: new PublicKey(data.updatedBy as string),
+            newUri: data.new_uri as string,                       // snake_case from IDL
+            updatedBy: new PublicKey(data.updated_by as string), // snake_case from IDL
           },
         };
 
@@ -118,11 +118,11 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "WalletUpdated",
           data: {
             asset: new PublicKey(data.asset as string),
-            oldWallet: data.oldWallet
-              ? new PublicKey(data.oldWallet as string)
+            oldWallet: data.old_wallet                           // snake_case from IDL
+              ? new PublicKey(data.old_wallet as string)
               : null,
-            newWallet: new PublicKey(data.newWallet as string),
-            updatedBy: new PublicKey(data.updatedBy as string),
+            newWallet: new PublicKey(data.new_wallet as string), // snake_case from IDL
+            updatedBy: new PublicKey(data.updated_by as string), // snake_case from IDL
           },
         };
 
@@ -152,8 +152,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             registry: new PublicKey(data.registry as string),
             collection: new PublicKey(data.collection as string),
-            baseIndex: data.baseIndex as number,
-            createdBy: new PublicKey(data.createdBy as string),
+            baseIndex: data.base_index as number,                // snake_case from IDL
+            createdBy: new PublicKey(data.created_by as string), // snake_case from IDL
           },
         };
 
@@ -171,9 +171,9 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
         return {
           type: "BaseRegistryRotated",
           data: {
-            oldRegistry: new PublicKey(data.oldRegistry as string),
-            newRegistry: new PublicKey(data.newRegistry as string),
-            rotatedBy: new PublicKey(data.rotatedBy as string),
+            oldRegistry: new PublicKey(data.old_registry as string), // snake_case from IDL
+            newRegistry: new PublicKey(data.new_registry as string), // snake_case from IDL
+            rotatedBy: new PublicKey(data.rotated_by as string),     // snake_case from IDL
           },
         };
 
@@ -182,14 +182,22 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "NewFeedback",
           data: {
             asset: new PublicKey(data.asset as string),
-            clientAddress: new PublicKey(data.clientAddress as string),
-            feedbackIndex: BigInt(data.feedbackIndex as string),
+            clientAddress: new PublicKey(data.client_address as string), // snake_case from IDL
+            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
             score: data.score as number,
+            feedbackHash: new Uint8Array(data.feedback_hash as number[]),// snake_case from IDL
+            // ATOM enriched fields (v0.4.0)
+            newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
+            newQualityScore: data.new_quality_score as number,           // snake_case from IDL
+            newConfidence: data.new_confidence as number,                // snake_case from IDL
+            newRiskScore: data.new_risk_score as number,                 // snake_case from IDL
+            newDiversityRatio: data.new_diversity_ratio as number,       // snake_case from IDL
+            isUniqueClient: data.is_unique_client as boolean,            // snake_case from IDL
+            // Variable-size fields
             tag1: data.tag1 as string,
             tag2: data.tag2 as string,
             endpoint: data.endpoint as string,
-            feedbackUri: data.feedbackUri as string,
-            feedbackHash: new Uint8Array(data.feedbackHash as number[]),
+            feedbackUri: data.feedback_uri as string,                    // snake_case from IDL
           },
         };
 
@@ -198,8 +206,14 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "FeedbackRevoked",
           data: {
             asset: new PublicKey(data.asset as string),
-            clientAddress: new PublicKey(data.clientAddress as string),
-            feedbackIndex: BigInt(data.feedbackIndex as string),
+            clientAddress: new PublicKey(data.client_address as string), // snake_case from IDL
+            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
+            // ATOM enriched fields (v0.4.0)
+            originalScore: data.original_score as number,                // snake_case from IDL
+            hadImpact: data.had_impact as boolean,                       // snake_case from IDL
+            newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
+            newQualityScore: data.new_quality_score as number,           // snake_case from IDL
+            newConfidence: data.new_confidence as number,                // snake_case from IDL
           },
         };
 
@@ -208,10 +222,10 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "ResponseAppended",
           data: {
             asset: new PublicKey(data.asset as string),
-            feedbackIndex: BigInt(data.feedbackIndex as string),
+            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
             responder: new PublicKey(data.responder as string),
-            responseUri: data.responseUri as string,
-            responseHash: new Uint8Array(data.responseHash as number[]),
+            responseUri: data.response_uri as string,                    // snake_case from IDL
+            responseHash: new Uint8Array(data.response_hash as number[]),// snake_case from IDL
           },
         };
 
@@ -220,10 +234,10 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "ValidationRequested",
           data: {
             asset: new PublicKey(data.asset as string),
-            validatorAddress: new PublicKey(data.validatorAddress as string),
+            validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
             nonce: data.nonce as number,
-            requestUri: data.requestUri as string,
-            requestHash: new Uint8Array(data.requestHash as number[]),
+            requestUri: data.request_uri as string,                            // snake_case from IDL
+            requestHash: new Uint8Array(data.request_hash as number[]),        // snake_case from IDL
             requester: new PublicKey(data.requester as string),
           },
         };
@@ -233,11 +247,11 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "ValidationResponded",
           data: {
             asset: new PublicKey(data.asset as string),
-            validatorAddress: new PublicKey(data.validatorAddress as string),
+            validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
             nonce: data.nonce as number,
             response: data.response as number,
-            responseUri: data.responseUri as string,
-            responseHash: new Uint8Array(data.responseHash as number[]),
+            responseUri: data.response_uri as string,                          // snake_case from IDL
+            responseHash: new Uint8Array(data.response_hash as number[]),      // snake_case from IDL
             tag: data.tag as string,
           },
         };

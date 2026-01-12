@@ -13,14 +13,14 @@ export interface ProcessorOptions {
 
 export class Processor {
   private connection: Connection;
-  private prisma: PrismaClient;
+  private prisma: PrismaClient | null;
   private programId: PublicKey;
   private mode: IndexerMode;
   private poller: Poller | null = null;
   private wsIndexer: WebSocketIndexer | null = null;
   private isRunning = false;
 
-  constructor(prisma: PrismaClient, options?: ProcessorOptions) {
+  constructor(prisma: PrismaClient | null, options?: ProcessorOptions) {
     this.prisma = prisma;
     this.mode = options?.mode || config.indexerMode;
     this.programId = new PublicKey(config.programId);
