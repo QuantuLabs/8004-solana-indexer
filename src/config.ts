@@ -21,7 +21,7 @@ export const config = {
 
   // Program ID (8004 Agent Registry v0.4.0)
   programId:
-    process.env.PROGRAM_ID || "ASD4jYGBofvxwdKV8EArNWhK6jv9cDquGLH5ybL3Qqkz",
+    process.env.PROGRAM_ID || "HHCVWcqsziJMmp43u2UAgAfH2cBjUFxVdW1M3C3NqzvT",
 
   // Indexer mode: "auto" | "polling" | "websocket"
   // auto = tries WebSocket first, falls back to polling if unavailable

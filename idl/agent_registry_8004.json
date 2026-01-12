@@ -1,5 +1,5 @@
 {
-  "address": "ASD4jYGBofvxwdKV8EArNWhK6jv9cDquGLH5ybL3Qqkz",
+  "address": "HHCVWcqsziJMmp43u2UAgAfH2cBjUFxVdW1M3C3NqzvT",
   "metadata": {
     "name": "agent_registry_8004",
     "version": "0.3.0",
@@ -401,12 +401,6 @@
           "signer": true
         },
         {
-          "name": "asset"
-        },
-        {
-          "name": "collection"
-        },
-        {
           "name": "agent_account",
           "pda": {
             "seeds": [
@@ -428,6 +422,12 @@
           }
         },
         {
+          "name": "asset"
+        },
+        {
+          "name": "collection"
+        },
+        {
           "name": "atom_config",
           "docs": [
             "AtomConfig PDA (owned by atom-engine)"
@@ -441,17 +441,37 @@
           "writable": true
         },
         {
-          "name": "atom_engine_program",
-          "docs": [
-            "atom-engine program"
-          ]
+          "name": "atom_engine_program"
         },
         {
-          "name": "instructions_sysvar",
-          "docs": [
-            "Instructions sysvar (passed to atom-engine for CPI caller verification)"
-          ],
-          "address": "Sysvar1nstructions1111111111111111111111111"
+          "name": "registry_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  116,
+                  111,
+                  109,
+                  95,
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "system_program",
@@ -595,38 +615,38 @@
               {
                 "kind": "const",
                 "value": [
-                  140,
-                  46,
-                  88,
-                  2,
-                  161,
-                  67,
-                  191,
-                  143,
-                  216,
-                  85,
-                  162,
-                  196,
-                  122,
-                  213,
-                  203,
-                  54,
-                  32,
-                  149,
-                  158,
-                  38,
-                  102,
-                  232,
-                  194,
-                  132,
-                  1,
-                  218,
-                  135,
-                  80,
+                  241,
+                  225,
+                  70,
+                  254,
+                  89,
+                  108,
+                  104,
                   74,
-                  64,
-                  23,
-                  207
+                  240,
+                  174,
+                  84,
+                  226,
+                  42,
+                  48,
+                  161,
+                  86,
+                  161,
+                  228,
+                  49,
+                  65,
+                  152,
+                  214,
+                  24,
+                  194,
+                  99,
+                  150,
+                  178,
+                  28,
+                  192,
+                  111,
+                  95,
+                  240
                 ]
               }
             ],
@@ -901,9 +921,6 @@
           "signer": true
         },
         {
-          "name": "asset"
-        },
-        {
           "name": "agent_account",
           "pda": {
             "seeds": [
@@ -923,6 +940,9 @@
               }
             ]
           }
+        },
+        {
+          "name": "asset"
         },
         {
           "name": "validator"
@@ -974,9 +994,6 @@
           "signer": true
         },
         {
-          "name": "asset"
-        },
-        {
           "name": "agent_account",
           "pda": {
             "seeds": [
@@ -996,6 +1013,9 @@
               }
             ]
           }
+        },
+        {
+          "name": "asset"
         }
       ],
       "args": [
@@ -1048,6 +1068,27 @@
           "signer": true
         },
         {
+          "name": "agent_account",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "asset"
+              }
+            ]
+          }
+        },
+        {
           "name": "asset"
         },
         {
@@ -1064,17 +1105,37 @@
           "writable": true
         },
         {
-          "name": "atom_engine_program",
-          "docs": [
-            "atom-engine program"
-          ]
+          "name": "atom_engine_program"
         },
         {
-          "name": "instructions_sysvar",
-          "docs": [
-            "Instructions sysvar (passed to atom-engine for CPI caller verification)"
-          ],
-          "address": "Sysvar1nstructions1111111111111111111111111"
+          "name": "registry_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  116,
+                  111,
+                  109,
+                  95,
+                  99,
+                  112,
+                  105,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
         },
         {
           "name": "system_program",
