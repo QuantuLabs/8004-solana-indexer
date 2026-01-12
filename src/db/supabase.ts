@@ -1,9 +1,9 @@
 /**
  * Supabase database handlers for production mode
- * Writes events directly to Supabase PostgreSQL
+ * Writes events directly to Supabase PostgreSQL via pg client
  */
 
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { Pool } from "pg";
 import {
   ProgramEvent,
   AgentRegisteredInRegistry,
@@ -31,17 +31,21 @@ export interface EventContext {
   blockTime: Date;
 }
 
-let supabaseClient: SupabaseClient | null = null;
+let pool: Pool | null = null;
 const seenCollections = new Set<string>();
 
-function getSupabase(): SupabaseClient {
-  if (!supabaseClient) {
-    if (!config.supabaseUrl || !config.supabaseKey) {
-      throw new Error("Supabase URL and Key required");
+function getPool(): Pool {
+  if (!pool) {
+    if (!config.supabaseDsn) {
+      throw new Error("SUPABASE_DSN required for supabase mode");
     }
-    supabaseClient = createClient(config.supabaseUrl, config.supabaseKey);
+    pool = new Pool({
+      connectionString: config.supabaseDsn,
+      ssl: { rejectUnauthorized: false },
+      max: 10,
+    });
   }
-  return supabaseClient;
+  return pool;
 }
 
 export async function handleEvent(
@@ -114,18 +118,16 @@ async function ensureCollection(collection: string): Promise<void> {
   if (seenCollections.has(collection)) return;
   seenCollections.add(collection);
 
-  const supabase = getSupabase();
-  const { error } = await supabase.from("collections").upsert(
-    {
-      collection,
-      registry_type: "BASE",
-      created_at: new Date().toISOString(),
-    },
-    { onConflict: "collection" }
-  );
-
-  if (error) {
-    logger.error({ error, collection }, "Failed to ensure collection");
+  const db = getPool();
+  try {
+    await db.query(
+      `INSERT INTO collections (collection, registry_type, created_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (collection) DO NOTHING`,
+      [collection, "BASE", new Date().toISOString()]
+    );
+  } catch (error: any) {
+    logger.error({ error: error.message, collection }, "Failed to ensure collection");
   }
 }
 
@@ -133,27 +135,25 @@ async function handleAgentRegistered(
   data: AgentRegisteredInRegistry,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const collection = data.collection.toBase58();
 
-  // Ensure collection exists
   await ensureCollection(collection);
 
-  const { error } = await supabase.from("agents").upsert({
-    asset: assetId,
-    owner: data.owner.toBase58(),
-    agent_uri: null,
-    collection,
-    block_slot: Number(ctx.slot),
-    tx_signature: ctx.signature,
-    created_at: ctx.blockTime.toISOString(),
-  });
-
-  if (error) {
-    logger.error({ error, assetId }, "Failed to register agent");
-  } else {
+  try {
+    await db.query(
+      `INSERT INTO agents (asset, owner, agent_uri, collection, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (asset) DO UPDATE SET
+         owner = EXCLUDED.owner,
+         block_slot = EXCLUDED.block_slot,
+         updated_at = EXCLUDED.created_at`,
+      [assetId, data.owner.toBase58(), null, collection, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+    );
     logger.info({ assetId, owner: data.owner.toBase58() }, "Agent registered");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed to register agent");
   }
 }
 
@@ -161,29 +161,17 @@ async function handleAgentOwnerSynced(
   data: AgentOwnerSynced,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
 
-  const { error } = await supabase
-    .from("agents")
-    .update({
-      owner: data.newOwner.toBase58(),
-      block_slot: Number(ctx.slot),
-      updated_at: ctx.blockTime.toISOString(),
-    })
-    .eq("asset", assetId);
-
-  if (error) {
-    logger.error({ error, assetId }, "Failed to sync owner");
-  } else {
-    logger.info(
-      {
-        assetId,
-        oldOwner: data.oldOwner.toBase58(),
-        newOwner: data.newOwner.toBase58(),
-      },
-      "Agent owner synced"
+  try {
+    await db.query(
+      `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
+      [data.newOwner.toBase58(), Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
     );
+    logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed to sync owner");
   }
 }
 
@@ -191,22 +179,17 @@ async function handleUriUpdated(
   data: UriUpdated,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
 
-  const { error } = await supabase
-    .from("agents")
-    .update({
-      agent_uri: data.newUri,
-      block_slot: Number(ctx.slot),
-      updated_at: ctx.blockTime.toISOString(),
-    })
-    .eq("asset", assetId);
-
-  if (error) {
-    logger.error({ error, assetId }, "Failed to update URI");
-  } else {
+  try {
+    await db.query(
+      `UPDATE agents SET agent_uri = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
+      [data.newUri, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+    );
     logger.info({ assetId, newUri: data.newUri }, "Agent URI updated");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed to update URI");
   }
 }
 
@@ -214,25 +197,17 @@ async function handleWalletUpdated(
   data: WalletUpdated,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
 
-  const { error } = await supabase
-    .from("agents")
-    .update({
-      agent_wallet: data.newWallet.toBase58(),
-      block_slot: Number(ctx.slot),
-      updated_at: ctx.blockTime.toISOString(),
-    })
-    .eq("asset", assetId);
-
-  if (error) {
-    logger.error({ error, assetId }, "Failed to update wallet");
-  } else {
-    logger.info(
-      { assetId, newWallet: data.newWallet.toBase58() },
-      "Agent wallet updated"
+  try {
+    await db.query(
+      `UPDATE agents SET agent_wallet = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
+      [data.newWallet.toBase58(), Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
     );
+    logger.info({ assetId, newWallet: data.newWallet.toBase58() }, "Agent wallet updated");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed to update wallet");
   }
 }
 
@@ -240,27 +215,24 @@ async function handleMetadataSet(
   data: MetadataSet,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const keyHash = Buffer.from(data.value).slice(0, 16).toString("hex");
   const id = `${assetId}:${keyHash}`;
 
-  const { error } = await supabase.from("metadata").upsert({
-    id,
-    asset: assetId,
-    key: data.key,
-    key_hash: keyHash,
-    value: Buffer.from(data.value).toString("base64"),
-    immutable: data.immutable,
-    block_slot: Number(ctx.slot),
-    tx_signature: ctx.signature,
-    updated_at: ctx.blockTime.toISOString(),
-  });
-
-  if (error) {
-    logger.error({ error, assetId, key: data.key }, "Failed to set metadata");
-  } else {
+  try {
+    await db.query(
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (id) DO UPDATE SET
+         value = EXCLUDED.value,
+         block_slot = EXCLUDED.block_slot,
+         updated_at = EXCLUDED.updated_at`,
+      [id, assetId, data.key, keyHash, Buffer.from(data.value).toString("base64"), data.immutable, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+    );
     logger.info({ assetId, key: data.key }, "Metadata set");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, key: data.key }, "Failed to set metadata");
   }
 }
 
@@ -268,23 +240,14 @@ async function handleMetadataDeleted(
   data: MetadataDeleted,
   _ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
 
-  // Delete all metadata entries for this asset+key
-  const { error } = await supabase
-    .from("metadata")
-    .delete()
-    .eq("asset", assetId)
-    .eq("key", data.key);
-
-  if (error) {
-    logger.error(
-      { error, assetId, key: data.key },
-      "Failed to delete metadata"
-    );
-  } else {
+  try {
+    await db.query(`DELETE FROM metadata WHERE asset = $1 AND key = $2`, [assetId, data.key]);
     logger.info({ assetId, key: data.key }, "Metadata deleted");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, key: data.key }, "Failed to delete metadata");
   }
 }
 
@@ -292,27 +255,21 @@ async function handleBaseRegistryCreated(
   data: BaseRegistryCreated,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const collection = data.collection.toBase58();
 
-  const { error } = await supabase.from("collections").upsert(
-    {
-      collection,
-      registry_type: "BASE",
-      authority: data.createdBy.toBase58(),
-      base_index: data.baseIndex,
-      created_at: ctx.blockTime.toISOString(),
-    },
-    { onConflict: "collection" }
-  );
-
-  if (error) {
-    logger.error({ error, collection }, "Failed to create base registry");
-  } else {
-    logger.info(
-      { registryId: data.registry.toBase58(), baseIndex: data.baseIndex },
-      "Base registry created"
+  try {
+    await db.query(
+      `INSERT INTO collections (collection, registry_type, authority, base_index, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (collection) DO UPDATE SET
+         authority = EXCLUDED.authority,
+         base_index = EXCLUDED.base_index`,
+      [collection, "BASE", data.createdBy.toBase58(), data.baseIndex, ctx.blockTime.toISOString()]
     );
+    logger.info({ registryId: data.registry.toBase58(), baseIndex: data.baseIndex }, "Base registry created");
+  } catch (error: any) {
+    logger.error({ error: error.message, collection }, "Failed to create base registry");
   }
 }
 
@@ -320,26 +277,20 @@ async function handleUserRegistryCreated(
   data: UserRegistryCreated,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const collection = data.collection.toBase58();
 
-  const { error } = await supabase.from("collections").upsert(
-    {
-      collection,
-      registry_type: "USER",
-      authority: data.owner.toBase58(),
-      created_at: ctx.blockTime.toISOString(),
-    },
-    { onConflict: "collection" }
-  );
-
-  if (error) {
-    logger.error({ error, collection }, "Failed to create user registry");
-  } else {
-    logger.info(
-      { registryId: data.registry.toBase58(), owner: data.owner.toBase58() },
-      "User registry created"
+  try {
+    await db.query(
+      `INSERT INTO collections (collection, registry_type, authority, created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (collection) DO UPDATE SET
+         authority = EXCLUDED.authority`,
+      [collection, "USER", data.owner.toBase58(), ctx.blockTime.toISOString()]
     );
+    logger.info({ registryId: data.registry.toBase58(), owner: data.owner.toBase58() }, "User registry created");
+  } catch (error: any) {
+    logger.error({ error: error.message, collection }, "Failed to create user registry");
   }
 }
 
@@ -347,48 +298,47 @@ async function handleNewFeedback(
   data: NewFeedback,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
-  const { error } = await supabase.from("feedbacks").upsert({
-    id,
-    asset: assetId,
-    client_address: clientAddress,
-    feedback_index: Number(data.feedbackIndex),
-    score: data.score,
-    tag1: data.tag1 || null,
-    tag2: data.tag2 || null,
-    endpoint: data.endpoint || null,
-    feedback_uri: data.feedbackUri || null,
-    feedback_hash: data.feedbackHash
-      ? Buffer.from(data.feedbackHash).toString("hex")
-      : null,
-    // ATOM enriched fields (v0.4.0)
-    new_trust_tier: data.newTrustTier,
-    new_quality_score: data.newQualityScore,
-    new_confidence: data.newConfidence,
-    new_risk_score: data.newRiskScore,
-    new_diversity_ratio: data.newDiversityRatio,
-    is_unique_client: data.isUniqueClient,
-    is_revoked: false,
-    block_slot: Number(ctx.slot),
-    tx_signature: ctx.signature,
-    created_at: ctx.blockTime.toISOString(),
-  });
-
-  if (error) {
-    logger.error({ error, assetId, feedbackIndex: data.feedbackIndex }, "Failed to save feedback");
-  } else {
-    logger.info(
-      {
-        assetId,
-        feedbackIndex: data.feedbackIndex.toString(),
-        score: data.score,
-      },
-      "New feedback"
+  try {
+    // Insert feedback record
+    await db.query(
+      `INSERT INTO feedbacks (id, asset, client_address, feedback_index, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+         new_trust_tier, new_quality_score, new_confidence, new_risk_score, new_diversity_ratio, is_unique_client,
+         is_revoked, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+       ON CONFLICT (id) DO UPDATE SET
+         score = EXCLUDED.score,
+         block_slot = EXCLUDED.block_slot`,
+      [
+        id, assetId, clientAddress, Number(data.feedbackIndex), data.score,
+        data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
+        data.feedbackHash ? Buffer.from(data.feedbackHash).toString("hex") : null,
+        data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio, data.isUniqueClient,
+        false, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()
+      ]
     );
+
+    // Update agent's current ATOM stats
+    await db.query(
+      `UPDATE agents SET
+         trust_tier = $1,
+         quality_score = $2,
+         confidence = $3,
+         risk_score = $4,
+         diversity_ratio = $5,
+         feedback_count = feedback_count + 1,
+         updated_at = $6
+       WHERE asset = $7`,
+      [data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.blockTime.toISOString(), assetId]
+    );
+
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to save feedback");
   }
 }
 
@@ -396,32 +346,43 @@ async function handleFeedbackRevoked(
   data: FeedbackRevoked,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
-  const { error } = await supabase
-    .from("feedbacks")
-    .update({
-      is_revoked: true,
-      revoked_at: ctx.blockTime.toISOString(),
-      // ATOM enriched fields (v0.4.0) - final stats after revoke
-      revoke_original_score: data.originalScore,
-      revoke_had_impact: data.hadImpact,
-      revoke_new_trust_tier: data.newTrustTier,
-      revoke_new_quality_score: data.newQualityScore,
-      revoke_new_confidence: data.newConfidence,
-    })
-    .eq("id", id);
-
-  if (error) {
-    logger.error({ error, assetId, feedbackIndex: data.feedbackIndex }, "Failed to revoke feedback");
-  } else {
-    logger.info(
-      { assetId, feedbackIndex: data.feedbackIndex.toString() },
-      "Feedback revoked"
+  try {
+    // Update feedback record
+    await db.query(
+      `UPDATE feedbacks SET
+         is_revoked = true,
+         revoked_at = $1,
+         revoke_original_score = $2,
+         revoke_had_impact = $3,
+         revoke_new_trust_tier = $4,
+         revoke_new_quality_score = $5,
+         revoke_new_confidence = $6
+       WHERE id = $7`,
+      [ctx.blockTime.toISOString(), data.originalScore, data.hadImpact, data.newTrustTier, data.newQualityScore, data.newConfidence, id]
     );
+
+    // Update agent's current ATOM stats (revoke may change them)
+    if (data.hadImpact) {
+      await db.query(
+        `UPDATE agents SET
+           trust_tier = $1,
+           quality_score = $2,
+           confidence = $3,
+           feedback_count = GREATEST(feedback_count - 1, 0),
+           updated_at = $4
+         WHERE asset = $5`,
+        [data.newTrustTier, data.newQualityScore, data.newConfidence, ctx.blockTime.toISOString(), assetId]
+      );
+    }
+
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact }, "Feedback revoked");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to revoke feedback");
   }
 }
 
@@ -429,32 +390,23 @@ async function handleResponseAppended(
   data: ResponseAppended,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const responder = data.responder.toBase58();
   const id = `${assetId}:${data.feedbackIndex}:${responder}`;
 
-  const { error } = await supabase.from("feedback_responses").upsert({
-    id,
-    asset: assetId,
-    feedback_index: Number(data.feedbackIndex),
-    responder,
-    response_uri: data.responseUri || null,
-    response_hash: data.responseHash
-      ? Buffer.from(data.responseHash).toString("hex")
-      : null,
-    block_slot: Number(ctx.slot),
-    tx_signature: ctx.signature,
-    created_at: ctx.blockTime.toISOString(),
-  });
-
-  if (error) {
-    logger.error({ error, assetId, feedbackIndex: data.feedbackIndex }, "Failed to append response");
-  } else {
-    logger.info(
-      { assetId, feedbackIndex: data.feedbackIndex.toString() },
-      "Response appended"
+  try {
+    await db.query(
+      `INSERT INTO feedback_responses (id, asset, feedback_index, responder, response_uri, response_hash, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, assetId, Number(data.feedbackIndex), responder, data.responseUri || null,
+       data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
+       Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
     );
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to append response");
   }
 }
 
@@ -462,38 +414,23 @@ async function handleValidationRequested(
   data: ValidationRequested,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const validatorAddress = data.validatorAddress.toBase58();
   const id = `${assetId}:${validatorAddress}:${data.nonce}`;
 
-  const { error } = await supabase.from("validations").upsert({
-    id,
-    asset: assetId,
-    validator_address: validatorAddress,
-    nonce: data.nonce,
-    requester: data.requester.toBase58(),
-    request_uri: data.requestUri || null,
-    request_hash: data.requestHash
-      ? Buffer.from(data.requestHash).toString("hex")
-      : null,
-    status: "PENDING",
-    block_slot: Number(ctx.slot),
-    tx_signature: ctx.signature,
-    created_at: ctx.blockTime.toISOString(),
-  });
-
-  if (error) {
-    logger.error({ error, assetId, nonce: data.nonce }, "Failed to request validation");
-  } else {
-    logger.info(
-      {
-        assetId,
-        validator: validatorAddress,
-        nonce: data.nonce,
-      },
-      "Validation requested"
+  try {
+    await db.query(
+      `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, assetId, validatorAddress, data.nonce, data.requester.toBase58(),
+       data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
+       "PENDING", Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
     );
+    logger.info({ assetId, validator: validatorAddress, nonce: data.nonce }, "Validation requested");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, nonce: data.nonce }, "Failed to request validation");
   }
 }
 
@@ -501,36 +438,27 @@ async function handleValidationResponded(
   data: ValidationResponded,
   ctx: EventContext
 ): Promise<void> {
-  const supabase = getSupabase();
+  const db = getPool();
   const assetId = data.asset.toBase58();
   const validatorAddress = data.validatorAddress.toBase58();
   const id = `${assetId}:${validatorAddress}:${data.nonce}`;
 
-  const { error } = await supabase
-    .from("validations")
-    .update({
-      response: data.response,
-      response_uri: data.responseUri || null,
-      response_hash: data.responseHash
-        ? Buffer.from(data.responseHash).toString("hex")
-        : null,
-      tag: data.tag || null,
-      status: "RESPONDED",
-      updated_at: ctx.blockTime.toISOString(),
-    })
-    .eq("id", id);
-
-  if (error) {
-    logger.error({ error, assetId, nonce: data.nonce }, "Failed to respond to validation");
-  } else {
-    logger.info(
-      {
-        assetId,
-        validator: validatorAddress,
-        nonce: data.nonce,
-        response: data.response,
-      },
-      "Validation responded"
+  try {
+    await db.query(
+      `UPDATE validations SET
+         response = $1,
+         response_uri = $2,
+         response_hash = $3,
+         tag = $4,
+         status = $5,
+         updated_at = $6
+       WHERE id = $7`,
+      [data.response, data.responseUri || null,
+       data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
+       data.tag || null, "RESPONDED", ctx.blockTime.toISOString(), id]
     );
+    logger.info({ assetId, validator: validatorAddress, nonce: data.nonce, response: data.response }, "Validation responded");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, nonce: data.nonce }, "Failed to respond to validation");
   }
 }

@@ -13,6 +13,7 @@ export const config = {
   // Supabase (production)
   supabaseUrl: process.env.SUPABASE_URL,
   supabaseKey: process.env.SUPABASE_KEY, // service_role key for writes
+  supabaseDsn: process.env.SUPABASE_DSN, // PostgreSQL DSN for direct pg connection
 
   // Solana RPC (works with any provider)
   rpcUrl: process.env.RPC_URL || "https://api.devnet.solana.com",
@@ -52,11 +53,8 @@ export function validateConfig(): void {
 
   // Validate Supabase config when in supabase mode
   if (config.dbMode === "supabase") {
-    if (!config.supabaseUrl) {
-      throw new Error("SUPABASE_URL required when DB_MODE=supabase");
-    }
-    if (!config.supabaseKey) {
-      throw new Error("SUPABASE_KEY required when DB_MODE=supabase");
+    if (!config.supabaseDsn) {
+      throw new Error("SUPABASE_DSN required when DB_MODE=supabase");
     }
   }
 }
