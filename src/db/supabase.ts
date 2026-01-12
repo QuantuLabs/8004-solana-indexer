@@ -43,6 +43,11 @@ function getPool(): Pool {
       connectionString: config.supabaseDsn,
       ssl: { rejectUnauthorized: false },
       max: 10,
+      connectionTimeoutMillis: 10000, // 10s timeout
+      idleTimeoutMillis: 30000,
+    });
+    pool.on('error', (err) => {
+      logger.error({ error: err.message }, 'Unexpected pool error');
     });
   }
   return pool;
