@@ -304,12 +304,11 @@ async function handleNewFeedback(
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
-    // Insert feedback record
+    // Insert feedback record (ATOM stats go in agents table, not here)
     await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-         new_trust_tier, new_quality_score, new_confidence, new_risk_score, new_diversity_ratio, is_unique_client,
          is_revoked, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (id) DO UPDATE SET
          score = EXCLUDED.score,
          block_slot = EXCLUDED.block_slot`,
@@ -317,7 +316,6 @@ async function handleNewFeedback(
         id, assetId, clientAddress, Number(data.feedbackIndex), data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         data.feedbackHash ? Buffer.from(data.feedbackHash).toString("hex") : null,
-        data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio, data.isUniqueClient,
         false, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()
       ]
     );
@@ -352,18 +350,13 @@ async function handleFeedbackRevoked(
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
-    // Update feedback record
+    // Update feedback record (mark as revoked, ATOM stats update goes to agents table)
     await db.query(
       `UPDATE feedbacks SET
          is_revoked = true,
-         revoked_at = $1,
-         revoke_original_score = $2,
-         revoke_had_impact = $3,
-         revoke_new_trust_tier = $4,
-         revoke_new_quality_score = $5,
-         revoke_new_confidence = $6
-       WHERE id = $7`,
-      [ctx.blockTime.toISOString(), data.originalScore, data.hadImpact, data.newTrustTier, data.newQualityScore, data.newConfidence, id]
+         revoked_at = $1
+       WHERE id = $2`,
+      [ctx.blockTime.toISOString(), id]
     );
 
     // Update agent's current ATOM stats (revoke may change them)
