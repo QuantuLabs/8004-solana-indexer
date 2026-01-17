@@ -325,7 +325,7 @@ async function handleNewFeedback(
       ]
     );
 
-    // Update agent's current ATOM stats
+    // Update agent's current ATOM stats + compute raw_avg_score
     await db.query(
       `UPDATE agents SET
          trust_tier = $1,
@@ -334,6 +334,11 @@ async function handleNewFeedback(
          risk_score = $4,
          diversity_ratio = $5,
          feedback_count = feedback_count + 1,
+         raw_avg_score = COALESCE((
+           SELECT ROUND(AVG(score))::smallint
+           FROM feedbacks
+           WHERE asset = $7 AND NOT is_revoked
+         ), 0),
          updated_at = $6
        WHERE asset = $7`,
       [data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.blockTime.toISOString(), assetId]
@@ -364,7 +369,7 @@ async function handleFeedbackRevoked(
       [ctx.blockTime.toISOString(), id]
     );
 
-    // Update agent's current ATOM stats (revoke may change them)
+    // Update agent's current ATOM stats + recalculate raw_avg_score (revoke may change them)
     if (data.hadImpact) {
       await db.query(
         `UPDATE agents SET
@@ -372,6 +377,11 @@ async function handleFeedbackRevoked(
            quality_score = $2,
            confidence = $3,
            feedback_count = GREATEST(feedback_count - 1, 0),
+           raw_avg_score = COALESCE((
+             SELECT ROUND(AVG(score))::smallint
+             FROM feedbacks
+             WHERE asset = $5 AND NOT is_revoked
+           ), 0),
            updated_at = $4
          WHERE asset = $5`,
         [data.newTrustTier, data.newQualityScore, data.newConfidence, ctx.blockTime.toISOString(), assetId]

@@ -64,7 +64,9 @@ export interface NewFeedback {
   feedbackIndex: bigint;
   score: number;
   feedbackHash: Uint8Array;
-  // ATOM enriched fields (v0.4.0)
+  // ATOM enabled flag
+  atomEnabled: boolean;       // Whether ATOM Engine was used
+  // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
   newTrustTier: number;       // u8 (0-4)
   newQualityScore: number;    // u16 (0-10000)
   newConfidence: number;      // u16 (0-10000)
@@ -82,8 +84,10 @@ export interface FeedbackRevoked {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
-  // ATOM enriched fields (v0.4.0)
   originalScore: number;      // u8
+  // ATOM enabled flag
+  atomEnabled: boolean;       // Whether ATOM Engine was used
+  // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
   hadImpact: boolean;
   newTrustTier: number;       // u8 (0-4)
   newQualityScore: number;    // u16 (0-10000)

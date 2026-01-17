@@ -186,7 +186,9 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
             score: data.score as number,
             feedbackHash: new Uint8Array(data.feedback_hash as number[]),// snake_case from IDL
-            // ATOM enriched fields (v0.4.0)
+            // ATOM enabled flag
+            atomEnabled: data.atom_enabled as boolean,                   // snake_case from IDL
+            // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
             newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
             newQualityScore: data.new_quality_score as number,           // snake_case from IDL
             newConfidence: data.new_confidence as number,                // snake_case from IDL

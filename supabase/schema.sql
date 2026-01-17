@@ -50,6 +50,8 @@ CREATE TABLE agents (
   risk_score SMALLINT DEFAULT 0 CHECK (risk_score >= 0 AND risk_score <= 100),
   diversity_ratio SMALLINT DEFAULT 0 CHECK (diversity_ratio >= 0 AND diversity_ratio <= 255),
   feedback_count INTEGER DEFAULT 0,
+  -- Raw average (simple arithmetic mean, for when ATOM not enabled)
+  raw_avg_score SMALLINT DEFAULT 0 CHECK (raw_avg_score >= 0 AND raw_avg_score <= 100),
 
   -- Leaderboard sort key (computed, Redis-compatible ≤2^53) --
   -- Formula: mixed-radix packing with deterministic tie-breaker
