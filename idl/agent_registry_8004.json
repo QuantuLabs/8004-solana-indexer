@@ -1,5 +1,5 @@
 {
-  "address": "HHCVWcqsziJMmp43u2UAgAfH2cBjUFxVdW1M3C3NqzvT",
+  "address": "6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1",
   "metadata": {
     "name": "agent_registry_8004",
     "version": "0.3.0",
@@ -436,7 +436,8 @@
         {
           "name": "atom_stats",
           "docs": [
-            "AtomStats PDA (owned by atom-engine, created on first feedback)"
+            "AtomStats PDA - OPTIONAL initialization",
+            "If uninitialized, feedback works without ATOM Engine"
           ],
           "writable": true
         },
@@ -615,38 +616,38 @@
               {
                 "kind": "const",
                 "value": [
-                  241,
-                  225,
-                  70,
-                  254,
+                  79,
+                  165,
+                  45,
                   89,
-                  108,
-                  104,
-                  74,
-                  240,
-                  174,
-                  84,
-                  226,
-                  42,
-                  48,
-                  161,
-                  86,
-                  161,
-                  228,
-                  49,
-                  65,
-                  152,
-                  214,
-                  24,
+                  251,
+                  145,
+                  89,
+                  188,
+                  251,
+                  113,
+                  195,
+                  53,
+                  82,
+                  253,
+                  175,
+                  168,
+                  9,
+                  47,
+                  54,
                   194,
-                  99,
-                  150,
-                  178,
-                  28,
+                  19,
+                  14,
                   192,
-                  111,
-                  95,
-                  240
+                  128,
+                  177,
+                  126,
+                  140,
+                  90,
+                  175,
+                  0,
+                  205,
+                  100
                 ]
               }
             ],
@@ -699,6 +700,64 @@
             "Metaplex Core program"
           ],
           "address": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_validation_config",
+      "docs": [
+        "Initialize the ValidationConfig (global validation registry state)"
+      ],
+      "discriminator": [
+        138,
+        209,
+        223,
+        183,
+        48,
+        227,
+        146,
+        152
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  108,
+                  105,
+                  100,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
@@ -916,12 +975,59 @@
       ],
       "accounts": [
         {
+          "name": "config",
+          "docs": [
+            "ValidationConfig for tracking global counters"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  108,
+                  105,
+                  100,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
           "name": "requester",
+          "docs": [
+            "Agent owner (requester)"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "payer",
+          "docs": [
+            "Payer for the validation request account (can be different from requester)"
+          ],
           "writable": true,
           "signer": true
         },
         {
           "name": "agent_account",
+          "docs": [
+            "Agent account (to verify ownership and get asset)"
+          ],
           "pda": {
             "seeds": [
               {
@@ -942,10 +1048,55 @@
           }
         },
         {
-          "name": "asset"
+          "name": "asset",
+          "docs": [
+            "Agent asset (Metaplex Core)"
+          ]
+        },
+        {
+          "name": "validation_request",
+          "docs": [
+            "Validation request PDA (to be created)"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  108,
+                  105,
+                  100,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "asset"
+              },
+              {
+                "kind": "arg",
+                "path": "validator_address"
+              },
+              {
+                "kind": "arg",
+                "path": "nonce"
+              }
+            ]
+          }
         },
         {
           "name": "validator"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -975,7 +1126,8 @@
     {
       "name": "respond_to_validation",
       "docs": [
-        "Validator responds to a validation request"
+        "Validator responds to a validation request",
+        "ERC-8004: Enables progressive validation - validators can update responses"
       ],
       "discriminator": [
         64,
@@ -989,12 +1141,51 @@
       ],
       "accounts": [
         {
+          "name": "config",
+          "docs": [
+            "ValidationConfig for tracking global counters"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  108,
+                  105,
+                  100,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
           "name": "validator",
+          "docs": [
+            "Validator (signer)"
+          ],
           "writable": true,
           "signer": true
         },
         {
           "name": "agent_account",
+          "docs": [
+            "Agent account (to verify no self-validation)"
+          ],
           "pda": {
             "seeds": [
               {
@@ -1015,10 +1206,57 @@
           }
         },
         {
-          "name": "asset"
+          "name": "asset",
+          "docs": [
+            "Agent asset (Metaplex Core)"
+          ]
+        },
+        {
+          "name": "validation_request",
+          "docs": [
+            "Validation request PDA (existing, to be updated)",
+            "ERC-8004: Enables progressive validation - validators can update responses"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  108,
+                  105,
+                  100,
+                  97,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "asset"
+              },
+              {
+                "kind": "account",
+                "path": "validation_request.validator_address",
+                "account": "ValidationRequest"
+              },
+              {
+                "kind": "arg",
+                "path": "nonce"
+              }
+            ]
+          }
         }
       ],
       "args": [
+        {
+          "name": "validator_address",
+          "type": "pubkey"
+        },
         {
           "name": "nonce",
           "type": "u32"
@@ -1100,7 +1338,8 @@
         {
           "name": "atom_stats",
           "docs": [
-            "AtomStats PDA (owned by atom-engine)"
+            "AtomStats PDA - OPTIONAL initialization",
+            "If uninitialized, revoke works without ATOM Engine"
           ],
           "writable": true
         },
@@ -1842,6 +2081,32 @@
         223,
         246
       ]
+    },
+    {
+      "name": "ValidationConfig",
+      "discriminator": [
+        169,
+        98,
+        16,
+        22,
+        71,
+        9,
+        255,
+        7
+      ]
+    },
+    {
+      "name": "ValidationRequest",
+      "discriminator": [
+        130,
+        174,
+        153,
+        111,
+        74,
+        241,
+        40,
+        140
+      ]
     }
   ],
   "events": [
@@ -2258,6 +2523,11 @@
       "code": 12400,
       "name": "InvalidProgram",
       "msg": "Invalid program ID for CPI call"
+    },
+    {
+      "code": 12401,
+      "name": "InvalidAtomStatsAccount",
+      "msg": "Invalid AtomStats account - must be correct PDA for this asset"
     }
   ],
   "types": [
@@ -2453,6 +2723,10 @@
             "type": "u8"
           },
           {
+            "name": "atom_enabled",
+            "type": "bool"
+          },
+          {
             "name": "had_impact",
             "type": "bool"
           },
@@ -2604,6 +2878,10 @@
                 32
               ]
             }
+          },
+          {
+            "name": "atom_enabled",
+            "type": "bool"
           },
           {
             "name": "new_trust_tier",
@@ -2842,10 +3120,112 @@
       }
     },
     {
+      "name": "ValidationConfig",
+      "docs": [
+        "Global validation registry configuration"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "docs": [
+              "Registry authority (program owner)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "total_requests",
+            "docs": [
+              "Total validation requests created"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_responses",
+            "docs": [
+              "Total validation responses recorded"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump seed"
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValidationRequest",
+      "docs": [
+        "Individual validation request (state stored on-chain)",
+        "URIs, tags, hashes (except request_hash), and created_at are stored in events only",
+        "This optimized structure follows ERC-8004 immutability requirements while minimizing rent cost"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "asset",
+            "docs": [
+              "Agent asset (Metaplex Core) - used as primary identifier"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "validator_address",
+            "docs": [
+              "Validator address (who can respond)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "nonce",
+            "docs": [
+              "Nonce for multiple validations from same validator (enables re-validation)"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "request_hash",
+            "docs": [
+              "Request hash (SHA-256 of request content for integrity verification)"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "response",
+            "docs": [
+              "Current response value (0-100, 0 = pending/no response)",
+              "ERC-8004: 0 is a valid response score, use responded_at to determine pending status"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "responded_at",
+            "docs": [
+              "Timestamp of last response (0 if no response yet)",
+              "ERC-8004: Equivalent to lastUpdate, enables progressive validation"
+            ],
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
       "name": "ValidationRequested",
       "docs": [
         "Event emitted when validation is requested",
-        "Field order optimized for indexing: fixed-size fields first, variable-size (String) last"
+        "Field order optimized for indexing: fixed-size fields first, variable-size (String) last",
+        "ERC-8004: Events store full metadata not kept on-chain for rent optimization"
       ],
       "type": {
         "kind": "struct",
@@ -2876,6 +3256,10 @@
             }
           },
           {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
             "name": "request_uri",
             "type": "string"
           }
@@ -2886,7 +3270,8 @@
       "name": "ValidationResponded",
       "docs": [
         "Event emitted when validator responds",
-        "Field order optimized for indexing: fixed-size fields first, variable-size (String) last"
+        "Field order optimized for indexing: fixed-size fields first, variable-size (String) last",
+        "ERC-8004: Enables progressive validation - validators can update responses"
       ],
       "type": {
         "kind": "struct",
@@ -2915,6 +3300,10 @@
                 32
               ]
             }
+          },
+          {
+            "name": "responded_at",
+            "type": "i64"
           },
           {
             "name": "response_uri",
