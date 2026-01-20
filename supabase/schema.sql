@@ -40,6 +40,7 @@ CREATE TABLE agents (
   owner TEXT NOT NULL,
   agent_uri TEXT,
   agent_wallet TEXT,
+  atom_enabled BOOLEAN DEFAULT TRUE,
   collection TEXT REFERENCES collections(collection),
   nft_name TEXT,
 
@@ -141,17 +142,19 @@ CREATE INDEX idx_feedbacks_not_revoked ON feedbacks(asset, created_at DESC) WHER
 CREATE TABLE feedback_responses (
   id TEXT PRIMARY KEY,
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
+  client_address TEXT NOT NULL,
   feedback_index BIGINT NOT NULL,
   responder TEXT NOT NULL,
   response_uri TEXT,
   response_hash TEXT,
   block_slot BIGINT NOT NULL,
   tx_signature TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(asset, client_address, feedback_index, responder)
 );
 
 CREATE INDEX idx_responses_asset ON feedback_responses(asset);
-CREATE INDEX idx_responses_lookup ON feedback_responses(asset, feedback_index);
+CREATE INDEX idx_responses_lookup ON feedback_responses(asset, client_address, feedback_index);
 
 -- =============================================
 -- VALIDATIONS
@@ -333,3 +336,8 @@ CREATE POLICY "Public read atom_config" ON atom_config FOR SELECT USING (true);
 
 -- Service role write access (indexer uses SUPABASE_DSN with service_role)
 -- No INSERT/UPDATE/DELETE policies = blocked for anon users
+
+-- Modified:
+-- - feedback_responses table: Added client_address column
+-- - Updated UNIQUE constraint to (asset, client_address, feedback_index, responder)
+-- - Updated idx_responses_lookup index to include client_address

@@ -4,9 +4,11 @@
  */
 
 import { Pool } from "pg";
+import { createHash } from "crypto";
 import {
   ProgramEvent,
   AgentRegisteredInRegistry,
+  AtomEnabled,
   AgentOwnerSynced,
   UriUpdated,
   WalletUpdated,
@@ -64,6 +66,10 @@ export async function handleEvent(
 
     case "AgentOwnerSynced":
       await handleAgentOwnerSynced(event.data, ctx);
+      break;
+
+    case "AtomEnabled":
+      await handleAtomEnabled(event.data, ctx);
       break;
 
     case "UriUpdated":
@@ -148,13 +154,14 @@ async function handleAgentRegistered(
 
   try {
     await db.query(
-      `INSERT INTO agents (asset, owner, agent_uri, collection, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (asset) DO UPDATE SET
          owner = EXCLUDED.owner,
+         atom_enabled = EXCLUDED.atom_enabled,
          block_slot = EXCLUDED.block_slot,
          updated_at = EXCLUDED.created_at`,
-      [assetId, data.owner.toBase58(), null, collection, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+      [assetId, data.owner.toBase58(), null, collection, data.atomEnabled, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, owner: data.owner.toBase58() }, "Agent registered");
   } catch (error: any) {
@@ -177,6 +184,24 @@ async function handleAgentOwnerSynced(
     logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to sync owner");
+  }
+}
+
+async function handleAtomEnabled(
+  data: AtomEnabled,
+  ctx: EventContext
+): Promise<void> {
+  const db = getPool();
+  const assetId = data.asset.toBase58();
+
+  try {
+    await db.query(
+      `UPDATE agents SET atom_enabled = true, block_slot = $1, updated_at = $2 WHERE asset = $3`,
+      [Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+    );
+    logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed to enable ATOM");
   }
 }
 
@@ -222,7 +247,8 @@ async function handleMetadataSet(
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
-  const keyHash = Buffer.from(data.value).slice(0, 16).toString("hex");
+  // FIX: Calculate key_hash from key (sha256(key)[0..16]), not from value
+  const keyHash = createHash("sha256").update(data.key).digest().slice(0, 16).toString("hex");
   const id = `${assetId}:${keyHash}`;
 
   try {
@@ -268,6 +294,7 @@ async function handleBaseRegistryCreated(
       `INSERT INTO collections (collection, registry_type, authority, base_index, created_at)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (collection) DO UPDATE SET
+         registry_type = EXCLUDED.registry_type,
          authority = EXCLUDED.authority,
          base_index = EXCLUDED.base_index`,
       [collection, "BASE", data.createdBy.toBase58(), data.baseIndex, ctx.blockTime.toISOString()]
@@ -290,6 +317,7 @@ async function handleUserRegistryCreated(
       `INSERT INTO collections (collection, registry_type, authority, created_at)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (collection) DO UPDATE SET
+         registry_type = EXCLUDED.registry_type,
          authority = EXCLUDED.authority`,
       [collection, "USER", data.owner.toBase58(), ctx.blockTime.toISOString()]
     );
@@ -309,40 +337,72 @@ async function handleNewFeedback(
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
-    // Insert feedback record (ATOM stats go in agents table, not here)
-    await db.query(
+    // Normalize optional hash: all-zero means "no hash" for IPFS
+    const isAllZeroHash = data.feedbackHash && data.feedbackHash.every(b => b === 0);
+    const feedbackHash = (data.feedbackHash && !isAllZeroHash)
+      ? Buffer.from(data.feedbackHash).toString("hex")
+      : null;
+
+    const insertResult = await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          is_revoked, block_slot, tx_signature, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-       ON CONFLICT (id) DO UPDATE SET
-         score = EXCLUDED.score,
-         block_slot = EXCLUDED.block_slot`,
+       ON CONFLICT (id) DO NOTHING`,
       [
-        id, assetId, clientAddress, Number(data.feedbackIndex), data.score,
+        id, assetId, clientAddress, data.feedbackIndex.toString(), data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
-        data.feedbackHash ? Buffer.from(data.feedbackHash).toString("hex") : null,
+        feedbackHash,
         false, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()
       ]
     );
 
-    // Update agent's current ATOM stats + compute raw_avg_score
-    await db.query(
-      `UPDATE agents SET
-         trust_tier = $1,
-         quality_score = $2,
-         confidence = $3,
-         risk_score = $4,
-         diversity_ratio = $5,
-         feedback_count = feedback_count + 1,
-         raw_avg_score = COALESCE((
-           SELECT ROUND(AVG(score))::smallint
-           FROM feedbacks
-           WHERE asset = $7 AND NOT is_revoked
-         ), 0),
-         updated_at = $6
-       WHERE asset = $7`,
-      [data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.blockTime.toISOString(), assetId]
-    );
+    if (insertResult.rowCount === 0) {
+      logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
+      return;
+    }
+
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
+
+    if (data.atomEnabled) {
+      await db.query(
+        `UPDATE agents SET
+           trust_tier = $3,
+           quality_score = $4,
+           confidence = $5,
+           risk_score = $6,
+           diversity_ratio = $7,
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [
+          ctx.blockTime.toISOString(),
+          assetId,
+          data.newTrustTier,
+          data.newQualityScore,
+          data.newConfidence,
+          data.newRiskScore,
+          data.newDiversityRatio,
+        ]
+      );
+    } else {
+      await db.query(
+        `UPDATE agents SET
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId]
+      );
+    }
 
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
   } catch (error: any) {
@@ -369,22 +429,36 @@ async function handleFeedbackRevoked(
       [ctx.blockTime.toISOString(), id]
     );
 
-    // Update agent's current ATOM stats + recalculate raw_avg_score (revoke may change them)
-    if (data.hadImpact) {
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
+
+    await db.query(
+      `UPDATE agents SET
+         ${baseUpdate}
+       WHERE asset = $2`,
+      [ctx.blockTime.toISOString(), assetId]
+    );
+
+    if (data.atomEnabled && data.hadImpact) {
       await db.query(
         `UPDATE agents SET
-           trust_tier = $1,
-           quality_score = $2,
-           confidence = $3,
-           feedback_count = GREATEST(feedback_count - 1, 0),
-           raw_avg_score = COALESCE((
-             SELECT ROUND(AVG(score))::smallint
-             FROM feedbacks
-             WHERE asset = $5 AND NOT is_revoked
-           ), 0),
-           updated_at = $4
-         WHERE asset = $5`,
-        [data.newTrustTier, data.newQualityScore, data.newConfidence, ctx.blockTime.toISOString(), assetId]
+           trust_tier = $3,
+           quality_score = $4,
+           confidence = $5,
+           updated_at = $1
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
       );
     }
 
@@ -400,16 +474,32 @@ async function handleResponseAppended(
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
+  const clientAddress = data.client.toBase58();
   const responder = data.responder.toBase58();
-  const id = `${assetId}:${data.feedbackIndex}:${responder}`;
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}`;
 
   try {
+    const feedbackCheck = await db.query(
+      `SELECT id FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
+      [assetId, clientAddress, data.feedbackIndex.toString()]
+    );
+    if (feedbackCheck.rowCount === 0) {
+      logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() }, "Feedback not found for response");
+      return;
+    }
+
+    // Normalize optional hash: all-zero means "no hash" for IPFS
+    const isAllZeroHash = data.responseHash && data.responseHash.every(b => b === 0);
+    const responseHash = (data.responseHash && !isAllZeroHash)
+      ? Buffer.from(data.responseHash).toString("hex")
+      : null;
+
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, feedback_index, responder, response_uri, response_hash, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (id) DO NOTHING`,
-      [id, assetId, Number(data.feedbackIndex), responder, data.responseUri || null,
-       data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
+      [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
+       responseHash,
        Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
@@ -535,3 +625,8 @@ export async function saveIndexerState(signature: string, slot: bigint): Promise
     logger.error({ error: error.message }, "Failed to save indexer state");
   }
 }
+
+// Modified:
+// - handleResponseAppended: Added client_address column to INSERT statement
+// - handleNewFeedback/handleResponseAppended: All-zero hashes now stored as NULL
+// - All feedback_index values converted to string before INSERT
