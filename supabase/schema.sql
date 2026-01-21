@@ -163,7 +163,7 @@ CREATE TABLE validations (
   id TEXT PRIMARY KEY,
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   validator_address TEXT NOT NULL,
-  nonce INTEGER NOT NULL,
+  nonce BIGINT NOT NULL,  -- BIGINT: Solana u32 can exceed INTEGER max (2^31-1)
   requester TEXT,
   request_uri TEXT,
   request_hash TEXT,
