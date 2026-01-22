@@ -185,7 +185,11 @@ describe("Poller", () => {
     it("should log failed transaction processing", async () => {
       const sig = createMockSignatureInfo();
 
-      (mockPrisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "resume-signature",
+        lastSlot: TEST_SLOT,
+      });
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
       (mockConnection.getParsedTransaction as any).mockRejectedValue(
@@ -206,7 +210,11 @@ describe("Poller", () => {
     it("should log failed transaction processing with non-Error object", async () => {
       const sig = createMockSignatureInfo();
 
-      (mockPrisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "resume-signature",
+        lastSlot: TEST_SLOT,
+      });
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
       (mockConnection.getParsedTransaction as any).mockRejectedValue("String error");
@@ -233,7 +241,11 @@ describe("Poller", () => {
         confirmationStatus: "finalized" as const,
       };
 
-      (mockPrisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "resume-signature",
+        lastSlot: TEST_SLOT,
+      });
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
       (mockConnection.getParsedTransaction as any).mockRejectedValue(
@@ -252,7 +264,11 @@ describe("Poller", () => {
     });
 
     it("should handle error in polling loop gracefully", async () => {
-      (mockPrisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "resume-signature",
+        lastSlot: TEST_SLOT,
+      });
       // Make getSignaturesForAddress throw to trigger catch block in poll()
       (mockConnection.getSignaturesForAddress as any).mockRejectedValueOnce(
         new Error("Network error")
@@ -274,6 +290,7 @@ describe("Poller", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -307,6 +324,7 @@ describe("Poller", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);

@@ -6,6 +6,13 @@ export interface AgentRegisteredInRegistry {
   registry: PublicKey;
   collection: PublicKey;
   owner: PublicKey;
+  atomEnabled: boolean;
+  agentUri: string;
+}
+
+export interface AtomEnabled {
+  asset: PublicKey;
+  enabledBy: PublicKey;
 }
 
 export interface AgentOwnerSynced {
@@ -96,6 +103,7 @@ export interface FeedbackRevoked {
 
 export interface ResponseAppended {
   asset: PublicKey;
+  client: PublicKey;
   feedbackIndex: bigint;
   responder: PublicKey;
   responseUri: string;
@@ -124,6 +132,7 @@ export interface ValidationResponded {
 // Union type for all events
 export type ProgramEvent =
   | { type: "AgentRegisteredInRegistry"; data: AgentRegisteredInRegistry }
+  | { type: "AtomEnabled"; data: AtomEnabled }
   | { type: "AgentOwnerSynced"; data: AgentOwnerSynced }
   | { type: "UriUpdated"; data: UriUpdated }
   | { type: "WalletUpdated"; data: WalletUpdated }
@@ -142,6 +151,7 @@ export type ProgramEvent =
 export const EVENT_DISCRIMINATORS: Record<string, string> = {
   AgentOwnerSynced: "65e4b8fc14b946f9",
   AgentRegisteredInRegistry: "ebf157e201dfbaaf",
+  AtomEnabled: "f6b3aedf616e4ac8",
   BaseRegistryCreated: "879ce7e4244c002b",
   BaseRegistryRotated: "8eb839c2f11d3c7c",
   FeedbackRevoked: "cd101f5e36651007",

@@ -30,13 +30,13 @@ describe("Parser Decoder", () => {
   describe("IDL loading", () => {
     it("should load IDL successfully", () => {
       expect(idl).toBeDefined();
-      expect(idl.address).toBe("3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC");
+      expect(idl.address).toBe("6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1");
     });
 
     it("should have events defined in IDL", () => {
       expect(idl.events).toBeDefined();
       expect(Array.isArray(idl.events)).toBe(true);
-      expect(idl.events!.length).toBe(14);
+      expect(idl.events!.length).toBe(15);
     });
   });
 
@@ -69,6 +69,7 @@ describe("Parser Decoder", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -87,6 +88,7 @@ describe("Parser Decoder", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const eventData2 = {
@@ -165,6 +167,7 @@ describe("Parser Decoder", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -185,6 +188,7 @@ describe("Parser Decoder", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -217,6 +221,7 @@ describe("Parser Decoder", () => {
           registry: TEST_REGISTRY.toBase58(),
           collection: TEST_COLLECTION.toBase58(),
           owner: TEST_OWNER.toBase58(),
+          atom_enabled: true,
         },
       };
 
@@ -235,8 +240,8 @@ describe("Parser Decoder", () => {
         name: "AgentOwnerSynced",
         data: {
           asset: TEST_ASSET.toBase58(),
-          oldOwner: TEST_OWNER.toBase58(),
-          newOwner: TEST_NEW_OWNER.toBase58(),
+          old_owner: TEST_OWNER.toBase58(),
+          new_owner: TEST_NEW_OWNER.toBase58(),
         },
       };
 
@@ -254,8 +259,8 @@ describe("Parser Decoder", () => {
         name: "UriUpdated",
         data: {
           asset: TEST_ASSET.toBase58(),
-          newUri: "https://example.com/agent.json",
-          updatedBy: TEST_OWNER.toBase58(),
+          new_uri: "https://example.com/agent.json",
+          updated_by: TEST_OWNER.toBase58(),
         },
       };
 
@@ -271,9 +276,9 @@ describe("Parser Decoder", () => {
         name: "WalletUpdated",
         data: {
           asset: TEST_ASSET.toBase58(),
-          oldWallet: null,
-          newWallet: TEST_WALLET.toBase58(),
-          updatedBy: TEST_OWNER.toBase58(),
+          old_wallet: null,
+          new_wallet: TEST_WALLET.toBase58(),
+          updated_by: TEST_OWNER.toBase58(),
         },
       };
 
@@ -293,9 +298,9 @@ describe("Parser Decoder", () => {
         name: "WalletUpdated",
         data: {
           asset: TEST_ASSET.toBase58(),
-          oldWallet: oldWallet.toBase58(),
-          newWallet: TEST_WALLET.toBase58(),
-          updatedBy: TEST_OWNER.toBase58(),
+          old_wallet: oldWallet.toBase58(),
+          new_wallet: TEST_WALLET.toBase58(),
+          updated_by: TEST_OWNER.toBase58(),
         },
       };
 
@@ -347,8 +352,8 @@ describe("Parser Decoder", () => {
         data: {
           registry: TEST_REGISTRY.toBase58(),
           collection: TEST_COLLECTION.toBase58(),
-          baseIndex: 0,
-          createdBy: TEST_OWNER.toBase58(),
+          base_index: 0,
+          created_by: TEST_OWNER.toBase58(),
         },
       };
 
@@ -382,9 +387,9 @@ describe("Parser Decoder", () => {
       const event = {
         name: "BaseRegistryRotated",
         data: {
-          oldRegistry: TEST_REGISTRY.toBase58(),
-          newRegistry: newRegistry.toBase58(),
-          rotatedBy: TEST_OWNER.toBase58(),
+          old_registry: TEST_REGISTRY.toBase58(),
+          new_registry: newRegistry.toBase58(),
+          rotated_by: TEST_OWNER.toBase58(),
         },
       };
 
@@ -399,14 +404,21 @@ describe("Parser Decoder", () => {
         name: "NewFeedback",
         data: {
           asset: TEST_ASSET.toBase58(),
-          clientAddress: TEST_CLIENT.toBase58(),
-          feedbackIndex: "0",
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
           score: 85,
+          feedback_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
           tag1: "quality",
           tag2: "speed",
           endpoint: "/api/chat",
-          feedbackUri: "ipfs://QmXXX",
-          feedbackHash: Array.from(TEST_HASH),
+          feedback_uri: "ipfs://QmXXX",
         },
       };
 
@@ -424,8 +436,14 @@ describe("Parser Decoder", () => {
         name: "FeedbackRevoked",
         data: {
           asset: TEST_ASSET.toBase58(),
-          clientAddress: TEST_CLIENT.toBase58(),
-          feedbackIndex: "1",
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "1",
+          original_score: 85,
+          atom_enabled: true,
+          had_impact: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
         },
       };
 
@@ -441,10 +459,11 @@ describe("Parser Decoder", () => {
         name: "ResponseAppended",
         data: {
           asset: TEST_ASSET.toBase58(),
-          feedbackIndex: "0",
+          client: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
           responder: TEST_OWNER.toBase58(),
-          responseUri: "ipfs://QmYYY",
-          responseHash: Array.from(TEST_HASH),
+          response_uri: "ipfs://QmYYY",
+          response_hash: Array.from(TEST_HASH),
         },
       };
 
@@ -460,10 +479,10 @@ describe("Parser Decoder", () => {
         name: "ValidationRequested",
         data: {
           asset: TEST_ASSET.toBase58(),
-          validatorAddress: TEST_VALIDATOR.toBase58(),
+          validator_address: TEST_VALIDATOR.toBase58(),
           nonce: 1,
-          requestUri: "ipfs://QmZZZ",
-          requestHash: Array.from(TEST_HASH),
+          request_uri: "ipfs://QmZZZ",
+          request_hash: Array.from(TEST_HASH),
           requester: TEST_OWNER.toBase58(),
         },
       };
@@ -480,11 +499,11 @@ describe("Parser Decoder", () => {
         name: "ValidationResponded",
         data: {
           asset: TEST_ASSET.toBase58(),
-          validatorAddress: TEST_VALIDATOR.toBase58(),
+          validator_address: TEST_VALIDATOR.toBase58(),
           nonce: 1,
           response: 90,
-          responseUri: "ipfs://QmAAA",
-          responseHash: Array.from(TEST_HASH),
+          response_uri: "ipfs://QmAAA",
+          response_hash: Array.from(TEST_HASH),
           tag: "security",
         },
       };

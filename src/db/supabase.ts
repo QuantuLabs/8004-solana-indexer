@@ -31,6 +31,7 @@ export interface EventContext {
   signature: string;
   slot: bigint;
   blockTime: Date;
+  txIndex?: number; // Transaction index within the block (for deterministic ordering)
 }
 
 let pool: Pool | null = null;
@@ -149,21 +150,31 @@ async function handleAgentRegistered(
   const db = getPool();
   const assetId = data.asset.toBase58();
   const collection = data.collection.toBase58();
+  const agentUri = data.agentUri || null;
 
   await ensureCollection(collection);
 
   try {
     await db.query(
-      `INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_index, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (asset) DO UPDATE SET
          owner = EXCLUDED.owner,
+         agent_uri = EXCLUDED.agent_uri,
          atom_enabled = EXCLUDED.atom_enabled,
          block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.created_at`,
-      [assetId, data.owner.toBase58(), null, collection, data.atomEnabled, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+      [assetId, data.owner.toBase58(), agentUri, collection, data.atomEnabled, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
-    logger.info({ assetId, owner: data.owner.toBase58() }, "Agent registered");
+    logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
+
+    // Trigger URI metadata extraction if configured and URI is present
+    if (agentUri && config.metadataIndexMode !== "off") {
+      digestAndStoreUriMetadata(assetId, agentUri).catch((err) => {
+        logger.warn({ assetId, uri: agentUri, error: err.message }, "Failed to digest URI metadata");
+      });
+    }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to register agent");
   }
@@ -211,13 +222,21 @@ async function handleUriUpdated(
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
+  const newUri = data.newUri || null;
 
   try {
     await db.query(
       `UPDATE agents SET agent_uri = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [data.newUri, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [newUri, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
     );
-    logger.info({ assetId, newUri: data.newUri }, "Agent URI updated");
+    logger.info({ assetId, newUri }, "Agent URI updated");
+
+    // Trigger URI metadata extraction if configured and URI is present
+    if (newUri && config.metadataIndexMode !== "off") {
+      digestAndStoreUriMetadata(assetId, newUri).catch((err) => {
+        logger.warn({ assetId, uri: newUri, error: err.message }, "Failed to digest URI metadata");
+      });
+    }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to update URI");
   }
@@ -253,13 +272,14 @@ async function handleMetadataSet(
 
   try {
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
          block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.updated_at`,
-      [id, assetId, data.key, keyHash, Buffer.from(data.value).toString("base64"), data.immutable, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+      [id, assetId, data.key, keyHash, Buffer.from(data.value).toString("base64"), data.immutable, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
   } catch (error: any) {
@@ -345,14 +365,14 @@ async function handleNewFeedback(
 
     const insertResult = await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-         is_revoked, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         is_revoked, block_slot, tx_index, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        ON CONFLICT (id) DO NOTHING`,
       [
         id, assetId, clientAddress, data.feedbackIndex.toString(), data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         feedbackHash,
-        false, Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()
+        false, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()
       ]
     );
 
@@ -495,12 +515,12 @@ async function handleResponseAppended(
       : null;
 
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash,
-       Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+       Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
   } catch (error: any) {
@@ -519,12 +539,12 @@ async function handleValidationRequested(
 
   try {
     await db.query(
-      `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, validatorAddress, data.nonce, data.requester.toBase58(),
        data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-       "PENDING", Number(ctx.slot), ctx.signature, ctx.blockTime.toISOString()]
+       "PENDING", Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, validator: validatorAddress, nonce: data.nonce }, "Validation requested");
   } catch (error: any) {
@@ -626,7 +646,81 @@ export async function saveIndexerState(signature: string, slot: bigint): Promise
   }
 }
 
-// Modified:
-// - handleResponseAppended: Added client_address column to INSERT statement
-// - handleNewFeedback/handleResponseAppended: All-zero hashes now stored as NULL
-// - All feedback_index values converted to string before INSERT
+// =============================================
+// URI METADATA EXTRACTION
+// =============================================
+
+import { digestUri, serializeValue } from "../indexer/uriDigest.js";
+
+/**
+ * Fetch, digest, and store URI metadata for an agent
+ * Called asynchronously after agent registration or URI update
+ */
+async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<void> {
+  if (config.metadataIndexMode === "off") {
+    return;
+  }
+
+  const result = await digestUri(uri);
+
+  if (result.status !== "ok" || !result.fields) {
+    logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
+    // Store error status as metadata
+    await storeUriMetadata(assetId, "uri:status", JSON.stringify({
+      status: result.status,
+      error: result.error,
+      bytes: result.bytes,
+      hash: result.hash,
+    }));
+    return;
+  }
+
+  // Store each extracted field
+  const maxValueBytes = 10000; // 10KB max per field
+  for (const [key, value] of Object.entries(result.fields)) {
+    const serialized = serializeValue(value, maxValueBytes);
+
+    if (serialized.oversize) {
+      // Store metadata about oversize field
+      await storeUriMetadata(assetId, `${key}_meta`, JSON.stringify({
+        status: "oversize",
+        bytes: serialized.bytes,
+        sha256: result.hash,
+      }));
+    } else {
+      await storeUriMetadata(assetId, key, serialized.value);
+    }
+  }
+
+  // Store success status
+  await storeUriMetadata(assetId, "uri:status", JSON.stringify({
+    status: "ok",
+    bytes: result.bytes,
+    hash: result.hash,
+    fieldCount: Object.keys(result.fields).length,
+  }));
+
+  logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");
+}
+
+/**
+ * Store a single URI metadata entry
+ */
+async function storeUriMetadata(assetId: string, key: string, value: string): Promise<void> {
+  const db = getPool();
+  const keyHash = createHash("sha256").update(key).digest().slice(0, 16).toString("hex");
+  const id = `${assetId}:${keyHash}`;
+
+  try {
+    await db.query(
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, updated_at)
+       VALUES ($1, $2, $3, $4, $5, false, 0, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         value = EXCLUDED.value,
+         updated_at = NOW()`,
+      [id, assetId, key, keyHash, Buffer.from(value).toString("base64")]
+    );
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
+  }
+}

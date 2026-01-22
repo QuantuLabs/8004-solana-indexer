@@ -1,5 +1,6 @@
 import { vi } from "vitest";
 import { PublicKey, Keypair } from "@solana/web3.js";
+import { createHash } from "crypto";
 
 // Generate deterministic test keypairs using seed bytes
 function createTestPubkey(seed: number): PublicKey {
@@ -9,7 +10,7 @@ function createTestPubkey(seed: number): PublicKey {
 
 // Test keypairs - using valid 32-byte public keys
 export const TEST_PROGRAM_ID = new PublicKey(
-  "3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC"
+  "6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1"
 );
 export const TEST_ASSET = createTestPubkey(1);
 export const TEST_OWNER = createTestPubkey(2);
@@ -93,57 +94,43 @@ export const SAMPLE_LOGS = {
   ],
 };
 
+function getEventDiscriminator(eventName: string): Buffer {
+  return createHash("sha256")
+    .update(`event:${eventName}`)
+    .digest()
+    .subarray(0, 8);
+}
+
 /**
  * Encode an Anchor event manually for testing.
  * Anchor events are: discriminator (8 bytes) + borsh-serialized data
  * The discriminator is the first 8 bytes of SHA256("event:<EventName>")
  */
 export function encodeAnchorEvent(eventName: string, data: Record<string, any>): Buffer {
-  // Event discriminators from the IDL
-  const EVENT_DISCRIMINATORS: Record<string, number[]> = {
-    AgentOwnerSynced: [101, 228, 184, 252, 20, 185, 70, 249],
-    AgentRegisteredInRegistry: [235, 241, 87, 226, 1, 223, 186, 175],
-    BaseRegistryCreated: [135, 156, 231, 228, 36, 76, 0, 43],
-    BaseRegistryRotated: [142, 184, 57, 194, 241, 29, 60, 124],
-    FeedbackRevoked: [42, 164, 86, 229, 102, 57, 226, 107],
-    MetadataDeleted: [133, 11, 160, 186, 17, 196, 66, 205],
-    MetadataSet: [165, 149, 191, 46, 63, 144, 96, 71],
-    NewFeedback: [203, 253, 87, 187, 39, 80, 205, 50],
-    ResponseAppended: [38, 184, 90, 199, 56, 249, 194, 240],
-    UriUpdated: [71, 228, 14, 198, 192, 78, 38, 106],
-    UserRegistryCreated: [55, 76, 218, 186, 141, 93, 122, 124],
-    ValidationRequested: [142, 196, 147, 233, 10, 190, 66, 180],
-    ValidationResponded: [214, 183, 195, 169, 184, 142, 105, 84],
-    WalletUpdated: [93, 90, 213, 6, 170, 101, 178, 197],
-  };
+  const discriminator = getEventDiscriminator(eventName);
 
-  const discriminator = EVENT_DISCRIMINATORS[eventName];
-  if (!discriminator) {
-    throw new Error(`Unknown event: ${eventName}`);
-  }
-
-  // Manually serialize the event data based on event type
-  // This is a simplified serialization for testing purposes
-  const buffers: Buffer[] = [Buffer.from(discriminator)];
+  // Manually serialize the event data based on event type.
+  const buffers: Buffer[] = [discriminator];
 
   switch (eventName) {
     case "AgentRegisteredInRegistry":
-      // asset: Pubkey (32), registry: Pubkey (32), collection: Pubkey (32), owner: Pubkey (32)
+      // asset: Pubkey (32), registry: Pubkey (32), collection: Pubkey (32), owner: Pubkey (32), atomEnabled: bool
       buffers.push(Buffer.from(data.asset.toBytes()));
       buffers.push(Buffer.from(data.registry.toBytes()));
       buffers.push(Buffer.from(data.collection.toBytes()));
       buffers.push(Buffer.from(data.owner.toBytes()));
+      buffers.push(Buffer.from([data.atomEnabled ? 1 : 0]));
       break;
 
     case "UriUpdated":
-      // asset: Pubkey (32), newUri: String, updatedBy: Pubkey (32)
+      // asset: Pubkey (32), updatedBy: Pubkey (32), newUri: String
       buffers.push(Buffer.from(data.asset.toBytes()));
+      buffers.push(Buffer.from(data.updatedBy.toBytes()));
       const uriBytes = Buffer.from(data.newUri, "utf-8");
       const uriLenBuf = Buffer.alloc(4);
       uriLenBuf.writeUInt32LE(uriBytes.length);
       buffers.push(uriLenBuf);
       buffers.push(uriBytes);
-      buffers.push(Buffer.from(data.updatedBy.toBytes()));
       break;
 
     default:

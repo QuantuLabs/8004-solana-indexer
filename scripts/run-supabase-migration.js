@@ -4,6 +4,7 @@
  * Usage: node scripts/run-supabase-migration.js
  */
 
+import "dotenv/config";
 import { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -16,7 +17,7 @@ async function runMigration() {
   console.log('🚀 Starting Supabase migration: Add client_address to feedback_responses\n');
 
   // Read DATABASE_URL from environment
-  const databaseUrl = process.env.DATABASE_URL || process.env.SUPABASE_DSN;
+  const databaseUrl = process.env.SUPABASE_DSN || process.env.DATABASE_URL;
 
   if (!databaseUrl) {
     console.error('❌ Error: DATABASE_URL or SUPABASE_DSN not found in environment');
@@ -24,10 +25,20 @@ async function runMigration() {
     process.exit(1);
   }
 
-  const pool = new Pool({
-    connectionString: databaseUrl,
-    ssl: { rejectUnauthorized: false }
-  });
+  const sslModeRaw = (process.env.PGSSLMODE || process.env.SUPABASE_SSL || "").toLowerCase();
+  const sslDisabled =
+    sslModeRaw === "disable" ||
+    sslModeRaw === "false" ||
+    sslModeRaw === "0" ||
+    databaseUrl.includes("sslmode=disable");
+
+  const createPool = (forceNoSsl = false) =>
+    new Pool({
+      connectionString: databaseUrl,
+      ssl: forceNoSsl || sslDisabled ? false : { rejectUnauthorized: false },
+    });
+
+  let pool = createPool();
 
   try {
     // Read migration file
@@ -48,7 +59,17 @@ async function runMigration() {
     console.log('▶️  Executing migration...\n');
 
     // Execute migration
-    await pool.query(migrationSQL);
+    try {
+      await pool.query(migrationSQL);
+    } catch (error) {
+      if (String(error?.message || "").includes("does not support SSL")) {
+        await pool.end();
+        pool = createPool(true);
+        await pool.query(migrationSQL);
+      } else {
+        throw error;
+      }
+    }
 
     console.log('✅ Migration completed successfully!\n');
 

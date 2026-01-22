@@ -41,6 +41,7 @@ describe("DB Handlers", () => {
             registry: TEST_REGISTRY,
             collection: TEST_COLLECTION,
             owner: TEST_OWNER,
+            atomEnabled: true,
           },
         };
 
@@ -54,6 +55,7 @@ describe("DB Handlers", () => {
               owner: TEST_OWNER.toBase58(),
               collection: TEST_COLLECTION.toBase58(),
               registry: TEST_REGISTRY.toBase58(),
+              atomEnabled: true,
             }),
           })
         );
@@ -266,6 +268,13 @@ describe("DB Handlers", () => {
             endpoint: "/api/chat",
             feedbackUri: "ipfs://QmXXX",
             feedbackHash: TEST_HASH,
+            atomEnabled: true,
+            newTrustTier: 0,
+            newQualityScore: 0,
+            newConfidence: 0,
+            newRiskScore: 0,
+            newDiversityRatio: 0,
+            isUniqueClient: true,
           },
         };
 
@@ -274,8 +283,9 @@ describe("DB Handlers", () => {
         expect(prisma.feedback.upsert).toHaveBeenCalledWith(
           expect.objectContaining({
             where: {
-              agentId_feedbackIndex: {
+              agentId_client_feedbackIndex: {
                 agentId: TEST_ASSET.toBase58(),
+                client: TEST_CLIENT.toBase58(),
                 feedbackIndex: 0n,
               },
             },
@@ -297,6 +307,12 @@ describe("DB Handlers", () => {
             asset: TEST_ASSET,
             clientAddress: TEST_CLIENT,
             feedbackIndex: 0n,
+            originalScore: 0,
+            atomEnabled: true,
+            hadImpact: false,
+            newTrustTier: 0,
+            newQualityScore: 0,
+            newConfidence: 0,
           },
         };
 
@@ -305,6 +321,7 @@ describe("DB Handlers", () => {
         expect(prisma.feedback.updateMany).toHaveBeenCalledWith({
           where: {
             agentId: TEST_ASSET.toBase58(),
+            client: TEST_CLIENT.toBase58(),
             feedbackIndex: 0n,
           },
           data: expect.objectContaining({
@@ -323,6 +340,7 @@ describe("DB Handlers", () => {
           type: "ResponseAppended",
           data: {
             asset: TEST_ASSET,
+            client: TEST_CLIENT,
             feedbackIndex: 0n,
             responder: TEST_OWNER,
             responseUri: "ipfs://QmYYY",
@@ -332,13 +350,15 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.feedbackResponse.create).toHaveBeenCalledWith({
-          data: expect.objectContaining({
-            feedbackId: "feedback-uuid",
-            responder: TEST_OWNER.toBase58(),
-            responseUri: "ipfs://QmYYY",
-          }),
-        });
+        expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({
+              feedbackId: "feedback-uuid",
+              responder: TEST_OWNER.toBase58(),
+              responseUri: "ipfs://QmYYY",
+            }),
+          })
+        );
       });
 
       it("should not create response when feedback not found", async () => {
@@ -348,6 +368,7 @@ describe("DB Handlers", () => {
           type: "ResponseAppended",
           data: {
             asset: TEST_ASSET,
+            client: TEST_CLIENT,
             feedbackIndex: 0n,
             responder: TEST_OWNER,
             responseUri: "ipfs://QmYYY",
@@ -357,7 +378,7 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.feedbackResponse.create).not.toHaveBeenCalled();
+        expect(prisma.feedbackResponse.upsert).not.toHaveBeenCalled();
       });
     });
 

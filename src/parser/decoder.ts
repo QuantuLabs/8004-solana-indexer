@@ -90,6 +90,19 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             registry: new PublicKey(data.registry as string),
             collection: new PublicKey(data.collection as string),
             owner: new PublicKey(data.owner as string),
+            atomEnabled: data.atom_enabled === undefined
+              ? true
+              : (data.atom_enabled as boolean), // snake_case from IDL
+            agentUri: (data.agent_uri as string) || "", // snake_case from IDL
+          },
+        };
+
+      case "AtomEnabled":
+        return {
+          type: "AtomEnabled",
+          data: {
+            asset: new PublicKey(data.asset as string),
+            enabledBy: new PublicKey(data.enabled_by as string), // snake_case from IDL
           },
         };
 
@@ -212,6 +225,9 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
             // ATOM enriched fields (v0.4.0)
             originalScore: data.original_score as number,                // snake_case from IDL
+            atomEnabled: data.atom_enabled === undefined
+              ? false
+              : (data.atom_enabled as boolean),                          // snake_case from IDL
             hadImpact: data.had_impact as boolean,                       // snake_case from IDL
             newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
             newQualityScore: data.new_quality_score as number,           // snake_case from IDL
@@ -224,6 +240,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "ResponseAppended",
           data: {
             asset: new PublicKey(data.asset as string),
+            client: new PublicKey(data.client as string),
             feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
             responder: new PublicKey(data.responder as string),
             responseUri: data.response_uri as string,                    // snake_case from IDL

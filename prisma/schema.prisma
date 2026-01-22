@@ -16,6 +16,7 @@ model Agent {
   nftName    String   // NFT display name
   collection String   // collection pubkey
   registry   String   // registry config pubkey
+  atomEnabled Boolean @default(true)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -75,7 +76,7 @@ model Feedback {
   agent     Agent              @relation(fields: [agentId], references: [id], onDelete: Cascade)
   responses FeedbackResponse[]
 
-  @@unique([agentId, feedbackIndex])
+  @@unique([agentId, client, feedbackIndex])
   @@index([agentId])
   @@index([client])
   @@index([score])
@@ -98,7 +99,11 @@ model FeedbackResponse {
 
   feedback Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
 
+  // Multiple responses per responder allowed (ERC-8004 spec)
+  // Unique per transaction to avoid duplicates during re-indexing
+  @@unique([feedbackId, responder, txSignature])
   @@index([feedbackId])
+  @@index([feedbackId, responder])
 }
 
 // Validation requests and responses

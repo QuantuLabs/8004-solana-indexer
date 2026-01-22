@@ -2,6 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import { config, validateConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
+import { startApiServer } from "./api/server.js";
 
 async function main() {
   try {
@@ -43,6 +44,13 @@ async function main() {
   const processor = new Processor(prisma);
 
   await processor.start();
+
+  // Start REST API server in local mode
+  if (config.dbMode === "local" && prisma) {
+    const apiPort = parseInt(process.env.API_PORT || "3001");
+    await startApiServer({ prisma, port: apiPort });
+    logger.info({ apiPort }, "REST API available at http://localhost:" + apiPort + "/rest/v1");
+  }
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutdown signal received");

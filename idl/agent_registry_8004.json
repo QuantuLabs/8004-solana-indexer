@@ -2,7 +2,7 @@
   "address": "6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1",
   "metadata": {
     "name": "agent_registry_8004",
-    "version": "0.3.0",
+    "version": "0.5.0",
     "spec": "0.1.0",
     "description": "8004 AI Agent Identity & Reputation Registry (Consolidated)"
   },
@@ -25,13 +25,51 @@
       "accounts": [
         {
           "name": "responder",
+          "docs": [
+            "Responder must be agent owner or agent wallet"
+          ],
           "signer": true
         },
         {
-          "name": "asset"
+          "name": "agent_account",
+          "docs": [
+            "Agent account for authorization check"
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "asset_key"
+              }
+            ]
+          }
+        },
+        {
+          "name": "asset",
+          "docs": [
+            "Core asset (for PDA derivation)"
+          ]
         }
       ],
       "args": [
+        {
+          "name": "asset_key",
+          "type": "pubkey"
+        },
+        {
+          "name": "client_address",
+          "type": "pubkey"
+        },
         {
           "name": "feedback_index",
           "type": "u64"
@@ -380,6 +418,60 @@
       ]
     },
     {
+      "name": "enable_atom",
+      "docs": [
+        "Enable ATOM for an agent (one-way)"
+      ],
+      "discriminator": [
+        202,
+        27,
+        88,
+        88,
+        150,
+        1,
+        240,
+        97
+      ],
+      "accounts": [
+        {
+          "name": "agent_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "asset",
+          "docs": [
+            "Core asset for ownership verification"
+          ]
+        },
+        {
+          "name": "owner",
+          "docs": [
+            "Agent owner (must match Core asset owner)"
+          ],
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "give_feedback",
       "docs": [
         "Give feedback to an agent"
@@ -428,10 +520,15 @@
           "name": "collection"
         },
         {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
           "name": "atom_config",
           "docs": [
             "AtomConfig PDA (owned by atom-engine)"
-          ]
+          ],
+          "optional": true
         },
         {
           "name": "atom_stats",
@@ -439,13 +536,16 @@
             "AtomStats PDA - OPTIONAL initialization",
             "If uninitialized, feedback works without ATOM Engine"
           ],
-          "writable": true
+          "writable": true,
+          "optional": true
         },
         {
-          "name": "atom_engine_program"
+          "name": "atom_engine_program",
+          "optional": true
         },
         {
           "name": "registry_authority",
+          "optional": true,
           "pda": {
             "seeds": [
               {
@@ -473,10 +573,6 @@
               }
             ]
           }
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -959,6 +1055,159 @@
       ]
     },
     {
+      "name": "register_with_options",
+      "docs": [
+        "Register agent with explicit ATOM setting (default is true)"
+      ],
+      "discriminator": [
+        177,
+        175,
+        96,
+        41,
+        59,
+        166,
+        13,
+        6
+      ],
+      "accounts": [
+        {
+          "name": "registry_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "collection"
+              }
+            ]
+          }
+        },
+        {
+          "name": "agent_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "asset",
+          "docs": [
+            "New asset to create"
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "collection",
+          "docs": [
+            "Collection for this registry"
+          ],
+          "writable": true
+        },
+        {
+          "name": "user_collection_authority",
+          "docs": [
+            "Optional: PDA authority for user collections"
+          ],
+          "optional": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  101,
+                  114,
+                  95,
+                  99,
+                  111,
+                  108,
+                  108,
+                  101,
+                  99,
+                  116,
+                  105,
+                  111,
+                  110,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "mpl_core_program",
+          "docs": [
+            "Metaplex Core program"
+          ],
+          "address": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+        }
+      ],
+      "args": [
+        {
+          "name": "agent_uri",
+          "type": "string"
+        },
+        {
+          "name": "atom_enabled",
+          "type": "bool"
+        }
+      ]
+    },
+    {
       "name": "request_validation",
       "docs": [
         "Request validation for an agent"
@@ -1041,8 +1290,8 @@
                 ]
               },
               {
-                "kind": "account",
-                "path": "asset"
+                "kind": "arg",
+                "path": "asset_key"
               }
             ]
           }
@@ -1077,8 +1326,8 @@
                 ]
               },
               {
-                "kind": "account",
-                "path": "asset"
+                "kind": "arg",
+                "path": "asset_key"
               },
               {
                 "kind": "arg",
@@ -1100,6 +1349,10 @@
         }
       ],
       "args": [
+        {
+          "name": "asset_key",
+          "type": "pubkey"
+        },
         {
           "name": "validator_address",
           "type": "pubkey"
@@ -1199,8 +1452,8 @@
                 ]
               },
               {
-                "kind": "account",
-                "path": "asset"
+                "kind": "arg",
+                "path": "asset_key"
               }
             ]
           }
@@ -1236,13 +1489,12 @@
                 ]
               },
               {
-                "kind": "account",
-                "path": "asset"
+                "kind": "arg",
+                "path": "asset_key"
               },
               {
-                "kind": "account",
-                "path": "validation_request.validator_address",
-                "account": "ValidationRequest"
+                "kind": "arg",
+                "path": "validator_address"
               },
               {
                 "kind": "arg",
@@ -1253,6 +1505,10 @@
         }
       ],
       "args": [
+        {
+          "name": "asset_key",
+          "type": "pubkey"
+        },
         {
           "name": "validator_address",
           "type": "pubkey"
@@ -1330,10 +1586,15 @@
           "name": "asset"
         },
         {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
           "name": "atom_config",
           "docs": [
             "AtomConfig PDA (owned by atom-engine)"
-          ]
+          ],
+          "optional": true
         },
         {
           "name": "atom_stats",
@@ -1341,13 +1602,16 @@
             "AtomStats PDA - OPTIONAL initialization",
             "If uninitialized, revoke works without ATOM Engine"
           ],
-          "writable": true
+          "writable": true,
+          "optional": true
         },
         {
-          "name": "atom_engine_program"
+          "name": "atom_engine_program",
+          "optional": true
         },
         {
           "name": "registry_authority",
+          "optional": true,
           "pda": {
             "seeds": [
               {
@@ -1375,10 +1639,6 @@
               }
             ]
           }
-        },
-        {
-          "name": "system_program",
-          "address": "11111111111111111111111111111111"
         }
       ],
       "args": [
@@ -1681,9 +1941,6 @@
       "accounts": [
         {
           "name": "metadata_entry",
-          "docs": [
-            "Uses max space for init, realloc in instruction handles actual sizing"
-          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -2137,6 +2394,19 @@
       ]
     },
     {
+      "name": "AtomEnabled",
+      "discriminator": [
+        246,
+        179,
+        174,
+        223,
+        97,
+        110,
+        74,
+        200
+      ]
+    },
+    {
       "name": "BaseRegistryCreated",
       "discriminator": [
         135,
@@ -2405,6 +2675,16 @@
       "msg": "At least one tag must be provided"
     },
     {
+      "code": 12058,
+      "name": "AtomStatsNotInitialized",
+      "msg": "ATOM stats not initialized - call initialize_atom_stats first"
+    },
+    {
+      "code": 12059,
+      "name": "AtomAlreadyEnabled",
+      "msg": "ATOM already enabled for this agent"
+    },
+    {
       "code": 12100,
       "name": "RequestUriTooLong",
       "msg": "Request URI exceeds 200 bytes"
@@ -2571,6 +2851,13 @@
             "type": "u8"
           },
           {
+            "name": "atom_enabled",
+            "docs": [
+              "ATOM Engine enabled (irreversible once set to true)"
+            ],
+            "type": "bool"
+          },
+          {
             "name": "agent_wallet",
             "docs": [
               "Agent's operational wallet (set via Ed25519 signature verification)",
@@ -2583,7 +2870,7 @@
           {
             "name": "agent_uri",
             "docs": [
-              "Agent URI (IPFS/Arweave/HTTP link, max 200 bytes)"
+              "Agent URI (IPFS/Arweave/HTTP link, max 250 bytes)"
             ],
             "type": "string"
           },
@@ -2624,7 +2911,8 @@
     {
       "name": "AgentRegisteredInRegistry",
       "docs": [
-        "Event emitted when agent is registered in a specific registry"
+        "Event emitted when agent is registered in a specific registry",
+        "Field order: fixed-size first (Pubkey, bool), variable-size last (String)"
       ],
       "type": {
         "kind": "struct",
@@ -2643,6 +2931,33 @@
           },
           {
             "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "atom_enabled",
+            "type": "bool"
+          },
+          {
+            "name": "agent_uri",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AtomEnabled",
+      "docs": [
+        "Event emitted when ATOM is enabled for an agent (one-way)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "asset",
+            "type": "pubkey"
+          },
+          {
+            "name": "enabled_by",
             "type": "pubkey"
           }
         ]
@@ -2810,7 +3125,7 @@
           {
             "name": "metadata_value",
             "docs": [
-              "Metadata value (max 256 bytes, arbitrary binary data)"
+              "Metadata value (max 250 bytes, arbitrary binary data)"
             ],
             "type": "bytes"
           }
@@ -3006,6 +3321,10 @@
         "fields": [
           {
             "name": "asset",
+            "type": "pubkey"
+          },
+          {
+            "name": "client",
             "type": "pubkey"
           },
           {

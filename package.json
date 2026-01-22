@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
+    "dev:localnet": "cp .env.localnet .env && tsx watch src/index.ts",
     "start": "node dist/index.js",
     "start:tsx": "npx tsx src/index.ts",
     "db:generate": "prisma generate",
@@ -32,20 +33,22 @@
   "license": "MIT",
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
-    "@prisma/client": "^6.2.0",
+    "@prisma/client": "^6.19.2",
     "@solana/web3.js": "^1.98.0",
     "@supabase/supabase-js": "^2.49.0",
+    "@types/express": "^5.0.6",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "pg": "^8.16.3",
     "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0",
-    "pg": "^8.16.3"
+    "pino-pretty": "^13.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@types/pg": "^8.11.6",
     "@vitest/coverage-v8": "^2.1.9",
-    "prisma": "^6.2.0",
+    "prisma": "^6.19.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"

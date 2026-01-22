@@ -1,5 +1,30 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { PublicKey, Connection } from "@solana/web3.js";
+
+vi.mock("@solana/web3.js", async () => {
+  const actual = await vi.importActual<any>("@solana/web3.js");
+  let getSlotMock: (() => Promise<number>) | null = null;
+
+  class MockConnection {
+    constructor(_endpoint: string, _config?: unknown) {}
+
+    async getSlot(): Promise<number> {
+      if (!getSlotMock) {
+        throw new Error("getSlot mock not set");
+      }
+      return await getSlotMock();
+    }
+  }
+
+  return {
+    ...actual,
+    Connection: MockConnection,
+    __setGetSlotMock: (fn: (() => Promise<number>) | null) => {
+      getSlotMock = fn;
+    },
+  };
+});
+
+import * as web3 from "@solana/web3.js";
 import {
   WebSocketIndexer,
   testWebSocketConnection,
@@ -184,6 +209,7 @@ describe("WebSocketIndexer", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -226,6 +252,7 @@ describe("WebSocketIndexer", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -266,6 +293,7 @@ describe("WebSocketIndexer", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -305,6 +333,7 @@ describe("WebSocketIndexer", () => {
         registry: TEST_REGISTRY,
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
+        atomEnabled: true,
       };
 
       const eventData2 = {
@@ -371,21 +400,29 @@ describe("WebSocketIndexer", () => {
 });
 
 describe("testWebSocketConnection", () => {
+  const web3Mock = web3 as typeof web3 & {
+    __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
+  };
+
+  afterEach(() => {
+    web3Mock.__setGetSlotMock(null);
+    vi.restoreAllMocks();
+  });
+
   it("should return false when connection fails", async () => {
-    // Using an invalid URL that will fail
+    web3Mock.__setGetSlotMock(() =>
+      Promise.reject(new Error("Connection failed"))
+    );
+
     const result = await testWebSocketConnection("wss://invalid.nonexistent.local");
 
     expect(result).toBe(false);
   });
 
   it("should return true when connection succeeds", async () => {
-    // For this test, we need to verify the return true branch
-    // Since we can't easily mock the Connection class in ESM,
-    // we test the failure path above and trust the success path exists
-    // The function internally tries to connect and calls getSlot()
+    web3Mock.__setGetSlotMock(() => Promise.resolve(123));
 
-    // This test verifies the function returns a boolean
     const result = await testWebSocketConnection("wss://api.devnet.solana.com");
-    expect(typeof result).toBe("boolean");
+    expect(result).toBe(true);
   });
 });

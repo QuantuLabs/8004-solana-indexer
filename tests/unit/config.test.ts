@@ -24,7 +24,6 @@ describe("Config", () => {
       delete process.env.BATCH_SIZE;
       delete process.env.WS_RECONNECT_INTERVAL;
       delete process.env.WS_MAX_RETRIES;
-      delete process.env.GRAPHQL_PORT;
       delete process.env.LOG_LEVEL;
 
       const { config } = await import("../../src/config.js");
@@ -32,13 +31,12 @@ describe("Config", () => {
       expect(config.databaseUrl).toBe("file:./data/indexer.db");
       expect(config.rpcUrl).toBe("https://api.devnet.solana.com");
       expect(config.wsUrl).toBe("wss://api.devnet.solana.com");
-      expect(config.programId).toBe("3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC");
+      expect(config.programId).toBe("6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1");
       expect(config.indexerMode).toBe("auto");
       expect(config.pollingInterval).toBe(5000);
       expect(config.batchSize).toBe(100);
       expect(config.wsReconnectInterval).toBe(3000);
       expect(config.wsMaxRetries).toBe(5);
-      expect(config.graphqlPort).toBe(4000);
       expect(config.logLevel).toBe("info");
     });
 
@@ -52,7 +50,6 @@ describe("Config", () => {
       process.env.BATCH_SIZE = "200";
       process.env.WS_RECONNECT_INTERVAL = "5000";
       process.env.WS_MAX_RETRIES = "10";
-      process.env.GRAPHQL_PORT = "5000";
       process.env.LOG_LEVEL = "debug";
 
       const { config } = await import("../../src/config.js");
@@ -66,7 +63,6 @@ describe("Config", () => {
       expect(config.batchSize).toBe(200);
       expect(config.wsReconnectInterval).toBe(5000);
       expect(config.wsMaxRetries).toBe(10);
-      expect(config.graphqlPort).toBe(5000);
       expect(config.logLevel).toBe("debug");
     });
 

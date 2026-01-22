@@ -109,26 +109,95 @@ export class Poller {
     // Step 2: Reverse to get chronological order (oldest first)
     allSignatures.reverse();
 
-    // Step 3: Process in chronological order
-    let processed = 0;
+    // Step 3: Group by slot for efficient block fetching
+    const bySlot = new Map<number, ConfirmedSignatureInfo[]>();
     for (const sig of allSignatures) {
+      const slot = sig.slot;
+      if (!bySlot.has(slot)) {
+        bySlot.set(slot, []);
+      }
+      bySlot.get(slot)!.push(sig);
+    }
+
+    logger.info({ slots: bySlot.size, transactions: allSignatures.length }, "Grouped by slot for tx_index resolution");
+
+    // Step 4: Process slot by slot with tx_index
+    let processed = 0;
+    const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
+
+    for (const slot of sortedSlots) {
       if (!this.isRunning) break;
 
-      try {
-        await this.processTransaction(sig);
-        this.lastSignature = sig.signature;
-        await this.saveState(sig.signature, BigInt(sig.slot));
-        processed++;
+      const sigs = bySlot.get(slot)!;
 
-        if (processed % 10 === 0) {
-          logger.info({ processed, total: allSignatures.length }, "Backfill progress");
+      // Build signature -> txIndex map for this slot
+      const txIndexMap = await this.getTxIndexMap(slot, sigs);
+
+      // Process transactions in tx_index order
+      const sigsWithIndex = sigs.map(sig => ({
+        sig,
+        txIndex: txIndexMap.get(sig.signature) ?? 0
+      })).sort((a, b) => a.txIndex - b.txIndex);
+
+      for (const { sig, txIndex } of sigsWithIndex) {
+        if (!this.isRunning) break;
+
+        try {
+          await this.processTransaction(sig, txIndex);
+          this.lastSignature = sig.signature;
+          await this.saveState(sig.signature, BigInt(sig.slot));
+          processed++;
+
+          if (processed % 10 === 0) {
+            logger.info({ processed, total: allSignatures.length }, "Backfill progress");
+          }
+        } catch (error) {
+          logger.error({ error, signature: sig.signature }, "Error processing backfill transaction");
         }
-      } catch (error) {
-        logger.error({ error, signature: sig.signature }, "Error processing backfill transaction");
       }
     }
 
     logger.info({ processed, total: allSignatures.length }, "Backfill finished, switching to live polling");
+  }
+
+  /**
+   * Get transaction index within a block for multiple signatures
+   * Fetches block once and maps signature -> index
+   * Only called when multiple txs exist in the same slot (rare case)
+   */
+  private async getTxIndexMap(slot: number, sigs: ConfirmedSignatureInfo[]): Promise<Map<string, number>> {
+    const txIndexMap = new Map<string, number>();
+
+    // If only one transaction in slot, index is 0 - no need to fetch block
+    if (sigs.length === 1) {
+      txIndexMap.set(sigs[0].signature, 0);
+      return txIndexMap;
+    }
+
+    try {
+      // Fetch block with full transaction details to get signatures in order
+      const block = await this.connection.getBlock(slot, {
+        maxSupportedTransactionVersion: 0,
+        transactionDetails: "full",
+      });
+
+      if (block?.transactions) {
+        // Build signature -> index map from block transactions (in execution order)
+        const sigSet = new Set(sigs.map(s => s.signature));
+        block.transactions.forEach((tx, idx) => {
+          const sig = tx.transaction.signatures[0]; // First signature is the tx signature
+          if (sigSet.has(sig)) {
+            txIndexMap.set(sig, idx);
+          }
+        });
+      }
+    } catch (error) {
+      logger.warn({ slot, error }, "Failed to fetch block for tx_index, using fallback order");
+      // Fallback: assign sequential indices based on signature order
+      sigs.forEach((sig, i) => txIndexMap.set(sig.signature, i));
+    }
+
+    return txIndexMap;
   }
 
   async stop(): Promise<void> {
@@ -208,18 +277,43 @@ export class Poller {
 
     logger.info({ count: signatures.length }, "Processing transactions");
 
-    // Process oldest first
-    for (const sig of signatures.reverse()) {
-      try {
-        await this.processTransaction(sig);
-        this.lastSignature = sig.signature;
-        await this.saveState(sig.signature, BigInt(sig.slot));
-      } catch (error) {
-        logger.error(
-          { error, signature: sig.signature },
-          "Error processing transaction"
-        );
-        await this.logFailedTransaction(sig, error);
+    // Reverse to process oldest first
+    const reversed = signatures.reverse();
+
+    // Group by slot for tx_index resolution
+    const bySlot = new Map<number, ConfirmedSignatureInfo[]>();
+    for (const sig of reversed) {
+      if (!bySlot.has(sig.slot)) {
+        bySlot.set(sig.slot, []);
+      }
+      bySlot.get(sig.slot)!.push(sig);
+    }
+
+    // Process slot by slot
+    const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
+
+    for (const slot of sortedSlots) {
+      const sigs = bySlot.get(slot)!;
+      const txIndexMap = await this.getTxIndexMap(slot, sigs);
+
+      // Sort by tx_index within slot
+      const sigsWithIndex = sigs.map(sig => ({
+        sig,
+        txIndex: txIndexMap.get(sig.signature) ?? 0
+      })).sort((a, b) => a.txIndex - b.txIndex);
+
+      for (const { sig, txIndex } of sigsWithIndex) {
+        try {
+          await this.processTransaction(sig, txIndex);
+          this.lastSignature = sig.signature;
+          await this.saveState(sig.signature, BigInt(sig.slot));
+        } catch (error) {
+          logger.error(
+            { error, signature: sig.signature },
+            "Error processing transaction"
+          );
+          await this.logFailedTransaction(sig, error);
+        }
       }
     }
   }
@@ -245,7 +339,7 @@ export class Poller {
     return signatures.filter((sig) => sig.err === null);
   }
 
-  private async processTransaction(sig: ConfirmedSignatureInfo): Promise<void> {
+  private async processTransaction(sig: ConfirmedSignatureInfo, txIndex?: number): Promise<void> {
     const tx = await this.connection.getParsedTransaction(sig.signature, {
       maxSupportedTransactionVersion: 0,
     });
@@ -261,7 +355,7 @@ export class Poller {
     }
 
     logger.debug(
-      { signature: sig.signature, eventCount: parsed.events.length },
+      { signature: sig.signature, eventCount: parsed.events.length, txIndex },
       "Parsed transaction"
     );
 
@@ -275,6 +369,7 @@ export class Poller {
         blockTime: sig.blockTime
           ? new Date(sig.blockTime * 1000)
           : new Date(),
+        txIndex,
       };
 
       await handleEvent(this.prisma, typedEvent, ctx);

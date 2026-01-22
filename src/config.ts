@@ -2,6 +2,7 @@ import "dotenv/config";
 
 export type IndexerMode = "auto" | "polling" | "websocket";
 export type DbMode = "local" | "supabase";
+export type MetadataIndexMode = "off" | "normal" | "full";
 
 export const config = {
   // Database mode: "local" (SQLite/Prisma) | "supabase" (PostgreSQL via Supabase)
@@ -40,6 +41,14 @@ export const config = {
 
   // Logging
   logLevel: process.env.LOG_LEVEL || "info",
+
+  // URI Metadata indexing (fetch and extract fields from agent_uri)
+  // off = don't fetch URIs, normal = extract standard fields, full = store entire JSON
+  metadataIndexMode: (process.env.INDEX_METADATA || "normal") as MetadataIndexMode,
+  // Maximum bytes to fetch from URI (prevents memory exhaustion)
+  metadataMaxBytes: parseInt(process.env.METADATA_MAX_BYTES || "262144", 10), // 256KB
+  // Fixed timeout for URI fetch (security: no user-configurable timeout)
+  metadataTimeoutMs: 5000,
 } as const;
 
 export function validateConfig(): void {

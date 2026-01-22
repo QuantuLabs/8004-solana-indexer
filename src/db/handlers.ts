@@ -2,6 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import {
   ProgramEvent,
   AgentRegisteredInRegistry,
+  AtomEnabled,
   AgentOwnerSynced,
   UriUpdated,
   WalletUpdated,
@@ -18,6 +19,7 @@ import {
 import { createChildLogger } from "../logger.js";
 import { config } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
+import { digestUri, serializeValue } from "../indexer/uriDigest.js";
 
 const logger = createChildLogger("db-handlers");
 
@@ -25,6 +27,7 @@ export interface EventContext {
   signature: string;
   slot: bigint;
   blockTime: Date;
+  txIndex?: number; // Transaction index within the block (for deterministic ordering)
 }
 
 /**
@@ -53,6 +56,10 @@ export async function handleEvent(
 
     case "AgentOwnerSynced":
       await handleAgentOwnerSynced(prisma, event.data, ctx);
+      break;
+
+    case "AtomEnabled":
+      await handleAtomEnabled(prisma, event.data, ctx);
       break;
 
     case "UriUpdated":
@@ -115,26 +122,37 @@ async function handleAgentRegistered(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const agentUri = data.agentUri || "";
 
   await prisma.agent.upsert({
     where: { id: assetId },
     create: {
       id: assetId,
       owner: data.owner.toBase58(),
-      uri: "",
+      uri: agentUri,
       nftName: "",
       collection: data.collection.toBase58(),
       registry: data.registry.toBase58(),
+      atomEnabled: data.atomEnabled,
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
     },
     update: {
       collection: data.collection.toBase58(),
       registry: data.registry.toBase58(),
+      atomEnabled: data.atomEnabled,
+      uri: agentUri,
     },
   });
 
-  logger.info({ assetId, owner: data.owner.toBase58() }, "Agent registered");
+  logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
+
+  // Trigger URI metadata extraction if configured and URI is present
+  if (agentUri && config.metadataIndexMode !== "off") {
+    digestAndStoreUriMetadataLocal(prisma, assetId, agentUri).catch((err) => {
+      logger.warn({ assetId, uri: agentUri, error: err.message }, "Failed to digest URI metadata");
+    });
+  }
 }
 
 async function handleAgentOwnerSynced(
@@ -162,9 +180,9 @@ async function handleAgentOwnerSynced(
   );
 }
 
-async function handleUriUpdated(
+async function handleAtomEnabled(
   prisma: PrismaClient,
-  data: UriUpdated,
+  data: AtomEnabled,
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
@@ -172,12 +190,38 @@ async function handleUriUpdated(
   await prisma.agent.update({
     where: { id: assetId },
     data: {
-      uri: data.newUri,
+      atomEnabled: true,
       updatedAt: ctx.blockTime,
     },
   });
 
-  logger.info({ assetId, newUri: data.newUri }, "Agent URI updated");
+  logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
+}
+
+async function handleUriUpdated(
+  prisma: PrismaClient,
+  data: UriUpdated,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const newUri = data.newUri || "";
+
+  await prisma.agent.update({
+    where: { id: assetId },
+    data: {
+      uri: newUri,
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  logger.info({ assetId, newUri }, "Agent URI updated");
+
+  // Trigger URI metadata extraction if configured and URI is present
+  if (newUri && config.metadataIndexMode !== "off") {
+    digestAndStoreUriMetadataLocal(prisma, assetId, newUri).catch((err) => {
+      logger.warn({ assetId, uri: newUri, error: err.message }, "Failed to digest URI metadata");
+    });
+  }
 }
 
 async function handleWalletUpdated(
@@ -309,8 +353,9 @@ async function handleNewFeedback(
 
   await prisma.feedback.upsert({
     where: {
-      agentId_feedbackIndex: {
+      agentId_client_feedbackIndex: {
         agentId: assetId,
+        client: data.clientAddress.toBase58(),
         feedbackIndex: data.feedbackIndex,
       },
     },
@@ -350,6 +395,7 @@ async function handleFeedbackRevoked(
   await prisma.feedback.updateMany({
     where: {
       agentId: assetId,
+      client: data.clientAddress.toBase58(),
       feedbackIndex: data.feedbackIndex,
     },
     data: {
@@ -371,11 +417,13 @@ async function handleResponseAppended(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const clientAddress = data.client.toBase58();
 
   const feedback = await prisma.feedback.findUnique({
     where: {
-      agentId_feedbackIndex: {
+      agentId_client_feedbackIndex: {
         agentId: assetId,
+        client: clientAddress,
         feedbackIndex: data.feedbackIndex,
       },
     },
@@ -383,14 +431,23 @@ async function handleResponseAppended(
 
   if (!feedback) {
     logger.warn(
-      { assetId, feedbackIndex: data.feedbackIndex.toString() },
+      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response"
     );
     return;
   }
 
-  await prisma.feedbackResponse.create({
-    data: {
+  // Multiple responses per responder allowed (ERC-8004)
+  // Use upsert with txSignature to avoid duplicates during re-indexing
+  await prisma.feedbackResponse.upsert({
+    where: {
+      feedbackId_responder_txSignature: {
+        feedbackId: feedback.id,
+        responder: data.responder.toBase58(),
+        txSignature: ctx.signature,
+      },
+    },
+    create: {
       feedbackId: feedback.id,
       responder: data.responder.toBase58(),
       responseUri: data.responseUri,
@@ -398,6 +455,7 @@ async function handleResponseAppended(
       txSignature: ctx.signature,
       slot: ctx.slot,
     },
+    update: {},
   });
 
   logger.info(
@@ -477,4 +535,90 @@ async function handleValidationResponded(
     },
     "Validation responded"
   );
+}
+
+/**
+ * Fetch, digest, and store URI metadata for an agent (local/Prisma mode)
+ */
+async function digestAndStoreUriMetadataLocal(
+  prisma: PrismaClient,
+  assetId: string,
+  uri: string
+): Promise<void> {
+  if (config.metadataIndexMode === "off") {
+    return;
+  }
+
+  const result = await digestUri(uri);
+
+  if (result.status !== "ok" || !result.fields) {
+    logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
+    // Store error status as metadata
+    await storeUriMetadataLocal(prisma, assetId, "uri:status", JSON.stringify({
+      status: result.status,
+      error: result.error,
+      bytes: result.bytes,
+      hash: result.hash,
+    }));
+    return;
+  }
+
+  // Store each extracted field
+  const maxValueBytes = 10000; // 10KB max per field
+  for (const [key, value] of Object.entries(result.fields)) {
+    const serialized = serializeValue(value, maxValueBytes);
+
+    if (serialized.oversize) {
+      // Store metadata about oversize field
+      await storeUriMetadataLocal(prisma, assetId, `${key}_meta`, JSON.stringify({
+        status: "oversize",
+        bytes: serialized.bytes,
+        sha256: result.hash,
+      }));
+    } else {
+      await storeUriMetadataLocal(prisma, assetId, key, serialized.value);
+    }
+  }
+
+  // Store success status
+  await storeUriMetadataLocal(prisma, assetId, "uri:status", JSON.stringify({
+    status: "ok",
+    bytes: result.bytes,
+    hash: result.hash,
+    fieldCount: Object.keys(result.fields).length,
+  }));
+
+  logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");
+}
+
+/**
+ * Store a single URI metadata entry (local/Prisma mode)
+ */
+async function storeUriMetadataLocal(
+  prisma: PrismaClient,
+  assetId: string,
+  key: string,
+  value: string
+): Promise<void> {
+  try {
+    await prisma.agentMetadata.upsert({
+      where: {
+        agentId_key: {
+          agentId: assetId,
+          key,
+        },
+      },
+      create: {
+        agentId: assetId,
+        key,
+        value: Buffer.from(value),
+        immutable: false,
+      },
+      update: {
+        value: Buffer.from(value),
+      },
+    });
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
+  }
 }

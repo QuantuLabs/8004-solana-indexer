@@ -8,19 +8,12 @@ ALTER TABLE feedback_responses ADD COLUMN IF NOT EXISTS client_address TEXT;
 -- Step 2: Drop existing unique constraint
 ALTER TABLE feedback_responses DROP CONSTRAINT IF EXISTS feedback_responses_asset_feedback_index_responder_key;
 
--- Step 3: For existing responses without client_address, we cannot backfill accurately
--- Options:
---   A) Delete all existing responses (clean slate)
---   B) Set a placeholder client_address (e.g., 'MIGRATION_PLACEHOLDER')
---   C) Leave as NULL and let future responses work correctly
+-- Step 3: For existing responses without client_address, we cannot backfill accurately.
+-- Clean slate: wipe existing responses so all future rows include client_address.
+TRUNCATE feedback_responses;
 
--- RECOMMENDED: Clean slate (delete existing responses if any exist)
--- Uncomment the line below if you want to delete existing responses:
--- DELETE FROM feedback_responses WHERE client_address IS NULL;
-
--- Step 4: Make client_address NOT NULL (if you chose option A above)
--- Uncomment the line below if you deleted existing responses:
--- ALTER TABLE feedback_responses ALTER COLUMN client_address SET NOT NULL;
+-- Step 4: Enforce client_address NOT NULL after wipe
+ALTER TABLE feedback_responses ALTER COLUMN client_address SET NOT NULL;
 
 -- Step 5: Add new unique constraint with client_address
 ALTER TABLE feedback_responses ADD CONSTRAINT feedback_responses_unique
