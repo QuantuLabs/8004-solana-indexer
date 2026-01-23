@@ -174,7 +174,27 @@ export function createApiServer(options: ApiServerOptions): Express {
         if (feedback) {
           where.feedbackId = feedback.id;
         } else {
-          res.json([]);
+          // Check orphan responses (feedback not yet indexed)
+          const orphans = await prisma.orphanResponse.findMany({
+            where: { agentId: asset, client: client_address, feedbackIndex: BigInt(feedback_index) },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            skip: offset,
+          });
+          const mapped = orphans.map(o => ({
+            id: o.id,
+            feedback_id: null,
+            asset: o.agentId,
+            client_address: o.client,
+            feedback_index: o.feedbackIndex.toString(),
+            responder: o.responder,
+            response_uri: o.responseUri,
+            response_hash: o.responseHash ? Buffer.from(o.responseHash).toString('hex') : null,
+            block_slot: o.slot ? Number(o.slot) : 0,
+            tx_signature: o.txSignature || '',
+            created_at: o.createdAt.toISOString(),
+          }));
+          res.json(mapped);
           return;
         }
       }

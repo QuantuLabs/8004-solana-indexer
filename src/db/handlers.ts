@@ -390,18 +390,19 @@ async function handleNewFeedback(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const clientAddress = data.clientAddress.toBase58();
 
-  await prisma.feedback.upsert({
+  const feedback = await prisma.feedback.upsert({
     where: {
       agentId_client_feedbackIndex: {
         agentId: assetId,
-        client: data.clientAddress.toBase58(),
+        client: clientAddress,
         feedbackIndex: data.feedbackIndex,
       },
     },
     create: {
       agentId: assetId,
-      client: data.clientAddress.toBase58(),
+      client: clientAddress,
       feedbackIndex: data.feedbackIndex,
       score: data.score,
       tag1: data.tag1,
@@ -414,6 +415,37 @@ async function handleNewFeedback(
     },
     update: {},
   });
+
+  // Reconcile orphan responses: move to FeedbackResponse now that feedback exists
+  const orphans = await prisma.orphanResponse.findMany({
+    where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+  });
+
+  for (const orphan of orphans) {
+    await prisma.feedbackResponse.upsert({
+      where: {
+        feedbackId_responder_txSignature: {
+          feedbackId: feedback.id,
+          responder: orphan.responder,
+          txSignature: orphan.txSignature ?? "",
+        },
+      },
+      create: {
+        feedbackId: feedback.id,
+        responder: orphan.responder,
+        responseUri: orphan.responseUri,
+        responseHash: orphan.responseHash,
+        txSignature: orphan.txSignature,
+        slot: orphan.slot,
+      },
+      update: {},
+    });
+    await prisma.orphanResponse.delete({ where: { id: orphan.id } });
+  }
+
+  if (orphans.length > 0) {
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), count: orphans.length }, "Reconciled orphan responses");
+  }
 
   logger.info(
     {
