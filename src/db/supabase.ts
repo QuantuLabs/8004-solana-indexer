@@ -242,19 +242,25 @@ async function handleUriUpdated(
   }
 }
 
+// Solana default pubkey (111...111) indicates wallet reset
+const DEFAULT_PUBKEY = "11111111111111111111111111111111";
+
 async function handleWalletUpdated(
   data: WalletUpdated,
   ctx: EventContext
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
+  // Convert default pubkey to NULL (wallet reset semantics)
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
 
   try {
     await db.query(
       `UPDATE agents SET agent_wallet = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [data.newWallet.toBase58(), Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [newWallet, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
     );
-    logger.info({ assetId, newWallet: data.newWallet.toBase58() }, "Agent wallet updated");
+    logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to update wallet");
   }

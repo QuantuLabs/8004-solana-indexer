@@ -380,8 +380,38 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/stats', globalStatsHandler);
   app.get('/rest/v1/global_stats', globalStatsHandler);
 
-  // GET /rest/v1/metadata - Not supported in local mode (no Prisma model)
-  // Metadata is only available in Supabase mode via PostgREST
+  // GET /rest/v1/metadata - Metadata entries (PostgREST format)
+  app.get('/rest/v1/metadata', async (req: Request, res: Response) => {
+    try {
+      const asset = parsePostgRESTValue(req.query.asset as string);
+      const key = parsePostgRESTValue(req.query.key as string);
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 100;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const where: any = {};
+      if (asset) where.agentId = asset;
+      if (key) where.key = key;
+
+      const metadata = await prisma.agentMetadata.findMany({
+        where,
+        take: limit,
+      });
+
+      // Convert to PostgREST format (SDK handles decompression)
+      const results = metadata.map((m) => ({
+        id: `${m.agentId}:${m.key}`,
+        asset: m.agentId,
+        key: m.key,
+        value: Buffer.from(m.value).toString('base64'), // Base64 for Supabase parity
+        immutable: m.immutable,
+      }));
+
+      res.json(results);
+    } catch (error) {
+      logger.error({ error }, 'Error fetching metadata');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
 
   // GET /rest/v1/leaderboard - Top agents (PostgREST format)
   app.get('/rest/v1/leaderboard', async (req: Request, res: Response) => {
