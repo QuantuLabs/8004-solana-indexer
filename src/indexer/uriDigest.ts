@@ -115,15 +115,30 @@ export async function digestUri(uri: string): Promise<UriDigestResult> {
 
     // Extract standard fields
     const fields: Record<string, unknown> = {};
+    const standardKeys = new Set(Object.keys(STANDARD_FIELDS));
+
     for (const [jsonKey, metaKey] of Object.entries(STANDARD_FIELDS)) {
       if (json[jsonKey] !== undefined) {
         fields[metaKey] = json[jsonKey];
       }
     }
 
-    // In "full" mode, include the entire JSON
+    // In "full" mode, store unknown keys individually (with DoS protection)
     if (config.metadataIndexMode === "full") {
-      fields["uri:raw"] = json;
+      const MAX_EXTRA_KEYS = 50; // Protection against malicious JSON with many keys
+      let extraKeyCount = 0;
+
+      for (const [key, value] of Object.entries(json)) {
+        if (!standardKeys.has(key)) {
+          if (extraKeyCount >= MAX_EXTRA_KEYS) {
+            logger.warn({ uri }, `Exceeded ${MAX_EXTRA_KEYS} extra keys, truncating`);
+            break;
+          }
+          // Store with uri: prefix for queryability
+          fields[`uri:${key}`] = value;
+          extraKeyCount++;
+        }
+      }
     }
 
     return {

@@ -187,6 +187,118 @@ describe("URI Digest Module", () => {
     });
   });
 
+  describe("mode full - individual keys with limit", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      // Override config for full mode tests
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "full",
+          metadataMaxBytes: 262144,
+          metadataTimeoutMs: 5000,
+        },
+      }));
+    });
+
+    it("should store unknown keys individually as uri:<key>", async () => {
+      // Re-import with full mode config
+      vi.resetModules();
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "full",
+          metadataMaxBytes: 262144,
+          metadataTimeoutMs: 5000,
+        },
+      }));
+
+      const { digestUri: digestUriFull } = await import("../../src/indexer/uriDigest.js");
+
+      const mockJson = {
+        name: "Test Agent",
+        customField1: "value1",
+        customField2: "value2",
+        nestedObject: { foo: "bar" },
+      };
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        headers: new Headers({ "content-length": "100" }),
+        body: {
+          getReader: () => ({
+            read: vi.fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: new TextEncoder().encode(JSON.stringify(mockJson)),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn(),
+          }),
+        },
+      } as unknown as Response);
+
+      const result = await digestUriFull("https://example.com/agent.json");
+
+      expect(result.status).toBe("ok");
+      expect(result.fields).toBeDefined();
+      // Standard field
+      expect(result.fields!["uri:name"]).toBe("Test Agent");
+      // Custom fields stored with uri: prefix
+      expect(result.fields!["uri:customField1"]).toBe("value1");
+      expect(result.fields!["uri:customField2"]).toBe("value2");
+      expect(result.fields!["uri:nestedObject"]).toEqual({ foo: "bar" });
+      // No uri:raw blob
+      expect(result.fields!["uri:raw"]).toBeUndefined();
+    });
+
+    it("should limit extra keys to MAX_EXTRA_KEYS (50) for DoS protection", async () => {
+      vi.resetModules();
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "full",
+          metadataMaxBytes: 262144,
+          metadataTimeoutMs: 5000,
+        },
+      }));
+
+      const { digestUri: digestUriFull } = await import("../../src/indexer/uriDigest.js");
+
+      // Create JSON with 100 custom keys (beyond the 50 limit)
+      const mockJson: Record<string, string> = { name: "Test" };
+      for (let i = 0; i < 100; i++) {
+        mockJson[`custom_${i}`] = `value_${i}`;
+      }
+
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        headers: new Headers({ "content-length": "5000" }),
+        body: {
+          getReader: () => ({
+            read: vi.fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: new TextEncoder().encode(JSON.stringify(mockJson)),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            cancel: vi.fn(),
+          }),
+        },
+      } as unknown as Response);
+
+      const result = await digestUriFull("https://example.com/agent.json");
+
+      expect(result.status).toBe("ok");
+      expect(result.fields).toBeDefined();
+
+      // Count extra keys (excluding standard field uri:name)
+      const extraKeyCount = Object.keys(result.fields!).filter(
+        k => k.startsWith("uri:custom_")
+      ).length;
+
+      // Should be limited to 50
+      expect(extraKeyCount).toBe(50);
+    });
+  });
+
   describe("serializeValue", () => {
     it("should serialize string values directly", () => {
       const result = serializeValue("hello", 100);

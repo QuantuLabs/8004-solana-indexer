@@ -279,7 +279,7 @@ async function handleMetadataSet(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.updated_at`,
-      [id, assetId, data.key, keyHash, Buffer.from(data.value).toString("base64"), data.immutable, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [id, assetId, data.key, keyHash, Buffer.from(data.value), data.immutable, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
   } catch (error: any) {
@@ -718,7 +718,7 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
          updated_at = NOW()`,
-      [id, assetId, key, keyHash, Buffer.from(value).toString("base64")]
+      [id, assetId, key, keyHash, Buffer.from(value)]
     );
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
