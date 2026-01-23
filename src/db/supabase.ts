@@ -720,8 +720,8 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
     const compressedValue = await compressForStorage(Buffer.from(value));
 
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, updated_at)
-       VALUES ($1, $2, $3, $4, $5, false, 0, NOW())
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
+       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', NOW())
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
          updated_at = NOW()`,
