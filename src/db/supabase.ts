@@ -165,7 +165,7 @@ async function handleAgentRegistered(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.created_at`,
-      [assetId, data.owner.toBase58(), agentUri, collection, data.atomEnabled, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [assetId, data.owner.toBase58(), agentUri, collection, data.atomEnabled, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
@@ -190,7 +190,7 @@ async function handleAgentOwnerSynced(
   try {
     await db.query(
       `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [data.newOwner.toBase58(), Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [data.newOwner.toBase58(), ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
   } catch (error: any) {
@@ -208,7 +208,7 @@ async function handleAtomEnabled(
   try {
     await db.query(
       `UPDATE agents SET atom_enabled = true, block_slot = $1, updated_at = $2 WHERE asset = $3`,
-      [Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
   } catch (error: any) {
@@ -227,7 +227,7 @@ async function handleUriUpdated(
   try {
     await db.query(
       `UPDATE agents SET agent_uri = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [newUri, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [newUri, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, newUri }, "Agent URI updated");
 
@@ -258,7 +258,7 @@ async function handleWalletUpdated(
   try {
     await db.query(
       `UPDATE agents SET agent_wallet = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [newWallet, Number(ctx.slot), ctx.blockTime.toISOString(), assetId]
+      [newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
   } catch (error: any) {
@@ -270,6 +270,12 @@ async function handleMetadataSet(
   data: MetadataSet,
   ctx: EventContext
 ): Promise<void> {
+  // Skip reserved _uri: prefix to avoid collision with URI-derived metadata
+  if (data.key.startsWith("_uri:")) {
+    logger.warn({ assetId: data.asset.toBase58(), key: data.key }, "Skipping reserved _uri: prefix");
+    return;
+  }
+
   const db = getPool();
   const assetId = data.asset.toBase58();
   // FIX: Calculate key_hash from key (sha256(key)[0..16]), not from value
@@ -288,7 +294,7 @@ async function handleMetadataSet(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.updated_at`,
-      [id, assetId, data.key, keyHash, compressedValue, data.immutable, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
   } catch (error: any) {
@@ -381,7 +387,7 @@ async function handleNewFeedback(
         id, assetId, clientAddress, data.feedbackIndex.toString(), data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         feedbackHash,
-        false, Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()
+        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()
       ]
     );
 
@@ -529,7 +535,7 @@ async function handleResponseAppended(
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash,
-       Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+       ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
   } catch (error: any) {
@@ -553,7 +559,7 @@ async function handleValidationRequested(
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, validatorAddress, data.nonce, data.requester.toBase58(),
        data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-       "PENDING", Number(ctx.slot), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+       "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, validator: validatorAddress, nonce: data.nonce }, "Validation requested");
   } catch (error: any) {
@@ -648,7 +654,7 @@ export async function saveIndexerState(signature: string, slot: bigint): Promise
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
          updated_at = NOW()`,
-      [signature, Number(slot)]
+      [signature, slot.toString()]
     );
   } catch (error: any) {
     logger.error({ error: error.message }, "Failed to save indexer state");
@@ -671,12 +677,25 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
     return;
   }
 
+  // Purge old URI-derived metadata before storing new ones
+  // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
+  const db = getPool();
+  try {
+    await db.query(
+      `DELETE FROM metadata WHERE asset = $1 AND key LIKE '\\_uri:%' ESCAPE '\\'`,
+      [assetId]
+    );
+    logger.debug({ assetId }, "Purged old URI metadata");
+  } catch (error: any) {
+    logger.warn({ assetId, error: error.message }, "Failed to purge old URI metadata");
+  }
+
   const result = await digestUri(uri);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadata(assetId, "uri:status", JSON.stringify({
+    await storeUriMetadata(assetId, "_uri:_status", JSON.stringify({
       status: result.status,
       error: result.error,
       bytes: result.bytes,
@@ -703,7 +722,7 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
   }
 
   // Store success status
-  await storeUriMetadata(assetId, "uri:status", JSON.stringify({
+  await storeUriMetadata(assetId, "_uri:_status", JSON.stringify({
     status: "ok",
     bytes: result.bytes,
     hash: result.hash,
@@ -714,19 +733,20 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
 }
 
 // Standard URI fields that should NOT be compressed (frequently read)
+// Uses "_uri:" prefix to avoid collision with user's on-chain metadata
 const STANDARD_URI_FIELDS = new Set([
-  "uri:type",
-  "uri:name",
-  "uri:description",
-  "uri:image",
-  "uri:endpoints",
-  "uri:registrations",
-  "uri:supported_trusts",
-  "uri:active",
-  "uri:x402_support",
-  "uri:skills",
-  "uri:domains",
-  "uri:status",
+  "_uri:type",
+  "_uri:name",
+  "_uri:description",
+  "_uri:image",
+  "_uri:endpoints",
+  "_uri:registrations",
+  "_uri:supported_trusts",
+  "_uri:active",
+  "_uri:x402_support",
+  "_uri:skills",
+  "_uri:domains",
+  "_uri:_status",
 ]);
 
 /**

@@ -25,19 +25,20 @@ import { compressForStorage } from "../utils/compression.js";
 const logger = createChildLogger("db-handlers");
 
 // Standard URI fields - never compressed for fast reads (parity with supabase.ts)
+// Uses "_uri:" prefix to avoid collision with user's on-chain metadata
 const STANDARD_URI_FIELDS = new Set([
-  "uri:type",
-  "uri:name",
-  "uri:description",
-  "uri:image",
-  "uri:endpoints",
-  "uri:registrations",
-  "uri:supported_trusts",
-  "uri:active",
-  "uri:x402_support",
-  "uri:skills",
-  "uri:domains",
-  "uri:status",
+  "_uri:type",
+  "_uri:name",
+  "_uri:description",
+  "_uri:image",
+  "_uri:endpoints",
+  "_uri:registrations",
+  "_uri:supported_trusts",
+  "_uri:active",
+  "_uri:x402_support",
+  "_uri:skills",
+  "_uri:domains",
+  "_uri:_status",
 ]);
 
 // Solana default pubkey (111...111) indicates wallet reset
@@ -273,6 +274,12 @@ async function handleMetadataSet(
   data: MetadataSet,
   ctx: EventContext
 ): Promise<void> {
+  // Skip reserved _uri: prefix to avoid collision with URI-derived metadata
+  if (data.key.startsWith("_uri:")) {
+    logger.warn({ assetId: data.asset.toBase58(), key: data.key }, "Skipping reserved _uri: prefix");
+    return;
+  }
+
   const assetId = data.asset.toBase58();
 
   await prisma.agentMetadata.upsert({
@@ -572,12 +579,26 @@ async function digestAndStoreUriMetadataLocal(
     return;
   }
 
+  // Purge old URI-derived metadata before storing new ones
+  // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
+  try {
+    await prisma.agentMetadata.deleteMany({
+      where: {
+        agentId: assetId,
+        key: { startsWith: "_uri:" },
+      },
+    });
+    logger.debug({ assetId }, "Purged old URI metadata");
+  } catch (error: any) {
+    logger.warn({ assetId, error: error.message }, "Failed to purge old URI metadata");
+  }
+
   const result = await digestUri(uri);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadataLocal(prisma, assetId, "uri:status", JSON.stringify({
+    await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify({
       status: result.status,
       error: result.error,
       bytes: result.bytes,
@@ -604,7 +625,7 @@ async function digestAndStoreUriMetadataLocal(
   }
 
   // Store success status
-  await storeUriMetadataLocal(prisma, assetId, "uri:status", JSON.stringify({
+  await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify({
     status: "ok",
     bytes: result.bytes,
     hash: result.hash,
