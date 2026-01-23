@@ -120,11 +120,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       });
 
       // Map to SDK expected format
+      // Note: feedback_index as String to preserve BigInt precision (> 2^53)
       const mapped = feedbacks.map(f => ({
         id: f.id,
         asset: f.agentId,
         client_address: f.client,
-        feedback_index: Number(f.feedbackIndex),
+        feedback_index: f.feedbackIndex.toString(),
         score: f.score,
         tag1: f.tag1,
         tag2: f.tag2,
@@ -187,12 +188,13 @@ export function createApiServer(options: ApiServerOptions): Express {
       });
 
       // Map to SDK expected format (IndexedFeedbackResponse)
+      // Note: feedback_index as String to preserve BigInt precision (> 2^53)
       const mapped = responses.map(r => ({
         id: r.id,
         feedback_id: r.feedbackId,
         asset: r.feedback.agentId,
         client_address: r.feedback.client,
-        feedback_index: Number(r.feedback.feedbackIndex),
+        feedback_index: r.feedback.feedbackIndex.toString(),
         responder: r.responder,
         response_uri: r.responseUri,
         response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,

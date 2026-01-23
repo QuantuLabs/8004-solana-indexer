@@ -511,16 +511,19 @@ async function handleResponseAppended(
   const assetId = data.asset.toBase58();
   const clientAddress = data.client.toBase58();
   const responder = data.responder.toBase58();
-  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}`;
+  // Multiple responses per responder allowed (ERC-8004) - include tx_signature in id
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}`;
 
   try {
+    // Check if feedback exists - if not, store as orphan response
     const feedbackCheck = await db.query(
       `SELECT id FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
       [assetId, clientAddress, data.feedbackIndex.toString()]
     );
+
     if (feedbackCheck.rowCount === 0) {
-      logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() }, "Feedback not found for response");
-      return;
+      logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+        "Feedback not found for response - storing as orphan (will link on backfill)");
     }
 
     // Normalize optional hash: all-zero means "no hash" for IPFS
@@ -537,7 +540,7 @@ async function handleResponseAppended(
        responseHash,
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
-    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to append response");
   }
@@ -577,18 +580,22 @@ async function handleValidationResponded(
   const id = `${assetId}:${validatorAddress}:${data.nonce}`;
 
   try {
+    // Use UPSERT to handle case where request wasn't indexed (DB reset, late start, etc.)
     await db.query(
-      `UPDATE validations SET
-         response = $1,
-         response_uri = $2,
-         response_hash = $3,
-         tag = $4,
-         status = $5,
-         updated_at = $6
-       WHERE id = $7`,
-      [data.response, data.responseUri || null,
+      `INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, tx_signature, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+       ON CONFLICT (id) DO UPDATE SET
+         response = EXCLUDED.response,
+         response_uri = EXCLUDED.response_uri,
+         response_hash = EXCLUDED.response_hash,
+         tag = EXCLUDED.tag,
+         status = EXCLUDED.status,
+         updated_at = EXCLUDED.updated_at`,
+      [id, assetId, validatorAddress, data.nonce, data.response,
+       data.responseUri || null,
        data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
-       data.tag || null, "RESPONDED", ctx.blockTime.toISOString(), id]
+       data.tag || null, "RESPONDED",
+       ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, validator: validatorAddress, nonce: data.nonce, response: data.response }, "Validation responded");
   } catch (error: any) {
@@ -705,7 +712,7 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
   }
 
   // Store each extracted field
-  const maxValueBytes = 10000; // 10KB max per field
+  const maxValueBytes = config.metadataMaxValueBytes;
   for (const [key, value] of Object.entries(result.fields)) {
     const serialized = serializeValue(value, maxValueBytes);
 
@@ -721,12 +728,13 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
     }
   }
 
-  // Store success status
+  // Store success status with truncation info
   await storeUriMetadata(assetId, "_uri:_status", JSON.stringify({
     status: "ok",
     bytes: result.bytes,
     hash: result.hash,
     fieldCount: Object.keys(result.fields).length,
+    truncatedKeys: result.truncatedKeys || false,
   }));
 
   logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");

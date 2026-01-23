@@ -44,6 +44,16 @@ const STANDARD_URI_FIELDS = new Set([
 // Solana default pubkey (111...111) indicates wallet reset
 const DEFAULT_PUBKEY = "11111111111111111111111111111111";
 
+/**
+ * Normalize hash: all-zero means "no hash" → NULL (parity with Supabase)
+ */
+function normalizeHash(hash: Uint8Array | number[]): Buffer | null {
+  if (!hash || hash.every(b => b === 0)) {
+    return null;
+  }
+  return Buffer.from(hash);
+}
+
 export interface EventContext {
   signature: string;
   slot: bigint;
@@ -398,7 +408,7 @@ async function handleNewFeedback(
       tag2: data.tag2,
       endpoint: data.endpoint,
       feedbackUri: data.feedbackUri,
-      feedbackHash: Buffer.from(data.feedbackHash),
+      feedbackHash: normalizeHash(data.feedbackHash),
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
     },
@@ -481,7 +491,7 @@ async function handleResponseAppended(
       feedbackId: feedback.id,
       responder: data.responder.toBase58(),
       responseUri: data.responseUri,
-      responseHash: Buffer.from(data.responseHash),
+      responseHash: normalizeHash(data.responseHash),
       txSignature: ctx.signature,
       slot: ctx.slot,
     },
@@ -515,7 +525,7 @@ async function handleValidationRequested(
       requester: data.requester.toBase58(),
       nonce: data.nonce,
       requestUri: data.requestUri,
-      requestHash: Buffer.from(data.requestHash),
+      requestHash: normalizeHash(data.requestHash),
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
     },
@@ -539,16 +549,38 @@ async function handleValidationResponded(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
 
-  await prisma.validation.updateMany({
+  // Use UPSERT to handle case where request wasn't indexed (DB reset, late start, etc.)
+  await prisma.validation.upsert({
     where: {
+      agentId_validator_nonce: {
+        agentId: assetId,
+        validator: data.validatorAddress.toBase58(),
+        nonce: data.nonce,
+      },
+    },
+    create: {
       agentId: assetId,
       validator: data.validatorAddress.toBase58(),
       nonce: data.nonce,
-    },
-    data: {
+      // Request fields unknown - set to empty/null
+      requester: data.validatorAddress.toBase58(), // Best guess: validator is requester
+      requestUri: null,
+      requestHash: null, // Unknown request
+      requestTxSignature: ctx.signature, // Use response tx as placeholder
+      requestSlot: ctx.slot,
+      // Response fields
       response: data.response,
       responseUri: data.responseUri,
-      responseHash: Buffer.from(data.responseHash),
+      responseHash: normalizeHash(data.responseHash),
+      tag: data.tag,
+      respondedAt: ctx.blockTime,
+      responseTxSignature: ctx.signature,
+      responseSlot: ctx.slot,
+    },
+    update: {
+      response: data.response,
+      responseUri: data.responseUri,
+      responseHash: normalizeHash(data.responseHash),
       tag: data.tag,
       respondedAt: ctx.blockTime,
       responseTxSignature: ctx.signature,
@@ -608,7 +640,7 @@ async function digestAndStoreUriMetadataLocal(
   }
 
   // Store each extracted field
-  const maxValueBytes = 10000; // 10KB max per field
+  const maxValueBytes = config.metadataMaxValueBytes;
   for (const [key, value] of Object.entries(result.fields)) {
     const serialized = serializeValue(value, maxValueBytes);
 
@@ -624,12 +656,13 @@ async function digestAndStoreUriMetadataLocal(
     }
   }
 
-  // Store success status
+  // Store success status with truncation info
   await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify({
     status: "ok",
     bytes: result.bytes,
     hash: result.hash,
     fieldCount: Object.keys(result.fields).length,
+    truncatedKeys: result.truncatedKeys || false,
   }));
 
   logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");

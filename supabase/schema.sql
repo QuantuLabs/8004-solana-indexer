@@ -148,9 +148,12 @@ CREATE TABLE feedback_responses (
   response_uri TEXT,
   response_hash TEXT,
   block_slot BIGINT NOT NULL,
+  tx_index INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(asset, client_address, feedback_index, responder)
+  -- Multiple responses per responder allowed (ERC-8004)
+  -- id format: asset:client:index:responder:tx_signature
+  UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
 );
 
 CREATE INDEX idx_responses_asset ON feedback_responses(asset);

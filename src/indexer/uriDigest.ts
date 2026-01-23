@@ -23,18 +23,20 @@ export interface UriDigestResult {
  * Standard ERC-8004 registration file fields
  * Maps builder field names to metadata keys
  */
+// Prefix "_uri:" for indexer-derived metadata to avoid collision with on-chain metadata
+// Users can set on-chain metadata with any key, so we use underscore prefix for internal keys
 const STANDARD_FIELDS: Record<string, string> = {
-  type: "uri:type",
-  name: "uri:name",
-  description: "uri:description",
-  image: "uri:image",
-  endpoints: "uri:endpoints",
-  registrations: "uri:registrations",
-  supportedTrusts: "uri:supported_trusts",
-  active: "uri:active",
-  x402support: "uri:x402_support",
-  skills: "uri:skills",
-  domains: "uri:domains",
+  type: "_uri:type",
+  name: "_uri:name",
+  description: "_uri:description",
+  image: "_uri:image",
+  endpoints: "_uri:endpoints",
+  registrations: "_uri:registrations",
+  supportedTrusts: "_uri:supported_trusts",
+  active: "_uri:active",
+  x402support: "_uri:x402_support",
+  skills: "_uri:skills",
+  domains: "_uri:domains",
 };
 
 /**
@@ -124,6 +126,7 @@ export async function digestUri(uri: string): Promise<UriDigestResult> {
     }
 
     // In "full" mode, store unknown keys individually (with DoS protection)
+    let truncatedKeys = false;
     if (config.metadataIndexMode === "full") {
       const MAX_EXTRA_KEYS = 50; // Protection against malicious JSON with many keys
       let extraKeyCount = 0;
@@ -132,10 +135,11 @@ export async function digestUri(uri: string): Promise<UriDigestResult> {
         if (!standardKeys.has(key)) {
           if (extraKeyCount >= MAX_EXTRA_KEYS) {
             logger.warn({ uri }, `Exceeded ${MAX_EXTRA_KEYS} extra keys, truncating`);
+            truncatedKeys = true;
             break;
           }
-          // Store with uri: prefix for queryability
-          fields[`uri:${key}`] = value;
+          // Store with _uri: prefix (internal) to avoid collision with on-chain metadata
+          fields[`_uri:${key}`] = value;
           extraKeyCount++;
         }
       }
@@ -146,6 +150,7 @@ export async function digestUri(uri: string): Promise<UriDigestResult> {
       bytes: totalBytes,
       hash,
       fields,
+      truncatedKeys,
     };
   } catch (error: unknown) {
     if (error instanceof Error) {

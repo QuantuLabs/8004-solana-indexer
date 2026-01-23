@@ -59,28 +59,28 @@ describe('Fixes Verification', () => {
 
   describe('Standard URI Fields', () => {
     const STANDARD_URI_FIELDS = new Set([
-      "uri:type",
-      "uri:name",
-      "uri:description",
-      "uri:image",
-      "uri:endpoints",
-      "uri:registrations",
-      "uri:supported_trusts",
-      "uri:active",
-      "uri:x402_support",
-      "uri:skills",
-      "uri:domains",
-      "uri:status",
+      "_uri:type",
+      "_uri:name",
+      "_uri:description",
+      "_uri:image",
+      "_uri:endpoints",
+      "_uri:registrations",
+      "_uri:supported_trusts",
+      "_uri:active",
+      "_uri:x402_support",
+      "_uri:skills",
+      "_uri:domains",
+      "_uri:_status",
     ]);
 
     it('should not compress standard fields', () => {
-      expect(STANDARD_URI_FIELDS.has("uri:name")).toBe(true);
-      expect(STANDARD_URI_FIELDS.has("uri:description")).toBe(true);
-      expect(STANDARD_URI_FIELDS.has("uri:endpoints")).toBe(true);
+      expect(STANDARD_URI_FIELDS.has("_uri:name")).toBe(true);
+      expect(STANDARD_URI_FIELDS.has("_uri:description")).toBe(true);
+      expect(STANDARD_URI_FIELDS.has("_uri:endpoints")).toBe(true);
     });
 
     it('should compress custom fields', () => {
-      expect(STANDARD_URI_FIELDS.has("uri:custom_field")).toBe(false);
+      expect(STANDARD_URI_FIELDS.has("_uri:custom_field")).toBe(false);
       expect(STANDARD_URI_FIELDS.has("extra:something")).toBe(false);
     });
   });
@@ -119,7 +119,7 @@ describe('Fixes Verification', () => {
     it('should format metadata for PostgREST compatibility', () => {
       const mockMetadata = {
         agentId: 'agent123',
-        key: 'uri:name',
+        key: '_uri:name',
         value: Buffer.from([0x00, 0x74, 0x65, 0x73, 0x74]), // PREFIX_RAW + "test"
         immutable: false,
       };
@@ -132,9 +132,9 @@ describe('Fixes Verification', () => {
         immutable: mockMetadata.immutable,
       };
 
-      expect(formatted.id).toBe('agent123:uri:name');
+      expect(formatted.id).toBe('agent123:_uri:name');
       expect(formatted.asset).toBe('agent123');
-      expect(formatted.key).toBe('uri:name');
+      expect(formatted.key).toBe('_uri:name');
       expect(typeof formatted.value).toBe('string'); // Base64 string
       expect(formatted.immutable).toBe(false);
     });

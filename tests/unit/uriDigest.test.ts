@@ -84,14 +84,14 @@ describe("URI Digest Module", () => {
       expect(result.bytes).toBeGreaterThan(0);
       expect(result.hash).toBeDefined();
       expect(result.fields).toBeDefined();
-      expect(result.fields!["uri:type"]).toBe("ai-agent");
-      expect(result.fields!["uri:name"]).toBe("Test Agent");
-      expect(result.fields!["uri:description"]).toBe("A test agent");
-      expect(result.fields!["uri:image"]).toBe("https://example.com/image.png");
-      expect(result.fields!["uri:skills"]).toEqual(["web-search", "code-generation"]);
-      expect(result.fields!["uri:domains"]).toEqual(["finance", "tech"]);
-      expect(result.fields!["uri:active"]).toBe(true);
-      expect(result.fields!["uri:endpoints"]).toEqual([
+      expect(result.fields!["_uri:type"]).toBe("ai-agent");
+      expect(result.fields!["_uri:name"]).toBe("Test Agent");
+      expect(result.fields!["_uri:description"]).toBe("A test agent");
+      expect(result.fields!["_uri:image"]).toBe("https://example.com/image.png");
+      expect(result.fields!["_uri:skills"]).toEqual(["web-search", "code-generation"]);
+      expect(result.fields!["_uri:domains"]).toEqual(["finance", "tech"]);
+      expect(result.fields!["_uri:active"]).toBe(true);
+      expect(result.fields!["_uri:endpoints"]).toEqual([
         { type: "mcp", url: "https://api.example.com/mcp" }
       ]);
     });
@@ -241,13 +241,13 @@ describe("URI Digest Module", () => {
       expect(result.status).toBe("ok");
       expect(result.fields).toBeDefined();
       // Standard field
-      expect(result.fields!["uri:name"]).toBe("Test Agent");
-      // Custom fields stored with uri: prefix
-      expect(result.fields!["uri:customField1"]).toBe("value1");
-      expect(result.fields!["uri:customField2"]).toBe("value2");
-      expect(result.fields!["uri:nestedObject"]).toEqual({ foo: "bar" });
-      // No uri:raw blob
-      expect(result.fields!["uri:raw"]).toBeUndefined();
+      expect(result.fields!["_uri:name"]).toBe("Test Agent");
+      // Custom fields stored with _uri: prefix
+      expect(result.fields!["_uri:customField1"]).toBe("value1");
+      expect(result.fields!["_uri:customField2"]).toBe("value2");
+      expect(result.fields!["_uri:nestedObject"]).toEqual({ foo: "bar" });
+      // No _uri:raw blob
+      expect(result.fields!["_uri:raw"]).toBeUndefined();
     });
 
     it("should limit extra keys to MAX_EXTRA_KEYS (50) for DoS protection", async () => {
@@ -289,9 +289,9 @@ describe("URI Digest Module", () => {
       expect(result.status).toBe("ok");
       expect(result.fields).toBeDefined();
 
-      // Count extra keys (excluding standard field uri:name)
+      // Count extra keys (excluding standard field _uri:name)
       const extraKeyCount = Object.keys(result.fields!).filter(
-        k => k.startsWith("uri:custom_")
+        k => k.startsWith("_uri:custom_")
       ).length;
 
       // Should be limited to 50

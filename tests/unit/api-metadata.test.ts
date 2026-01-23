@@ -53,13 +53,13 @@ describe('Metadata API Endpoint Logic', () => {
       const mockData = [
         {
           agentId: 'agent123',
-          key: 'uri:name',
+          key: '_uri:name',
           value: Buffer.from([0x00, 0x54, 0x65, 0x73, 0x74]), // PREFIX_RAW + "Test"
           immutable: false,
         },
         {
           agentId: 'agent123',
-          key: 'uri:description',
+          key: '_uri:description',
           value: Buffer.from([0x00, 0x44, 0x65, 0x73, 0x63]), // PREFIX_RAW + "Desc"
           immutable: true,
         },
@@ -69,12 +69,12 @@ describe('Metadata API Endpoint Logic', () => {
 
       expect(result).toHaveLength(2);
       expect(result[0].asset).toBe('agent123');
-      expect(result[0].key).toBe('uri:name');
-      expect(result[0].id).toBe('agent123:uri:name');
+      expect(result[0].key).toBe('_uri:name');
+      expect(result[0].id).toBe('agent123:_uri:name');
       expect(result[0].immutable).toBe(false);
       expect(typeof result[0].value).toBe('string'); // Base64
 
-      expect(result[1].id).toBe('agent123:uri:description');
+      expect(result[1].id).toBe('agent123:_uri:description');
       expect(result[1].immutable).toBe(true);
     });
 

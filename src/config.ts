@@ -47,6 +47,8 @@ export const config = {
   metadataIndexMode: (process.env.INDEX_METADATA || "normal") as MetadataIndexMode,
   // Maximum bytes to fetch from URI (prevents memory exhaustion)
   metadataMaxBytes: parseInt(process.env.METADATA_MAX_BYTES || "262144", 10), // 256KB
+  // Maximum bytes per field value (prevents single oversize field)
+  metadataMaxValueBytes: parseInt(process.env.METADATA_MAX_VALUE_BYTES || "10000", 10), // 10KB
   // Fixed timeout for URI fetch (security: no user-configurable timeout)
   metadataTimeoutMs: 5000,
 } as const;
