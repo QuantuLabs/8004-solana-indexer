@@ -773,3 +773,25 @@ async function storeUriMetadataLocal(
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
   }
 }
+
+/**
+ * Cleanup old orphan responses (> maxAgeDays old)
+ * Call periodically or at startup to prevent table pollution
+ */
+export async function cleanupOrphanResponses(
+  prisma: PrismaClient,
+  maxAgeDays: number = 7
+): Promise<number> {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - maxAgeDays);
+
+  const result = await prisma.orphanResponse.deleteMany({
+    where: { createdAt: { lt: cutoff } },
+  });
+
+  if (result.count > 0) {
+    logger.info({ deleted: result.count, maxAgeDays }, "Cleaned up old orphan responses");
+  }
+
+  return result.count;
+}

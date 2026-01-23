@@ -3,6 +3,7 @@ import { config, validateConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
 import { startApiServer } from "./api/server.js";
+import { cleanupOrphanResponses } from "./db/handlers.js";
 
 async function main() {
   try {
@@ -30,6 +31,8 @@ async function main() {
     try {
       await prisma.$connect();
       logger.info("Database connected (SQLite via Prisma)");
+      // Cleanup old orphan responses at startup (> 7 days)
+      await cleanupOrphanResponses(prisma, 7);
     } catch (error) {
       logger.fatal({ error }, "Failed to connect to database");
       process.exit(1);
