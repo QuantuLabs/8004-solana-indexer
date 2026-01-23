@@ -707,8 +707,26 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
   logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");
 }
 
+// Standard URI fields that should NOT be compressed (frequently read)
+const STANDARD_URI_FIELDS = new Set([
+  "uri:type",
+  "uri:name",
+  "uri:description",
+  "uri:image",
+  "uri:endpoints",
+  "uri:registrations",
+  "uri:supported_trusts",
+  "uri:active",
+  "uri:x402_support",
+  "uri:skills",
+  "uri:domains",
+  "uri:status",
+]);
+
 /**
  * Store a single URI metadata entry
+ * Standard fields are stored raw (no compression) for fast reads
+ * Extra/custom fields are compressed with ZSTD if > 256 bytes
  */
 async function storeUriMetadata(assetId: string, key: string, value: string): Promise<void> {
   const db = getPool();
@@ -716,8 +734,12 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
   const id = `${assetId}:${keyHash}`;
 
   try {
-    // Compress value for storage (threshold: 256 bytes)
-    const compressedValue = await compressForStorage(Buffer.from(value));
+    // Only compress non-standard fields (custom/extra data)
+    // Standard fields are read frequently and shouldn't incur decompression cost
+    const shouldCompress = !STANDARD_URI_FIELDS.has(key);
+    const storedValue = shouldCompress
+      ? await compressForStorage(Buffer.from(value))
+      : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
 
     await db.query(
       `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
@@ -725,7 +747,7 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
          updated_at = NOW()`,
-      [id, assetId, key, keyHash, compressedValue]
+      [id, assetId, key, keyHash, storedValue]
     );
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
