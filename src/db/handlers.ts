@@ -40,6 +40,9 @@ const STANDARD_URI_FIELDS = new Set([
   "uri:status",
 ]);
 
+// Solana default pubkey (111...111) indicates wallet reset
+const DEFAULT_PUBKEY = "11111111111111111111111111111111";
+
 export interface EventContext {
   signature: string;
   slot: bigint;
@@ -247,17 +250,20 @@ async function handleWalletUpdated(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  // Convert default pubkey to NULL (wallet reset semantics)
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
 
   await prisma.agent.update({
     where: { id: assetId },
     data: {
-      wallet: data.newWallet.toBase58(),
+      wallet: newWallet,
       updatedAt: ctx.blockTime,
     },
   });
 
   logger.info(
-    { assetId, newWallet: data.newWallet.toBase58() },
+    { assetId, newWallet: newWallet ?? "(reset)" },
     "Agent wallet updated"
   );
 }
