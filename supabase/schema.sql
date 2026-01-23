@@ -96,7 +96,7 @@ CREATE TABLE metadata (
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   key TEXT NOT NULL,
   key_hash TEXT NOT NULL,
-  value TEXT,  -- base64 encoded
+  value BYTEA,  -- binary with compression prefix (0x00=raw, 0x01=zstd)
   immutable BOOLEAN DEFAULT FALSE,
   block_slot BIGINT NOT NULL,
   tx_signature TEXT NOT NULL,

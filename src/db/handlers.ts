@@ -20,8 +20,25 @@ import { createChildLogger } from "../logger.js";
 import { config } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
 import { digestUri, serializeValue } from "../indexer/uriDigest.js";
+import { compressForStorage } from "../utils/compression.js";
 
 const logger = createChildLogger("db-handlers");
+
+// Standard URI fields - never compressed for fast reads (parity with supabase.ts)
+const STANDARD_URI_FIELDS = new Set([
+  "uri:type",
+  "uri:name",
+  "uri:description",
+  "uri:image",
+  "uri:endpoints",
+  "uri:registrations",
+  "uri:supported_trusts",
+  "uri:active",
+  "uri:x402_support",
+  "uri:skills",
+  "uri:domains",
+  "uri:status",
+]);
 
 export interface EventContext {
   signature: string;
@@ -593,6 +610,9 @@ async function digestAndStoreUriMetadataLocal(
 
 /**
  * Store a single URI metadata entry (local/Prisma mode)
+ * Applies compression parity with Supabase mode:
+ * - Standard URI fields: RAW with 0x00 prefix
+ * - Custom fields: ZSTD compressed if > 256 bytes
  */
 async function storeUriMetadataLocal(
   prisma: PrismaClient,
@@ -601,6 +621,14 @@ async function storeUriMetadataLocal(
   value: string
 ): Promise<void> {
   try {
+    // Apply compression parity with Supabase mode
+    const shouldCompress = !STANDARD_URI_FIELDS.has(key);
+    const storedBuffer = shouldCompress
+      ? await compressForStorage(Buffer.from(value))
+      : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
+    // Convert to Uint8Array for Prisma compatibility
+    const storedValue = new Uint8Array(storedBuffer);
+
     await prisma.agentMetadata.upsert({
       where: {
         agentId_key: {
@@ -611,11 +639,11 @@ async function storeUriMetadataLocal(
       create: {
         agentId: assetId,
         key,
-        value: Buffer.from(value),
+        value: storedValue,
         immutable: false,
       },
       update: {
-        value: Buffer.from(value),
+        value: storedValue,
       },
     });
   } catch (error: any) {
