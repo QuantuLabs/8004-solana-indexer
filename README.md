@@ -6,6 +6,7 @@ A lightweight, self-hosted Solana indexer for the [8004 Agent Registry](https://
 
 - **Dual-mode indexing**: WebSocket (real-time) + polling (fallback)
 - **14 Anchor event types** indexed (Identity, Reputation, Validation)
+- **v0.5.0 feedback fields**: `value` (i64), `valueDecimals` (0-6), nullable `score`
 - **GraphQL API** with built-in GraphiQL explorer
 - **Works with any Solana RPC** (Helius, QuickNode, public devnet)
 - **Zero external dependencies**: SQLite included, just Node.js required
@@ -77,7 +78,7 @@ query {
   }
 }
 
-# Get agent details
+# Get agent details with v0.5.0 feedback fields
 query {
   agent(id: "AgentPubkeyHere") {
     id
@@ -85,7 +86,9 @@ query {
     nftName
     metadata { key value }
     feedbacks(limit: 5) {
-      score
+      score           # 0-100 or null (ATOM skipped)
+      value           # i64 raw metric (e.g., profit in cents)
+      valueDecimals   # 0-6 decimal precision
       tag1
       client
     }
