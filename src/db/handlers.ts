@@ -47,11 +47,11 @@ const DEFAULT_PUBKEY = "11111111111111111111111111111111";
 /**
  * Normalize hash: all-zero means "no hash" → NULL (parity with Supabase)
  */
-function normalizeHash(hash: Uint8Array | number[]): Buffer | null {
+function normalizeHash(hash: Uint8Array | number[]): Uint8Array<ArrayBuffer> | null {
   if (!hash || hash.every(b => b === 0)) {
     return null;
   }
-  return Buffer.from(hash);
+  return Uint8Array.from(hash) as Uint8Array<ArrayBuffer>;
 }
 
 export interface EventContext {
@@ -413,6 +413,8 @@ async function handleNewFeedback(
       agentId: assetId,
       client: clientAddress,
       feedbackIndex: data.feedbackIndex,
+      value: data.value,
+      valueDecimals: data.valueDecimals,
       score: data.score,
       tag1: data.tag1,
       tag2: data.tag2,

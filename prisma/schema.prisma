@@ -58,7 +58,9 @@ model Feedback {
   agentId       String
   client        String   // client pubkey
   feedbackIndex BigInt   // on-chain index
-  score         Int      // 0-100
+  value         BigInt   @default(0)  // i64 raw metric value (v0.5.0)
+  valueDecimals Int      @default(0)  // decimal precision 0-6 (v0.5.0)
+  score         Int?     // 0-100, null if ATOM skipped (v0.5.0)
   tag1          String   // category tag 1
   tag2          String   // category tag 2
   endpoint      String   // endpoint used

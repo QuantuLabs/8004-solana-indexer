@@ -380,12 +380,13 @@ async function handleNewFeedback(
       : null;
 
     const insertResult = await db.query(
-      `INSERT INTO feedbacks (id, asset, client_address, feedback_index, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+      `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          is_revoked, block_slot, tx_index, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (id) DO NOTHING`,
       [
-        id, assetId, clientAddress, data.feedbackIndex.toString(), data.score,
+        id, assetId, clientAddress, data.feedbackIndex.toString(),
+        data.value.toString(), data.valueDecimals, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         feedbackHash,
         false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()

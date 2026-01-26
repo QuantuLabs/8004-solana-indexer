@@ -110,13 +110,16 @@ CREATE INDEX idx_metadata_key ON metadata(key);
 
 -- =============================================
 -- FEEDBACKS (immutable log - raw data only)
+-- v0.5.0: Added value, value_decimals, score is now nullable
 -- =============================================
 CREATE TABLE feedbacks (
   id TEXT PRIMARY KEY,
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   client_address TEXT NOT NULL,
   feedback_index BIGINT NOT NULL,
-  score SMALLINT NOT NULL CHECK (score >= 0 AND score <= 100),
+  value BIGINT DEFAULT 0,  -- v0.5.0: i64 raw metric value (e.g., profit in cents)
+  value_decimals SMALLINT DEFAULT 0 CHECK (value_decimals >= 0 AND value_decimals <= 6),  -- v0.5.0: decimal precision
+  score SMALLINT CHECK (score >= 0 AND score <= 100),  -- v0.5.0: nullable (NULL = ATOM skipped)
   tag1 TEXT,
   tag2 TEXT,
   endpoint TEXT,
@@ -125,6 +128,7 @@ CREATE TABLE feedbacks (
   is_revoked BOOLEAN DEFAULT FALSE,
   revoked_at TIMESTAMPTZ,
   block_slot BIGINT NOT NULL,
+  tx_index INTEGER,  -- for deterministic ordering
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(asset, client_address, feedback_index)
@@ -213,6 +217,36 @@ CREATE TABLE indexer_state (
 -- =============================================
 -- VIEWS (for API)
 -- =============================================
+
+-- Metadata decoded (all formats) - use when you need all metadata
+-- value_text may contain "_compressed:base64..." for ZSTD entries
+CREATE OR REPLACE VIEW metadata_decoded AS
+SELECT
+  id, asset, key, key_hash, immutable, block_slot, tx_signature, created_at, updated_at,
+  CASE
+    WHEN value IS NULL OR octet_length(value) = 0 THEN NULL
+    WHEN get_byte(value, 0) = 0 THEN convert_from(substring(value from 2), 'utf8')
+    WHEN get_byte(value, 0) = 1 THEN '_compressed:' || encode(value, 'base64')
+    ELSE encode(value, 'base64')
+  END AS value_text,
+  CASE
+    WHEN value IS NULL OR octet_length(value) = 0 THEN 'empty'
+    WHEN get_byte(value, 0) = 0 THEN 'raw'
+    WHEN get_byte(value, 0) = 1 THEN 'zstd'
+    ELSE 'legacy'
+  END AS encoding
+FROM metadata;
+
+-- Metadata decoded (RAW only) - JSON-safe guaranteed
+-- Use this when you need JSON-parseable values (most common case)
+CREATE OR REPLACE VIEW metadata_decoded_raw AS
+SELECT
+  id, asset, key, key_hash, immutable, block_slot, tx_signature, created_at, updated_at,
+  convert_from(substring(value from 2), 'utf8') AS value_text
+FROM metadata
+WHERE value IS NOT NULL
+  AND octet_length(value) > 0
+  AND get_byte(value, 0) = 0;
 
 -- Global leaderboard (top tiers, uses partial index)
 CREATE OR REPLACE VIEW leaderboard AS
@@ -400,9 +434,12 @@ $$ LANGUAGE plpgsql;
 GRANT SELECT ON agent_global_ids TO anon;
 GRANT SELECT ON agent_global_ids TO authenticated;
 
--- Modified:
--- - feedback_responses table: Added client_address column
--- - Updated UNIQUE constraint to (asset, client_address, feedback_index, responder)
--- - Updated idx_responses_lookup index to include client_address
--- - Added deterministic ordering indexes for feedbacks
--- - Added agent_global_ids materialized view for gamification
+-- Grant read access to metadata views
+GRANT SELECT ON metadata_decoded TO anon;
+GRANT SELECT ON metadata_decoded TO authenticated;
+GRANT SELECT ON metadata_decoded_raw TO anon;
+GRANT SELECT ON metadata_decoded_raw TO authenticated;
+
+-- Modified 2026-01-24:
+-- - Added metadata_decoded VIEW (all formats with encoding info)
+-- - Added metadata_decoded_raw VIEW (RAW only, JSON-safe)

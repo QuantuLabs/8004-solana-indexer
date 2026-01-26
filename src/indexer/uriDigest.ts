@@ -45,6 +45,7 @@ export interface UriDigestResult {
   bytes?: number;
   hash?: string;
   fields?: Record<string, unknown>;
+  truncatedKeys?: boolean;
 }
 
 /**

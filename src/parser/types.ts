@@ -69,18 +69,17 @@ export interface NewFeedback {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
-  score: number;
+  value: bigint;              // i64 - raw metric value (v0.5.0)
+  valueDecimals: number;      // u8 - decimal precision 0-6 (v0.5.0)
+  score: number | null;       // Option<u8> - 0-100, null = skip ATOM (v0.5.0)
   feedbackHash: Uint8Array;
-  // ATOM enabled flag
-  atomEnabled: boolean;       // Whether ATOM Engine was used
-  // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
+  atomEnabled: boolean;       // Whether ATOM Engine was used (score != null)
   newTrustTier: number;       // u8 (0-4)
   newQualityScore: number;    // u16 (0-10000)
   newConfidence: number;      // u16 (0-10000)
   newRiskScore: number;       // u8 (0-100)
   newDiversityRatio: number;  // u8 (0-255)
   isUniqueClient: boolean;
-  // Variable-size fields
   tag1: string;
   tag2: string;
   endpoint: string;

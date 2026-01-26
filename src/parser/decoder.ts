@@ -9,6 +9,43 @@ import { config } from "../config.js";
 
 const logger = createChildLogger("decoder");
 
+/**
+ * Parse value to bigint (handles Anchor BN format, string, number)
+ */
+function parseBigInt(value: unknown): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'string') return BigInt(value);
+  if (typeof value === 'number') return BigInt(value);
+  if (value && typeof value === 'object' && 'negative' in value && 'words' in value) {
+    const bn = value as { negative: number; words: number[] };
+    let result = 0n;
+    for (let i = 0; i < bn.words.length; i++) {
+      result += BigInt(bn.words[i]) << BigInt(i * 26);
+    }
+    return bn.negative ? -result : result;
+  }
+  return BigInt(String(value));
+}
+
+/**
+ * Parse i64 value (signed)
+ */
+function parseI64(value: unknown): bigint {
+  return parseBigInt(value);
+}
+
+/**
+ * Parse Option<u8> - returns number or null
+ */
+function parseOptionU8(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+  if (value && typeof value === 'object' && 'some' in value) {
+    return (value as { some: number }).some;
+  }
+  return null;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -195,24 +232,23 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "NewFeedback",
           data: {
             asset: new PublicKey(data.asset as string),
-            clientAddress: new PublicKey(data.client_address as string), // snake_case from IDL
-            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
-            score: data.score as number,
-            feedbackHash: new Uint8Array(data.feedback_hash as number[]),// snake_case from IDL
-            // ATOM enabled flag
-            atomEnabled: data.atom_enabled as boolean,                   // snake_case from IDL
-            // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
-            newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
-            newQualityScore: data.new_quality_score as number,           // snake_case from IDL
-            newConfidence: data.new_confidence as number,                // snake_case from IDL
-            newRiskScore: data.new_risk_score as number,                 // snake_case from IDL
-            newDiversityRatio: data.new_diversity_ratio as number,       // snake_case from IDL
-            isUniqueClient: data.is_unique_client as boolean,            // snake_case from IDL
-            // Variable-size fields
+            clientAddress: new PublicKey(data.client_address as string),
+            feedbackIndex: parseBigInt(data.feedback_index),
+            value: parseI64(data.value),
+            valueDecimals: data.value_decimals as number,
+            score: parseOptionU8(data.score),
+            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
+            atomEnabled: data.atom_enabled as boolean,
+            newTrustTier: data.new_trust_tier as number,
+            newQualityScore: data.new_quality_score as number,
+            newConfidence: data.new_confidence as number,
+            newRiskScore: data.new_risk_score as number,
+            newDiversityRatio: data.new_diversity_ratio as number,
+            isUniqueClient: data.is_unique_client as boolean,
             tag1: data.tag1 as string,
             tag2: data.tag2 as string,
             endpoint: data.endpoint as string,
-            feedbackUri: data.feedback_uri as string,                    // snake_case from IDL
+            feedbackUri: data.feedback_uri as string,
           },
         };
 

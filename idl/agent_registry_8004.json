@@ -577,8 +577,31 @@
       ],
       "args": [
         {
-          "name": "score",
+          "name": "value",
+          "type": "i64"
+        },
+        {
+          "name": "value_decimals",
           "type": "u8"
+        },
+        {
+          "name": "score",
+          "type": {
+            "option": "u8"
+          }
+        },
+        {
+          "name": "feedback_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "feedback_index",
+          "type": "u64"
         },
         {
           "name": "tag1",
@@ -595,19 +618,6 @@
         {
           "name": "feedback_uri",
           "type": "string"
-        },
-        {
-          "name": "feedback_hash",
-          "type": {
-            "array": [
-              "u8",
-              32
-            ]
-          }
-        },
-        {
-          "name": "feedback_index",
-          "type": "u64"
         }
       ]
     },
@@ -2567,7 +2577,7 @@
     {
       "code": 12000,
       "name": "UriTooLong",
-      "msg": "URI exceeds 200 bytes"
+      "msg": "URI exceeds 250 bytes"
     },
     {
       "code": 12001,
@@ -2577,7 +2587,7 @@
     {
       "code": 12002,
       "name": "ValueTooLong",
-      "msg": "Value exceeds 256 bytes"
+      "msg": "Value exceeds 250 bytes"
     },
     {
       "code": 12003,
@@ -2642,7 +2652,7 @@
     {
       "code": 12051,
       "name": "ResponseUriTooLong",
-      "msg": "Response URI exceeds 200 bytes"
+      "msg": "Response URI exceeds 250 bytes"
     },
     {
       "code": 12052,
@@ -2675,6 +2685,16 @@
       "msg": "At least one tag must be provided"
     },
     {
+      "code": 12060,
+      "name": "EndpointTooLong",
+      "msg": "Endpoint exceeds 250 bytes"
+    },
+    {
+      "code": 12061,
+      "name": "InvalidDecimals",
+      "msg": "Invalid decimals (max 6)"
+    },
+    {
       "code": 12058,
       "name": "AtomStatsNotInitialized",
       "msg": "ATOM stats not initialized - call initialize_atom_stats first"
@@ -2687,7 +2707,7 @@
     {
       "code": 12100,
       "name": "RequestUriTooLong",
-      "msg": "Request URI exceeds 200 bytes"
+      "msg": "Request URI exceeds 250 bytes"
     },
     {
       "code": 12101,
@@ -3182,8 +3202,18 @@
             "type": "u64"
           },
           {
-            "name": "score",
+            "name": "value",
+            "type": "i64"
+          },
+          {
+            "name": "value_decimals",
             "type": "u8"
+          },
+          {
+            "name": "score",
+            "type": {
+              "option": "u8"
+            }
           },
           {
             "name": "feedback_hash",

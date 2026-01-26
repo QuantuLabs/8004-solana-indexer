@@ -126,7 +126,9 @@ export function createApiServer(options: ApiServerOptions): Express {
         asset: f.agentId,
         client_address: f.client,
         feedback_index: f.feedbackIndex.toString(),
-        score: f.score,
+        value: f.value.toString(),           // v0.5.0: i64 raw metric value
+        value_decimals: f.valueDecimals,     // v0.5.0: decimal precision 0-6
+        score: f.score,                      // v0.5.0: Option<u8>, null if ATOM skipped
         tag1: f.tag1,
         tag2: f.tag2,
         endpoint: f.endpoint,
@@ -458,9 +460,9 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       // Calculate average score and sort
       const withScores = agents.map(a => {
-        const activeFeedbacks = a.feedbacks.filter(f => !f.revoked);
+        const activeFeedbacks = a.feedbacks.filter(f => !f.revoked && f.score !== null);
         const avgScore = activeFeedbacks.length > 0
-          ? activeFeedbacks.reduce((sum, f) => sum + f.score, 0) / activeFeedbacks.length
+          ? activeFeedbacks.reduce((sum, f) => sum + (f.score ?? 0), 0) / activeFeedbacks.length
           : 0;
         return {
           asset: a.id,
