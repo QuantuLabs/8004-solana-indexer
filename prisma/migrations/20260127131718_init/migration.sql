@@ -7,6 +7,7 @@ CREATE TABLE "Agent" (
     "nftName" TEXT NOT NULL,
     "collection" TEXT NOT NULL,
     "registry" TEXT NOT NULL,
+    "atomEnabled" BOOLEAN NOT NULL DEFAULT true,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     "createdTxSignature" TEXT,
@@ -31,12 +32,14 @@ CREATE TABLE "Feedback" (
     "agentId" TEXT NOT NULL,
     "client" TEXT NOT NULL,
     "feedbackIndex" BIGINT NOT NULL,
-    "score" INTEGER NOT NULL,
+    "value" BIGINT NOT NULL DEFAULT 0,
+    "valueDecimals" INTEGER NOT NULL DEFAULT 0,
+    "score" INTEGER,
     "tag1" TEXT NOT NULL,
     "tag2" TEXT NOT NULL,
     "endpoint" TEXT NOT NULL,
     "feedbackUri" TEXT NOT NULL,
-    "feedbackHash" BLOB NOT NULL,
+    "feedbackHash" BLOB,
     "revoked" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "createdTxSignature" TEXT,
@@ -52,11 +55,25 @@ CREATE TABLE "FeedbackResponse" (
     "feedbackId" TEXT NOT NULL,
     "responder" TEXT NOT NULL,
     "responseUri" TEXT NOT NULL,
-    "responseHash" BLOB NOT NULL,
+    "responseHash" BLOB,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "txSignature" TEXT,
     "slot" BIGINT,
     CONSTRAINT "FeedbackResponse_feedbackId_fkey" FOREIGN KEY ("feedbackId") REFERENCES "Feedback" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- CreateTable
+CREATE TABLE "OrphanResponse" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "agentId" TEXT NOT NULL,
+    "client" TEXT NOT NULL,
+    "feedbackIndex" BIGINT NOT NULL,
+    "responder" TEXT NOT NULL,
+    "responseUri" TEXT NOT NULL,
+    "responseHash" BLOB,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "txSignature" TEXT,
+    "slot" BIGINT
 );
 
 -- CreateTable
@@ -66,8 +83,8 @@ CREATE TABLE "Validation" (
     "validator" TEXT NOT NULL,
     "requester" TEXT NOT NULL,
     "nonce" INTEGER NOT NULL,
-    "requestUri" TEXT NOT NULL,
-    "requestHash" BLOB NOT NULL,
+    "requestUri" TEXT,
+    "requestHash" BLOB,
     "response" INTEGER,
     "responseUri" TEXT,
     "responseHash" BLOB,
@@ -149,6 +166,21 @@ CREATE UNIQUE INDEX "Feedback_agentId_client_feedbackIndex_key" ON "Feedback"("a
 
 -- CreateIndex
 CREATE INDEX "FeedbackResponse_feedbackId_idx" ON "FeedbackResponse"("feedbackId");
+
+-- CreateIndex
+CREATE INDEX "FeedbackResponse_feedbackId_responder_idx" ON "FeedbackResponse"("feedbackId", "responder");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "FeedbackResponse_feedbackId_responder_txSignature_key" ON "FeedbackResponse"("feedbackId", "responder", "txSignature");
+
+-- CreateIndex
+CREATE INDEX "OrphanResponse_agentId_idx" ON "OrphanResponse"("agentId");
+
+-- CreateIndex
+CREATE INDEX "OrphanResponse_agentId_client_feedbackIndex_idx" ON "OrphanResponse"("agentId", "client", "feedbackIndex");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "OrphanResponse_agentId_client_feedbackIndex_responder_txSignature_key" ON "OrphanResponse"("agentId", "client", "feedbackIndex", "responder", "txSignature");
 
 -- CreateIndex
 CREATE INDEX "Validation_agentId_idx" ON "Validation"("agentId");
