@@ -193,13 +193,19 @@ async function handleAgentOwnerSynced(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
 
-  await prisma.agent.update({
+  // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
+  const result = await prisma.agent.updateMany({
     where: { id: assetId },
     data: {
       owner: data.newOwner.toBase58(),
       updatedAt: ctx.blockTime,
     },
   });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for owner sync, event may be out of order");
+    return;
+  }
 
   logger.info(
     {
@@ -218,13 +224,19 @@ async function handleAtomEnabled(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
 
-  await prisma.agent.update({
+  // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
+  const result = await prisma.agent.updateMany({
     where: { id: assetId },
     data: {
       atomEnabled: true,
       updatedAt: ctx.blockTime,
     },
   });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for ATOM enable, event may be out of order");
+    return;
+  }
 
   logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
 }
@@ -237,13 +249,19 @@ async function handleUriUpdated(
   const assetId = data.asset.toBase58();
   const newUri = data.newUri || "";
 
-  await prisma.agent.update({
+  // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
+  const result = await prisma.agent.updateMany({
     where: { id: assetId },
     data: {
       uri: newUri,
       updatedAt: ctx.blockTime,
     },
   });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for URI update, event may be out of order");
+    return;
+  }
 
   logger.info({ assetId, newUri }, "Agent URI updated");
 
@@ -265,13 +283,19 @@ async function handleWalletUpdated(
   const newWalletRaw = data.newWallet.toBase58();
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
 
-  await prisma.agent.update({
+  // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
+  const result = await prisma.agent.updateMany({
     where: { id: assetId },
     data: {
       wallet: newWallet,
       updatedAt: ctx.blockTime,
     },
   });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for wallet update, event may be out of order");
+    return;
+  }
 
   logger.info(
     { assetId, newWallet: newWallet ?? "(reset)" },
