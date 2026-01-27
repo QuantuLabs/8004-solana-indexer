@@ -1,17 +1,21 @@
-import { vi, beforeAll, afterAll, beforeEach } from "vitest";
-import { PrismaClient } from "@prisma/client";
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
-// Mock environment for e2e tests
-process.env.DATABASE_URL =
-  process.env.DATABASE_URL ||
-  "postgresql://postgres:postgres@localhost:5432/indexer8004_test?schema=public";
-process.env.RPC_URL =
-  process.env.RPC_URL || "https://api.devnet.solana.com";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const testDbPath = join(__dirname, '../../prisma/test.db');
+
+// Set environment BEFORE any other imports
+process.env.DATABASE_URL = process.env.DATABASE_URL || `file:${testDbPath}`;
+process.env.RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
 process.env.WS_URL = process.env.WS_URL || "wss://api.devnet.solana.com";
-process.env.PROGRAM_ID =
-  process.env.PROGRAM_ID || "3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC";
+process.env.PROGRAM_ID = process.env.PROGRAM_ID || "3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC";
 process.env.LOG_LEVEL = "silent";
 process.env.INDEXER_MODE = "polling";
+
+// Now import dependencies
+import { vi, beforeAll, afterAll, beforeEach } from "vitest";
+import { PrismaClient } from "@prisma/client";
 
 // Mock pino logger to be silent during tests
 vi.mock("pino", () => {
@@ -32,16 +36,17 @@ let prisma: PrismaClient;
 beforeAll(async () => {
   prisma = new PrismaClient();
 
-  // Clean database before tests
+  // Clean database before tests (SQLite uses DELETE, not TRUNCATE)
   try {
-    await prisma.$executeRaw`TRUNCATE TABLE "EventLog" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "FeedbackResponse" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "Validation" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "Feedback" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "AgentMetadata" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "Agent" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "Registry" CASCADE`;
-    await prisma.$executeRaw`TRUNCATE TABLE "IndexerState" CASCADE`;
+    await prisma.eventLog.deleteMany();
+    await prisma.feedbackResponse.deleteMany();
+    await prisma.orphanResponse.deleteMany();
+    await prisma.validation.deleteMany();
+    await prisma.feedback.deleteMany();
+    await prisma.agentMetadata.deleteMany();
+    await prisma.agent.deleteMany();
+    await prisma.registry.deleteMany();
+    await prisma.indexerState.deleteMany();
   } catch {
     // Tables may not exist yet, that's fine
   }
