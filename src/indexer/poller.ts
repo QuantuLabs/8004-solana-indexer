@@ -318,25 +318,72 @@ export class Poller {
     }
   }
 
+  /**
+   * Fetch new signatures since lastSignature
+   * Uses pagination with `before` to handle cases where new tx count > batchSize
+   * Returns signatures in newest-first order (caller should reverse for processing)
+   */
   private async fetchSignatures(): Promise<ConfirmedSignatureInfo[]> {
-    const options: {
-      limit: number;
-      before?: string;
-      until?: string;
-    } = {
-      limit: this.batchSize,
-    };
-
-    if (this.lastSignature) {
-      options.until = this.lastSignature;
+    if (!this.lastSignature) {
+      // No last signature - just get the latest batch
+      const signatures = await this.connection.getSignaturesForAddress(
+        this.programId,
+        { limit: this.batchSize }
+      );
+      return signatures.filter((sig) => sig.err === null);
     }
 
-    const signatures = await this.connection.getSignaturesForAddress(
-      this.programId,
-      options
-    );
+    // Paginate backwards from newest until we reach lastSignature
+    const allSignatures: ConfirmedSignatureInfo[] = [];
+    let beforeSignature: string | undefined = undefined;
 
-    return signatures.filter((sig) => sig.err === null);
+    while (true) {
+      const options: { limit: number; before?: string } = {
+        limit: this.batchSize,
+      };
+      if (beforeSignature) {
+        options.before = beforeSignature;
+      }
+
+      const batch = await this.connection.getSignaturesForAddress(
+        this.programId,
+        options
+      );
+
+      if (batch.length === 0) {
+        break;
+      }
+
+      // Filter out failed transactions and check for lastSignature
+      for (const sig of batch) {
+        if (sig.signature === this.lastSignature) {
+          // Reached our checkpoint, we're done
+          return allSignatures;
+        }
+        if (sig.err === null) {
+          allSignatures.push(sig);
+        }
+      }
+
+      // Move to older signatures for next iteration
+      beforeSignature = batch[batch.length - 1].signature;
+
+      // Safety: if we've collected too many, log warning and break
+      if (allSignatures.length > 10000) {
+        logger.warn({ count: allSignatures.length }, "Large gap detected, processing available signatures");
+        break;
+      }
+
+      // Small delay to avoid rate limiting during pagination
+      if (batch.length >= this.batchSize) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } else {
+        // Got fewer than requested, no more signatures
+        break;
+      }
+    }
+
+    return allSignatures;
   }
 
   private async processTransaction(sig: ConfirmedSignatureInfo, txIndex?: number): Promise<void> {
