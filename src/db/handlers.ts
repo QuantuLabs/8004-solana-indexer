@@ -770,6 +770,24 @@ async function digestAndStoreUriMetadataLocal(
     truncatedKeys: result.truncatedKeys || false,
   }));
 
+  // Sync nftName from _uri:name if not already set
+  const uriName = result.fields["_uri:name"];
+  if (uriName && typeof uriName === "string") {
+    try {
+      // Check current value first, then update if empty
+      const agent = await prisma.agent.findUnique({ where: { id: assetId }, select: { nftName: true } });
+      if (!agent?.nftName) {
+        await prisma.agent.update({
+          where: { id: assetId },
+          data: { nftName: uriName },
+        });
+        logger.debug({ assetId, name: uriName }, "Synced nftName from URI metadata");
+      }
+    } catch (error: any) {
+      logger.warn({ assetId, error: error.message }, "Failed to sync nftName");
+    }
+  }
+
   logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");
 }
 

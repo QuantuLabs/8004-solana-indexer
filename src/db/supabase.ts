@@ -742,6 +742,20 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
     truncatedKeys: result.truncatedKeys || false,
   }));
 
+  // Sync nft_name from _uri:name if not already set
+  const uriName = result.fields["_uri:name"];
+  if (uriName && typeof uriName === "string") {
+    try {
+      await db.query(
+        `UPDATE agents SET nft_name = $1 WHERE asset = $2 AND (nft_name IS NULL OR nft_name = '')`,
+        [uriName, assetId]
+      );
+      logger.debug({ assetId, name: uriName }, "Synced nft_name from URI metadata");
+    } catch (error: any) {
+      logger.warn({ assetId, error: error.message }, "Failed to sync nft_name");
+    }
+  }
+
   logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "URI metadata indexed");
 }
 
