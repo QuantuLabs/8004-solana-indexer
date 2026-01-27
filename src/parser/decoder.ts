@@ -11,11 +11,18 @@ const logger = createChildLogger("decoder");
 
 /**
  * Parse value to bigint (handles Anchor BN format, string, number)
+ * Validates safe integer range to prevent silent precision loss
  */
 function parseBigInt(value: unknown): bigint {
   if (typeof value === 'bigint') return value;
   if (typeof value === 'string') return BigInt(value);
-  if (typeof value === 'number') return BigInt(value);
+  if (typeof value === 'number') {
+    // Warn if number exceeds safe integer range (potential precision loss)
+    if (!Number.isSafeInteger(value)) {
+      logger.warn({ value }, "Unsafe integer conversion to BigInt - potential precision loss");
+    }
+    return BigInt(Math.trunc(value)); // Use trunc to avoid fractional issues
+  }
   if (value && typeof value === 'object' && 'negative' in value && 'words' in value) {
     const bn = value as { negative: number; words: number[] };
     let result = 0n;
@@ -258,7 +265,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             clientAddress: new PublicKey(data.client_address as string), // snake_case from IDL
-            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
+            feedbackIndex: parseBigInt(data.feedback_index),             // snake_case from IDL
             // ATOM enriched fields (v0.4.0)
             originalScore: data.original_score as number,                // snake_case from IDL
             atomEnabled: data.atom_enabled === undefined
@@ -277,7 +284,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             client: new PublicKey(data.client as string),
-            feedbackIndex: BigInt(data.feedback_index as string),        // snake_case from IDL
+            feedbackIndex: parseBigInt(data.feedback_index),             // snake_case from IDL
             responder: new PublicKey(data.responder as string),
             responseUri: data.response_uri as string,                    // snake_case from IDL
             responseHash: new Uint8Array(data.response_hash as number[]),// snake_case from IDL
