@@ -34,9 +34,72 @@ const PRIVATE_IPV4_RANGES = [
 const PRIVATE_IPV6_RANGES = [
   /^f[cd][0-9a-f]{2}:/i,      // IPv6 unique local (fc00::/7)
   /^fe80:/i,                  // IPv6 link-local
-  /^::1$/i,                   // IPv6 loopback (exact match after zone strip)
-  /^::$/,                     // Unspecified address
 ];
+
+/**
+ * Check if IPv6 address is loopback (::1) or unspecified (::)
+ * Handles all textual forms: 0:0:0:0:0:0:0:1, ::0001, ::1, etc.
+ */
+function isIPv6LoopbackOrUnspecified(ipv6: string): boolean {
+  // Remove brackets if present
+  let addr = ipv6.startsWith('[') ? ipv6.slice(1, -1) : ipv6;
+
+  // Strip zone ID
+  const zoneIdx = addr.indexOf('%');
+  if (zoneIdx !== -1) addr = addr.slice(0, zoneIdx);
+
+  // Reject multiple :: (invalid IPv6)
+  if ((addr.match(/::/g) || []).length > 1) return false;
+
+  // Parse segments, handling :: compression
+  const segments: number[] = [];
+
+  if (addr.includes('::')) {
+    // Split on :: to get left and right parts
+    const [left, right] = addr.split('::');
+    const leftParts = left ? left.split(':') : [];
+    const rightParts = right ? right.split(':') : [];
+
+    // Parse left segments
+    for (const p of leftParts) {
+      const val = parseInt(p, 16);
+      if (isNaN(val) || val < 0 || val > 0xffff) return false;
+      segments.push(val);
+    }
+
+    // Fill zeros for :: compression
+    const zerosNeeded = 8 - leftParts.length - rightParts.length;
+    for (let i = 0; i < zerosNeeded; i++) {
+      segments.push(0);
+    }
+
+    // Parse right segments
+    for (const p of rightParts) {
+      const val = parseInt(p, 16);
+      if (isNaN(val) || val < 0 || val > 0xffff) return false;
+      segments.push(val);
+    }
+  } else {
+    // No compression, split directly
+    const parts = addr.split(':');
+    if (parts.length !== 8) return false;
+    for (const p of parts) {
+      const val = parseInt(p, 16);
+      if (isNaN(val) || val < 0 || val > 0xffff) return false;
+      segments.push(val);
+    }
+  }
+
+  if (segments.length !== 8) return false;
+
+  // Check for loopback (::1) - all zeros except last is 1
+  const isLoopback = segments.slice(0, 7).every(s => s === 0) && segments[7] === 1;
+
+  // Check for unspecified (::) - all zeros
+  const isUnspecified = segments.every(s => s === 0);
+
+  return isLoopback || isUnspecified;
+}
 
 /**
  * Canonicalize IP address to standard dotted-decimal (IPv4) or detect IPv6 private
@@ -183,6 +246,9 @@ function isPrivateIP(ip: string): boolean {
       if (pattern.test(canonical.ipv4)) return true;
     }
   } else if (canonical && 'ipv6' in canonical) {
+    // Check IPv6 loopback/unspecified (handles all forms: 0:0:0:0:0:0:0:1, ::1, etc.)
+    if (isIPv6LoopbackOrUnspecified(canonical.ipv6)) return true;
+
     // Check IPv6 against private ranges
     for (const pattern of PRIVATE_IPV6_RANGES) {
       if (pattern.test(canonical.ipv6)) return true;
