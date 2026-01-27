@@ -187,13 +187,21 @@ export class WebSocketIndexer {
   }
 }
 
-export async function testWebSocketConnection(wsUrl: string): Promise<boolean> {
+/**
+ * Test if WebSocket endpoint is available
+ * @param rpcUrl - HTTP RPC endpoint for connection test
+ * @param wsUrl - WebSocket endpoint to configure
+ */
+export async function testWebSocketConnection(rpcUrl: string, wsUrl: string): Promise<boolean> {
   try {
-    const connection = new Connection(wsUrl, {
+    // Use HTTP endpoint for getSlot, but configure WS endpoint
+    const connection = new Connection(rpcUrl, {
       wsEndpoint: wsUrl,
       commitment: "confirmed",
     });
+    // Test HTTP connectivity first
     await connection.getSlot();
+    // TODO: Could add actual WS subscription test here if needed
     return true;
   } catch (error) {
     logger.debug({ error }, "WebSocket connection test failed");

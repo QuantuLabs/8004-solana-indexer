@@ -19,6 +19,8 @@ export class Processor {
   private poller: Poller | null = null;
   private wsIndexer: WebSocketIndexer | null = null;
   private isRunning = false;
+  private wsMonitorInterval: ReturnType<typeof setInterval> | null = null;
+  private wsMonitorInProgress = false; // Reentrancy guard for async interval
 
   constructor(prisma: PrismaClient | null, options?: ProcessorOptions) {
     this.prisma = prisma;
@@ -59,6 +61,12 @@ export class Processor {
     logger.info("Stopping processor");
     this.isRunning = false;
 
+    // Clean up WebSocket monitor interval
+    if (this.wsMonitorInterval) {
+      clearInterval(this.wsMonitorInterval);
+      this.wsMonitorInterval = null;
+    }
+
     if (this.poller) {
       await this.poller.stop();
       this.poller = null;
@@ -92,7 +100,7 @@ export class Processor {
 
   private async startAuto(): Promise<void> {
     logger.info("Testing WebSocket connection...");
-    const wsAvailable = await testWebSocketConnection(config.wsUrl);
+    const wsAvailable = await testWebSocketConnection(config.rpcUrl, config.wsUrl);
 
     if (wsAvailable) {
       logger.info("WebSocket available, using WebSocket mode");
@@ -115,22 +123,43 @@ export class Processor {
   }
 
   private monitorWebSocket(): void {
-    setInterval(async () => {
-      if (!this.isRunning) return;
+    // Clean up any existing interval before creating new one
+    if (this.wsMonitorInterval) {
+      clearInterval(this.wsMonitorInterval);
+    }
+
+    this.wsMonitorInterval = setInterval(async () => {
+      // Reentrancy guard - skip if previous tick still running
+      if (this.wsMonitorInProgress) {
+        return;
+      }
+
+      if (!this.isRunning) {
+        if (this.wsMonitorInterval) {
+          clearInterval(this.wsMonitorInterval);
+          this.wsMonitorInterval = null;
+        }
+        return;
+      }
 
       if (this.wsIndexer && !this.wsIndexer.isActive()) {
-        logger.warn("WebSocket connection lost, relying on polling");
+        this.wsMonitorInProgress = true;
+        try {
+          logger.warn("WebSocket connection lost, relying on polling");
 
-        // Switch to faster polling when WS is down
-        if (this.poller) {
-          await this.poller.stop();
-          this.poller = new Poller({
-            connection: this.connection,
-            prisma: this.prisma,
-            programId: this.programId,
-            pollingInterval: config.pollingInterval,
-          });
-          await this.poller.start();
+          // Switch to faster polling when WS is down
+          if (this.poller) {
+            await this.poller.stop();
+            this.poller = new Poller({
+              connection: this.connection,
+              prisma: this.prisma,
+              programId: this.programId,
+              pollingInterval: config.pollingInterval,
+            });
+            await this.poller.start();
+          }
+        } finally {
+          this.wsMonitorInProgress = false;
         }
       }
     }, 10000);
