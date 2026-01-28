@@ -209,7 +209,6 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             registry: new PublicKey(data.registry as string),
             collection: new PublicKey(data.collection as string),
-            baseIndex: data.base_index as number,                // snake_case from IDL
             createdBy: new PublicKey(data.created_by as string), // snake_case from IDL
           },
         };
@@ -221,16 +220,6 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             registry: new PublicKey(data.registry as string),
             collection: new PublicKey(data.collection as string),
             owner: new PublicKey(data.owner as string),
-          },
-        };
-
-      case "BaseRegistryRotated":
-        return {
-          type: "BaseRegistryRotated",
-          data: {
-            oldRegistry: new PublicKey(data.old_registry as string), // snake_case from IDL
-            newRegistry: new PublicKey(data.new_registry as string), // snake_case from IDL
-            rotatedBy: new PublicKey(data.rotated_by as string),     // snake_case from IDL
           },
         };
 

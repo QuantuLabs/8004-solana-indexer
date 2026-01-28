@@ -35,13 +35,73 @@ export interface EventContext {
 }
 
 let pool: Pool | null = null;
-const seenCollections = new Set<string>();
+
+// LRU-limited collection cache to prevent unbounded memory growth
+const MAX_SEEN_COLLECTIONS = 1000;
+const seenCollections = new Map<string, number>(); // collection -> timestamp
+
+// Check if collection is in cache (read-only, does NOT add)
+function hasSeenCollection(collection: string): boolean {
+  if (seenCollections.has(collection)) {
+    // Update access time for LRU
+    seenCollections.set(collection, Date.now());
+    return true;
+  }
+  return false;
+}
+
+// Mark collection as seen (call AFTER successful DB operation)
+function markCollectionSeen(collection: string): void {
+  // Evict oldest entries if at capacity
+  if (seenCollections.size >= MAX_SEEN_COLLECTIONS) {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [key, time] of seenCollections) {
+      if (time < oldestTime) {
+        oldestTime = time;
+        oldestKey = key;
+      }
+    }
+
+    if (oldestKey) {
+      seenCollections.delete(oldestKey);
+      logger.debug({ evictedCollection: oldestKey, cacheSize: seenCollections.size }, "Evicted oldest collection from cache");
+    }
+  }
+
+  seenCollections.set(collection, Date.now());
+}
+
+// Stats tracking
+let eventStats = {
+  agentRegistered: 0,
+  feedbackReceived: 0,
+  validationRequested: 0,
+  validationResponded: 0,
+  metadataSet: 0,
+  errors: 0,
+  lastLogTime: Date.now(),
+};
+
+function logStatsIfNeeded(): void {
+  const now = Date.now();
+  // Log stats every 60 seconds
+  if (now - eventStats.lastLogTime > 60000) {
+    logger.info({
+      ...eventStats,
+      collectionCacheSize: seenCollections.size,
+    }, "Supabase handler stats (60s)");
+    eventStats.lastLogTime = now;
+  }
+}
 
 function getPool(): Pool {
   if (!pool) {
     if (!config.supabaseDsn) {
       throw new Error("SUPABASE_DSN required for supabase mode");
     }
+    logger.info({ maxConnections: 10 }, "Creating PostgreSQL connection pool");
     pool = new Pool({
       connectionString: config.supabaseDsn,
       ssl: { rejectUnauthorized: false },
@@ -50,7 +110,11 @@ function getPool(): Pool {
       idleTimeoutMillis: 30000,
     });
     pool.on('error', (err) => {
-      logger.error({ error: err.message }, 'Unexpected pool error');
+      eventStats.errors++;
+      logger.error({ error: err.message, stack: err.stack }, 'Unexpected pool error');
+    });
+    pool.on('connect', () => {
+      logger.debug("New database connection established");
     });
   }
   return pool;
@@ -60,75 +124,96 @@ export async function handleEvent(
   event: ProgramEvent,
   ctx: EventContext
 ): Promise<void> {
-  switch (event.type) {
-    case "AgentRegisteredInRegistry":
-      await handleAgentRegistered(event.data, ctx);
-      break;
+  const startTime = Date.now();
 
-    case "AgentOwnerSynced":
-      await handleAgentOwnerSynced(event.data, ctx);
-      break;
+  try {
+    switch (event.type) {
+      case "AgentRegisteredInRegistry":
+        await handleAgentRegistered(event.data, ctx);
+        eventStats.agentRegistered++;
+        break;
 
-    case "AtomEnabled":
-      await handleAtomEnabled(event.data, ctx);
-      break;
+      case "AgentOwnerSynced":
+        await handleAgentOwnerSynced(event.data, ctx);
+        break;
 
-    case "UriUpdated":
-      await handleUriUpdated(event.data, ctx);
-      break;
+      case "AtomEnabled":
+        await handleAtomEnabled(event.data, ctx);
+        break;
 
-    case "WalletUpdated":
-      await handleWalletUpdated(event.data, ctx);
-      break;
+      case "UriUpdated":
+        await handleUriUpdated(event.data, ctx);
+        break;
 
-    case "MetadataSet":
-      await handleMetadataSet(event.data, ctx);
-      break;
+      case "WalletUpdated":
+        await handleWalletUpdated(event.data, ctx);
+        break;
 
-    case "MetadataDeleted":
-      await handleMetadataDeleted(event.data, ctx);
-      break;
+      case "MetadataSet":
+        await handleMetadataSet(event.data, ctx);
+        eventStats.metadataSet++;
+        break;
 
-    case "BaseRegistryCreated":
-      await handleBaseRegistryCreated(event.data, ctx);
-      break;
+      case "MetadataDeleted":
+        await handleMetadataDeleted(event.data, ctx);
+        break;
 
-    case "UserRegistryCreated":
-      await handleUserRegistryCreated(event.data, ctx);
-      break;
+      case "BaseRegistryCreated":
+        await handleBaseRegistryCreated(event.data, ctx);
+        break;
 
-    case "BaseRegistryRotated":
-      logger.info({ event: event.data }, "Base registry rotated");
-      break;
+      case "UserRegistryCreated":
+        await handleUserRegistryCreated(event.data, ctx);
+        break;
 
-    case "NewFeedback":
-      await handleNewFeedback(event.data, ctx);
-      break;
+      case "NewFeedback":
+        await handleNewFeedback(event.data, ctx);
+        eventStats.feedbackReceived++;
+        break;
 
-    case "FeedbackRevoked":
-      await handleFeedbackRevoked(event.data, ctx);
-      break;
+      case "FeedbackRevoked":
+        await handleFeedbackRevoked(event.data, ctx);
+        break;
 
-    case "ResponseAppended":
-      await handleResponseAppended(event.data, ctx);
-      break;
+      case "ResponseAppended":
+        await handleResponseAppended(event.data, ctx);
+        break;
 
-    case "ValidationRequested":
-      await handleValidationRequested(event.data, ctx);
-      break;
+      case "ValidationRequested":
+        await handleValidationRequested(event.data, ctx);
+        eventStats.validationRequested++;
+        break;
 
-    case "ValidationResponded":
-      await handleValidationResponded(event.data, ctx);
-      break;
+      case "ValidationResponded":
+        await handleValidationResponded(event.data, ctx);
+        eventStats.validationResponded++;
+        break;
 
-    default:
-      logger.warn({ event }, "Unhandled event type");
+      default:
+        logger.warn({ event }, "Unhandled event type");
+    }
+
+    const duration = Date.now() - startTime;
+    if (duration > 1000) {
+      logger.warn({ eventType: event.type, duration, signature: ctx.signature }, "Slow event processing");
+    }
+
+    logStatsIfNeeded();
+  } catch (error: any) {
+    eventStats.errors++;
+    logger.error({
+      error: error.message,
+      eventType: event.type,
+      signature: ctx.signature,
+      slot: ctx.slot.toString()
+    }, "Error handling event");
+    throw error; // Re-throw to let caller handle
   }
 }
 
 async function ensureCollection(collection: string): Promise<void> {
-  if (seenCollections.has(collection)) return;
-  seenCollections.add(collection);
+  // Use LRU cache to check if we've seen this collection recently
+  if (hasSeenCollection(collection)) return;
 
   const db = getPool();
   try {
@@ -138,7 +223,12 @@ async function ensureCollection(collection: string): Promise<void> {
        ON CONFLICT (collection) DO NOTHING`,
       [collection, "BASE", new Date().toISOString()]
     );
+    // Only cache after successful DB operation
+    markCollectionSeen(collection);
+    logger.debug({ collection }, "Ensured collection exists");
   } catch (error: any) {
+    // Don't cache on failure - allow retry on next event
+    eventStats.errors++;
     logger.error({ error: error.message, collection }, "Failed to ensure collection");
   }
 }
@@ -327,15 +417,14 @@ async function handleBaseRegistryCreated(
 
   try {
     await db.query(
-      `INSERT INTO collections (collection, registry_type, authority, base_index, created_at)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO collections (collection, registry_type, authority, created_at)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (collection) DO UPDATE SET
          registry_type = EXCLUDED.registry_type,
-         authority = EXCLUDED.authority,
-         base_index = EXCLUDED.base_index`,
-      [collection, "BASE", data.createdBy.toBase58(), data.baseIndex, ctx.blockTime.toISOString()]
+         authority = EXCLUDED.authority`,
+      [collection, "BASE", data.createdBy.toBase58(), ctx.blockTime.toISOString()]
     );
-    logger.info({ registryId: data.registry.toBase58(), baseIndex: data.baseIndex }, "Base registry created");
+    logger.info({ registryId: data.registry.toBase58() }, "Base registry created");
   } catch (error: any) {
     logger.error({ error: error.message, collection }, "Failed to create base registry");
   }

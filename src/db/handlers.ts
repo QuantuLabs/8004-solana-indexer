@@ -117,11 +117,6 @@ export async function handleEvent(
       await handleUserRegistryCreated(prisma, event.data, ctx);
       break;
 
-    case "BaseRegistryRotated":
-      // Just log for now - could update a state table
-      logger.info({ event: event.data }, "Base registry rotated");
-      break;
-
     case "NewFeedback":
       await handleNewFeedback(prisma, event.data, ctx);
       break;

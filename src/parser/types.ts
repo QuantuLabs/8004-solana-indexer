@@ -49,7 +49,6 @@ export interface MetadataDeleted {
 export interface BaseRegistryCreated {
   registry: PublicKey;
   collection: PublicKey;
-  baseIndex: number;
   createdBy: PublicKey;
 }
 
@@ -57,12 +56,6 @@ export interface UserRegistryCreated {
   registry: PublicKey;
   collection: PublicKey;
   owner: PublicKey;
-}
-
-export interface BaseRegistryRotated {
-  oldRegistry: PublicKey;
-  newRegistry: PublicKey;
-  rotatedBy: PublicKey;
 }
 
 export interface NewFeedback {
@@ -139,7 +132,6 @@ export type ProgramEvent =
   | { type: "MetadataDeleted"; data: MetadataDeleted }
   | { type: "BaseRegistryCreated"; data: BaseRegistryCreated }
   | { type: "UserRegistryCreated"; data: UserRegistryCreated }
-  | { type: "BaseRegistryRotated"; data: BaseRegistryRotated }
   | { type: "NewFeedback"; data: NewFeedback }
   | { type: "FeedbackRevoked"; data: FeedbackRevoked }
   | { type: "ResponseAppended"; data: ResponseAppended }
@@ -152,7 +144,6 @@ export const EVENT_DISCRIMINATORS: Record<string, string> = {
   AgentRegisteredInRegistry: "ebf157e201dfbaaf",
   AtomEnabled: "f6b3aedf616e4ac8",
   BaseRegistryCreated: "879ce7e4244c002b",
-  BaseRegistryRotated: "8eb839c2f11d3c7c",
   FeedbackRevoked: "cd101f5e36651007",
   MetadataDeleted: "fbf4993f23fc8336",
   MetadataSet: "be7d47770e1f1ac5",
