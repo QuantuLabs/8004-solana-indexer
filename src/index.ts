@@ -31,8 +31,8 @@ async function main() {
     try {
       await prisma.$connect();
       logger.info("Database connected (SQLite via Prisma)");
-      // Cleanup old orphan responses at startup (> 7 days)
-      await cleanupOrphanResponses(prisma, 7);
+      // Cleanup old orphan responses at startup (> 30 min)
+      await cleanupOrphanResponses(prisma);
     } catch (error) {
       logger.fatal({ error }, "Failed to connect to database");
       process.exit(1);

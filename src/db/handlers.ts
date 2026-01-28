@@ -835,22 +835,22 @@ async function storeUriMetadataLocal(
 }
 
 /**
- * Cleanup old orphan responses (> maxAgeDays old)
+ * Cleanup old orphan responses (> maxAgeMinutes old)
  * Call periodically or at startup to prevent table pollution
+ * Orphan responses should be reconciled within seconds, 30 min default is generous
  */
 export async function cleanupOrphanResponses(
   prisma: PrismaClient,
-  maxAgeDays: number = 7
+  maxAgeMinutes: number = 30
 ): Promise<number> {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - maxAgeDays);
+  const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000);
 
   const result = await prisma.orphanResponse.deleteMany({
     where: { createdAt: { lt: cutoff } },
   });
 
   if (result.count > 0) {
-    logger.info({ deleted: result.count, maxAgeDays }, "Cleaned up old orphan responses");
+    logger.info({ deleted: result.count, maxAgeMinutes }, "Cleaned up old orphan responses");
   }
 
   return result.count;
