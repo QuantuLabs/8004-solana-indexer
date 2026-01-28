@@ -136,7 +136,7 @@ model Validation {
   agentId      String
   validator    String    // validator pubkey
   requester    String    // who requested validation
-  nonce        Int       // unique nonce for this agent+validator
+  nonce        BigInt    // unique nonce for this agent+validator (u64 on-chain)
   requestUri   String?   // URI to validation request (null if orphan response)
   requestHash  Bytes?    // SHA-256 hash of request (null if all-zero/IPFS or orphan)
   response     Int?      // validator response (0-100, null if pending)

@@ -297,7 +297,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
-            nonce: data.nonce as number,
+            nonce: BigInt(data.nonce as string | number),                      // u64 on-chain
             requestUri: data.request_uri as string,                            // snake_case from IDL
             requestHash: new Uint8Array(data.request_hash as number[]),        // snake_case from IDL
             requester: new PublicKey(data.requester as string),
@@ -310,7 +310,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
-            nonce: data.nonce as number,
+            nonce: BigInt(data.nonce as string | number),                      // u64 on-chain
             response: data.response as number,
             responseUri: data.response_uri as string,                          // snake_case from IDL
             responseHash: new Uint8Array(data.response_hash as number[]),      // snake_case from IDL

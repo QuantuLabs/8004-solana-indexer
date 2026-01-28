@@ -8,6 +8,7 @@ import { PrismaClient } from "@prisma/client";
 import { config } from "../config.js";
 import { parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
 import { handleEvent, EventContext } from "../db/handlers.js";
+import { saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 
 const logger = createChildLogger("websocket");
@@ -125,7 +126,7 @@ export class WebSocketIndexer {
         }
       }
 
-      // Update state only in local mode
+      // Update state - both local and Supabase modes
       if (this.prisma) {
         await this.prisma.indexerState.upsert({
           where: { id: "main" },
@@ -139,6 +140,9 @@ export class WebSocketIndexer {
             lastSlot: BigInt(ctx.slot),
           },
         });
+      } else {
+        // Supabase mode - persist cursor for recovery
+        await saveIndexerState(logs.signature, BigInt(ctx.slot));
       }
     } catch (error) {
       logger.error({ error, signature: logs.signature }, "Error handling logs");

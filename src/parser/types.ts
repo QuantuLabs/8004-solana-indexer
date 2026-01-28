@@ -112,7 +112,7 @@ export interface ResponseAppended {
 export interface ValidationRequested {
   asset: PublicKey;
   validatorAddress: PublicKey;
-  nonce: number;
+  nonce: bigint;  // u64 on-chain
   requestUri: string;
   requestHash: Uint8Array;
   requester: PublicKey;
@@ -121,7 +121,7 @@ export interface ValidationRequested {
 export interface ValidationResponded {
   asset: PublicKey;
   validatorAddress: PublicKey;
-  nonce: number;
+  nonce: bigint;  // u64 on-chain
   response: number;
   responseUri: string;
   responseHash: Uint8Array;

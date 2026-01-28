@@ -59,69 +59,136 @@ export class Poller {
 
   /**
    * Backfill all historical transactions from the program
-   * Step 1: Fetch ALL signatures backwards (newest to oldest)
-   * Step 2: Reverse to get chronological order (oldest to newest)
-   * Step 3: Process in order
+   * Uses streaming approach to avoid OOM - fetches and processes in batches
+   * Processes oldest-to-newest within each batch for correct ordering
    */
   private async backfill(): Promise<void> {
-    logger.info("Starting historical backfill - collecting all signatures...");
+    logger.info("Starting historical backfill with streaming batches...");
 
-    // Step 1: Collect ALL signatures (newest to oldest)
-    const allSignatures: ConfirmedSignatureInfo[] = [];
+    // First, find the oldest signature by paginating to the end
+    // We need to process oldest-first, so we collect checkpoints
+    const checkpoints: string[] = [];
     let beforeSignature: string | undefined = undefined;
+    let totalEstimate = 0;
 
+    // Phase 1: Collect checkpoint signatures (one per ~1000 txs) to avoid loading all in memory
+    logger.info("Phase 1: Scanning for oldest transactions...");
     while (this.isRunning) {
-      const options: { limit: number; before?: string } = {
-        limit: this.batchSize,
-      };
-      if (beforeSignature) {
-        options.before = beforeSignature;
+      const signatures = await this.connection.getSignaturesForAddress(
+        this.programId,
+        { limit: this.batchSize, before: beforeSignature }
+      );
+
+      if (signatures.length === 0) break;
+
+      const validSigs = signatures.filter((sig) => sig.err === null);
+      totalEstimate += validSigs.length;
+
+      // Save checkpoint every batch
+      if (validSigs.length > 0) {
+        checkpoints.push(validSigs[validSigs.length - 1].signature);
       }
 
-      const signatures = await this.connection.getSignaturesForAddress(
+      beforeSignature = signatures[signatures.length - 1].signature;
+
+      if (signatures.length < this.batchSize) break;
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      if (totalEstimate % 5000 === 0) {
+        logger.info({ scanned: totalEstimate }, "Scanning progress...");
+      }
+    }
+
+    logger.info({ totalEstimate, checkpoints: checkpoints.length }, "Phase 1 complete, starting Phase 2: processing oldest-first");
+
+    // Phase 2: Process from oldest to newest using checkpoints in reverse
+    // Process checkpoint windows from oldest (last checkpoint) to newest (first checkpoint)
+    let processed = 0;
+
+    for (let i = checkpoints.length - 1; i >= 0 && this.isRunning; i--) {
+      const afterSig = checkpoints[i];
+      const untilSig = i > 0 ? checkpoints[i - 1] : undefined;
+
+      // Fetch signatures in this window (afterSig to untilSig)
+      const windowSigs = await this.fetchSignatureWindow(afterSig, untilSig);
+
+      if (windowSigs.length === 0) continue;
+
+      // Process this batch (already in chronological order)
+      processed += await this.processSignatureBatch(windowSigs, processed, totalEstimate);
+
+      logger.info({ processed, total: totalEstimate, checkpoint: i }, "Backfill checkpoint processed");
+    }
+
+    // Phase 3: Process any remaining newest transactions (before first checkpoint)
+    if (checkpoints.length > 0 && this.isRunning) {
+      const newestSigs = await this.fetchSignatureWindow(undefined, checkpoints[0]);
+      if (newestSigs.length > 0) {
+        processed += await this.processSignatureBatch(newestSigs, processed, totalEstimate);
+      }
+    }
+
+    logger.info({ processed }, "Backfill finished, switching to live polling");
+  }
+
+  /**
+   * Fetch signatures in a window (from afterSig to untilSig)
+   * Returns signatures in chronological order (oldest first)
+   */
+  private async fetchSignatureWindow(
+    afterSig: string | undefined,
+    untilSig: string | undefined
+  ): Promise<ConfirmedSignatureInfo[]> {
+    const windowSigs: ConfirmedSignatureInfo[] = [];
+    let beforeSig: string | undefined = untilSig;
+
+    while (this.isRunning) {
+      const options: { limit: number; before?: string; until?: string } = {
+        limit: this.batchSize,
+      };
+      if (beforeSig) options.before = beforeSig;
+      if (afterSig) options.until = afterSig;
+
+      const batch = await this.connection.getSignaturesForAddress(
         this.programId,
         options
       );
 
-      const validSigs = signatures.filter((sig) => sig.err === null);
+      if (batch.length === 0) break;
 
-      if (validSigs.length === 0) {
-        break;
-      }
+      const validBatch = batch.filter((sig) => sig.err === null);
+      windowSigs.push(...validBatch);
 
-      allSignatures.push(...validSigs);
-      logger.info({ fetched: validSigs.length, total: allSignatures.length }, "Fetched backfill batch");
+      beforeSig = batch[batch.length - 1].signature;
 
-      // Move to older signatures
-      beforeSignature = validSigs[validSigs.length - 1].signature;
+      if (batch.length < this.batchSize) break;
 
-      // If we got fewer than requested, we've reached the end
-      if (signatures.length < this.batchSize) {
-        break;
-      }
-
-      // Small delay to avoid rate limiting
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    logger.info({ total: allSignatures.length }, "All signatures collected, processing oldest to newest...");
+    // Reverse to get chronological order (oldest first)
+    return windowSigs.reverse();
+  }
 
-    // Step 2: Reverse to get chronological order (oldest first)
-    allSignatures.reverse();
-
-    // Step 3: Group by slot for efficient block fetching
+  /**
+   * Process a batch of signatures with slot grouping and tx_index resolution
+   * Returns number of successfully processed transactions
+   */
+  private async processSignatureBatch(
+    signatures: ConfirmedSignatureInfo[],
+    previousCount: number,
+    totalEstimate: number
+  ): Promise<number> {
+    // Group by slot for tx_index resolution
     const bySlot = new Map<number, ConfirmedSignatureInfo[]>();
-    for (const sig of allSignatures) {
-      const slot = sig.slot;
-      if (!bySlot.has(slot)) {
-        bySlot.set(slot, []);
+    for (const sig of signatures) {
+      if (!bySlot.has(sig.slot)) {
+        bySlot.set(sig.slot, []);
       }
-      bySlot.get(slot)!.push(sig);
+      bySlot.get(sig.slot)!.push(sig);
     }
 
-    logger.info({ slots: bySlot.size, transactions: allSignatures.length }, "Grouped by slot for tx_index resolution");
-
-    // Step 4: Process slot by slot with tx_index
     let processed = 0;
     const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
 
@@ -129,11 +196,8 @@ export class Poller {
       if (!this.isRunning) break;
 
       const sigs = bySlot.get(slot)!;
-
-      // Build signature -> txIndex map for this slot
       const txIndexMap = await this.getTxIndexMap(slot, sigs);
 
-      // Process transactions in tx_index order
       const sigsWithIndex = sigs.map(sig => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? 0
@@ -148,8 +212,8 @@ export class Poller {
           await this.saveState(sig.signature, BigInt(sig.slot));
           processed++;
 
-          if (processed % 10 === 0) {
-            logger.info({ processed, total: allSignatures.length }, "Backfill progress");
+          if ((previousCount + processed) % 100 === 0) {
+            logger.info({ processed: previousCount + processed, total: totalEstimate }, "Backfill progress");
           }
         } catch (error) {
           logger.error({ error, signature: sig.signature }, "Error processing backfill transaction");
@@ -157,7 +221,7 @@ export class Poller {
       }
     }
 
-    logger.info({ processed, total: allSignatures.length }, "Backfill finished, switching to live polling");
+    return processed;
   }
 
   /**
@@ -368,10 +432,9 @@ export class Poller {
       // Move to older signatures for next iteration
       beforeSignature = batch[batch.length - 1].signature;
 
-      // Safety: if we've collected too many, log warning and break
-      if (allSignatures.length > 10000) {
-        logger.warn({ count: allSignatures.length }, "Large gap detected, processing available signatures");
-        break;
+      // Log progress for large gaps (but continue - don't lose data!)
+      if (allSignatures.length > 0 && allSignatures.length % 10000 === 0) {
+        logger.info({ count: allSignatures.length }, "Large gap being processed, continuing pagination...");
       }
 
       // Small delay to avoid rate limiting during pagination

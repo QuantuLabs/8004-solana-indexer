@@ -565,7 +565,7 @@ async function handleValidationRequested(
          requester = EXCLUDED.requester,
          request_uri = EXCLUDED.request_uri,
          request_hash = EXCLUDED.request_hash`,
-      [id, assetId, validatorAddress, data.nonce, data.requester.toBase58(),
+      [id, assetId, validatorAddress, data.nonce.toString(), data.requester.toBase58(),
        data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
        "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
@@ -596,7 +596,7 @@ async function handleValidationResponded(
          tag = EXCLUDED.tag,
          status = EXCLUDED.status,
          updated_at = EXCLUDED.updated_at`,
-      [id, assetId, validatorAddress, data.nonce, data.response,
+      [id, assetId, validatorAddress, data.nonce.toString(), data.response,
        data.responseUri || null,
        data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
        data.tag || null, "RESPONDED",
