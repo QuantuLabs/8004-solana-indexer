@@ -435,6 +435,7 @@ export class Poller {
         txIndex: txIndexMap.get(sig.signature) ?? 0
       })).sort((a, b) => a.txIndex - b.txIndex);
 
+      let batchFailed = false;
       for (const { sig, txIndex } of sigsWithIndex) {
         try {
           await this.processTransaction(sig, txIndex);
@@ -445,7 +446,7 @@ export class Poller {
           this.errorCount++;
           logger.error(
             { error: error instanceof Error ? error.message : String(error), signature: sig.signature },
-            "Error processing transaction"
+            "Error processing transaction - stopping batch to prevent event loss"
           );
           try {
             await this.logFailedTransaction(sig, error);
@@ -455,7 +456,16 @@ export class Poller {
               "Failed to log failed transaction"
             );
           }
+          batchFailed = true;
+          break;
         }
+      }
+      if (batchFailed) {
+        logger.warn(
+          { slot, lastSignature: this.lastSignature },
+          "Batch processing halted - will retry failed tx on next poll cycle"
+        );
+        break;
       }
     }
 

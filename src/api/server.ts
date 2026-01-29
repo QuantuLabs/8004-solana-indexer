@@ -268,14 +268,14 @@ export function createApiServer(options: ApiServerOptions): Express {
         nonce: v.nonce,
         requester: v.requester,
         request_uri: v.requestUri,
-        request_hash: null, // Not stored in this version
+        request_hash: v.requestHash ? Buffer.from(v.requestHash).toString('hex') : null,
         response: v.response,
         response_uri: v.responseUri,
-        response_hash: null, // Not stored in this version
+        response_hash: v.responseHash ? Buffer.from(v.responseHash).toString('hex') : null,
         tag: v.tag,
         status: v.response !== null ? 'RESPONDED' as const : 'PENDING' as const,
-        block_slot: 0, // Not stored in this version
-        tx_signature: '',
+        block_slot: v.requestSlot ? Number(v.requestSlot) : (v.responseSlot ? Number(v.responseSlot) : 0),
+        tx_signature: v.requestTxSignature || v.responseTxSignature || '',
         created_at: v.createdAt.toISOString(),
         updated_at: v.respondedAt?.toISOString() || v.createdAt.toISOString(),
       }));
