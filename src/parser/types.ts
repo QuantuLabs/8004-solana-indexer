@@ -62,17 +62,20 @@ export interface NewFeedback {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
-  value: bigint;              // i64 - raw metric value (v0.5.0)
-  valueDecimals: number;      // u8 - decimal precision 0-6 (v0.5.0)
-  score: number | null;       // Option<u8> - 0-100, null = skip ATOM (v0.5.0)
+  slot: bigint;
+  value: bigint;
+  valueDecimals: number;
+  score: number | null;
   feedbackHash: Uint8Array;
-  atomEnabled: boolean;       // Whether ATOM Engine was used (score != null)
-  newTrustTier: number;       // u8 (0-4)
-  newQualityScore: number;    // u16 (0-10000)
-  newConfidence: number;      // u16 (0-10000)
-  newRiskScore: number;       // u8 (0-100)
-  newDiversityRatio: number;  // u8 (0-255)
+  atomEnabled: boolean;
+  newTrustTier: number;
+  newQualityScore: number;
+  newConfidence: number;
+  newRiskScore: number;
+  newDiversityRatio: number;
   isUniqueClient: boolean;
+  newFeedbackDigest: Uint8Array;
+  newFeedbackCount: bigint;
   tag1: string;
   tag2: string;
   endpoint: string;
@@ -83,23 +86,28 @@ export interface FeedbackRevoked {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
-  originalScore: number;      // u8
-  // ATOM enabled flag
-  atomEnabled: boolean;       // Whether ATOM Engine was used
-  // ATOM enriched fields (v0.4.0) - 0 if atomEnabled=false
+  feedbackHash: Uint8Array;
+  slot: bigint;
+  originalScore: number;
+  atomEnabled: boolean;
   hadImpact: boolean;
-  newTrustTier: number;       // u8 (0-4)
-  newQualityScore: number;    // u16 (0-10000)
-  newConfidence: number;      // u16 (0-10000)
+  newTrustTier: number;
+  newQualityScore: number;
+  newConfidence: number;
+  newRevokeDigest: Uint8Array;
+  newRevokeCount: bigint;
 }
 
 export interface ResponseAppended {
   asset: PublicKey;
   client: PublicKey;
   feedbackIndex: bigint;
+  slot: bigint;
   responder: PublicKey;
-  responseUri: string;
   responseHash: Uint8Array;
+  newResponseDigest: Uint8Array;
+  newResponseCount: bigint;
+  responseUri: string;
 }
 
 export interface ValidationRequested {

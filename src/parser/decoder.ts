@@ -230,6 +230,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             asset: new PublicKey(data.asset as string),
             clientAddress: new PublicKey(data.client_address as string),
             feedbackIndex: parseBigInt(data.feedback_index),
+            slot: parseBigInt(data.slot),
             value: parseI64(data.value),
             valueDecimals: data.value_decimals as number,
             score: parseOptionU8(data.score),
@@ -241,6 +242,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             newRiskScore: data.new_risk_score as number,
             newDiversityRatio: data.new_diversity_ratio as number,
             isUniqueClient: data.is_unique_client as boolean,
+            newFeedbackDigest: new Uint8Array(data.new_feedback_digest as number[]),
+            newFeedbackCount: parseBigInt(data.new_feedback_count),
             tag1: data.tag1 as string,
             tag2: data.tag2 as string,
             endpoint: data.endpoint as string,
@@ -253,17 +256,20 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           type: "FeedbackRevoked",
           data: {
             asset: new PublicKey(data.asset as string),
-            clientAddress: new PublicKey(data.client_address as string), // snake_case from IDL
-            feedbackIndex: parseBigInt(data.feedback_index),             // snake_case from IDL
-            // ATOM enriched fields (v0.4.0)
-            originalScore: data.original_score as number,                // snake_case from IDL
+            clientAddress: new PublicKey(data.client_address as string),
+            feedbackIndex: parseBigInt(data.feedback_index),
+            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
+            slot: parseBigInt(data.slot),
+            originalScore: data.original_score as number,
             atomEnabled: data.atom_enabled === undefined
               ? false
-              : (data.atom_enabled as boolean),                          // snake_case from IDL
-            hadImpact: data.had_impact as boolean,                       // snake_case from IDL
-            newTrustTier: data.new_trust_tier as number,                 // snake_case from IDL
-            newQualityScore: data.new_quality_score as number,           // snake_case from IDL
-            newConfidence: data.new_confidence as number,                // snake_case from IDL
+              : (data.atom_enabled as boolean),
+            hadImpact: data.had_impact as boolean,
+            newTrustTier: data.new_trust_tier as number,
+            newQualityScore: data.new_quality_score as number,
+            newConfidence: data.new_confidence as number,
+            newRevokeDigest: new Uint8Array(data.new_revoke_digest as number[]),
+            newRevokeCount: parseBigInt(data.new_revoke_count),
           },
         };
 
@@ -273,10 +279,13 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             client: new PublicKey(data.client as string),
-            feedbackIndex: parseBigInt(data.feedback_index),             // snake_case from IDL
+            feedbackIndex: parseBigInt(data.feedback_index),
+            slot: parseBigInt(data.slot),
             responder: new PublicKey(data.responder as string),
-            responseUri: data.response_uri as string,                    // snake_case from IDL
-            responseHash: new Uint8Array(data.response_hash as number[]),// snake_case from IDL
+            responseHash: new Uint8Array(data.response_hash as number[]),
+            newResponseDigest: new Uint8Array(data.new_response_digest as number[]),
+            newResponseCount: parseBigInt(data.new_response_count),
+            responseUri: data.response_uri as string,
           },
         };
 
