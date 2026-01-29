@@ -26,10 +26,14 @@ CREATE TABLE collections (
   collection TEXT PRIMARY KEY,
   registry_type TEXT CHECK (registry_type IN ('BASE', 'USER')),
   authority TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Verification status (reorg resilience) --
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ
 );
 
 CREATE INDEX idx_collections_authority ON collections(authority);
+CREATE INDEX idx_collections_status ON collections(status) WHERE status = 'PENDING';
 
 -- =============================================
 -- AGENTS (Identity + ATOM Stats + Leaderboard)
@@ -68,13 +72,19 @@ CREATE TABLE agents (
   block_slot BIGINT NOT NULL,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+  -- Verification status (reorg resilience) --
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ,
+  verified_slot BIGINT
 );
 
 -- Standard indexes
 CREATE INDEX idx_agents_owner ON agents(owner);
 CREATE INDEX idx_agents_collection ON agents(collection);
 CREATE INDEX idx_agents_wallet ON agents(agent_wallet);
+CREATE INDEX idx_agents_status ON agents(status) WHERE status = 'PENDING';
 
 -- LEADERBOARD: Partial index (only top tiers = small, fast)
 CREATE INDEX idx_agents_leaderboard_top ON agents(sort_key DESC)
@@ -101,11 +111,15 @@ CREATE TABLE metadata (
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Verification status (reorg resilience) --
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ,
   UNIQUE(asset, key_hash)
 );
 
 CREATE INDEX idx_metadata_asset ON metadata(asset);
 CREATE INDEX idx_metadata_key ON metadata(key);
+CREATE INDEX idx_metadata_status ON metadata(status) WHERE status = 'PENDING';
 
 -- =============================================
 -- FEEDBACKS (immutable log - raw data only)
@@ -130,6 +144,9 @@ CREATE TABLE feedbacks (
   tx_index INTEGER,  -- for deterministic ordering
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Verification status (reorg resilience) --
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ,
   UNIQUE(asset, client_address, feedback_index)
 );
 
@@ -138,6 +155,7 @@ CREATE INDEX idx_feedbacks_client ON feedbacks(client_address);
 CREATE INDEX idx_feedbacks_tag1 ON feedbacks(tag1) WHERE tag1 IS NOT NULL;
 CREATE INDEX idx_feedbacks_endpoint ON feedbacks(endpoint) WHERE endpoint IS NOT NULL;
 CREATE INDEX idx_feedbacks_not_revoked ON feedbacks(asset, created_at DESC) WHERE NOT is_revoked;
+CREATE INDEX idx_feedbacks_status ON feedbacks(status) WHERE status = 'PENDING';
 
 -- =============================================
 -- FEEDBACK_RESPONSES
@@ -154,6 +172,9 @@ CREATE TABLE feedback_responses (
   tx_index INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Verification status (reorg resilience) --
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ,
   -- Multiple responses per responder allowed (ERC-8004)
   -- id format: asset:client:index:responder:tx_signature
   UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
@@ -161,6 +182,7 @@ CREATE TABLE feedback_responses (
 
 CREATE INDEX idx_responses_asset ON feedback_responses(asset);
 CREATE INDEX idx_responses_lookup ON feedback_responses(asset, client_address, feedback_index);
+CREATE INDEX idx_responses_status ON feedback_responses(status) WHERE status = 'PENDING';
 
 -- =============================================
 -- VALIDATIONS
@@ -179,14 +201,19 @@ CREATE TABLE validations (
   tag TEXT,
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RESPONDED')),
   block_slot BIGINT NOT NULL,
+  tx_index INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
+  -- Verification status (reorg resilience) - separate from response status --
+  chain_status TEXT DEFAULT 'PENDING' CHECK (chain_status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  chain_verified_at TIMESTAMPTZ,
   UNIQUE(asset, validator_address, nonce)
 );
 
 CREATE INDEX idx_validations_asset ON validations(asset);
 CREATE INDEX idx_validations_validator ON validations(validator_address);
+CREATE INDEX idx_validations_chain_status ON validations(chain_status) WHERE chain_status = 'PENDING';
 CREATE INDEX idx_validations_status ON validations(status);
 CREATE INDEX idx_validations_pending ON validations(validator_address, created_at DESC)
 WHERE status = 'PENDING';
@@ -210,8 +237,28 @@ CREATE TABLE indexer_state (
   id TEXT PRIMARY KEY DEFAULT 'main',
   last_signature TEXT,
   last_slot BIGINT,
+  source TEXT DEFAULT 'poller',
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- =============================================
+-- AGENT_DIGEST_CACHE (hash-chain verification)
+-- =============================================
+CREATE TABLE agent_digest_cache (
+  agent_id TEXT PRIMARY KEY,
+  feedback_digest BYTEA,
+  feedback_count BIGINT DEFAULT 0,
+  response_digest BYTEA,
+  response_count BIGINT DEFAULT 0,
+  revoke_digest BYTEA,
+  revoke_count BIGINT DEFAULT 0,
+  last_verified_at TIMESTAMPTZ,
+  last_verified_slot BIGINT,
+  needs_gap_fill BOOLEAN DEFAULT FALSE,
+  gap_fill_from_slot BIGINT
+);
+
+CREATE INDEX idx_agent_digest_cache_gap_fill ON agent_digest_cache(needs_gap_fill) WHERE needs_gap_fill = TRUE;
 
 -- =============================================
 -- VIEWS (for API)
@@ -219,7 +266,8 @@ CREATE TABLE indexer_state (
 
 -- Metadata decoded (all formats) - use when you need all metadata
 -- value_text may contain "_compressed:base64..." for ZSTD entries
-CREATE OR REPLACE VIEW metadata_decoded AS
+CREATE OR REPLACE VIEW metadata_decoded
+WITH (security_invoker = true) AS
 SELECT
   id, asset, key, key_hash, immutable, block_slot, tx_signature, created_at, updated_at,
   CASE
@@ -238,7 +286,8 @@ FROM metadata;
 
 -- Metadata decoded (RAW only) - JSON-safe guaranteed
 -- Use this when you need JSON-parseable values (most common case)
-CREATE OR REPLACE VIEW metadata_decoded_raw AS
+CREATE OR REPLACE VIEW metadata_decoded_raw
+WITH (security_invoker = true) AS
 SELECT
   id, asset, key, key_hash, immutable, block_slot, tx_signature, created_at, updated_at,
   convert_from(substring(value from 2), 'utf8') AS value_text
@@ -248,7 +297,8 @@ WHERE value IS NOT NULL
   AND get_byte(value, 0) = 0;
 
 -- Global leaderboard (top tiers, uses partial index)
-CREATE OR REPLACE VIEW leaderboard AS
+CREATE OR REPLACE VIEW leaderboard
+WITH (security_invoker = true) AS
 SELECT
   asset, owner, collection, nft_name, agent_uri,
   trust_tier, quality_score, confidence, risk_score,
@@ -258,7 +308,8 @@ WHERE trust_tier >= 2
 ORDER BY sort_key DESC;
 
 -- Collection stats
-CREATE OR REPLACE VIEW collection_stats AS
+CREATE OR REPLACE VIEW collection_stats
+WITH (security_invoker = true) AS
 SELECT
   c.collection,
   c.registry_type,
@@ -271,7 +322,8 @@ LEFT JOIN agents a ON c.collection = a.collection
 GROUP BY c.collection, c.registry_type, c.authority;
 
 -- Global stats
-CREATE OR REPLACE VIEW global_stats AS
+CREATE OR REPLACE VIEW global_stats
+WITH (security_invoker = true) AS
 SELECT
   (SELECT COUNT(*) FROM agents) AS total_agents,
   (SELECT COUNT(*) FROM collections) AS total_collections,
@@ -280,6 +332,51 @@ SELECT
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,
   (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE feedback_count > 0) AS avg_quality;
+
+-- Verification stats (reorg resilience)
+CREATE OR REPLACE VIEW verification_stats
+WITH (security_invoker = true) AS
+SELECT
+  'agents' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM agents
+UNION ALL
+SELECT
+  'collections' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM collections
+UNION ALL
+SELECT
+  'feedbacks' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM feedbacks
+UNION ALL
+SELECT
+  'feedback_responses' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM feedback_responses
+UNION ALL
+SELECT
+  'validations' AS model,
+  COUNT(*) FILTER (WHERE chain_status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE chain_status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE chain_status = 'ORPHANED') AS orphaned_count
+FROM validations
+UNION ALL
+SELECT
+  'metadata' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM metadata;
 
 -- =============================================
 -- RPC FUNCTIONS
@@ -360,6 +457,7 @@ ALTER TABLE feedback_responses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE validations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE atom_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE indexer_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_digest_cache ENABLE ROW LEVEL SECURITY;
 
 -- Public read access
 CREATE POLICY "Public read agents" ON agents FOR SELECT USING (true);
@@ -369,6 +467,7 @@ CREATE POLICY "Public read feedbacks" ON feedbacks FOR SELECT USING (true);
 CREATE POLICY "Public read feedback_responses" ON feedback_responses FOR SELECT USING (true);
 CREATE POLICY "Public read validations" ON validations FOR SELECT USING (true);
 CREATE POLICY "Public read atom_config" ON atom_config FOR SELECT USING (true);
+CREATE POLICY "Public read agent_digest_cache" ON agent_digest_cache FOR SELECT USING (true);
 
 -- Service role write access (indexer uses SUPABASE_DSN with service_role)
 -- No INSERT/UPDATE/DELETE policies = blocked for anon users
@@ -439,6 +538,17 @@ GRANT SELECT ON metadata_decoded TO authenticated;
 GRANT SELECT ON metadata_decoded_raw TO anon;
 GRANT SELECT ON metadata_decoded_raw TO authenticated;
 
+-- Grant read access to verification stats view
+GRANT SELECT ON verification_stats TO anon;
+GRANT SELECT ON verification_stats TO authenticated;
+
 -- Modified 2026-01-24:
 -- - Added metadata_decoded VIEW (all formats with encoding info)
 -- - Added metadata_decoded_raw VIEW (RAW only, JSON-safe)
+
+-- Modified 2026-01-29:
+-- - Added reorg resilience: status/verified_at columns to agents, feedbacks, feedback_responses, validations, metadata
+-- - Added chain_status/chain_verified_at to validations (separate from response status)
+-- - Added agent_digest_cache table for hash-chain verification
+-- - Added source column to indexer_state
+-- - Added partial indexes for PENDING status queries
