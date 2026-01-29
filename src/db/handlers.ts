@@ -31,9 +31,9 @@ const STANDARD_URI_FIELDS = new Set([
   "_uri:name",
   "_uri:description",
   "_uri:image",
-  "_uri:endpoints",
+  "_uri:services",           // ERC-8004 standard: "services" not "endpoints"
   "_uri:registrations",
-  "_uri:supported_trusts",
+  "_uri:supported_trust",    // ERC-8004 standard: singular "supportedTrust"
   "_uri:active",
   "_uri:x402_support",
   "_uri:skills",

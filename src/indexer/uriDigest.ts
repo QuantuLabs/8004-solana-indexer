@@ -618,12 +618,15 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
     return { status: "blocked", error: "DNS resolved to private IP" };
   }
 
-  // Build fetch URL with pinned IP to prevent DNS rebinding
+  // Build fetch URL with pinned IP to prevent DNS rebinding (HTTP only)
   // family 0 means use hostname directly (trusted gateways)
+  // HTTPS: Skip IP pinning - TLS/SNI requires hostname match, and HTTPS already
+  // validates certificate chain which mitigates DNS rebinding attacks
   let pinnedFetchUrl = fetchUrl;
   const originalHost = url.hostname;
-  if (resolved.family !== 0) {
-    // Replace hostname with resolved IP
+  const isHttps = url.protocol === "https:";
+  if (resolved.family !== 0 && !isHttps) {
+    // Replace hostname with resolved IP (HTTP only)
     const pinnedUrl = new URL(fetchUrl);
     pinnedUrl.hostname = resolved.family === 6 ? `[${resolved.ip}]` : resolved.ip;
     pinnedFetchUrl = pinnedUrl.toString();
@@ -634,6 +637,7 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
 
   try {
     // Disable automatic redirects to prevent SSRF via redirect
+    const usingPinnedIp = resolved.family !== 0 && !isHttps;
     const response = await fetch(pinnedFetchUrl, {
       signal: controller.signal,
       redirect: "manual", // Don't follow redirects automatically
@@ -641,7 +645,7 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
         Accept: "application/json",
         "User-Agent": "8004-Indexer/1.0",
         // Set Host header when using pinned IP for virtual hosting
-        ...(resolved.family !== 0 && { Host: originalHost }),
+        ...(usingPinnedIp && { Host: originalHost }),
       },
     });
 
