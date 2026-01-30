@@ -366,11 +366,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       });
 
       // Map to SDK expected format (IndexedValidation interface)
+      // Note: nonce is BigInt but small values - safe to convert to Number for JSON
       const mapped = validations.map(v => ({
         id: v.id,
         asset: v.agentId,
         validator_address: v.validator,
-        nonce: v.nonce.toString(),
+        nonce: Number(v.nonce),
         requester: v.requester,
         request_uri: v.requestUri,
         request_hash: v.requestHash ? Buffer.from(v.requestHash).toString('hex') : null,
@@ -475,6 +476,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       } else {
         // Get stats for all collections using single SQL query (prevents N+1 DoS)
         // Instead of 50 registries × 2 queries = 100 queries, this does 1 query
+        // Note: Table/column names match Prisma schema (Registry, Agent, Feedback)
         const stats = await prisma.$queryRaw<Array<{
           collection: string;
           registry_type: string;
@@ -485,24 +487,24 @@ export function createApiServer(options: ApiServerOptions): Express {
         }>>`
           SELECT
             r.collection,
-            r.registry_type,
+            r."registryType" as registry_type,
             r.authority,
             COALESCE(agent_stats.agent_count, 0) as agent_count,
             COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
             feedback_stats.avg_score
-          FROM registries r
+          FROM "Registry" r
           LEFT JOIN (
             SELECT collection, COUNT(*) as agent_count
-            FROM agents
+            FROM "Agent"
             GROUP BY collection
           ) agent_stats ON agent_stats.collection = r.collection
           LEFT JOIN (
             SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
-            FROM feedbacks f
-            JOIN agents a ON a.id = f.agent_id
+            FROM "Feedback" f
+            JOIN "Agent" a ON a.id = f."agentId"
             GROUP BY a.collection
           ) feedback_stats ON feedback_stats.collection = r.collection
-          ORDER BY r.created_at DESC
+          ORDER BY r."createdAt" DESC
           LIMIT ${MAX_COLLECTION_STATS}
         `;
 
@@ -682,16 +684,18 @@ export function createApiServer(options: ApiServerOptions): Express {
       };
 
       // Use separate queries to avoid dynamic SQL construction (safer pattern)
+      // Note: CAST instead of ::int for SQLite/PostgreSQL compatibility
+      // Note: Table names match Prisma model names (Agent, Feedback)
       const result = collection
         ? await prisma.$queryRaw<LeaderboardRow[]>`
             SELECT
               a.id as asset,
               a.owner,
               a.collection,
-              COALESCE(ROUND(AVG(f.score)), 0)::int as trust_score,
+              CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
               COUNT(f.id) as feedback_count
-            FROM agents a
-            LEFT JOIN feedbacks f ON f.agent_id = a.id
+            FROM "Agent" a
+            LEFT JOIN "Feedback" f ON f."agentId" = a.id
               AND f.revoked = false
               AND f.score IS NOT NULL
             WHERE a.collection = ${collection}
@@ -705,10 +709,10 @@ export function createApiServer(options: ApiServerOptions): Express {
               a.id as asset,
               a.owner,
               a.collection,
-              COALESCE(ROUND(AVG(f.score)), 0)::int as trust_score,
+              CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
               COUNT(f.id) as feedback_count
-            FROM agents a
-            LEFT JOIN feedbacks f ON f.agent_id = a.id
+            FROM "Agent" a
+            LEFT JOIN "Feedback" f ON f."agentId" = a.id
               AND f.revoked = false
               AND f.score IS NOT NULL
             GROUP BY a.id, a.owner, a.collection
