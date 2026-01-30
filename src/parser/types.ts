@@ -105,6 +105,7 @@ export interface ResponseAppended {
   slot: bigint;
   responder: PublicKey;
   responseHash: Uint8Array;
+  feedbackHash: Uint8Array;
   newResponseDigest: Uint8Array;
   newResponseCount: bigint;
   responseUri: string;

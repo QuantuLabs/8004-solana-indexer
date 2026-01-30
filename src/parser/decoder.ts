@@ -283,6 +283,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             slot: parseBigInt(data.slot),
             responder: new PublicKey(data.responder as string),
             responseHash: new Uint8Array(data.response_hash as number[]),
+            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
             newResponseDigest: new Uint8Array(data.new_response_digest as number[]),
             newResponseCount: parseBigInt(data.new_response_count),
             responseUri: data.response_uri as string,
