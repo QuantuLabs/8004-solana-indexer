@@ -160,10 +160,13 @@ describe("WebSocketIndexer", () => {
       await wsIndexer.start();
 
       // Trigger with valid logs (no events parsed, but should update state)
-      await logsHandler!(
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs: ["Program log: test"] },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // State should be updated even without events
       // (depends on implementation - may or may not call upsert)
@@ -180,11 +183,14 @@ describe("WebSocketIndexer", () => {
 
       await wsIndexer.start();
 
-      // Trigger with logs that don't contain parseable events
-      await logsHandler!(
+      // Trigger with logs that don't contain parseable events (goes through queue)
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs: ["Program log: test"] },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // No events parsed, so no eventLog should be created
       expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
@@ -210,15 +216,19 @@ describe("WebSocketIndexer", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
 
-      // Trigger with valid logs
-      await logsHandler!(
+      // Trigger with valid logs (goes through queue)
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // Should have processed the event
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
@@ -253,6 +263,7 @@ describe("WebSocketIndexer", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -260,11 +271,14 @@ describe("WebSocketIndexer", () => {
       // Make agent.upsert throw to trigger error handling
       (mockPrisma.agent.upsert as any).mockRejectedValue(new Error("DB error"));
 
-      // Trigger with valid logs
-      await logsHandler!(
+      // Trigger with valid logs (now goes through queue)
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // Should have logged the failure
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
@@ -294,6 +308,7 @@ describe("WebSocketIndexer", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -301,11 +316,14 @@ describe("WebSocketIndexer", () => {
       // Make agent.upsert throw a non-Error
       (mockPrisma.agent.upsert as any).mockRejectedValue("String error");
 
-      // Trigger with valid logs
-      await logsHandler!(
+      // Trigger with valid logs (now goes through queue)
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // Should have logged the failure with stringified error
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
@@ -334,6 +352,7 @@ describe("WebSocketIndexer", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const eventData2 = {
@@ -354,11 +373,14 @@ describe("WebSocketIndexer", () => {
         `Program ${TEST_PROGRAM_ID.toBase58()} success`,
       ];
 
-      // Trigger with logs containing multiple events
-      await logsHandler!(
+      // Trigger with logs containing multiple events (now goes through queue)
+      logsHandler!(
         { signature: TEST_SIGNATURE, err: null, logs },
         { slot: Number(TEST_SLOT) }
       );
+
+      // Wait for queue to process
+      await new Promise((r) => setTimeout(r, 50));
 
       // Should have created at least one event log (Anchor parser behavior varies)
       expect(mockPrisma.eventLog.create).toHaveBeenCalled();

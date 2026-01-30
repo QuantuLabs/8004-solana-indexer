@@ -4,7 +4,7 @@ import { vi, beforeEach, afterEach } from "vitest";
 process.env.DATABASE_URL = "postgresql://test:test@localhost:5432/test";
 process.env.RPC_URL = "https://api.devnet.solana.com";
 process.env.WS_URL = "wss://api.devnet.solana.com";
-process.env.PROGRAM_ID = "6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1";
+process.env.PROGRAM_ID = "8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N";
 process.env.LOG_LEVEL = "silent";
 
 // Mock pino logger to be silent during tests

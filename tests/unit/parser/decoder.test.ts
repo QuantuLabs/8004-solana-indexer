@@ -30,7 +30,7 @@ describe("Parser Decoder", () => {
   describe("IDL loading", () => {
     it("should load IDL successfully", () => {
       expect(idl).toBeDefined();
-      expect(idl.address).toBe("6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1");
+      expect(idl.address).toBe("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
     });
 
     it("should have events defined in IDL", () => {
@@ -70,6 +70,7 @@ describe("Parser Decoder", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -89,6 +90,7 @@ describe("Parser Decoder", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const eventData2 = {
@@ -168,6 +170,7 @@ describe("Parser Decoder", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -189,6 +192,7 @@ describe("Parser Decoder", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -222,6 +226,7 @@ describe("Parser Decoder", () => {
           collection: TEST_COLLECTION.toBase58(),
           owner: TEST_OWNER.toBase58(),
           atom_enabled: true,
+          agent_uri: "ipfs://QmTest",
         },
       };
 
@@ -385,6 +390,7 @@ describe("Parser Decoder", () => {
           asset: TEST_ASSET.toBase58(),
           client_address: TEST_CLIENT.toBase58(),
           feedback_index: "0",
+          slot: "123456",
           value: "9500",
           value_decimals: 2,
           score: 85,
@@ -396,6 +402,8 @@ describe("Parser Decoder", () => {
           new_risk_score: 10,
           new_diversity_ratio: 42,
           is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
           tag1: "quality",
           tag2: "speed",
           endpoint: "/api/chat",
@@ -421,12 +429,16 @@ describe("Parser Decoder", () => {
           asset: TEST_ASSET.toBase58(),
           client_address: TEST_CLIENT.toBase58(),
           feedback_index: "1",
+          feedback_hash: Array.from(TEST_HASH),
+          slot: "123456",
           original_score: 85,
           atom_enabled: true,
           had_impact: true,
           new_trust_tier: 1,
           new_quality_score: 8000,
           new_confidence: 9000,
+          new_revoke_digest: Array.from(TEST_HASH),
+          new_revoke_count: "1",
         },
       };
 
@@ -444,9 +456,13 @@ describe("Parser Decoder", () => {
           asset: TEST_ASSET.toBase58(),
           client: TEST_CLIENT.toBase58(),
           feedback_index: "0",
+          slot: "123456",
           responder: TEST_OWNER.toBase58(),
-          response_uri: "ipfs://QmYYY",
           response_hash: Array.from(TEST_HASH),
+          feedback_hash: Array.from(TEST_HASH),
+          new_response_digest: Array.from(TEST_HASH),
+          new_response_count: "1",
+          response_uri: "ipfs://QmYYY",
         },
       };
 
@@ -455,6 +471,7 @@ describe("Parser Decoder", () => {
       expect(result).not.toBeNull();
       expect(result!.type).toBe("ResponseAppended");
       expect(result!.data.responseUri).toBe("ipfs://QmYYY");
+      expect(result!.data.feedbackHash).toEqual(new Uint8Array(TEST_HASH));
     });
 
     it("should convert ValidationRequested event", () => {

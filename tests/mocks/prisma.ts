@@ -2,9 +2,14 @@ import { vi } from "vitest";
 import type { PrismaClient } from "@prisma/client";
 
 export function createMockPrismaClient(): PrismaClient {
-  return {
+  const mockClient = {
     $connect: vi.fn().mockResolvedValue(undefined),
     $disconnect: vi.fn().mockResolvedValue(undefined),
+    // $transaction passes the same mock client to the callback
+    // This allows testing atomic operations with the same mocks
+    $transaction: vi.fn().mockImplementation(async (fn: (tx: any) => Promise<any>) => {
+      return fn(mockClient);
+    }),
     agent: {
       findUnique: vi.fn(),
       findMany: vi.fn().mockResolvedValue([]),
@@ -70,7 +75,12 @@ export function createMockPrismaClient(): PrismaClient {
       delete: vi.fn(),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
-  } as unknown as PrismaClient;
+    indexerCursor: {
+      findUnique: vi.fn(),
+      upsert: vi.fn(),
+    },
+  };
+  return mockClient as unknown as PrismaClient;
 }
 
 export function resetMockPrisma(prisma: PrismaClient): void {

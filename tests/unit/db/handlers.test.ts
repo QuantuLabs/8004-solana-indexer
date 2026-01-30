@@ -403,13 +403,13 @@ describe("DB Handlers", () => {
     });
 
     describe("ValidationResponded", () => {
-      it("should update validation with response", async () => {
+      it("should upsert validation with response", async () => {
         const event: ProgramEvent = {
           type: "ValidationResponded",
           data: {
             asset: TEST_ASSET,
             validatorAddress: TEST_VALIDATOR,
-            nonce: 1,
+            nonce: 1n,
             response: 90,
             responseUri: "ipfs://QmAAA",
             responseHash: TEST_HASH,
@@ -419,13 +419,23 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.validation.updateMany).toHaveBeenCalledWith({
+        expect(prisma.validation.upsert).toHaveBeenCalledWith({
           where: {
+            agentId_validator_nonce: {
+              agentId: TEST_ASSET.toBase58(),
+              validator: TEST_VALIDATOR.toBase58(),
+              nonce: 1n,
+            },
+          },
+          create: expect.objectContaining({
             agentId: TEST_ASSET.toBase58(),
             validator: TEST_VALIDATOR.toBase58(),
-            nonce: 1,
-          },
-          data: expect.objectContaining({
+            nonce: 1n,
+            response: 90,
+            responseUri: "ipfs://QmAAA",
+            tag: "security",
+          }),
+          update: expect.objectContaining({
             response: 90,
             responseUri: "ipfs://QmAAA",
             tag: "security",
