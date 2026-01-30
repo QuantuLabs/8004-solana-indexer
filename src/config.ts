@@ -3,6 +3,7 @@ import "dotenv/config";
 export type IndexerMode = "auto" | "polling" | "websocket";
 export type DbMode = "local" | "supabase";
 export type MetadataIndexMode = "off" | "normal" | "full";
+export type ChainStatus = "PENDING" | "FINALIZED" | "ORPHANED";
 
 export const config = {
   // Database mode: "local" (SQLite/Prisma) | "supabase" (PostgreSQL via Supabase)
@@ -51,6 +52,18 @@ export const config = {
   metadataMaxValueBytes: parseInt(process.env.METADATA_MAX_VALUE_BYTES || "10000", 10), // 10KB
   // Fixed timeout for URI fetch (security: no user-configurable timeout)
   metadataTimeoutMs: 5000,
+
+  // Verification config (reorg resilience)
+  // Enable/disable background verification worker
+  verificationEnabled: process.env.VERIFICATION_ENABLED !== "false",
+  // Interval between verification cycles (ms)
+  verifyIntervalMs: parseInt(process.env.VERIFY_INTERVAL_MS || "60000", 10), // 60s
+  // Max items to verify per cycle (prevents RPC rate limiting)
+  verifyBatchSize: parseInt(process.env.VERIFY_BATCH_SIZE || "100", 10),
+  // Safety margin: slots behind finalized to wait before verifying
+  verifySafetyMarginSlots: parseInt(process.env.VERIFY_SAFETY_MARGIN_SLOTS || "32", 10),
+  // Max retries for existence checks before orphaning
+  verifyMaxRetries: parseInt(process.env.VERIFY_MAX_RETRIES || "3", 10),
 } as const;
 
 export function validateConfig(): void {
@@ -67,5 +80,18 @@ export function validateConfig(): void {
     if (!config.supabaseDsn) {
       throw new Error("SUPABASE_DSN required when DB_MODE=supabase");
     }
+  }
+
+  // Validate verification config
+  if (config.verifyIntervalMs < 5000) {
+    throw new Error("VERIFY_INTERVAL_MS must be at least 5000ms");
+  }
+
+  if (config.verifyBatchSize < 1 || config.verifyBatchSize > 1000) {
+    throw new Error("VERIFY_BATCH_SIZE must be between 1 and 1000");
+  }
+
+  if (config.verifySafetyMarginSlots < 0 || config.verifySafetyMarginSlots > 150) {
+    throw new Error("VERIFY_SAFETY_MARGIN_SLOTS must be between 0 and 150");
   }
 }

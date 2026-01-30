@@ -1,8 +1,10 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
+import { Pool } from "pg";
 import { config, IndexerMode } from "../config.js";
 import { Poller } from "./poller.js";
 import { WebSocketIndexer, testWebSocketConnection } from "./websocket.js";
+import { DataVerifier } from "./verifier.js";
 import { createChildLogger } from "../logger.js";
 
 const logger = createChildLogger("processor");
@@ -14,16 +16,19 @@ export interface ProcessorOptions {
 export class Processor {
   private connection: Connection;
   private prisma: PrismaClient | null;
+  private pool: Pool | null;
   private programId: PublicKey;
   private mode: IndexerMode;
   private poller: Poller | null = null;
   private wsIndexer: WebSocketIndexer | null = null;
+  private verifier: DataVerifier | null = null;
   private isRunning = false;
   private wsMonitorInterval: ReturnType<typeof setInterval> | null = null;
   private wsMonitorInProgress = false; // Reentrancy guard for async interval
 
-  constructor(prisma: PrismaClient | null, options?: ProcessorOptions) {
+  constructor(prisma: PrismaClient | null, pool: Pool | null = null, options?: ProcessorOptions) {
     this.prisma = prisma;
+    this.pool = pool;
     this.mode = options?.mode || config.indexerMode;
     this.programId = new PublicKey(config.programId);
     this.connection = new Connection(config.rpcUrl, {
@@ -55,6 +60,26 @@ export class Processor {
         await this.startAuto();
         break;
     }
+
+    // Start background verifier for reorg resilience
+    await this.startVerifier();
+  }
+
+  private async startVerifier(): Promise<void> {
+    if (!config.verificationEnabled) {
+      logger.info("Verification disabled via config");
+      return;
+    }
+
+    this.verifier = new DataVerifier(
+      this.connection,
+      this.prisma,
+      this.pool,
+      config.verifyIntervalMs
+    );
+
+    await this.verifier.start();
+    logger.info({ intervalMs: config.verifyIntervalMs }, "Background verifier started");
   }
 
   async stop(): Promise<void> {
@@ -65,6 +90,11 @@ export class Processor {
     if (this.wsMonitorInterval) {
       clearInterval(this.wsMonitorInterval);
       this.wsMonitorInterval = null;
+    }
+
+    if (this.verifier) {
+      await this.verifier.stop();
+      this.verifier = null;
     }
 
     if (this.poller) {
@@ -143,9 +173,16 @@ export class Processor {
       }
 
       if (this.wsIndexer && !this.wsIndexer.isActive()) {
+        // Check if WS is in self-healing mode (reconnecting/health-checking)
+        // Don't kill it during recovery - give it a chance to reconnect
+        if (this.wsIndexer.isRecovering()) {
+          logger.debug("WebSocket in recovery mode, waiting for self-heal");
+          return;
+        }
+
         this.wsMonitorInProgress = true;
         try {
-          logger.warn("WebSocket connection lost, relying on polling");
+          logger.warn("WebSocket connection lost and not recovering, relying on polling");
 
           // Switch to faster polling when WS is down
           if (this.poller) {
@@ -170,12 +207,16 @@ export class Processor {
     mode: IndexerMode;
     pollerActive: boolean;
     wsActive: boolean;
+    verifierActive: boolean;
+    verifierStats?: ReturnType<DataVerifier["getStats"]>;
   } {
     return {
       running: this.isRunning,
       mode: this.mode,
       pollerActive: this.poller !== null,
       wsActive: this.wsIndexer?.isActive() ?? false,
+      verifierActive: this.verifier !== null,
+      verifierStats: this.verifier?.getStats(),
     };
   }
 }
