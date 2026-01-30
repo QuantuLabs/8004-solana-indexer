@@ -18,6 +18,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:localnet": "vitest run --config vitest.e2e.config.ts -t 'Localnet'",
     "test:all": "vitest run --coverage && vitest run --config vitest.e2e.config.ts",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write src"
@@ -40,7 +41,10 @@
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
     "isomorphic-dompurify": "^2.35.0",
+    "lru-cache": "^11.2.5",
+    "p-queue": "^9.1.0",
     "pg": "^8.16.3",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0"
