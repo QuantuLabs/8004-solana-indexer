@@ -291,6 +291,7 @@ describe("Poller", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);
@@ -325,6 +326,7 @@ describe("Poller", () => {
         collection: TEST_COLLECTION,
         owner: TEST_OWNER,
         atomEnabled: true,
+        agentUri: "ipfs://QmTest",
       };
 
       const logs = createEventLogs("AgentRegisteredInRegistry", eventData);

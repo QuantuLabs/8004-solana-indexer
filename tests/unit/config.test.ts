@@ -31,7 +31,7 @@ describe("Config", () => {
       expect(config.databaseUrl).toBe("file:./data/indexer.db");
       expect(config.rpcUrl).toBe("https://api.devnet.solana.com");
       expect(config.wsUrl).toBe("wss://api.devnet.solana.com");
-      expect(config.programId).toBe("6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1");
+      expect(config.programId).toBe("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
       expect(config.indexerMode).toBe("auto");
       expect(config.pollingInterval).toBe(5000);
       expect(config.batchSize).toBe(100);

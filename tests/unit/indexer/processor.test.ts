@@ -6,6 +6,7 @@ const {
   mockPollerInstance,
   mockWsIndexerInstance,
   mockTestWebSocketConnection,
+  mockVerifierInstance,
 } = vi.hoisted(() => ({
   mockPollerInstance: {
     start: vi.fn(),
@@ -15,8 +16,14 @@ const {
     start: vi.fn(),
     stop: vi.fn(),
     isActive: vi.fn(),
+    isRecovering: vi.fn(),
   },
   mockTestWebSocketConnection: vi.fn(),
+  mockVerifierInstance: {
+    start: vi.fn(),
+    stop: vi.fn(),
+    getStats: vi.fn(),
+  },
 }));
 
 // Mock the modules BEFORE importing Processor
@@ -43,6 +50,10 @@ vi.mock("../../../src/indexer/websocket.js", () => ({
   testWebSocketConnection: mockTestWebSocketConnection,
 }));
 
+vi.mock("../../../src/indexer/verifier.js", () => ({
+  DataVerifier: vi.fn(() => mockVerifierInstance),
+}));
+
 vi.mock("../../../src/logger.js", () => ({
   createChildLogger: vi.fn(() => ({
     info: vi.fn(),
@@ -50,6 +61,25 @@ vi.mock("../../../src/logger.js", () => ({
     error: vi.fn(),
     debug: vi.fn(),
   })),
+}));
+
+vi.mock("../../../src/config.js", () => ({
+  config: {
+    rpcUrl: "http://localhost:8899",
+    wsUrl: "ws://localhost:8900",
+    programId: "11111111111111111111111111111111",
+    indexerMode: "auto",
+    pollingInterval: 5000,
+    wsReconnectInterval: 1000,
+    wsMaxRetries: 5,
+    verificationEnabled: false, // Disable verifier in tests
+    verifyIntervalMs: 60000,
+  },
+  IndexerMode: {
+    AUTO: "auto",
+    WEBSOCKET: "websocket",
+    POLLING: "polling",
+  },
 }));
 
 // Import after mocks are set up
@@ -70,7 +100,11 @@ describe("Processor", () => {
     mockWsIndexerInstance.start.mockResolvedValue(undefined);
     mockWsIndexerInstance.stop.mockResolvedValue(undefined);
     mockWsIndexerInstance.isActive.mockReturnValue(true);
+    mockWsIndexerInstance.isRecovering.mockReturnValue(false);
     mockTestWebSocketConnection.mockResolvedValue(true);
+    mockVerifierInstance.start.mockResolvedValue(undefined);
+    mockVerifierInstance.stop.mockResolvedValue(undefined);
+    mockVerifierInstance.getStats.mockReturnValue({});
   });
 
   describe("constructor", () => {
@@ -83,21 +117,21 @@ describe("Processor", () => {
     });
 
     it("should create processor with polling mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "polling" });
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("polling");
     });
 
     it("should create processor with websocket mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "websocket" });
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("websocket");
     });
 
     it("should create processor with auto mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("auto");
@@ -106,7 +140,7 @@ describe("Processor", () => {
 
   describe("getStatus", () => {
     it("should return initial status for polling mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "polling" });
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
 
       const status = processor.getStatus();
 
@@ -115,11 +149,13 @@ describe("Processor", () => {
         mode: "polling",
         pollerActive: false,
         wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
       });
     });
 
     it("should return initial status for websocket mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "websocket" });
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
 
       const status = processor.getStatus();
 
@@ -128,11 +164,13 @@ describe("Processor", () => {
         mode: "websocket",
         pollerActive: false,
         wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
       });
     });
 
     it("should return initial status for auto mode", () => {
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
 
       const status = processor.getStatus();
 
@@ -141,13 +179,15 @@ describe("Processor", () => {
         mode: "auto",
         pollerActive: false,
         wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
       });
     });
   });
 
   describe("start", () => {
     it("should start in polling mode", async () => {
-      const processor = new Processor(mockPrisma, { mode: "polling" });
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
       await processor.start();
 
       const status = processor.getStatus();
@@ -158,7 +198,7 @@ describe("Processor", () => {
     });
 
     it("should start in websocket mode", async () => {
-      const processor = new Processor(mockPrisma, { mode: "websocket" });
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
       await processor.start();
 
       const status = processor.getStatus();
@@ -169,7 +209,7 @@ describe("Processor", () => {
     });
 
     it("should start in auto mode with WebSocket available", async () => {
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
       // Wait for async operations
@@ -186,7 +226,7 @@ describe("Processor", () => {
     it("should fallback to polling in auto mode when WebSocket unavailable", async () => {
       mockTestWebSocketConnection.mockResolvedValueOnce(false);
 
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
       const status = processor.getStatus();
@@ -196,7 +236,7 @@ describe("Processor", () => {
     });
 
     it("should not start twice", async () => {
-      const processor = new Processor(mockPrisma, { mode: "polling" });
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
       await processor.start();
       await processor.start(); // Second call should be ignored
 
@@ -205,7 +245,7 @@ describe("Processor", () => {
 
     it("should handle default case in switch (same as auto)", async () => {
       // Create processor with a mode that falls through to default
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
       const status = processor.getStatus();
@@ -223,7 +263,7 @@ describe("Processor", () => {
     });
 
     it("should stop polling mode", async () => {
-      const processor = new Processor(mockPrisma, { mode: "polling" });
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
       await processor.start();
       await processor.stop();
 
@@ -233,7 +273,7 @@ describe("Processor", () => {
     });
 
     it("should stop websocket mode", async () => {
-      const processor = new Processor(mockPrisma, { mode: "websocket" });
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
       await processor.start();
       await processor.stop();
 
@@ -243,7 +283,7 @@ describe("Processor", () => {
     });
 
     it("should stop auto mode", async () => {
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
       // Wait for everything to start
@@ -260,7 +300,7 @@ describe("Processor", () => {
     it("should handle WebSocket connection loss in auto mode", async () => {
       vi.useFakeTimers();
 
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
       // Simulate WebSocket becoming inactive
@@ -278,7 +318,7 @@ describe("Processor", () => {
     it("should not monitor when processor is stopped", async () => {
       vi.useFakeTimers();
 
-      const processor = new Processor(mockPrisma, { mode: "auto" });
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
       await processor.stop();
 

@@ -10,7 +10,7 @@ function createTestPubkey(seed: number): PublicKey {
 
 // Test keypairs - using valid 32-byte public keys
 export const TEST_PROGRAM_ID = new PublicKey(
-  "6MuHv4dY4p9E4hSCEPr9dgbCSpMhq8x1vrUexbMVjfw1"
+  "8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N"
 );
 export const TEST_ASSET = createTestPubkey(1);
 export const TEST_OWNER = createTestPubkey(2);
@@ -114,12 +114,19 @@ export function encodeAnchorEvent(eventName: string, data: Record<string, any>):
 
   switch (eventName) {
     case "AgentRegisteredInRegistry":
-      // asset: Pubkey (32), registry: Pubkey (32), collection: Pubkey (32), owner: Pubkey (32), atomEnabled: bool
+      // asset: Pubkey (32), registry: Pubkey (32), collection: Pubkey (32), owner: Pubkey (32), atomEnabled: bool, agentUri: String
       buffers.push(Buffer.from(data.asset.toBytes()));
       buffers.push(Buffer.from(data.registry.toBytes()));
       buffers.push(Buffer.from(data.collection.toBytes()));
       buffers.push(Buffer.from(data.owner.toBytes()));
       buffers.push(Buffer.from([data.atomEnabled ? 1 : 0]));
+      // agent_uri: String (length prefix + bytes)
+      const agentUri = data.agentUri || "";
+      const agentUriBytes = Buffer.from(agentUri, "utf-8");
+      const agentUriLenBuf = Buffer.alloc(4);
+      agentUriLenBuf.writeUInt32LE(agentUriBytes.length);
+      buffers.push(agentUriLenBuf);
+      buffers.push(agentUriBytes);
       break;
 
     case "UriUpdated":
