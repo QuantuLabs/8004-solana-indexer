@@ -7,6 +7,12 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// Chain verification status for reorg resilience
+// PENDING: Ingested via confirmed commitment, awaiting verification
+// FINALIZED: Verified (hash-chain match OR on-chain existence at finalized)
+// ORPHANED: Reorg detected, data invalid
+// Note: SQLite doesn't support enums, using String with CHECK constraints in migrations
+
 // Agent identity (Core asset)
 model Agent {
   id         String   @id // asset pubkey (base58)
@@ -24,6 +30,11 @@ model Agent {
   createdTxSignature String?
   createdSlot        BigInt?
 
+  // Verification status (reorg resilience)
+  status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  verifiedAt   DateTime?
+  verifiedSlot BigInt?
+
   // Relations
   metadata    AgentMetadata[]
   feedbacks   Feedback[]
@@ -32,6 +43,7 @@ model Agent {
   @@index([owner])
   @@index([collection])
   @@index([registry])
+  @@index([status])
 }
 
 // Agent metadata entries (individual PDAs)
@@ -46,10 +58,15 @@ model AgentMetadata {
   txSignature String?
   slot        BigInt?
 
+  // Verification status (reorg resilience)
+  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  verifiedAt DateTime?
+
   agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
   @@unique([agentId, key])
   @@index([agentId])
+  @@index([status])
 }
 
 // Client feedback to agents
@@ -75,6 +92,10 @@ model Feedback {
   revokedTxSignature String?
   revokedSlot        BigInt?
 
+  // Verification status (reorg resilience - hash-chain verified)
+  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  verifiedAt DateTime?
+
   agent     Agent              @relation(fields: [agentId], references: [id], onDelete: Cascade)
   responses FeedbackResponse[]
 
@@ -84,6 +105,7 @@ model Feedback {
   @@index([score])
   @@index([tag1])
   @@index([tag2])
+  @@index([status])
 }
 
 // Agent responses to feedback
@@ -99,6 +121,10 @@ model FeedbackResponse {
   txSignature String?
   slot        BigInt?
 
+  // Verification status (reorg resilience - hash-chain verified)
+  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  verifiedAt DateTime?
+
   feedback Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
 
   // Multiple responses per responder allowed (ERC-8004 spec)
@@ -106,6 +132,7 @@ model FeedbackResponse {
   @@unique([feedbackId, responder, txSignature])
   @@index([feedbackId])
   @@index([feedbackId, responder])
+  @@index([status])
 }
 
 // Orphan responses (feedback not yet indexed or from different indexer start)
@@ -152,12 +179,18 @@ model Validation {
   responseTxSignature String?
   responseSlot        BigInt?
 
+  // Verification status (reorg resilience - existence verified)
+  // Named chainStatus to avoid conflict with existing validation status field
+  chainStatus     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  chainVerifiedAt DateTime?
+
   agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
   @@unique([agentId, validator, nonce])
   @@index([agentId])
   @@index([validator])
   @@index([requester])
+  @@index([chainStatus])
 }
 
 // Registry configurations (Base and User)
@@ -172,8 +205,13 @@ model Registry {
   txSignature String?
   slot        BigInt?
 
+  // Verification status (reorg resilience - existence verified)
+  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
+  verifiedAt DateTime?
+
   @@index([registryType])
   @@index([authority])
+  @@index([status])
 }
 
 // Indexer state for cursor management
@@ -181,7 +219,24 @@ model IndexerState {
   id            String   @id @default("main")
   lastSignature String?  // last processed transaction signature
   lastSlot      BigInt?  // last processed slot
+  source        String   @default("poller") // "websocket" | "poller"
   updatedAt     DateTime @updatedAt
+}
+
+// Agent digest cache for hash-chain verification (Feedback/Response/Revoke)
+// Stores on-chain digest values to compare against computed DB digests
+model AgentDigestCache {
+  agentId          String    @id
+  feedbackDigest   Bytes?    // Last verified on-chain digest
+  feedbackCount    BigInt    @default(0)
+  responseDigest   Bytes?
+  responseCount    BigInt    @default(0)
+  revokeDigest     Bytes?
+  revokeCount      BigInt    @default(0)
+  lastVerifiedAt   DateTime?
+  lastVerifiedSlot BigInt?
+  needsGapFill     Boolean   @default(false)
+  gapFillFromSlot  BigInt?
 }
 
 // Event log for debugging and replay
