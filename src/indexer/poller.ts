@@ -6,7 +6,7 @@ import {
 import { PrismaClient } from "@prisma/client";
 import { config } from "../config.js";
 import { parseTransaction, toTypedEvent } from "../parser/decoder.js";
-import { handleEvent, EventContext } from "../db/handlers.js";
+import { handleEventAtomic, EventContext } from "../db/handlers.js";
 import { loadIndexerState, saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 
@@ -625,7 +625,7 @@ export class Poller {
         txIndex,
       };
 
-      await handleEvent(this.prisma, typedEvent, ctx);
+      await handleEventAtomic(this.prisma, typedEvent, ctx);
 
       // Only log to Prisma in local mode
       if (this.prisma) {

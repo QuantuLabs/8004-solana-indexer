@@ -5,9 +5,10 @@ import {
   Context,
 } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
+import PQueue from "p-queue";
 import { config } from "../config.js";
 import { parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
-import { handleEvent, EventContext } from "../db/handlers.js";
+import { handleEventAtomic, EventContext } from "../db/handlers.js";
 import { saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 
@@ -17,6 +18,9 @@ const logger = createChildLogger("websocket");
 const HEALTH_CHECK_INTERVAL = 30_000;
 // Consider connection stale if no activity for 2 minutes
 const STALE_THRESHOLD = 120_000;
+// Concurrency limits to prevent OOM during high traffic
+const MAX_CONCURRENT_HANDLERS = 10;
+const MAX_QUEUE_SIZE = 1000; // Drop logs if queue exceeds this (backpressure)
 
 export interface WebSocketIndexerOptions {
   connection: Connection;
@@ -42,8 +46,13 @@ export class WebSocketIndexer {
   // Concurrency guards
   private isCheckingHealth = false;
   private isReconnecting = false;
+  // Bounded concurrency queue to prevent OOM during high traffic
+  private logQueue: PQueue;
+  private droppedLogs = 0;
 
   constructor(options: WebSocketIndexerOptions) {
+    // Initialize bounded queue for log processing
+    this.logQueue = new PQueue({ concurrency: MAX_CONCURRENT_HANDLERS });
     this.connection = options.connection;
     this.prisma = options.prisma;
     this.programId = options.programId;
@@ -68,7 +77,9 @@ export class WebSocketIndexer {
   async stop(): Promise<void> {
     logger.info({
       processedCount: this.processedCount,
-      errorCount: this.errorCount
+      errorCount: this.errorCount,
+      queueSize: this.logQueue.size,
+      droppedLogs: this.droppedLogs
     }, "Stopping WebSocket indexer");
 
     this.isRunning = false;
@@ -82,6 +93,13 @@ export class WebSocketIndexer {
         logger.warn({ error, subscriptionId: this.subscriptionId }, "Error removing subscription");
       }
       this.subscriptionId = null;
+    }
+
+    // Drain remaining queue items before shutdown (max 5s wait)
+    if (this.logQueue.size > 0) {
+      logger.info({ queueSize: this.logQueue.size }, "Draining log queue before shutdown");
+      this.logQueue.pause();
+      this.logQueue.clear();
     }
   }
 
@@ -125,21 +143,32 @@ export class WebSocketIndexer {
 
       // Check if connection is stale (no activity for too long)
       if (timeSinceActivity > STALE_THRESHOLD) {
-        logger.warn({
-          timeSinceActivity,
-          threshold: STALE_THRESHOLD
-        }, "WebSocket connection appears stale, reconnecting...");
-
-        await this.forceReconnect();
-        return;
+        // Ping RPC before reconnecting - connection may be healthy with no program activity
+        try {
+          const slot = await this.connection.getSlot();
+          logger.info({
+            timeSinceActivity,
+            slot
+          }, "No WebSocket events but RPC is healthy - program may have low activity");
+          // RPC is alive, just reset the activity timer instead of reconnecting
+          this.lastActivityTime = Date.now();
+          return;
+        } catch (error) {
+          // RPC is down, reconnect
+          logger.warn({
+            timeSinceActivity,
+            threshold: STALE_THRESHOLD,
+            error: error instanceof Error ? error.message : String(error)
+          }, "WebSocket stale AND RPC ping failed, reconnecting...");
+          await this.forceReconnect();
+          return;
+        }
       }
 
-      // Verify HTTP connectivity (but don't update lastActivityTime - only WS events should)
+      // Regular connectivity check (not stale, just verify RPC is up)
       try {
         const slot = await this.connection.getSlot();
         logger.debug({ slot }, "HTTP connectivity OK");
-        // NOTE: We intentionally don't update lastActivityTime here
-        // Only actual WebSocket events should reset the stale timer
       } catch (error) {
         logger.error({ error }, "Health check failed - connection error");
         await this.forceReconnect();
@@ -183,23 +212,42 @@ export class WebSocketIndexer {
 
       this.subscriptionId = this.connection.onLogs(
         this.programId,
-        // CRITICAL FIX: Wrap async callback to catch unhandled promise rejections
+        // Queue-based processing with backpressure to prevent OOM
         (logs: Logs, ctx: Context) => {
           this.lastActivityTime = Date.now();
-          this.handleLogs(logs, ctx).catch((error) => {
-            this.errorCount++;
-            logger.error({
-              error: error instanceof Error ? error.message : String(error),
-              signature: logs.signature,
-              errorCount: this.errorCount
-            }, "Unhandled error in handleLogs - caught by wrapper");
 
-            // If too many errors, force reconnect
-            if (this.errorCount > 10 && this.errorCount % 10 === 0) {
-              logger.warn({ errorCount: this.errorCount }, "High error count, scheduling reconnect");
-              this.forceReconnect().catch(e => {
-                logger.error({ error: e }, "Failed to reconnect after errors");
-              });
+          // Backpressure: drop logs if queue is full
+          if (this.logQueue.size >= MAX_QUEUE_SIZE) {
+            this.droppedLogs++;
+            if (this.droppedLogs % 100 === 1) {
+              logger.warn({
+                queueSize: this.logQueue.size,
+                droppedLogs: this.droppedLogs,
+                signature: logs.signature
+              }, "Queue full, dropping logs (backpressure)");
+            }
+            return;
+          }
+
+          // Add to bounded queue instead of fire-and-forget
+          this.logQueue.add(async () => {
+            try {
+              await this.handleLogs(logs, ctx);
+            } catch (error) {
+              this.errorCount++;
+              logger.error({
+                error: error instanceof Error ? error.message : String(error),
+                signature: logs.signature,
+                errorCount: this.errorCount
+              }, "Error in handleLogs - caught by queue");
+
+              // If too many errors, force reconnect
+              if (this.errorCount > 10 && this.errorCount % 10 === 0) {
+                logger.warn({ errorCount: this.errorCount }, "High error count, scheduling reconnect");
+                this.forceReconnect().catch(e => {
+                  logger.error({ error: e }, "Failed to reconnect after errors");
+                });
+              }
             }
           });
         },
@@ -249,11 +297,16 @@ export class WebSocketIndexer {
           blockTime,
         };
 
+        let eventProcessed = true;
+        let eventErrorMessage: string | undefined;
+
         try {
-          await handleEvent(this.prisma, typedEvent, eventCtx);
+          await handleEventAtomic(this.prisma, typedEvent, eventCtx);
         } catch (eventError) {
+          eventProcessed = false;
+          eventErrorMessage = eventError instanceof Error ? eventError.message : String(eventError);
           logger.error({
-            error: eventError instanceof Error ? eventError.message : String(eventError),
+            error: eventErrorMessage,
             eventType: typedEvent.type,
             signature: logs.signature
           }, "Error handling event");
@@ -265,12 +318,13 @@ export class WebSocketIndexer {
           try {
             await this.prisma.eventLog.create({
               data: {
-                eventType: typedEvent.type,
+                eventType: eventProcessed ? typedEvent.type : "PROCESSING_FAILED",
                 signature: logs.signature,
                 slot: BigInt(ctx.slot),
                 blockTime,
                 data: event.data as object,
-                processed: true,
+                processed: eventProcessed,
+                error: eventErrorMessage,
               },
             });
           } catch (prismaError) {
@@ -315,6 +369,8 @@ export class WebSocketIndexer {
         logger.info({
           processedCount: this.processedCount,
           errorCount: this.errorCount,
+          queueSize: this.logQueue.size,
+          droppedLogs: this.droppedLogs,
           lastDuration: duration
         }, "WebSocket processing stats");
       }
@@ -370,6 +426,12 @@ export class WebSocketIndexer {
       setTimeout(resolve, this.reconnectInterval)
     );
 
+    // Re-check after timeout - stop() may have been called during wait
+    if (!this.isRunning) {
+      logger.info("Reconnect aborted - stop() was called during wait");
+      return;
+    }
+
     await this.subscribe();
   }
 
@@ -377,11 +439,27 @@ export class WebSocketIndexer {
     return this.isRunning && this.subscriptionId !== null;
   }
 
-  getStats(): { processedCount: number; errorCount: number; lastActivity: number } {
+  /**
+   * Check if WebSocket is in recovery mode (running but reconnecting)
+   * Used by monitor to avoid killing WS during self-healing
+   */
+  isRecovering(): boolean {
+    return this.isRunning && (this.isReconnecting || this.isCheckingHealth);
+  }
+
+  getStats(): {
+    processedCount: number;
+    errorCount: number;
+    lastActivity: number;
+    queueSize: number;
+    droppedLogs: number;
+  } {
     return {
       processedCount: this.processedCount,
       errorCount: this.errorCount,
       lastActivity: this.lastActivityTime,
+      queueSize: this.logQueue.size,
+      droppedLogs: this.droppedLogs,
     };
   }
 }
