@@ -70,6 +70,25 @@ function safePaginationOffset(value: unknown): number {
 }
 
 /**
+ * Check if request wants count in response (PostgREST Prefer: count=exact)
+ */
+function wantsCount(req: Request): boolean {
+  const prefer = req.headers['prefer'];
+  if (!prefer) return false;
+  const preferStr = Array.isArray(prefer) ? prefer[0] : prefer;
+  return preferStr.includes('count=exact');
+}
+
+/**
+ * Set Content-Range header for PostgREST compatibility
+ * Format: "offset-end/total" e.g., "0-99/1234"
+ */
+function setContentRange(res: Response, offset: number, items: number, total: number): void {
+  const end = offset + items - 1;
+  res.setHeader('Content-Range', `${offset}-${Math.max(offset, end)}/${total}`);
+}
+
+/**
  * Parse PostgREST-style query parameter value
  * Examples: "eq.value" -> value, "neq.value" -> value, "false" -> "false"
  */
@@ -81,6 +100,18 @@ function parsePostgRESTValue(value: unknown): string | undefined {
   if (str.startsWith('neq.')) return str.slice(4);
   // Return as-is for non-PostgREST format
   return str;
+}
+
+/**
+ * Parse PostgREST IN query: "in.(val1,val2,val3)" -> ["val1", "val2", "val3"]
+ * Returns undefined if not in.() format
+ */
+function parsePostgRESTIn(value: unknown): string[] | undefined {
+  const str = safeQueryString(value);
+  if (!str || !str.startsWith('in.(') || !str.endsWith(')')) return undefined;
+  const inner = str.slice(4, -1);
+  if (!inner) return [];
+  return inner.split(',').map(v => v.trim());
 }
 
 /**
@@ -183,6 +214,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const feedback_index_in = parsePostgRESTIn(req.query.feedback_index);
       const is_revoked = parsePostgRESTValue(req.query.is_revoked);
       const tag1 = parsePostgRESTValue(req.query.tag1);
       const tag2 = parsePostgRESTValue(req.query.tag2);
@@ -198,7 +230,11 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: any = { ...buildStatusFilter(req) };
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
-      if (feedback_index !== undefined) where.feedbackIndex = BigInt(feedback_index);
+      if (feedback_index_in) {
+        where.feedbackIndex = { in: feedback_index_in.map(v => BigInt(v)) };
+      } else if (feedback_index !== undefined) {
+        where.feedbackIndex = BigInt(feedback_index);
+      }
       if (is_revoked !== undefined) where.revoked = is_revoked === 'true';
       if (tag1) where.tag1 = tag1;
       if (tag2) where.tag2 = tag2;
@@ -212,12 +248,22 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
       }
 
-      const feedbacks = await prisma.feedback.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: offset,
-      });
+      // If Prefer: count=exact, also get total count
+      const needsCount = wantsCount(req);
+      const [feedbacks, totalCount] = await Promise.all([
+        prisma.feedback.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        needsCount ? prisma.feedback.count({ where }) : Promise.resolve(0),
+      ]);
+
+      // Set Content-Range header if count was requested
+      if (needsCount) {
+        setContentRange(res, offset, feedbacks.length, totalCount);
+      }
 
       // Map to SDK expected format
       // Note: feedback_index as String to preserve BigInt precision (> 2^53)
@@ -234,6 +280,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         endpoint: f.endpoint,
         feedback_uri: f.feedbackUri,
         feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
+        running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
         is_revoked: f.revoked,
         revoked_at: null, // TODO: add revokedAt tracking
         status: f.status,
@@ -323,6 +370,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         responder: r.responder,
         response_uri: r.responseUri,
         response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
+        running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
         status: r.status,
         verified_at: r.verifiedAt?.toISOString() || null,
         block_slot: r.slot ? Number(r.slot) : Number(r.feedback.createdSlot || 0),
@@ -338,6 +386,55 @@ export function createApiServer(options: ApiServerOptions): Express {
   };
   app.get('/rest/v1/responses', responsesHandler);
   app.get('/rest/v1/feedback_responses', responsesHandler);
+
+  // GET /rest/v1/revocations - List revocations with filters (PostgREST format)
+  app.get('/rest/v1/revocations', async (req: Request, res: Response) => {
+    try {
+      const asset = parsePostgRESTValue(req.query.asset);
+      const client = parsePostgRESTValue(req.query.client);
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const where: any = { ...buildStatusFilter(req) };
+      if (asset) where.agentId = asset;
+      if (client) where.client = client;
+
+      const orderBy: { revokeCount?: 'asc' | 'desc'; createdAt?: 'asc' | 'desc' } =
+        order === 'revoke_count.desc' ? { revokeCount: 'desc' } : { createdAt: 'desc' };
+
+      const revocations = await prisma.revocation.findMany({
+        where,
+        orderBy,
+        take: limit,
+        skip: offset,
+      });
+
+      const mapped = revocations.map(r => ({
+        id: r.id,
+        asset: r.agentId,
+        client_address: r.client,
+        feedback_index: r.feedbackIndex.toString(),
+        feedback_hash: r.feedbackHash ? Buffer.from(r.feedbackHash).toString('hex') : null,
+        slot: Number(r.slot),
+        original_score: r.originalScore,
+        atom_enabled: r.atomEnabled,
+        had_impact: r.hadImpact,
+        running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+        revoke_count: Number(r.revokeCount),
+        tx_signature: r.txSignature,
+        status: r.status,
+        verified_at: r.verifiedAt?.toISOString() || null,
+        created_at: r.createdAt.toISOString(),
+      }));
+
+      res.json(mapped);
+    } catch (error) {
+      logger.error({ error }, 'Error fetching revocations');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
 
   // GET /rest/v1/validations - List validations with filters (PostgREST format)
   app.get('/rest/v1/validations', async (req: Request, res: Response) => {

@@ -234,7 +234,11 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             value: parseI64(data.value),
             valueDecimals: data.value_decimals as number,
             score: parseOptionU8(data.score),
-            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
+            // SEAL v1: feedback_file_hash is optional, seal_hash is computed on-chain
+            feedbackFileHash: data.feedback_file_hash
+              ? new Uint8Array(data.feedback_file_hash as number[])
+              : null,
+            sealHash: new Uint8Array(data.seal_hash as number[]),
             atomEnabled: data.atom_enabled as boolean,
             newTrustTier: data.new_trust_tier as number,
             newQualityScore: data.new_quality_score as number,
@@ -258,7 +262,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             asset: new PublicKey(data.asset as string),
             clientAddress: new PublicKey(data.client_address as string),
             feedbackIndex: parseBigInt(data.feedback_index),
-            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
+            // SEAL v1: seal_hash (was feedback_hash)
+            sealHash: new Uint8Array(data.seal_hash as number[]),
             slot: parseBigInt(data.slot),
             originalScore: data.original_score as number,
             atomEnabled: data.atom_enabled === undefined
@@ -283,7 +288,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             slot: parseBigInt(data.slot),
             responder: new PublicKey(data.responder as string),
             responseHash: new Uint8Array(data.response_hash as number[]),
-            feedbackHash: new Uint8Array(data.feedback_hash as number[]),
+            // SEAL v1: seal_hash (was feedback_hash)
+            sealHash: new Uint8Array(data.seal_hash as number[]),
             newResponseDigest: new Uint8Array(data.new_response_digest as number[]),
             newResponseCount: parseBigInt(data.new_response_count),
             responseUri: data.response_uri as string,

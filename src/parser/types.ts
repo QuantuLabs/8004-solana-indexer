@@ -66,7 +66,10 @@ export interface NewFeedback {
   value: bigint;
   valueDecimals: number;
   score: number | null;
-  feedbackHash: Uint8Array;
+  /** SEAL v1: Optional hash of external feedback file content */
+  feedbackFileHash: Uint8Array | null;
+  /** SEAL v1: On-chain computed hash (trustless) - was feedbackHash */
+  sealHash: Uint8Array;
   atomEnabled: boolean;
   newTrustTier: number;
   newQualityScore: number;
@@ -86,7 +89,8 @@ export interface FeedbackRevoked {
   asset: PublicKey;
   clientAddress: PublicKey;
   feedbackIndex: bigint;
-  feedbackHash: Uint8Array;
+  /** SEAL v1: On-chain computed hash from original feedback */
+  sealHash: Uint8Array;
   slot: bigint;
   originalScore: number;
   atomEnabled: boolean;
@@ -105,7 +109,8 @@ export interface ResponseAppended {
   slot: bigint;
   responder: PublicKey;
   responseHash: Uint8Array;
-  feedbackHash: Uint8Array;
+  /** SEAL v1: On-chain computed hash from original feedback */
+  sealHash: Uint8Array;
   newResponseDigest: Uint8Array;
   newResponseCount: bigint;
   responseUri: string;

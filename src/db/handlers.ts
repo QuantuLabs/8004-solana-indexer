@@ -837,7 +837,8 @@ async function handleNewFeedbackTx(
       tag2: data.tag2,
       endpoint: data.endpoint,
       feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.feedbackHash),
+      feedbackHash: normalizeHash(data.sealHash),
+      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
       status: DEFAULT_STATUS,
@@ -903,7 +904,8 @@ async function handleNewFeedback(
       tag2: data.tag2,
       endpoint: data.endpoint,
       feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.feedbackHash),
+      feedbackHash: normalizeHash(data.sealHash),
+      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
       status: DEFAULT_STATUS,
@@ -911,7 +913,7 @@ async function handleNewFeedback(
     update: {},
   });
 
-  // Reconcile orphan responses: move to FeedbackResponse now that feedback exists
+  // Reconcile orphan responses
   const orphans = await prisma.orphanResponse.findMany({
     where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
   });
@@ -959,18 +961,32 @@ async function handleFeedbackRevokedTx(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const clientAddress = data.clientAddress.toBase58();
+
   await tx.feedback.updateMany({
-    where: {
-      agentId: assetId,
-      client: data.clientAddress.toBase58(),
-      feedbackIndex: data.feedbackIndex,
-    },
-    data: {
-      revoked: true,
-      revokedTxSignature: ctx.signature,
-      revokedSlot: ctx.slot,
-    },
+    where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+    data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
+
+  await tx.revocation.upsert({
+    where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
+    create: {
+      agentId: assetId,
+      client: clientAddress,
+      feedbackIndex: data.feedbackIndex,
+      feedbackHash: normalizeHash(data.sealHash),
+      slot: data.slot,
+      originalScore: data.originalScore,
+      atomEnabled: data.atomEnabled,
+      hadImpact: data.hadImpact,
+      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+      revokeCount: data.newRevokeCount,
+      txSignature: ctx.signature,
+      status: DEFAULT_STATUS,
+    },
+    update: {},
+  });
+
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Feedback revoked");
 }
 
@@ -980,24 +996,33 @@ async function handleFeedbackRevoked(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const clientAddress = data.clientAddress.toBase58();
 
   await prisma.feedback.updateMany({
-    where: {
-      agentId: assetId,
-      client: data.clientAddress.toBase58(),
-      feedbackIndex: data.feedbackIndex,
-    },
-    data: {
-      revoked: true,
-      revokedTxSignature: ctx.signature,
-      revokedSlot: ctx.slot,
-    },
+    where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+    data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
 
-  logger.info(
-    { assetId, feedbackIndex: data.feedbackIndex.toString() },
-    "Feedback revoked"
-  );
+  await prisma.revocation.upsert({
+    where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
+    create: {
+      agentId: assetId,
+      client: clientAddress,
+      feedbackIndex: data.feedbackIndex,
+      feedbackHash: normalizeHash(data.sealHash),
+      slot: data.slot,
+      originalScore: data.originalScore,
+      atomEnabled: data.atomEnabled,
+      hadImpact: data.hadImpact,
+      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+      revokeCount: data.newRevokeCount,
+      txSignature: ctx.signature,
+      status: DEFAULT_STATUS,
+    },
+    update: {},
+  });
+
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Feedback revoked");
 }
 
 async function handleResponseAppendedTx(
@@ -1060,6 +1085,7 @@ async function handleResponseAppendedTx(
       responder,
       responseUri: data.responseUri,
       responseHash: normalizeHash(data.responseHash),
+      runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
       txSignature: ctx.signature,
       slot: ctx.slot,
       status: DEFAULT_STATUS,
@@ -1126,8 +1152,6 @@ async function handleResponseAppended(
     return;
   }
 
-  // Multiple responses per responder allowed (ERC-8004)
-  // Use upsert with txSignature to avoid duplicates during re-indexing
   await prisma.feedbackResponse.upsert({
     where: {
       feedbackId_responder_txSignature: {
@@ -1141,6 +1165,7 @@ async function handleResponseAppended(
       responder,
       responseUri: data.responseUri,
       responseHash: normalizeHash(data.responseHash),
+      runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
       txSignature: ctx.signature,
       slot: ctx.slot,
       status: DEFAULT_STATUS,
@@ -1148,10 +1173,7 @@ async function handleResponseAppended(
     update: {},
   });
 
-  logger.info(
-    { assetId, feedbackIndex: data.feedbackIndex.toString() },
-    "Response appended"
-  );
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
 }
 
 async function handleValidationRequestedTx(

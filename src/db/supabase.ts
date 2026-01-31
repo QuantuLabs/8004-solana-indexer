@@ -531,9 +531,10 @@ async function handleNewFeedbackTx(
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
-  const isAllZeroHash = data.feedbackHash && data.feedbackHash.every(b => b === 0);
-  const feedbackHash = (data.feedbackHash && !isAllZeroHash)
-    ? Buffer.from(data.feedbackHash).toString("hex")
+  // SEAL v1: sealHash is computed on-chain, stored in feedback_hash column
+  const isAllZeroHash = data.sealHash && data.sealHash.every(b => b === 0);
+  const feedbackHash = (data.sealHash && !isAllZeroHash)
+    ? Buffer.from(data.sealHash).toString("hex")
     : null;
   const insertResult = await client.query(
     `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
@@ -954,10 +955,10 @@ async function handleNewFeedback(
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
-    // Normalize optional hash: all-zero means "no hash" for IPFS
-    const isAllZeroHash = data.feedbackHash && data.feedbackHash.every(b => b === 0);
-    const feedbackHash = (data.feedbackHash && !isAllZeroHash)
-      ? Buffer.from(data.feedbackHash).toString("hex")
+    // SEAL v1: sealHash is computed on-chain, stored in feedback_hash column
+    const isAllZeroHash = data.sealHash && data.sealHash.every(b => b === 0);
+    const feedbackHash = (data.sealHash && !isAllZeroHash)
+      ? Buffer.from(data.sealHash).toString("hex")
       : null;
 
     const insertResult = await db.query(

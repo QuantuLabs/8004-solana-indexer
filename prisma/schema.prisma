@@ -69,32 +69,28 @@ model AgentMetadata {
   @@index([status])
 }
 
-// Client feedback to agents
 model Feedback {
-  id            String   @id @default(uuid())
-  agentId       String
-  client        String   // client pubkey
-  feedbackIndex BigInt   // on-chain index
-  value         BigInt   @default(0)  // i64 raw metric value (v0.5.0)
-  valueDecimals Int      @default(0)  // decimal precision 0-6 (v0.5.0)
-  score         Int?     // 0-100, null if ATOM skipped (v0.5.0)
-  tag1          String   // category tag 1
-  tag2          String   // category tag 2
-  endpoint      String   // endpoint used
-  feedbackUri   String   // URI to detailed feedback
-  feedbackHash  Bytes?   // SHA-256 hash of content (null if all-zero/IPFS)
-  revoked       Boolean  @default(false)
-  createdAt     DateTime @default(now())
-
-  // Transaction references
+  id                 String   @id @default(uuid())
+  agentId            String
+  client             String
+  feedbackIndex      BigInt
+  value              BigInt   @default(0)
+  valueDecimals      Int      @default(0)
+  score              Int?
+  tag1               String
+  tag2               String
+  endpoint           String
+  feedbackUri        String
+  feedbackHash       Bytes?
+  revoked            Boolean  @default(false)
+  runningDigest      Bytes?
+  createdAt          DateTime @default(now())
   createdTxSignature String?
   createdSlot        BigInt?
   revokedTxSignature String?
   revokedSlot        BigInt?
-
-  // Verification status (reorg resilience - hash-chain verified)
-  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
-  verifiedAt DateTime?
+  status             String   @default("PENDING")
+  verifiedAt         DateTime?
 
   agent     Agent              @relation(fields: [agentId], references: [id], onDelete: Cascade)
   responses FeedbackResponse[]
@@ -108,50 +104,61 @@ model Feedback {
   @@index([status])
 }
 
-// Agent responses to feedback
 model FeedbackResponse {
-  id           String   @id @default(uuid())
-  feedbackId   String
-  responder    String   // who responded (agent owner or wallet)
-  responseUri  String   // URI to response content
-  responseHash Bytes?   // SHA-256 hash of content (null if all-zero/IPFS)
-  createdAt    DateTime @default(now())
-
-  // Transaction reference
-  txSignature String?
-  slot        BigInt?
-
-  // Verification status (reorg resilience - hash-chain verified)
-  status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
-  verifiedAt DateTime?
+  id            String   @id @default(uuid())
+  feedbackId    String
+  responder     String
+  responseUri   String
+  responseHash  Bytes?
+  runningDigest Bytes?
+  createdAt     DateTime @default(now())
+  txSignature   String?
+  slot          BigInt?
+  status        String   @default("PENDING")
+  verifiedAt    DateTime?
 
   feedback Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
 
-  // Multiple responses per responder allowed (ERC-8004 spec)
-  // Unique per transaction to avoid duplicates during re-indexing
   @@unique([feedbackId, responder, txSignature])
   @@index([feedbackId])
   @@index([feedbackId, responder])
   @@index([status])
 }
 
-// Orphan responses (feedback not yet indexed or from different indexer start)
-// Parity with Supabase orphan_responses table
+model Revocation {
+  id            String   @id @default(uuid())
+  agentId       String
+  client        String
+  feedbackIndex BigInt
+  feedbackHash  Bytes?
+  slot          BigInt
+  originalScore Int?
+  atomEnabled   Boolean  @default(false)
+  hadImpact     Boolean  @default(false)
+  runningDigest Bytes?
+  revokeCount   BigInt
+  txSignature   String?
+  createdAt     DateTime @default(now())
+  status        String   @default("PENDING")
+  verifiedAt    DateTime?
+
+  @@unique([agentId, client, feedbackIndex])
+  @@index([agentId])
+  @@index([status])
+}
+
 model OrphanResponse {
   id            String   @id @default(uuid())
-  agentId       String   // agent asset pubkey
-  client        String   // client pubkey who gave feedback
-  feedbackIndex BigInt   // feedback index reference
-  responder     String   // who responded
-  responseUri   String   // URI to response content
-  responseHash  Bytes?   // SHA-256 hash (null if all-zero)
+  agentId       String
+  client        String
+  feedbackIndex BigInt
+  responder     String
+  responseUri   String
+  responseHash  Bytes?
   createdAt     DateTime @default(now())
+  txSignature   String?
+  slot          BigInt?
 
-  // Transaction reference
-  txSignature String?
-  slot        BigInt?
-
-  // Unique per transaction to avoid duplicates
   @@unique([agentId, client, feedbackIndex, responder, txSignature])
   @@index([agentId])
   @@index([agentId, client, feedbackIndex])
