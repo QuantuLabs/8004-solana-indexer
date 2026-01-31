@@ -464,7 +464,7 @@ async function handleMetadataSetTx(
   const assetId = data.asset.toBase58();
   const keyHash = createHash("sha256").update(data.key).digest().slice(0, 16).toString("hex");
   const id = `${assetId}:${keyHash}`;
-  const compressedValue = await compressForStorage(Buffer.from(data.value));
+  const compressedValue = await compressForStorage(stripNullBytes(data.value));
   await client.query(
     `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, updated_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -867,7 +867,7 @@ async function handleMetadataSet(
 
   try {
     // Compress value for storage (threshold: 256 bytes)
-    const compressedValue = await compressForStorage(Buffer.from(data.value));
+    const compressedValue = await compressForStorage(stripNullBytes(data.value));
 
     await db.query(
       `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, updated_at)
@@ -1261,6 +1261,7 @@ export async function saveIndexerState(signature: string, slot: bigint): Promise
 
 import { digestUri, serializeValue } from "../indexer/uriDigest.js";
 import { compressForStorage } from "../utils/compression.js";
+import { stripNullBytes } from "../utils/sanitize.js";
 
 /**
  * Fetch, digest, and store URI metadata for an agent

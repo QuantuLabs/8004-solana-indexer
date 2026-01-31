@@ -22,6 +22,7 @@ import { config, ChainStatus } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
 import { digestUri, serializeValue } from "../indexer/uriDigest.js";
 import { compressForStorage } from "../utils/compression.js";
+import { stripNullBytes } from "../utils/sanitize.js";
 
 const logger = createChildLogger("db-handlers");
 
@@ -615,7 +616,8 @@ async function handleMetadataSetTx(
     return;
   }
   const assetId = data.asset.toBase58();
-  const prefixedValue = Buffer.concat([Buffer.from([0x00]), Buffer.from(data.value)]);
+  const cleanValue = stripNullBytes(data.value);
+  const prefixedValue = Buffer.concat([Buffer.from([0x00]), cleanValue]);
   const existing = await tx.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
     select: { immutable: true },
@@ -654,8 +656,9 @@ async function handleMetadataSet(
 
   const assetId = data.asset.toBase58();
 
-  // Add PREFIX_RAW (0x00) for SDK decode compatibility
-  const prefixedValue = Buffer.concat([Buffer.from([0x00]), Buffer.from(data.value)]);
+  // Strip NULL bytes that break PostgreSQL UTF-8 encoding, then add PREFIX_RAW (0x00)
+  const cleanValue = stripNullBytes(data.value);
+  const prefixedValue = Buffer.concat([Buffer.from([0x00]), cleanValue]);
 
   // Fetch existing to check immutable state
   const existing = await prisma.agentMetadata.findUnique({

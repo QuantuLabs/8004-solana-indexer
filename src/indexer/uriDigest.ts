@@ -33,7 +33,9 @@ export function sanitizeText(text: string): string {
     ? text.slice(0, MAX_SANITIZE_INPUT_LENGTH)
     : text;
   // DOMPurify with ALLOWED_TAGS=[] strips all HTML, leaving plain text
-  return DOMPurify.sanitize(truncated, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }).trim();
+  const cleaned = DOMPurify.sanitize(truncated, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }).trim();
+  // Strip NULL bytes and control chars that break PostgreSQL UTF-8 (keep tab, newline, CR)
+  return cleaned.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 }
 
 /**
