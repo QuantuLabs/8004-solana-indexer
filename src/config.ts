@@ -6,15 +6,13 @@ export type MetadataIndexMode = "off" | "normal" | "full";
 export type ChainStatus = "PENDING" | "FINALIZED" | "ORPHANED";
 
 /**
- * Runtime configuration (populated at startup from on-chain data)
+ * Runtime configuration (populated at startup from on-chain data via SDK)
  */
 export const runtimeConfig: {
   baseCollection: string | null;
-  authority: string | null;
   initialized: boolean;
 } = {
   baseCollection: null,
-  authority: null,
   initialized: false,
 };
 
