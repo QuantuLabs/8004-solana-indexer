@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { PROGRAM_ID } from "8004-solana";
 
 export type IndexerMode = "auto" | "polling" | "websocket";
 export type DbMode = "local" | "supabase";
@@ -32,9 +33,8 @@ export const config = {
   rpcUrl: process.env.RPC_URL || "https://api.devnet.solana.com",
   wsUrl: process.env.WS_URL || "wss://api.devnet.solana.com",
 
-  // Program ID (8004 Agent Registry v0.5.0)
-  programId:
-    process.env.PROGRAM_ID || "8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N",
+  // Program ID from SDK (source of truth)
+  programId: PROGRAM_ID.toBase58(),
 
   // Indexer mode: "auto" | "polling" | "websocket"
   // auto = tries WebSocket first, falls back to polling if unavailable
