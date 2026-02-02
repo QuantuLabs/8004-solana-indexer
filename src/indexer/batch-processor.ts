@@ -343,17 +343,17 @@ export class EventBuffer {
 
   private async insertFeedbackSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    // NewFeedback uses 'clientAddress' field
     const client_addr = data.clientAddress?.toBase58?.() || data.clientAddress;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
+    const id = `${asset}:${client_addr}:${feedbackIndex}`;
 
     await client.query(`
-      INSERT INTO feedbacks (agent_id, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PENDING')
-      ON CONFLICT (agent_id, client_address, feedback_index) DO UPDATE SET
+      INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'PENDING')
+      ON CONFLICT (id) DO UPDATE SET
         score = COALESCE(EXCLUDED.score, feedbacks.score),
         updated_at = NOW()
-    `, [asset, client_addr, feedbackIndex.toString(),
+    `, [id, asset, client_addr, feedbackIndex.toString(),
         data.value?.toString() || "0", data.valueDecimals || 0, data.score,
         data.tag1 || "", data.tag2 || "", data.endpoint || "",
         data.feedbackUri || "", data.sealHash ? Buffer.from(data.sealHash).toString("hex") : null,
@@ -362,83 +362,73 @@ export class EventBuffer {
 
   private async insertRevocationSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    // FeedbackRevoked uses 'clientAddress' field
     const client_addr = data.clientAddress?.toBase58?.() || data.clientAddress;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
 
     await client.query(`
-      UPDATE feedbacks SET revoked = true, revoked_at = $1, updated_at = NOW()
-      WHERE agent_id = $2 AND client_address = $3 AND feedback_index = $4
+      UPDATE feedbacks SET is_revoked = true, revoked_at = $1
+      WHERE asset = $2 AND client_address = $3 AND feedback_index = $4
     `, [ctx.blockTime.toISOString(), asset, client_addr, feedbackIndex.toString()]);
   }
 
   private async insertResponseSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    // ResponseAppended uses 'client' field (not clientAddress)
     const client_addr = data.client?.toBase58?.() || data.client;
     const responder = data.responder?.toBase58?.() || data.responder;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
+    const id = `${asset}:${client_addr}:${feedbackIndex}:${responder}:${ctx.signature}`;
 
-    // First try to find the feedback
-    const fbResult = await client.query(
-      `SELECT id FROM feedbacks WHERE agent_id = $1 AND client_address = $2 AND feedback_index = $3`,
-      [asset, client_addr, feedbackIndex.toString()]
-    );
-
-    if (fbResult.rows.length > 0) {
-      await client.query(`
-        INSERT INTO feedback_responses (feedback_id, responder, response_uri, response_hash, slot, tx_signature, created_at, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING')
-      `, [fbResult.rows[0].id, responder, data.responseUri || "",
-          data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
-          ctx.slot.toString(), ctx.signature, ctx.blockTime.toISOString()]);
-    }
+    await client.query(`
+      INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING')
+      ON CONFLICT (id) DO NOTHING
+    `, [id, asset, client_addr, feedbackIndex.toString(), responder,
+        data.responseUri || "", data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
+        ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   private async insertValidationRequestSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    // ValidationRequested uses 'validatorAddress' field
     const validator = data.validatorAddress?.toBase58?.() || data.validatorAddress;
+    const requester = data.requester?.toBase58?.() || data.requester;
     const nonce = BigInt(data.nonce?.toString() || "0");
+    const id = `${asset}:${validator}:${nonce}`;
 
     await client.query(`
-      INSERT INTO validations (agent_id, validator, nonce, request_uri, request_hash, request_slot, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
-      ON CONFLICT (agent_id, validator, nonce) DO NOTHING
-    `, [asset, validator, nonce.toString(), data.requestUri || "",
+      INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING')
+      ON CONFLICT (id) DO NOTHING
+    `, [id, asset, validator, nonce.toString(), requester, data.requestUri || "",
         data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-        ctx.slot.toString(), ctx.signature, ctx.blockTime.toISOString()]);
+        ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
-  private async updateValidationResponseSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async updateValidationResponseSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    // ValidationResponded uses 'validatorAddress' field
     const validator = data.validatorAddress?.toBase58?.() || data.validatorAddress;
     const nonce = BigInt(data.nonce?.toString() || "0");
 
     await client.query(`
       UPDATE validations SET
-        response = $1, response_uri = $2, response_hash = $3, response_slot = $4, tag = $5, updated_at = NOW()
-      WHERE agent_id = $6 AND validator = $7 AND nonce = $8
+        response = $1, response_uri = $2, response_hash = $3, tag = $4, updated_at = NOW()
+      WHERE asset = $5 AND validator_address = $6 AND nonce = $7
     `, [data.response || 0, data.responseUri || "",
         data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
-        ctx.slot.toString(), data.tag || "",
-        asset, validator, nonce.toString()]);
+        data.tag || "", asset, validator, nonce.toString()]);
   }
 
   private async insertCollectionSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"], type: string): Promise<void> {
     const collection = data.collection?.toBase58?.() || data.collection;
-    // BaseRegistryCreated uses 'createdBy', UserRegistryCreated uses 'owner'
     const authority = type === "BaseRegistryCreated"
       ? (data.createdBy?.toBase58?.() || data.createdBy)
       : (data.owner?.toBase58?.() || data.owner);
     const registryType = type === "BaseRegistryCreated" ? "BASE" : "USER";
 
     await client.query(`
-      INSERT INTO collections (collection, registry_type, authority, slot, created_at)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO collections (collection, registry_type, authority, created_at, status)
+      VALUES ($1, $2, $3, $4, 'PENDING')
       ON CONFLICT (collection) DO NOTHING
-    `, [collection, registryType, authority, ctx.slot.toString(), ctx.blockTime.toISOString()]);
+    `, [collection, registryType, authority, ctx.blockTime.toISOString()]);
   }
 
   private async updateAgentUriSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
@@ -467,15 +457,16 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     const key = data.key || "";
     const value = data.value ? Buffer.from(data.value).toString("utf8") : "";
+    const id = `${asset}:${key}`;
 
     await client.query(`
-      INSERT INTO metadata (agent_id, key, value, slot, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
-      ON CONFLICT (agent_id, key) DO UPDATE SET
+      INSERT INTO metadata (id, asset, key, value, immutable, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
+      ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
-        slot = EXCLUDED.slot,
+        block_slot = EXCLUDED.block_slot,
         updated_at = NOW()
-    `, [asset, key, value, ctx.slot.toString(), ctx.signature, ctx.blockTime.toISOString()]);
+    `, [id, asset, key, value, data.immutable || false, ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   /**
