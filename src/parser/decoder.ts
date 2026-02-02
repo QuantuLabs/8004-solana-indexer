@@ -61,6 +61,12 @@ const idl: Idl = JSON.parse(readFileSync(idlPath, "utf-8"));
 const coder = new BorshCoder(idl);
 const eventParser = new EventParser(new PublicKey(config.programId), coder);
 
+// IDL version info for startup validation
+export const IDL_VERSION = (idl as any).metadata?.version || "unknown";
+export const IDL_PROGRAM_ID = (idl as any).address || config.programId;
+
+logger.info({ version: IDL_VERSION, programId: IDL_PROGRAM_ID }, "IDL loaded");
+
 export interface ParsedEvent {
   name: string;
   data: Record<string, unknown>;

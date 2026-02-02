@@ -70,6 +70,41 @@ function safePaginationOffset(value: unknown): number {
 }
 
 /**
+ * Safely parse BigInt from query parameter
+ * Returns undefined for invalid input instead of throwing
+ */
+function safeBigInt(value: unknown): bigint | undefined {
+  const str = safeQueryString(value);
+  if (!str) return undefined;
+  // Validate: only digits, optional leading minus
+  if (!/^-?\d+$/.test(str)) return undefined;
+  try {
+    return BigInt(str);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Safely parse BigInt array from query parameter (comma-separated)
+ */
+function safeBigIntArray(value: unknown): bigint[] | undefined {
+  const str = safeQueryString(value);
+  if (!str) return undefined;
+  const parts = str.split(',').map(s => s.trim());
+  const result: bigint[] = [];
+  for (const part of parts) {
+    if (!/^-?\d+$/.test(part)) return undefined;
+    try {
+      result.push(BigInt(part));
+    } catch {
+      return undefined;
+    }
+  }
+  return result.length > 0 ? result : undefined;
+}
+
+/**
  * Check if request wants count in response (PostgREST Prefer: count=exact)
  */
 function wantsCount(req: Request): boolean {
@@ -231,9 +266,11 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
       if (feedback_index_in) {
-        where.feedbackIndex = { in: feedback_index_in.map(v => BigInt(v)) };
+        const indices = safeBigIntArray(feedback_index_in.join(','));
+        if (indices) where.feedbackIndex = { in: indices };
       } else if (feedback_index !== undefined) {
-        where.feedbackIndex = BigInt(feedback_index);
+        const idx = safeBigInt(feedback_index);
+        if (idx !== undefined) where.feedbackIndex = idx;
       }
       if (is_revoked !== undefined) where.revoked = is_revoked === 'true';
       if (tag1) where.tag1 = tag1;
@@ -314,12 +351,17 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (feedback_id) {
         where.feedbackId = feedback_id;
       } else if (asset && client_address && feedback_index !== undefined) {
+        const idx = safeBigInt(feedback_index);
+        if (idx === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+          return;
+        }
         // Find feedback first, then get responses
         const feedback = await prisma.feedback.findFirst({
           where: {
             agentId: asset,
             client: client_address,
-            feedbackIndex: BigInt(feedback_index),
+            feedbackIndex: idx,
           },
         });
         if (feedback) {
@@ -327,7 +369,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         } else {
           // Check orphan responses (feedback not yet indexed)
           const orphans = await prisma.orphanResponse.findMany({
-            where: { agentId: asset, client: client_address, feedbackIndex: BigInt(feedback_index) },
+            where: { agentId: asset, client: client_address, feedbackIndex: idx },
             orderBy: { createdAt: 'desc' },
             take: limit,
             skip: offset,
@@ -450,7 +492,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: any = { ...buildStatusFilter(req, 'chainStatus') };
       if (asset) where.agentId = asset;
       if (validator) where.validator = validator;
-      if (nonce !== undefined) where.nonce = BigInt(nonce);
+      if (nonce !== undefined) {
+        const nonceInt = safeBigInt(nonce);
+        if (nonceInt !== undefined) where.nonce = nonceInt;
+      }
       if (responded !== undefined) {
         where.response = responded === 'true' ? { not: null } : null;
       }

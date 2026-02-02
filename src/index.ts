@@ -6,6 +6,7 @@ import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
 import { startApiServer } from "./api/server.js";
 import { cleanupOrphanResponses } from "./db/handlers.js";
+import { IDL_VERSION, IDL_PROGRAM_ID } from "./parser/decoder.js";
 
 async function main() {
   try {
@@ -15,9 +16,17 @@ async function main() {
     process.exit(1);
   }
 
+  // IDL/SDK version validation
+  if (IDL_PROGRAM_ID !== config.programId) {
+    logger.warn(
+      { idlProgramId: IDL_PROGRAM_ID, configProgramId: config.programId },
+      "IDL program ID mismatch - events may fail to parse"
+    );
+  }
   logger.info(
     {
       programId: config.programId,
+      idlVersion: IDL_VERSION,
       rpcUrl: config.rpcUrl,
       indexerMode: config.indexerMode,
       dbMode: config.dbMode,
