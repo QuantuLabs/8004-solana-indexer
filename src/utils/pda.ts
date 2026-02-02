@@ -5,7 +5,11 @@
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { createHash } from "crypto";
-import { config } from "../config.js";
+import {
+  PROGRAM_ID as SDK_PROGRAM_ID,
+  ATOM_ENGINE_PROGRAM_ID as SDK_ATOM_PROGRAM_ID,
+  MPL_CORE_PROGRAM_ID as SDK_MPL_CORE_PROGRAM_ID,
+} from "8004-solana";
 
 /**
  * RootConfig account structure (on-chain)
@@ -115,14 +119,10 @@ export async function fetchBaseCollection(
   return registryConfig.collection;
 }
 
-// Program IDs
-export const AGENT_REGISTRY_PROGRAM_ID = new PublicKey(config.programId);
-export const ATOM_ENGINE_PROGRAM_ID = new PublicKey(
-  "AToMNmthLzvTy3D2kz2obFmbVCsTCmYpDw1ptWUJdeU8"
-);
-export const MPL_CORE_PROGRAM_ID = new PublicKey(
-  "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
-);
+// Program IDs from SDK (source of truth)
+export const AGENT_REGISTRY_PROGRAM_ID = SDK_PROGRAM_ID;
+export const ATOM_ENGINE_PROGRAM_ID = SDK_ATOM_PROGRAM_ID;
+export const MPL_CORE_PROGRAM_ID = SDK_MPL_CORE_PROGRAM_ID;
 
 /**
  * Convert a number to little-endian buffer
