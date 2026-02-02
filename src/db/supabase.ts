@@ -100,7 +100,7 @@ function logStatsIfNeeded(): void {
   }
 }
 
-function getPool(): Pool {
+export function getPool(): Pool {
   if (!pool) {
     if (!config.supabaseDsn) {
       throw new Error("SUPABASE_DSN required for supabase mode");
