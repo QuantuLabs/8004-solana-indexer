@@ -23,7 +23,7 @@ import {
   ValidationResponded,
 } from "../parser/types.js";
 import { createChildLogger } from "../logger.js";
-import { config, ChainStatus } from "../config.js";
+import { config, ChainStatus, runtimeConfig } from "../config.js";
 import type { PoolClient } from "pg";
 
 const logger = createChildLogger("supabase-handlers");
@@ -75,6 +75,55 @@ function markCollectionSeen(collection: string): void {
   }
 
   seenCollections.set(collection, Date.now());
+}
+
+/**
+ * Check if a collection should be indexed
+ * Returns true if:
+ * 1. runtimeConfig not initialized (fallback - index everything)
+ * 2. Collection is the base collection
+ * 3. Collection is a known USER registry (created under our base)
+ */
+async function isAllowedCollection(client: PoolClient, collection: string): Promise<boolean> {
+  // Fallback: if base collection not initialized, index everything
+  if (!runtimeConfig.initialized || !runtimeConfig.baseCollection) {
+    return true;
+  }
+
+  // Is it the base collection?
+  if (collection === runtimeConfig.baseCollection) {
+    return true;
+  }
+
+  // Is it a known USER collection? (created under our base registry)
+  const result = await client.query(
+    `SELECT 1 FROM collections WHERE collection = $1 AND registry_type = 'USER' LIMIT 1`,
+    [collection]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Non-transactional version for standalone handlers
+ */
+async function isAllowedCollectionStandalone(collection: string): Promise<boolean> {
+  // Fallback: if base collection not initialized, index everything
+  if (!runtimeConfig.initialized || !runtimeConfig.baseCollection) {
+    return true;
+  }
+
+  // Is it the base collection?
+  if (collection === runtimeConfig.baseCollection) {
+    return true;
+  }
+
+  // Is it a known USER collection?
+  const db = getPool();
+  const result = await db.query(
+    `SELECT 1 FROM collections WHERE collection = $1 AND registry_type = 'USER' LIMIT 1`,
+    [collection]
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 // Stats tracking
@@ -378,8 +427,15 @@ async function handleAgentRegisteredTx(
   data: AgentRegisteredInRegistry,
   ctx: EventContext
 ): Promise<void> {
-  const assetId = data.asset.toBase58();
   const collection = data.collection.toBase58();
+
+  // Collection filtering: only index agents from allowed collections
+  if (!await isAllowedCollection(client, collection)) {
+    logger.debug({ collection, asset: data.asset.toBase58() }, "Skipping agent from non-indexed collection");
+    return;
+  }
+
+  const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection);
   await client.query(
@@ -730,9 +786,16 @@ async function handleAgentRegistered(
   data: AgentRegisteredInRegistry,
   ctx: EventContext
 ): Promise<void> {
+  const collection = data.collection.toBase58();
+
+  // Collection filtering: only index agents from allowed collections
+  if (!await isAllowedCollectionStandalone(collection)) {
+    logger.debug({ collection, asset: data.asset.toBase58() }, "Skipping agent from non-indexed collection");
+    return;
+  }
+
   const db = getPool();
   const assetId = data.asset.toBase58();
-  const collection = data.collection.toBase58();
   const agentUri = data.agentUri || null;
 
   await ensureCollection(collection);
