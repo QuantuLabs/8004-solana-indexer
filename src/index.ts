@@ -1,11 +1,11 @@
 import { PrismaClient } from "@prisma/client";
 import { Connection } from "@solana/web3.js";
+import { getBaseCollection } from "8004-solana";
 import { config, validateConfig, runtimeConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
 import { startApiServer } from "./api/server.js";
 import { cleanupOrphanResponses } from "./db/handlers.js";
-import { fetchRootConfig } from "./utils/pda.js";
 
 async function main() {
   try {
@@ -25,26 +25,23 @@ async function main() {
     "Starting 8004 Solana Indexer"
   );
 
-  // Fetch root config from on-chain to get base collection
+  // Fetch base collection from on-chain using SDK
   const connection = new Connection(config.rpcUrl, "confirmed");
   try {
-    const rootConfig = await fetchRootConfig(connection);
-    if (rootConfig) {
-      runtimeConfig.baseCollection = rootConfig.baseRegistry.toBase58();
-      runtimeConfig.authority = rootConfig.authority.toBase58();
+    const baseCollection = await getBaseCollection(connection);
+
+    if (baseCollection) {
+      runtimeConfig.baseCollection = baseCollection.toBase58();
       runtimeConfig.initialized = true;
       logger.info(
-        {
-          baseCollection: runtimeConfig.baseCollection,
-          authority: runtimeConfig.authority,
-        },
-        "Fetched root config from on-chain"
+        { baseCollection: runtimeConfig.baseCollection },
+        "Fetched base collection from on-chain via SDK"
       );
     } else {
-      logger.warn("Root config not found on-chain - indexing all collections");
+      logger.warn("Base collection not found on-chain - indexing all collections");
     }
   } catch (error) {
-    logger.error({ error }, "Failed to fetch root config from on-chain");
+    logger.error({ error }, "Failed to fetch base collection from on-chain");
   }
 
   // Initialize Prisma only for local mode

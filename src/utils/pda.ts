@@ -11,18 +11,36 @@ import { config } from "../config.js";
  * RootConfig account structure (on-chain)
  * - discriminator: 8 bytes
  * - authority: 32 bytes (Pubkey)
- * - base_registry: 32 bytes (Pubkey) - The base collection
+ * - base_registry: 32 bytes (Pubkey) - The RegistryConfig PDA (NOT the collection!)
  * - bump: 1 byte
  */
 export interface RootConfig {
   authority: PublicKey;
-  baseRegistry: PublicKey;
+  baseRegistry: PublicKey; // This is RegistryConfig PDA, not collection
+  bump: number;
+}
+
+/**
+ * RegistryConfig account structure (on-chain)
+ * - discriminator: 8 bytes
+ * - collection: 32 bytes (Pubkey) - The actual Metaplex Core collection
+ * - agent_count: 8 bytes (u64)
+ * - owner: 32 bytes (Pubkey)
+ * - fees_wallet: 32 bytes (Pubkey)
+ * - register_fee: 8 bytes (u64)
+ * - bump: 1 byte
+ */
+export interface RegistryConfig {
+  collection: PublicKey;
+  agentCount: bigint;
+  owner: PublicKey;
+  feesWallet: PublicKey;
+  registerFee: bigint;
   bump: number;
 }
 
 /**
  * Fetch and parse RootConfig from on-chain
- * Returns the base collection that the indexer should track
  */
 export async function fetchRootConfig(
   connection: Connection,
@@ -47,6 +65,54 @@ export async function fetchRootConfig(
     baseRegistry: new PublicKey(data.slice(40, 72)),
     bump: data[72],
   };
+}
+
+/**
+ * Fetch and parse RegistryConfig from on-chain
+ */
+export async function fetchRegistryConfig(
+  connection: Connection,
+  registryConfigPda: PublicKey
+): Promise<RegistryConfig | null> {
+  const accountInfo = await connection.getAccountInfo(registryConfigPda);
+
+  if (!accountInfo || accountInfo.data.length < 121) {
+    return null;
+  }
+
+  const data = accountInfo.data;
+  return {
+    collection: new PublicKey(data.slice(8, 40)),
+    agentCount: data.readBigUInt64LE(40),
+    owner: new PublicKey(data.slice(48, 80)),
+    feesWallet: new PublicKey(data.slice(80, 112)),
+    registerFee: data.readBigUInt64LE(112),
+    bump: data[120],
+  };
+}
+
+/**
+ * Fetch the actual base collection from on-chain
+ * Follows: RootConfig.baseRegistry → RegistryConfig.collection
+ */
+export async function fetchBaseCollection(
+  connection: Connection,
+  programId: PublicKey = AGENT_REGISTRY_PROGRAM_ID
+): Promise<PublicKey | null> {
+  // 1. Get RootConfig
+  const rootConfig = await fetchRootConfig(connection, programId);
+  if (!rootConfig) {
+    return null;
+  }
+
+  // 2. Get RegistryConfig from baseRegistry PDA
+  const registryConfig = await fetchRegistryConfig(connection, rootConfig.baseRegistry);
+  if (!registryConfig) {
+    return null;
+  }
+
+  // 3. Return the actual collection
+  return registryConfig.collection;
 }
 
 // Program IDs
