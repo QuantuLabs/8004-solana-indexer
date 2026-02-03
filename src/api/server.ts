@@ -257,10 +257,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       const endpoint = parsePostgRESTValue(req.query.endpoint);
       const orFilterRaw = safeQueryString(req.query.or); // Handle OR filter for tag search
       const orFilter = orFilterRaw && orFilterRaw.length <= 200 ? orFilterRaw : undefined; // Limit filter length
-      const limitStr = safeQueryString(req.query.limit);
-      const offsetStr = safeQueryString(req.query.offset);
-      const limit = Math.min(limitStr ? parseInt(limitStr) : 100, MAX_LIMIT);
-      const offset = offsetStr ? parseInt(offsetStr) : 0;
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const where: any = { ...buildStatusFilter(req) };
