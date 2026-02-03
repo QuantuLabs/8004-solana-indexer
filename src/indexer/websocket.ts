@@ -99,7 +99,14 @@ export class WebSocketIndexer {
     if (this.logQueue.size > 0) {
       logger.info({ queueSize: this.logQueue.size }, "Draining log queue before shutdown");
       this.logQueue.pause();
-      this.logQueue.clear();
+      const drainTimeout = 5000;
+      const drainPromise = this.logQueue.onIdle();
+      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, drainTimeout));
+      await Promise.race([drainPromise, timeoutPromise]);
+      if (this.logQueue.size > 0) {
+        logger.warn({ remaining: this.logQueue.size }, "Queue drain timeout, clearing remaining items");
+        this.logQueue.clear();
+      }
     }
   }
 
