@@ -272,7 +272,13 @@ export class Poller {
       if (!this.isRunning) break;
 
       const sigs = bySlot.get(slot)!;
-      const txIndexMap = await this.getTxIndexMap(slot, sigs);
+      let txIndexMap: Map<string, number>;
+      try {
+        txIndexMap = await this.getTxIndexMap(slot, sigs);
+      } catch (error) {
+        logger.warn({ slot, error: error instanceof Error ? error.message : String(error) }, "Failed to get tx index map, using default order");
+        txIndexMap = new Map(sigs.map((s, i) => [s.signature, i]));
+      }
 
       const sigsWithIndex = sigs.map(sig => ({
         sig,
