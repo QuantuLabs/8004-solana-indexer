@@ -7,7 +7,7 @@ import express, { Express, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { LRUCache } from 'lru-cache';
 import { Server } from 'http';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { logger } from '../logger.js';
 import { decompressFromStorage } from '../utils/compression.js';
 
@@ -208,8 +208,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.AgentWhereInput = { ...buildStatusFilter(req) };
       if (id) where.id = id;
       if (owner) where.owner = owner;
       if (collection) where.collection = collection;
@@ -260,8 +259,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.FeedbackWhereInput = { ...buildStatusFilter(req) };
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
       if (feedback_index_in) {
@@ -344,8 +342,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.FeedbackResponseWhereInput = { ...buildStatusFilter(req) };
 
       if (feedback_id) {
         where.feedbackId = feedback_id;
@@ -437,8 +434,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.RevocationWhereInput = { ...buildStatusFilter(req) };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
 
@@ -487,8 +483,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req, 'chainStatus') };
+      const where: Prisma.ValidationWhereInput = { ...buildStatusFilter(req, 'chainStatus') };
       if (asset) where.agentId = asset;
       if (validator) where.validator = validator;
       if (nonce !== undefined) {
@@ -543,8 +538,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.RegistryWhereInput = { ...buildStatusFilter(req) };
       if (collection) where.collection = collection;
 
       const registries = await prisma.registry.findMany({
@@ -744,8 +738,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const requestedLimit = safePaginationLimit(req.query.limit);
       const limit = Math.min(requestedLimit, MAX_METADATA_LIMIT);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const where: any = { ...buildStatusFilter(req) };
+      const where: Prisma.AgentMetadataWhereInput = { ...buildStatusFilter(req) };
       if (asset) where.agentId = asset;
       if (key) where.key = key;
 

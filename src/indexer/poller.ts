@@ -15,7 +15,10 @@ import { BatchRpcFetcher, EventBuffer } from "./batch-processor.js";
 const logger = createChildLogger("poller");
 
 // Batch processing configuration
-const USE_BATCH_MODE = config.dbMode === "supabase"; // Enable for Supabase mode
+// Batch RPC fetching: enabled for ALL modes (has built-in fallback)
+// Batch DB writes: only for Supabase mode (uses raw SQL)
+const USE_BATCH_RPC = true;
+const USE_BATCH_DB = config.dbMode === "supabase";
 
 export interface PollerOptions {
   connection: Connection;
@@ -53,12 +56,17 @@ export class Poller {
     this.pollingInterval = options.pollingInterval || config.pollingInterval;
     this.batchSize = options.batchSize || config.batchSize;
 
-    // Initialize batch processing for Supabase mode
-    if (USE_BATCH_MODE) {
+    // Initialize batch RPC fetcher (always enabled, has built-in fallback)
+    if (USE_BATCH_RPC) {
       this.batchFetcher = new BatchRpcFetcher(this.connection);
+      logger.info("Batch RPC fetching enabled (with fallback)");
+    }
+
+    // Initialize batch DB writer (Supabase mode only)
+    if (USE_BATCH_DB) {
       const pool = getPool();
       this.eventBuffer = new EventBuffer(pool, this.prisma);
-      logger.info("Batch processing mode enabled (RPC batch + DB batch)");
+      logger.info("Batch DB writes enabled (PostgreSQL)");
     }
   }
 
@@ -247,11 +255,10 @@ export class Poller {
   ): Promise<number> {
     const startTime = Date.now();
 
-    // BATCH MODE: Fetch all transactions in batch first
+    // BATCH RPC: Fetch all transactions in batch first (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
-    if (USE_BATCH_MODE && this.batchFetcher) {
+    if (USE_BATCH_RPC && this.batchFetcher) {
       const sigList = signatures.map(s => s.signature);
-      // Fetch in chunks of BATCH_RPC_SIZE for better throughput
       txCache = await this.batchFetcher.fetchTransactions(sigList);
       logger.debug({ requested: sigList.length, fetched: txCache.size }, "Batch RPC fetch complete");
     }
@@ -289,15 +296,15 @@ export class Poller {
         if (!this.isRunning) break;
 
         try {
-          // BATCH MODE: Use cached transaction if available
-          if (USE_BATCH_MODE && txCache) {
+          // Use cached transaction from batch RPC if available
+          if (USE_BATCH_RPC && txCache) {
             await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
           } else {
             await this.processTransaction(sig, txIndex);
           }
           this.lastSignature = sig.signature;
-          // Skip individual cursor saves in batch mode - handled by EventBuffer flush
-          if (!USE_BATCH_MODE) {
+          // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
+          if (!USE_BATCH_DB) {
             await this.saveState(sig.signature, BigInt(sig.slot));
           }
           processed++;
@@ -309,7 +316,8 @@ export class Poller {
               processed: previousCount + processed,
               total: totalEstimate,
               rate: `${Math.round(processed / elapsed)} tx/s`,
-              batchMode: USE_BATCH_MODE
+              batchRpc: USE_BATCH_RPC,
+              batchDb: USE_BATCH_DB
             }, "Backfill progress");
           }
         } catch (error) {
@@ -323,8 +331,8 @@ export class Poller {
       }
     }
 
-    // BATCH MODE: Flush remaining events at end of batch
-    if (USE_BATCH_MODE && this.eventBuffer && this.eventBuffer.size > 0) {
+    // BATCH DB: Flush remaining events at end of batch
+    if (USE_BATCH_DB && this.eventBuffer && this.eventBuffer.size > 0) {
       await this.eventBuffer.flush();
     }
 
@@ -473,14 +481,14 @@ export class Poller {
       return;
     }
 
-    logger.info({ count: signatures.length, batchMode: USE_BATCH_MODE }, "Processing transactions");
+    logger.info({ count: signatures.length, batchRpc: USE_BATCH_RPC, batchDb: USE_BATCH_DB }, "Processing transactions");
 
     // Reverse to process oldest first
     const reversed = signatures.reverse();
 
-    // BATCH MODE: Pre-fetch all transactions in batch
+    // BATCH RPC: Pre-fetch all transactions in batch (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
-    if (USE_BATCH_MODE && this.batchFetcher && reversed.length > 1) {
+    if (USE_BATCH_RPC && this.batchFetcher && reversed.length > 1) {
       const sigList = reversed.map(s => s.signature);
       txCache = await this.batchFetcher.fetchTransactions(sigList);
       logger.debug({ requested: sigList.length, fetched: txCache.size }, "Live poll batch RPC fetch");
@@ -511,15 +519,15 @@ export class Poller {
       let batchFailed = false;
       for (const { sig, txIndex } of sigsWithIndex) {
         try {
-          // BATCH MODE: Use cached transaction and buffer
-          if (USE_BATCH_MODE && txCache) {
+          // Use cached transaction from batch RPC if available
+          if (USE_BATCH_RPC && txCache) {
             await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
           } else {
             await this.processTransaction(sig, txIndex);
           }
           this.lastSignature = sig.signature;
-          // Skip individual cursor saves in batch mode - handled by EventBuffer flush
-          if (!USE_BATCH_MODE) {
+          // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
+          if (!USE_BATCH_DB) {
             await this.saveState(sig.signature, BigInt(sig.slot));
           }
           this.processedCount++;
@@ -550,8 +558,8 @@ export class Poller {
       }
     }
 
-    // BATCH MODE: Flush events after processing all transactions
-    if (USE_BATCH_MODE && this.eventBuffer && this.eventBuffer.size > 0) {
+    // BATCH DB: Flush events after processing all transactions
+    if (USE_BATCH_DB && this.eventBuffer && this.eventBuffer.size > 0) {
       await this.eventBuffer.flush();
     }
 

@@ -39,6 +39,9 @@ const DEFAULT_STATUS: ChainStatus = "PENDING";
 // Type alias for Prisma transaction client
 type PrismaTransactionClient = Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends">;
 
+// Union type for handlers that work with both PrismaClient and transaction client
+type PrismaClientOrTx = PrismaClient | PrismaTransactionClient;
+
 // Standard URI fields - never compressed for fast reads (parity with supabase.ts)
 // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
 const STANDARD_URI_FIELDS = new Set([
@@ -193,7 +196,7 @@ async function handleEventInner(
 ): Promise<void> {
   switch (event.type) {
     case "AgentRegisteredInRegistry":
-      await handleAgentRegisteredTx(tx, event.data, ctx);
+      await handleAgentRegisteredCore(tx, event.data, ctx);
       break;
     case "AgentOwnerSynced":
       await handleAgentOwnerSyncedTx(tx, event.data, ctx);
@@ -320,16 +323,16 @@ export async function handleEvent(
   }
 }
 
-// Transaction-aware handler (for atomic ingestion)
-async function handleAgentRegisteredTx(
-  tx: PrismaTransactionClient,
+// Core handler that works with both PrismaClient and transaction client
+async function handleAgentRegisteredCore(
+  client: PrismaClientOrTx,
   data: AgentRegisteredInRegistry,
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
 
-  await tx.agent.upsert({
+  await client.agent.upsert({
     where: { id: assetId },
     create: {
       id: assetId,
@@ -354,37 +357,15 @@ async function handleAgentRegisteredTx(
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 }
 
+// Non-atomic wrapper with URI digest side effect
 async function handleAgentRegistered(
   prisma: PrismaClient,
   data: AgentRegisteredInRegistry,
   ctx: EventContext
 ): Promise<void> {
+  await handleAgentRegisteredCore(prisma, data, ctx);
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
-
-  await prisma.agent.upsert({
-    where: { id: assetId },
-    create: {
-      id: assetId,
-      owner: data.owner.toBase58(),
-      uri: agentUri,
-      nftName: "",
-      collection: data.collection.toBase58(),
-      registry: data.registry.toBase58(),
-      atomEnabled: data.atomEnabled,
-      createdTxSignature: ctx.signature,
-      createdSlot: ctx.slot,
-      status: DEFAULT_STATUS,
-    },
-    update: {
-      collection: data.collection.toBase58(),
-      registry: data.registry.toBase58(),
-      atomEnabled: data.atomEnabled,
-      uri: agentUri,
-    },
-  });
-
-  logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
   // Trigger URI metadata extraction if configured and URI is present
   // Uses bounded queue to prevent OOM from unbounded concurrent fetches

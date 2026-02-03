@@ -86,9 +86,9 @@ export class Processor {
     logger.info("Stopping processor");
     this.isRunning = false;
 
-    // Clean up WebSocket monitor interval
+    // Clean up WebSocket monitor timeout
     if (this.wsMonitorInterval) {
-      clearInterval(this.wsMonitorInterval);
+      clearTimeout(this.wsMonitorInterval);
       this.wsMonitorInterval = null;
     }
 
@@ -153,55 +153,63 @@ export class Processor {
   }
 
   private monitorWebSocket(): void {
-    // Clean up any existing interval before creating new one
+    // Clean up any existing timeout before creating new one
     if (this.wsMonitorInterval) {
-      clearInterval(this.wsMonitorInterval);
+      clearTimeout(this.wsMonitorInterval);
+      this.wsMonitorInterval = null;
     }
 
-    this.wsMonitorInterval = setInterval(async () => {
-      // Reentrancy guard - skip if previous tick still running
-      if (this.wsMonitorInProgress) {
+    const scheduleNextCheck = () => {
+      if (!this.isRunning) return;
+      this.wsMonitorInterval = setTimeout(() => this.runWebSocketCheck(), 10000);
+    };
+
+    scheduleNextCheck();
+  }
+
+  private async runWebSocketCheck(): Promise<void> {
+    // Skip if not running or previous check still in progress
+    if (!this.isRunning || this.wsMonitorInProgress) {
+      this.scheduleNextWsCheck();
+      return;
+    }
+
+    if (this.wsIndexer && !this.wsIndexer.isActive()) {
+      // Check if WS is in self-healing mode (reconnecting/health-checking)
+      if (this.wsIndexer.isRecovering()) {
+        logger.debug("WebSocket in recovery mode, waiting for self-heal");
+        this.scheduleNextWsCheck();
         return;
       }
 
-      if (!this.isRunning) {
-        if (this.wsMonitorInterval) {
-          clearInterval(this.wsMonitorInterval);
-          this.wsMonitorInterval = null;
+      this.wsMonitorInProgress = true;
+      try {
+        logger.warn("WebSocket connection lost and not recovering, relying on polling");
+
+        // Switch to faster polling when WS is down
+        if (this.poller) {
+          await this.poller.stop();
+          this.poller = new Poller({
+            connection: this.connection,
+            prisma: this.prisma,
+            programId: this.programId,
+            pollingInterval: config.pollingInterval,
+          });
+          await this.poller.start();
         }
-        return;
+      } catch (error) {
+        logger.error({ error }, "Error in WebSocket monitor fallback");
+      } finally {
+        this.wsMonitorInProgress = false;
       }
+    }
 
-      if (this.wsIndexer && !this.wsIndexer.isActive()) {
-        // Check if WS is in self-healing mode (reconnecting/health-checking)
-        // Don't kill it during recovery - give it a chance to reconnect
-        if (this.wsIndexer.isRecovering()) {
-          logger.debug("WebSocket in recovery mode, waiting for self-heal");
-          return;
-        }
+    this.scheduleNextWsCheck();
+  }
 
-        this.wsMonitorInProgress = true;
-        try {
-          logger.warn("WebSocket connection lost and not recovering, relying on polling");
-
-          // Switch to faster polling when WS is down
-          if (this.poller) {
-            await this.poller.stop();
-            this.poller = new Poller({
-              connection: this.connection,
-              prisma: this.prisma,
-              programId: this.programId,
-              pollingInterval: config.pollingInterval,
-            });
-            await this.poller.start();
-          }
-        } catch (error) {
-          logger.error({ error }, "Error in WebSocket monitor fallback");
-        } finally {
-          this.wsMonitorInProgress = false;
-        }
-      }
-    }, 10000);
+  private scheduleNextWsCheck(): void {
+    if (!this.isRunning) return;
+    this.wsMonitorInterval = setTimeout(() => this.runWebSocketCheck(), 10000);
   }
 
   getStatus(): {
