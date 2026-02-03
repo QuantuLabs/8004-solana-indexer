@@ -6,6 +6,34 @@ export type DbMode = "local" | "supabase";
 export type MetadataIndexMode = "off" | "normal" | "full";
 export type ChainStatus = "PENDING" | "FINALIZED" | "ORPHANED";
 
+const VALID_DB_MODES: DbMode[] = ["local", "supabase"];
+const VALID_INDEXER_MODES: IndexerMode[] = ["auto", "polling", "websocket"];
+const VALID_METADATA_MODES: MetadataIndexMode[] = ["off", "normal", "full"];
+
+function parseDbMode(value: string | undefined): DbMode {
+  const mode = value || "local";
+  if (!VALID_DB_MODES.includes(mode as DbMode)) {
+    throw new Error(`Invalid DB_MODE '${mode}'. Must be one of: ${VALID_DB_MODES.join(", ")}`);
+  }
+  return mode as DbMode;
+}
+
+function parseIndexerMode(value: string | undefined): IndexerMode {
+  const mode = value || "auto";
+  if (!VALID_INDEXER_MODES.includes(mode as IndexerMode)) {
+    throw new Error(`Invalid INDEXER_MODE '${mode}'. Must be one of: ${VALID_INDEXER_MODES.join(", ")}`);
+  }
+  return mode as IndexerMode;
+}
+
+function parseMetadataMode(value: string | undefined): MetadataIndexMode {
+  const mode = value || "normal";
+  if (!VALID_METADATA_MODES.includes(mode as MetadataIndexMode)) {
+    throw new Error(`Invalid INDEX_METADATA '${mode}'. Must be one of: ${VALID_METADATA_MODES.join(", ")}`);
+  }
+  return mode as MetadataIndexMode;
+}
+
 /**
  * Runtime configuration (populated at startup from on-chain data via SDK)
  */
@@ -19,7 +47,7 @@ export const runtimeConfig: {
 
 export const config = {
   // Database mode: "local" (SQLite/Prisma) | "supabase" (PostgreSQL via Supabase)
-  dbMode: (process.env.DB_MODE || "local") as DbMode,
+  dbMode: parseDbMode(process.env.DB_MODE),
 
   // Local database (SQLite via Prisma)
   databaseUrl: process.env.DATABASE_URL || "file:./data/indexer.db",
@@ -38,7 +66,7 @@ export const config = {
 
   // Indexer mode: "auto" | "polling" | "websocket"
   // auto = tries WebSocket first, falls back to polling if unavailable
-  indexerMode: (process.env.INDEXER_MODE || "auto") as IndexerMode,
+  indexerMode: parseIndexerMode(process.env.INDEXER_MODE),
 
   // Polling config
   pollingInterval: parseInt(process.env.POLLING_INTERVAL || "5000", 10),
@@ -56,7 +84,7 @@ export const config = {
 
   // URI Metadata indexing (fetch and extract fields from agent_uri)
   // off = don't fetch URIs, normal = extract standard fields, full = store entire JSON
-  metadataIndexMode: (process.env.INDEX_METADATA || "normal") as MetadataIndexMode,
+  metadataIndexMode: parseMetadataMode(process.env.INDEX_METADATA),
   // Maximum bytes to fetch from URI (prevents memory exhaustion)
   metadataMaxBytes: parseInt(process.env.METADATA_MAX_BYTES || "262144", 10), // 256KB
   // Maximum bytes per field value (prevents single oversize field)
@@ -78,13 +106,7 @@ export const config = {
 } as const;
 
 export function validateConfig(): void {
-  if (!["auto", "polling", "websocket"].includes(config.indexerMode)) {
-    throw new Error("INDEXER_MODE must be 'auto', 'polling', or 'websocket'");
-  }
-
-  if (!["local", "supabase"].includes(config.dbMode)) {
-    throw new Error("DB_MODE must be 'local' or 'supabase'");
-  }
+  // Mode validations already done at parse time (parseDbMode, parseIndexerMode, parseMetadataMode)
 
   // Validate Supabase config when in supabase mode
   if (config.dbMode === "supabase") {
