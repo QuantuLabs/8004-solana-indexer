@@ -147,6 +147,10 @@ export class BatchRpcFetcher {
   }
 }
 
+// Retry configuration
+const MAX_FLUSH_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
 /**
  * Event Buffer - Accumulates events and flushes in batches
  */
@@ -157,12 +161,15 @@ export class EventBuffer {
   private pool: Pool | null = null;
   private prisma: PrismaClient | null = null;
   private lastCtx: BatchEvent["ctx"] | null = null;
+  private retryCount = 0;
+  private deadLetterQueue: BatchEvent[] = [];
 
   private stats = {
     eventsBuffered: 0,
     eventsFlushed: 0,
     flushCount: 0,
-    totalFlushTime: 0
+    totalFlushTime: 0,
+    deadLettered: 0
   };
 
   constructor(pool: Pool | null, prisma: PrismaClient | null) {
@@ -228,13 +235,43 @@ export class EventBuffer {
       }, "Batch flush complete");
 
     } catch (error) {
-      logger.error({ error, eventCount: eventsToFlush.length }, "Batch flush failed");
-      // Re-add events to buffer for retry
-      this.buffer = [...eventsToFlush, ...this.buffer];
-      throw error;
+      this.retryCount++;
+      logger.error({ error, eventCount: eventsToFlush.length, retryCount: this.retryCount }, "Batch flush failed");
+
+      if (this.retryCount >= MAX_FLUSH_RETRIES) {
+        // Move to dead letter queue after max retries (poison pill protection)
+        logger.warn({
+          eventCount: eventsToFlush.length,
+          retryCount: this.retryCount
+        }, "Max retries exceeded, moving events to dead letter queue");
+        this.deadLetterQueue.push(...eventsToFlush);
+        this.stats.deadLettered += eventsToFlush.length;
+        this.retryCount = 0;
+        // Don't re-throw - continue processing new events
+      } else {
+        // Re-add events to buffer for retry (limited retries)
+        this.buffer = [...eventsToFlush, ...this.buffer];
+        // Wait before next retry
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * this.retryCount));
+        throw error;
+      }
     } finally {
       this.flushInProgress = false;
     }
+  }
+
+  /**
+   * Get dead letter queue events (for manual inspection/replay)
+   */
+  getDeadLetterQueue(): BatchEvent[] {
+    return [...this.deadLetterQueue];
+  }
+
+  /**
+   * Clear dead letter queue after manual handling
+   */
+  clearDeadLetterQueue(): void {
+    this.deadLetterQueue = [];
   }
 
   /**
