@@ -21,9 +21,13 @@ const BATCH_SIZE_DB = 500;         // Max events per DB transaction
 const FLUSH_INTERVAL_MS = 500;     // Flush every 500ms even if batch not full
 const MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
 
+// EventData type for batch event data - uses Record for type safety while allowing runtime values
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type EventData = Record<string, any>;
+
 export interface BatchEvent {
   type: string;
-  data: Record<string, unknown>;
+  data: EventData;
   ctx: {
     signature: string;
     slot: bigint;
@@ -359,7 +363,7 @@ export class EventBuffer {
   }
 
   // Supabase insert helpers
-  private async insertAgentSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertAgentSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const owner = data.owner?.toBase58?.() || data.owner;
     const collection = data.collection?.toBase58?.() || data.collection;
@@ -378,7 +382,7 @@ export class EventBuffer {
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
-  private async insertFeedbackSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertFeedbackSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const client_addr = data.clientAddress?.toBase58?.() || data.clientAddress;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
@@ -397,7 +401,7 @@ export class EventBuffer {
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
-  private async insertRevocationSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertRevocationSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const client_addr = data.clientAddress?.toBase58?.() || data.clientAddress;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
@@ -408,7 +412,7 @@ export class EventBuffer {
     `, [ctx.blockTime.toISOString(), asset, client_addr, feedbackIndex.toString()]);
   }
 
-  private async insertResponseSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertResponseSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const client_addr = data.client?.toBase58?.() || data.client;
     const responder = data.responder?.toBase58?.() || data.responder;
@@ -424,7 +428,7 @@ export class EventBuffer {
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
-  private async insertValidationRequestSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertValidationRequestSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const validator = data.validatorAddress?.toBase58?.() || data.validatorAddress;
     const requester = data.requester?.toBase58?.() || data.requester;
@@ -440,7 +444,7 @@ export class EventBuffer {
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
-  private async updateValidationResponseSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
+  private async updateValidationResponseSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const validator = data.validatorAddress?.toBase58?.() || data.validatorAddress;
     const nonce = BigInt(data.nonce?.toString() || "0");
@@ -454,7 +458,7 @@ export class EventBuffer {
         data.tag || "", asset, validator, nonce.toString()]);
   }
 
-  private async insertCollectionSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"], type: string): Promise<void> {
+  private async insertCollectionSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"], type: string): Promise<void> {
     const collection = data.collection?.toBase58?.() || data.collection;
     const authority = type === "BaseRegistryCreated"
       ? (data.createdBy?.toBase58?.() || data.createdBy)
@@ -468,14 +472,14 @@ export class EventBuffer {
     `, [collection, registryType, authority, ctx.blockTime.toISOString()]);
   }
 
-  private async updateAgentUriSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
+  private async updateAgentUriSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     await client.query(`
       UPDATE agents SET agent_uri = $1, updated_at = NOW() WHERE asset = $2
     `, [data.newUri || "", asset]);
   }
 
-  private async updateAgentWalletSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
+  private async updateAgentWalletSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const wallet = data.newWallet?.toBase58?.() || data.newWallet;
     await client.query(`
@@ -483,14 +487,14 @@ export class EventBuffer {
     `, [wallet, asset]);
   }
 
-  private async updateAtomEnabledSupabase(client: PoolClient, data: any, _ctx: BatchEvent["ctx"]): Promise<void> {
+  private async updateAtomEnabledSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     await client.query(`
       UPDATE agents SET atom_enabled = true, updated_at = NOW() WHERE asset = $1
     `, [asset]);
   }
 
-  private async insertMetadataSupabase(client: PoolClient, data: any, ctx: BatchEvent["ctx"]): Promise<void> {
+  private async insertMetadataSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const key = data.key || "";
     const value = data.value ? Buffer.from(data.value).toString("utf8") : "";
