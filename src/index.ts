@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import { Connection } from "@solana/web3.js";
+import { Server } from "http";
 import { getBaseCollection } from "8004-solana";
 import { config, validateConfig, runtimeConfig } from "./config.js";
 import { logger } from "./logger.js";
@@ -79,9 +80,10 @@ async function main() {
   await processor.start();
 
   // Start REST API server in local mode
+  let apiServer: Server | null = null;
   if (config.dbMode === "local" && prisma) {
     const apiPort = parseInt(process.env.API_PORT || "3001");
-    await startApiServer({ prisma, port: apiPort });
+    apiServer = await startApiServer({ prisma, port: apiPort });
     logger.info({ apiPort }, "REST API available at http://localhost:" + apiPort + "/rest/v1");
   }
 
@@ -90,6 +92,12 @@ async function main() {
 
     try {
       await processor.stop();
+      if (apiServer) {
+        await new Promise<void>((resolve, reject) => {
+          apiServer!.close((err) => err ? reject(err) : resolve());
+        });
+        logger.info("API server closed");
+      }
       if (prisma) {
         await prisma.$disconnect();
       }

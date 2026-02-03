@@ -6,6 +6,7 @@
 import express, { Express, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { LRUCache } from 'lru-cache';
+import { Server } from 'http';
 import { PrismaClient } from '@prisma/client';
 import { logger } from '../logger.js';
 import { decompressFromStorage } from '../utils/compression.js';
@@ -885,14 +886,14 @@ export function createApiServer(options: ApiServerOptions): Express {
   return app;
 }
 
-export async function startApiServer(options: ApiServerOptions): Promise<void> {
+export async function startApiServer(options: ApiServerOptions): Promise<Server> {
   const { port = 3001 } = options;
   const app = createApiServer(options);
 
   return new Promise((resolve) => {
-    app.listen(port, () => {
+    const server = app.listen(port, () => {
       logger.info({ port }, 'REST API server started');
-      resolve();
+      resolve(server);
     });
   });
 }
