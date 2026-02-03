@@ -195,6 +195,8 @@ export class Processor {
             });
             await this.poller.start();
           }
+        } catch (error) {
+          logger.error({ error }, "Error in WebSocket monitor fallback");
         } finally {
           this.wsMonitorInProgress = false;
         }
