@@ -14,6 +14,7 @@ docs/SECURITY_AUDIT.md
 docs/*AUDIT*.md
 docs/*PLAN*.md
 REORG_RESILIENCE_PLAN.md
+deploy/
 
 # IDE
 .vscode/
