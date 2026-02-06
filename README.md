@@ -5,8 +5,10 @@ A lightweight, self-hosted Solana indexer for the [8004 Agent Registry](https://
 ## Features
 
 - **Dual-mode indexing**: WebSocket (real-time) + polling (fallback)
-- **14 Anchor event types** indexed (Identity, Reputation, Validation)
+- **13 Anchor event types** indexed (Identity, Reputation, Validation)
 - **v0.5.0 feedback fields**: `value` (i64), `valueDecimals` (0-6), nullable `score`
+- **Metadata queue**: Background URI fetching with concurrent processing
+- **REST API** with PostgREST-compatible query format
 - **GraphQL API** with built-in GraphiQL explorer
 - **Works with any Solana RPC** (Helius, QuickNode, public devnet)
 - **Zero external dependencies**: SQLite included, just Node.js required
@@ -119,7 +121,7 @@ query {
 | `agents(owner, collection, registry, limit, offset, orderBy)` | List agents with filters |
 | `feedbacks(agentId, client, minScore, maxScore, tag, revoked)` | List feedbacks |
 | `validations(agentId, validator, requester, pending)` | List validations |
-| `registries(registryType, authority)` | List registries |
+| `registries(collection)` | List collections |
 | `stats` | Indexer statistics |
 | `indexerStatus` | Indexer health status |
 | `searchAgents(query, limit)` | Search agents |
@@ -128,9 +130,30 @@ query {
 
 | Category | Events |
 |----------|--------|
-| **Identity** | AgentRegisteredInRegistry, AgentOwnerSynced, UriUpdated, WalletUpdated, MetadataSet, MetadataDeleted, BaseRegistryCreated, UserRegistryCreated |
+| **Identity** | AgentRegistered, AtomEnabled, AgentOwnerSynced, UriUpdated, WalletUpdated, MetadataSet, MetadataDeleted, RegistryInitialized |
 | **Reputation** | NewFeedback, FeedbackRevoked, ResponseAppended |
 | **Validation** | ValidationRequested, ValidationResponded |
+
+## REST API
+
+The indexer also exposes a REST API with PostgREST-compatible query format at `http://localhost:3001/rest/v1/`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /rest/v1/agents` | List agents (filter by owner, collection, wallet) |
+| `GET /rest/v1/feedbacks` | List feedbacks (filter by asset, client, tag, revoked) |
+| `GET /rest/v1/responses` | List feedback responses |
+| `GET /rest/v1/revocations` | List revocations |
+| `GET /rest/v1/validations` | List validations |
+| `GET /rest/v1/registries` | List collections |
+| `GET /rest/v1/collection_stats` | Collection-level statistics |
+| `GET /rest/v1/stats` | Global stats (agents, feedbacks, collections) |
+| `GET /rest/v1/stats/verification` | Verification status breakdown |
+| `GET /rest/v1/metadata` | Agent metadata entries |
+| `GET /rest/v1/leaderboard` | Top agents by reputation score |
+| `GET /health` | Health check |
+
+Supports `limit`, `offset` pagination and PostgREST-style filters (e.g., `?owner=eq.ADDRESS`). Use `Prefer: count=exact` header for total counts.
 
 ## Development
 
@@ -144,7 +167,7 @@ npm run db:studio     # Open Prisma Studio GUI
 
 ```
 src/
-├── api/        # GraphQL server and resolvers
+├── api/        # GraphQL + REST servers and resolvers
 ├── db/         # Database handlers
 ├── indexer/    # Poller, WebSocket, Processor
 ├── parser/     # Anchor event decoder
