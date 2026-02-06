@@ -30,7 +30,7 @@ describe("Parser Decoder", () => {
   describe("IDL loading", () => {
     it("should load IDL successfully", () => {
       expect(idl).toBeDefined();
-      expect(idl.address).toBe("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
+      expect(idl.address).toBe("8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm");
     });
 
     it("should have events defined in IDL", () => {

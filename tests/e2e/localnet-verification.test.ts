@@ -25,7 +25,7 @@ import * as path from "path";
 
 // Localnet RPC
 const LOCALNET_RPC = "http://localhost:8899";
-const PROGRAM_ID = new PublicKey("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
+const PROGRAM_ID = new PublicKey("8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm");
 const MPL_CORE_PROGRAM_ID = new PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
 
 // Load IDL

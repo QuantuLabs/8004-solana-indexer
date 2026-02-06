@@ -38,7 +38,7 @@ describe("Config", () => {
       expect(config.rpcUrl).toBe("https://api.devnet.solana.com");
       expect(config.wsUrl).toBe("wss://api.devnet.solana.com");
       // programId comes from SDK (PROGRAM_ID.toBase58()), not env var
-      expect(config.programId).toBe("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
+      expect(config.programId).toBe("8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm");
       expect(config.indexerMode).toBe("auto");
       expect(config.pollingInterval).toBe(5000);
       expect(config.batchSize).toBe(100);
@@ -64,7 +64,7 @@ describe("Config", () => {
       expect(config.rpcUrl).toBe("https://custom.rpc.com");
       expect(config.wsUrl).toBe("wss://custom.ws.com");
       // programId always comes from SDK, not configurable via env
-      expect(config.programId).toBe("8oo4SbcgjRBAXjmGU4YMcdFqfeLLrtn7n6f358PkAc3N");
+      expect(config.programId).toBe("8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm");
       expect(config.indexerMode).toBe("polling");
       expect(config.pollingInterval).toBe(10000);
       expect(config.batchSize).toBe(200);
