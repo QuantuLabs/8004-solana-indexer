@@ -655,7 +655,7 @@ export class DataVerifier {
     const needsAgentCheck: typeof pending = [];
 
     for (const r of pending) {
-      if (r.feedbackStatus === "ORPHANED") {
+      if (r.feedbackStatus === "ORPHANED" || !r.feedbackStatus) {
         orphanedResponses.push(r);
       } else {
         needsAgentCheck.push(r);

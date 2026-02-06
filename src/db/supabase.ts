@@ -532,16 +532,19 @@ async function handleNewFeedbackTx(
   const feedbackHash = (data.sealHash && !isAllZeroHash)
     ? Buffer.from(data.sealHash).toString("hex")
     : null;
+  const runningDigest = data.newFeedbackDigest
+    ? Buffer.from(data.newFeedbackDigest).toString("hex")
+    : null;
   const insertResult = await client.query(
     `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-       is_revoked, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+       running_digest, is_revoked, block_slot, tx_index, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
      ON CONFLICT (id) DO NOTHING`,
     [
       id, assetId, clientAddress, data.feedbackIndex.toString(),
       data.value.toString(), data.valueDecimals, data.score,
       data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
-      feedbackHash,
+      feedbackHash, runningDigest,
       false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
     ]
   );
@@ -632,6 +635,25 @@ async function handleFeedbackRevokedTx(
      WHERE id = $2`,
     [ctx.blockTime.toISOString(), id]
   );
+
+  const isOrphan = feedbackCheck.rowCount === 0;
+  const revokeDigest = data.newRevokeDigest
+    ? Buffer.from(data.newRevokeDigest).toString("hex")
+    : null;
+  const revokeSealHash = (data.sealHash && !data.sealHash.every(b => b === 0))
+    ? Buffer.from(data.sealHash).toString("hex")
+    : null;
+  const revokeId = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
+  await client.query(
+    `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     ON CONFLICT (asset, client_address, feedback_index) DO NOTHING`,
+    [revokeId, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
+     data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
+     revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
+     isOrphan ? "ORPHANED" : DEFAULT_STATUS]
+  );
+
   const baseUpdate = `
     feedback_count = COALESCE((
       SELECT COUNT(*)::int
@@ -662,7 +684,7 @@ async function handleFeedbackRevokedTx(
       [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
     );
   }
-  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: feedbackCheck.rowCount === 0 }, "Feedback revoked");
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
 }
 
 async function handleResponseAppendedTx(
@@ -683,16 +705,19 @@ async function handleResponseAppendedTx(
   const responseHash = (data.responseHash && !isAllZeroHash)
     ? Buffer.from(data.responseHash).toString("hex")
     : null;
+  const responseRunningDigest = data.newResponseDigest
+    ? Buffer.from(data.newResponseDigest).toString("hex")
+    : null;
 
   if (feedbackCheck.rowCount === 0) {
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
     await client.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash,
+       responseHash, responseRunningDigest,
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
@@ -712,11 +737,11 @@ async function handleResponseAppendedTx(
   }
 
   await client.query(
-    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (id) DO NOTHING`,
     [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-     responseHash,
+     responseHash, responseRunningDigest,
      ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
@@ -985,17 +1010,20 @@ async function handleNewFeedback(
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
 
+    const runningDigest = data.newFeedbackDigest
+      ? Buffer.from(data.newFeedbackDigest).toString("hex")
+      : null;
     const insertResult = await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-         is_revoked, block_slot, tx_index, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         running_digest, is_revoked, block_slot, tx_index, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        ON CONFLICT (id) DO NOTHING`,
       [
         id, assetId, clientAddress, data.feedbackIndex.toString(),
         data.value.toString(), data.valueDecimals, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
-        feedbackHash,
-        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()
+        feedbackHash, runningDigest,
+        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
       ]
     );
 
@@ -1094,6 +1122,23 @@ async function handleFeedbackRevoked(
       [ctx.blockTime.toISOString(), id]
     );
 
+    const isOrphan = feedbackCheck.rowCount === 0;
+    const revokeDigest = data.newRevokeDigest
+      ? Buffer.from(data.newRevokeDigest).toString("hex")
+      : null;
+    const revokeSealHash = (data.sealHash && !data.sealHash.every(b => b === 0))
+      ? Buffer.from(data.sealHash).toString("hex")
+      : null;
+    await db.query(
+      `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (asset, client_address, feedback_index) DO NOTHING`,
+      [id, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
+       data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
+       revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
+       isOrphan ? "ORPHANED" : DEFAULT_STATUS]
+    );
+
     const baseUpdate = `
       feedback_count = COALESCE((
         SELECT COUNT(*)::int
@@ -1127,7 +1172,7 @@ async function handleFeedbackRevoked(
       );
     }
 
-    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: feedbackCheck.rowCount === 0 }, "Feedback revoked");
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to revoke feedback");
   }
@@ -1153,16 +1198,19 @@ async function handleResponseAppended(
     const responseHash = (data.responseHash && !isAllZeroHash)
       ? Buffer.from(data.responseHash).toString("hex")
       : null;
+    const responseRunningDigest = data.newResponseDigest
+      ? Buffer.from(data.newResponseDigest).toString("hex")
+      : null;
 
     if (feedbackCheck.rowCount === 0) {
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
       await db.query(
-        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (id) DO NOTHING`,
         [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-         responseHash,
+         responseHash, responseRunningDigest,
          ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
       );
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
@@ -1182,11 +1230,11 @@ async function handleResponseAppended(
     }
 
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash,
+       responseHash, responseRunningDigest,
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");

@@ -7,6 +7,7 @@ import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
 import { startApiServer } from "./api/server.js";
 import { cleanupOrphanResponses } from "./db/handlers.js";
+import { getPool } from "./db/supabase.js";
 import { IDL_VERSION, IDL_PROGRAM_ID } from "./parser/decoder.js";
 
 async function main() {
@@ -75,7 +76,8 @@ async function main() {
     );
   }
 
-  const processor = new Processor(prisma);
+  const pool = config.dbMode === "supabase" ? getPool() : null;
+  const processor = new Processor(prisma, pool);
 
   await processor.start();
 
