@@ -81,10 +81,6 @@ export class DataVerifier {
     private verifyIntervalMs = config.verifyIntervalMs
   ) {}
 
-  private get isSupabaseMode(): boolean {
-    return this.prisma === null && this.pool !== null;
-  }
-
   async start(): Promise<void> {
     if (!config.verificationEnabled) {
       logger.info("Verification disabled via config");
@@ -234,7 +230,7 @@ export class DataVerifier {
   }
 
   private async verifyValidations(cutoffSlot: bigint): Promise<void> {
-    let pending: Array<{ id: string; agentId: string; validator: string; nonce: number }>;
+    let pending: Array<{ id: string; agentId: string; validator: string; nonce: bigint }>;
 
     if (this.prisma) {
       pending = await this.prisma.validation.findMany({
