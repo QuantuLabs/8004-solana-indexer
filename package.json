@@ -39,7 +39,7 @@
     "@supabase/supabase-js": "^2.49.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "8004-solana": "github:QuantuLabs/8004-solana-ts#main",
+    "8004-solana": "github:QuantuLabs/8004-solana-ts#v0.6.0",
     "bs58": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^16.4.7",
