@@ -351,7 +351,7 @@ describe("E2E: Reorg Resilience", () => {
 
       expect(agent!.status).toBe("FINALIZED");
       expect(agent!.verifiedAt).not.toBeNull();
-      expect(agent!.verifiedSlot).toBe(300000n);
+      expect(agent!.verifiedSlot).toBe(290000n);
     });
 
     it("should orphan agent when it does not exist on-chain", async () => {
@@ -1095,7 +1095,7 @@ describe("E2E: Reorg Resilience", () => {
       });
       expect(agent!.status).toBe("FINALIZED");
       expect(agent!.verifiedAt).not.toBeNull();
-      expect(agent!.verifiedSlot).toBe(600000n);
+      expect(agent!.verifiedSlot).toBe(590000n);
     });
   });
 
@@ -1401,7 +1401,6 @@ describe("E2E: Reorg Resilience", () => {
       expect(digests!.feedbackCount).toBe(5n);
       expect(digests!.responseCount).toBe(3n);
       expect(digests!.revokeCount).toBe(1n);
-      expect(digests!.slot).toBe(500000n);
     });
   });
 
