@@ -44,6 +44,8 @@ Edit `.env` to customize:
 | `PROGRAM_ID` | 8004 Agent Registry program ID | `8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm` |
 | `INDEXER_MODE` | `auto`, `polling`, or `websocket` | `auto` |
 | `GRAPHQL_PORT` | GraphQL server port | `4000` |
+| `TRUST_PROXY` | Express trust proxy setting (number or boolean) | `1` |
+| `ALLOW_INSECURE_URI` | Allow HTTP metadata URIs (insecure) | `false` |
 
 ### Using PostgreSQL (optional)
 
@@ -153,7 +155,7 @@ The indexer also exposes a REST API with PostgREST-compatible query format at `h
 | `GET /rest/v1/leaderboard` | Top agents by reputation score |
 | `GET /health` | Health check |
 
-Supports `limit`, `offset` pagination and PostgREST-style filters (e.g., `?owner=eq.ADDRESS`). Use `Prefer: count=exact` header for total counts.
+Supports `limit`, `offset` pagination and PostgREST-style filters (e.g., `?owner=eq.ADDRESS`). Use `Prefer: count=exact` header for total counts. The `status` parameter is validated and must be one of `PENDING`, `FINALIZED`, or `ORPHANED` (returns 400 for invalid values). Rate limiting is applied globally to all endpoints.
 
 ## Development
 

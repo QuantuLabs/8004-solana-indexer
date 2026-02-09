@@ -17,7 +17,7 @@ const logger = createChildLogger('compression');
 const COMPRESS_THRESHOLD = 256; // bytes
 const ZSTD_LEVEL = 3; // Good balance of speed and ratio
 // Security limits - prevent decompression bombs
-const MAX_COMPRESSED_SIZE = 100 * 1024; // 100KB compressed input limit (pre-decompression check)
+const MAX_COMPRESSED_SIZE = 10 * 1024; // 10KB compressed input limit (pre-decompression check)
 const MAX_DECOMPRESSED_SIZE = 1024 * 1024; // 1MB max output (post-decompression check)
 
 // Prefix bytes

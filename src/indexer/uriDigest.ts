@@ -642,15 +642,12 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
     return { status: "blocked", error: "DNS resolved to private IP" };
   }
 
-  // Build fetch URL with pinned IP to prevent DNS rebinding (HTTP only)
+  // Build fetch URL with pinned IP to prevent DNS rebinding
   // family 0 means use hostname directly (trusted gateways)
-  // HTTPS: Skip IP pinning - TLS/SNI requires hostname match, and HTTPS already
-  // validates certificate chain which mitigates DNS rebinding attacks
   let pinnedFetchUrl = fetchUrl;
   const originalHost = url.hostname;
   const isHttps = url.protocol === "https:";
   if (resolved.family !== 0 && !isHttps) {
-    // Replace hostname with resolved IP (HTTP only)
     const pinnedUrl = new URL(fetchUrl);
     pinnedUrl.hostname = resolved.family === 6 ? `[${resolved.ip}]` : resolved.ip;
     pinnedFetchUrl = pinnedUrl.toString();
@@ -662,16 +659,25 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
   try {
     // Disable automatic redirects to prevent SSRF via redirect
     const usingPinnedIp = resolved.family !== 0 && !isHttps;
+
     const response = await fetch(pinnedFetchUrl, {
       signal: controller.signal,
-      redirect: "manual", // Don't follow redirects automatically
+      redirect: "manual",
       headers: {
         Accept: "application/json",
         "User-Agent": "8004-Indexer/1.0",
-        // Set Host header when using pinned IP for virtual hosting
         ...(usingPinnedIp && { Host: originalHost }),
       },
     });
+
+    // Post-connect SSRF validation for HTTPS (can't IP-pin due to TLS/SNI)
+    // Re-resolve DNS and validate the connected IP hasn't rebounded to a private address
+    if (isHttps && resolved.family !== 0) {
+      const recheck = await validateHostResolution(url.hostname);
+      if (!recheck) {
+        return { status: "blocked", error: "DNS rebinding detected on HTTPS" };
+      }
+    }
 
     // Handle redirects manually with validation
     if (response.status >= 300 && response.status < 400) {
@@ -828,10 +834,14 @@ function convertToFetchUrl(uri: string): string | null {
     return uri;
   }
 
-  // HTTP (only for local testing, not recommended)
+  // HTTP (rejected by default, allow only with ALLOW_INSECURE_URI=true)
   if (uri.startsWith("http://")) {
-    logger.warn({ uri }, "HTTP URI used (insecure)");
-    return uri;
+    if (process.env.ALLOW_INSECURE_URI === "true") {
+      logger.warn({ uri }, "HTTP URI allowed via ALLOW_INSECURE_URI");
+      return uri;
+    }
+    logger.warn({ uri }, "HTTP URI rejected (set ALLOW_INSECURE_URI=true to allow)");
+    return null;
   }
 
   return null;

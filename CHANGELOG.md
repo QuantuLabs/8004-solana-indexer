@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-02-09
+
+### Breaking
+- HTTP metadata URIs rejected by default (set `ALLOW_INSECURE_URI=true` to allow)
+- Compressed metadata limit reduced from 100KB to 10KB
+- Verification errors now fail-closed (events stay PENDING instead of auto-FINALIZED)
+
+### Security
+- HTTPS DNS re-validation to prevent DNS rebinding SSRF
+- `@mongodb-js/zstd` moved to production dependencies (fixes deployment crash)
+- Status query parameter validation (rejects invalid values with 400)
+- BigInt nonce range check prevents truncation
+
+### Changed
+- Rate limiter applied globally (was only /rest/v1)
+- Trust proxy configurable via `TRUST_PROXY` env var (default: 1)
+
+### Added
+- New env vars: `TRUST_PROXY`, `ALLOW_INSECURE_URI`
+
 ## 1.2.0 - 2026-02-06
 
 ### Added

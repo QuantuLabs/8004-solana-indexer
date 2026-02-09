@@ -370,6 +370,7 @@ async function ensureCollectionTx(client: PoolClient, collection: string): Promi
   } catch (error: any) {
     eventStats.errors++;
     logger.error({ error: error.message, collection }, "Failed to ensure collection");
+    throw error;
   }
 }
 
@@ -533,7 +534,7 @@ async function handleNewFeedbackTx(
     ? Buffer.from(data.sealHash).toString("hex")
     : null;
   const runningDigest = data.newFeedbackDigest
-    ? Buffer.from(data.newFeedbackDigest).toString("hex")
+    ? Buffer.from(data.newFeedbackDigest)
     : null;
   const insertResult = await client.query(
     `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
@@ -638,7 +639,7 @@ async function handleFeedbackRevokedTx(
 
   const isOrphan = feedbackCheck.rowCount === 0;
   const revokeDigest = data.newRevokeDigest
-    ? Buffer.from(data.newRevokeDigest).toString("hex")
+    ? Buffer.from(data.newRevokeDigest)
     : null;
   const revokeSealHash = (data.sealHash && !data.sealHash.every(b => b === 0))
     ? Buffer.from(data.sealHash).toString("hex")
@@ -706,7 +707,7 @@ async function handleResponseAppendedTx(
     ? Buffer.from(data.responseHash).toString("hex")
     : null;
   const responseRunningDigest = data.newResponseDigest
-    ? Buffer.from(data.newResponseDigest).toString("hex")
+    ? Buffer.from(data.newResponseDigest)
     : null;
 
   if (feedbackCheck.rowCount === 0) {
@@ -1011,7 +1012,7 @@ async function handleNewFeedback(
       : null;
 
     const runningDigest = data.newFeedbackDigest
-      ? Buffer.from(data.newFeedbackDigest).toString("hex")
+      ? Buffer.from(data.newFeedbackDigest)
       : null;
     const insertResult = await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
@@ -1124,7 +1125,7 @@ async function handleFeedbackRevoked(
 
     const isOrphan = feedbackCheck.rowCount === 0;
     const revokeDigest = data.newRevokeDigest
-      ? Buffer.from(data.newRevokeDigest).toString("hex")
+      ? Buffer.from(data.newRevokeDigest)
       : null;
     const revokeSealHash = (data.sealHash && !data.sealHash.every(b => b === 0))
       ? Buffer.from(data.sealHash).toString("hex")
@@ -1199,7 +1200,7 @@ async function handleResponseAppended(
       ? Buffer.from(data.responseHash).toString("hex")
       : null;
     const responseRunningDigest = data.newResponseDigest
-      ? Buffer.from(data.newResponseDigest).toString("hex")
+      ? Buffer.from(data.newResponseDigest)
       : null;
 
     if (feedbackCheck.rowCount === 0) {

@@ -121,8 +121,12 @@ function wantsCount(req: Request): boolean {
  * Format: "offset-end/total" e.g., "0-99/1234"
  */
 function setContentRange(res: Response, offset: number, items: number, total: number): void {
+  if (items === 0) {
+    res.setHeader('Content-Range', `items */${total}`);
+    return;
+  }
   const end = offset + items - 1;
-  res.setHeader('Content-Range', `${offset}-${Math.max(offset, end)}/${total}`);
+  res.setHeader('Content-Range', `items ${offset}-${end}/${total}`);
 }
 
 /**
@@ -158,11 +162,16 @@ function parsePostgRESTIn(value: unknown): string[] | undefined {
  * ?status=PENDING: only pending
  * ?includeOrphaned=true: include all statuses
  */
-function buildStatusFilter(req: Request, fieldName = 'status'): Record<string, unknown> | undefined {
+const VALID_STATUSES = new Set(['PENDING', 'FINALIZED', 'ORPHANED']);
+
+function buildStatusFilter(req: Request, fieldName = 'status'): Record<string, unknown> | undefined | { _invalid: true } {
   const status = parsePostgRESTValue(req.query.status);
   const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
 
   if (status) {
+    if (!VALID_STATUSES.has(status)) {
+      return { _invalid: true };
+    }
     return { [fieldName]: status };
   }
 
@@ -174,13 +183,23 @@ function buildStatusFilter(req: Request, fieldName = 'status'): Record<string, u
   return { [fieldName]: { not: 'ORPHANED' } };
 }
 
+function isInvalidStatus(filter: ReturnType<typeof buildStatusFilter>): filter is { _invalid: true } {
+  return filter !== undefined && '_invalid' in filter;
+}
+
 export function createApiServer(options: ApiServerOptions): Express {
   const { prisma } = options;
   const app = express();
 
-  // Trust first proxy (for X-Forwarded-For header)
-  // Required for rate limiting to work behind reverse proxies (nginx, cloudflare, etc.)
-  app.set('trust proxy', 1);
+  const trustProxyRaw = process.env.TRUST_PROXY;
+  let trustProxy: string | number | boolean = 1;
+  if (trustProxyRaw !== undefined) {
+    if (trustProxyRaw === 'true') trustProxy = true;
+    else if (trustProxyRaw === 'false') trustProxy = false;
+    else if (/^\d+$/.test(trustProxyRaw)) trustProxy = Number(trustProxyRaw);
+    else trustProxy = trustProxyRaw;
+  }
+  app.set('trust proxy', trustProxy);
 
   app.use(express.json({ limit: '100kb' }));
 
@@ -189,7 +208,8 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.use(cors({
     origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
     methods: ['GET', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Prefer'],
+    exposedHeaders: ['Content-Range'],
     maxAge: 86400,
   }));
 
@@ -199,10 +219,16 @@ export function createApiServer(options: ApiServerOptions): Express {
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('X-XSS-Protection', '0');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'none'");
     next();
   });
 
-  // Rate limiting - protect against DoS attacks
+  // Health check (before rate limiter - cheap endpoint)
+  app.get('/health', (_req: Request, res: Response) => {
+    res.json({ status: 'ok' });
+  });
+
+  // Global rate limiting
   const limiter = rateLimit({
     windowMs: RATE_LIMIT_WINDOW_MS,
     max: RATE_LIMIT_MAX_REQUESTS,
@@ -210,12 +236,7 @@ export function createApiServer(options: ApiServerOptions): Express {
     standardHeaders: true,
     legacyHeaders: false,
   });
-  app.use('/rest/v1', limiter);
-
-  // Health check
-  app.get('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok' });
-  });
+  app.use(limiter);
 
   // GET /rest/v1/agents - List agents with filters (PostgREST format)
   app.get('/rest/v1/agents', async (req: Request, res: Response) => {
@@ -227,7 +248,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      const where: Prisma.AgentWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.AgentWhereInput = { ...statusFilter };
       if (id) where.id = id;
       if (owner) where.owner = owner;
       if (collection) where.collection = collection;
@@ -278,7 +304,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      const where: Prisma.FeedbackWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.FeedbackWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
       if (feedback_index_in) {
@@ -294,11 +325,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (endpoint) where.endpoint = endpoint;
       // Handle OR filter: (tag1.eq.value,tag2.eq.value)
       if (orFilter) {
-        const matches = orFilter.match(/tag1\.eq\.([^,)]+)/);
-        const tagValue = matches ? decodeURIComponent(matches[1]) : null;
-        if (tagValue) {
-          where.OR = [{ tag1: tagValue }, { tag2: tagValue }];
-        }
+        const tag1Match = orFilter.match(/tag1\.eq\.([^,)]+)/);
+        const tag2Match = orFilter.match(/tag2\.eq\.([^,)]+)/);
+        const orConditions: Prisma.FeedbackWhereInput[] = [];
+        if (tag1Match) orConditions.push({ tag1: decodeURIComponent(tag1Match[1]) });
+        if (tag2Match) orConditions.push({ tag2: decodeURIComponent(tag2Match[1]) });
+        if (orConditions.length > 0) where.OR = orConditions;
       }
 
       // If Prefer: count=exact, also get total count
@@ -361,7 +393,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      const where: Prisma.FeedbackResponseWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
 
       if (feedback_id) {
         where.feedbackId = feedback_id;
@@ -408,13 +445,21 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
       }
 
-      const responses = await prisma.feedbackResponse.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: offset,
-        include: { feedback: true },
-      });
+      const needsCount = wantsCount(req);
+      const [responses, totalCount] = await Promise.all([
+        prisma.feedbackResponse.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+          skip: offset,
+          include: { feedback: true },
+        }),
+        needsCount ? prisma.feedbackResponse.count({ where }) : Promise.resolve(0),
+      ]);
+
+      if (needsCount) {
+        setContentRange(res, offset, responses.length, totalCount);
+      }
 
       // Map to SDK expected format (IndexedFeedbackResponse)
       // Note: feedback_index as String to preserve BigInt precision (> 2^53)
@@ -453,7 +498,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
 
-      const where: Prisma.RevocationWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.RevocationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
 
@@ -496,13 +546,18 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/validations', async (req: Request, res: Response) => {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
-      const validator = parsePostgRESTValue(req.query.validator);
+      const validator = parsePostgRESTValue(req.query.validator) || parsePostgRESTValue(req.query.validator_address);
       const nonce = parsePostgRESTValue(req.query.nonce);
       const responded = parsePostgRESTValue(req.query.responded);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      const where: Prisma.ValidationWhereInput = { ...buildStatusFilter(req, 'chainStatus') };
+      const statusFilter = buildStatusFilter(req, 'chainStatus');
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.ValidationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (validator) where.validator = validator;
       if (nonce !== undefined) {
@@ -526,7 +581,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         id: v.id,
         asset: v.agentId,
         validator_address: v.validator,
-        nonce: Number(v.nonce),
+        nonce: v.nonce > BigInt(Number.MAX_SAFE_INTEGER) ? v.nonce.toString() : Number(v.nonce),
         requester: v.requester,
         request_uri: v.requestUri,
         request_hash: v.requestHash ? Buffer.from(v.requestHash).toString('hex') : null,
@@ -557,7 +612,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
-      const where: Prisma.RegistryWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.RegistryWhereInput = { ...statusFilter };
       if (collection) where.collection = collection;
 
       const registries = await prisma.registry.findMany({
@@ -757,7 +817,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const requestedLimit = safePaginationLimit(req.query.limit);
       const limit = Math.min(requestedLimit, MAX_METADATA_LIMIT);
 
-      const where: Prisma.AgentMetadataWhereInput = { ...buildStatusFilter(req) };
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      const where: Prisma.AgentMetadataWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (key) where.key = key;
 

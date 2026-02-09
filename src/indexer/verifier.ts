@@ -25,8 +25,7 @@ import {
 
 const logger = createChildLogger("verifier");
 
-// Borsh deserialization for AgentAccount (simplified - just extract digests)
-// AGENT_ACCOUNT_DISCRIMINATOR will be needed when implementing hash-chain verification
+// Borsh deserialization for AgentAccount (simplified - extract digest triplets)
 
 interface OnChainDigests {
   feedbackDigest: Uint8Array;
@@ -35,14 +34,28 @@ interface OnChainDigests {
   responseCount: bigint;
   revokeDigest: Uint8Array;
   revokeCount: bigint;
-  slot: bigint;
 }
+
+interface DbDigestState {
+  feedbackDigest: Buffer | null;
+  feedbackCount: bigint;
+  responseDigest: Buffer | null;
+  responseCount: bigint;
+  revokeDigest: Buffer | null;
+  revokeCount: bigint;
+}
+
+type ChainType = 'feedback' | 'response' | 'revoke';
 
 interface VerificationStats {
   agentsVerified: number;
   agentsOrphaned: number;
   feedbacksVerified: number;
   feedbacksOrphaned: number;
+  responsesVerified: number;
+  responsesOrphaned: number;
+  revocationsVerified: number;
+  revocationsOrphaned: number;
   validationsVerified: number;
   validationsOrphaned: number;
   metadataVerified: number;
@@ -63,6 +76,10 @@ export class DataVerifier {
     agentsOrphaned: 0,
     feedbacksVerified: 0,
     feedbacksOrphaned: 0,
+    responsesVerified: 0,
+    responsesOrphaned: 0,
+    revocationsVerified: 0,
+    revocationsOrphaned: 0,
     validationsVerified: 0,
     validationsOrphaned: 0,
     metadataVerified: 0,
@@ -73,6 +90,8 @@ export class DataVerifier {
     lastRunAt: null,
     lastRunDurationMs: 0,
   };
+  // Per-cycle cache for on-chain digests (cleared each cycle)
+  private digestCache = new Map<string, OnChainDigests | null>();
 
   constructor(
     private connection: Connection,
@@ -130,6 +149,9 @@ export class DataVerifier {
     logger.debug("Starting verification cycle");
 
     try {
+      // Clear per-cycle digest cache
+      this.digestCache.clear();
+
       // Get current finalized slot for cutoff calculation
       const currentSlot = await this.connection.getSlot("finalized");
       // Guard against negative cutoff (e.g., if safety margin > current slot on new networks)
@@ -145,6 +167,7 @@ export class DataVerifier {
         this.verifyRegistries(cutoffSlot),
         this.verifyFeedbacks(cutoffSlot),
         this.verifyFeedbackResponses(cutoffSlot),
+        this.verifyRevocations(cutoffSlot),
       ]);
 
       const duration = Date.now() - startTime;
@@ -195,7 +218,6 @@ export class DataVerifier {
     const existsMap = await this.batchVerifyAccounts(pubkeys, "finalized");
 
     const now = new Date();
-    const currentSlot = await this.connection.getSlot("finalized");
 
     for (const agent of pending) {
       if (!this.isRunning) break;
@@ -207,14 +229,21 @@ export class DataVerifier {
           await this.prisma.agent.update({
             where: { id: agent.id },
             data: exists
-              ? { status: "FINALIZED", verifiedAt: now, verifiedSlot: BigInt(currentSlot) }
+              ? { status: "FINALIZED", verifiedAt: now, verifiedSlot: cutoffSlot }
               : { status: "ORPHANED", verifiedAt: now },
           });
         } else if (this.pool) {
-          await this.pool.query(
-            `UPDATE agents SET status = $1, verified_at = $2 WHERE asset = $3`,
-            [exists ? "FINALIZED" : "ORPHANED", now.toISOString(), agent.id]
-          );
+          if (exists) {
+            await this.pool.query(
+              `UPDATE agents SET status = $1, verified_at = $2, verified_slot = $3 WHERE asset = $4`,
+              ["FINALIZED", now.toISOString(), cutoffSlot.toString(), agent.id]
+            );
+          } else {
+            await this.pool.query(
+              `UPDATE agents SET status = $1, verified_at = $2 WHERE asset = $3`,
+              ["ORPHANED", now.toISOString(), agent.id]
+            );
+          }
         }
 
         if (exists) {
@@ -261,6 +290,10 @@ export class DataVerifier {
       try {
         const assetPubkey = parseAssetPubkey(v.agentId);
         const validatorPubkey = new PublicKey(v.validator);
+        if (v.nonce > BigInt(Number.MAX_SAFE_INTEGER)) {
+          logger.warn({ validationId: v.id, nonce: v.nonce.toString() }, "Nonce exceeds MAX_SAFE_INTEGER, skipping");
+          continue;
+        }
         const [pda] = getValidationRequestPda(assetPubkey, validatorPubkey, Number(v.nonce));
         pdaMap.set(pda.toBase58(), v);
       } catch (error: any) {
@@ -489,13 +522,9 @@ export class DataVerifier {
   // =========================================================================
 
   /**
-   * Verify feedbacks using hash-chain digests from AgentAccount
-   * This is more complex than existence checks - requires fetching on-chain digests
-   * and comparing against computed digests from indexed events.
-   *
-   * For now, we use a simplified approach: mark feedbacks as FINALIZED after
-   * the safety margin if their agent exists. Full hash-chain verification
-   * can be added later for paranoid mode.
+   * Verify feedbacks using hash-chain digests from AgentAccount.
+   * Compares last DB running_digest against on-chain digest for cryptographic
+   * verification. Falls back to existence check if digest data unavailable.
    */
   private async verifyFeedbacks(cutoffSlot: bigint): Promise<void> {
     let pending: Array<{ id: string; agentId: string }>;
@@ -523,184 +552,189 @@ export class DataVerifier {
 
     logger.debug({ count: pending.length }, "Verifying feedbacks");
 
-    // Get unique agent IDs and batch verify
-    const agentIds = [...new Set(pending.map(f => f.agentId))];
+    // Group by agent for efficient batch processing
+    const byAgent = new Map<string, Array<{ id: string; agentId: string }>>();
+    for (const f of pending) {
+      const arr = byAgent.get(f.agentId) || [];
+      arr.push(f);
+      byAgent.set(f.agentId, arr);
+    }
+
+    const agentIds = [...byAgent.keys()];
     const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
 
     const now = new Date();
-    for (const f of pending) {
+
+    for (const [agentId, feedbacks] of byAgent) {
       if (!this.isRunning) break;
 
-      try {
-        const agentExists = existsMap.get(f.agentId) ?? false;
-        const newStatus = agentExists ? "FINALIZED" : "ORPHANED";
+      const agentExists = existsMap.get(agentId) ?? false;
 
-        if (this.prisma) {
-          await this.prisma.feedback.update({
-            where: { id: f.id },
-            data: { status: newStatus, verifiedAt: now },
-          });
-        } else if (this.pool) {
-          await this.pool.query(
-            `UPDATE feedbacks SET status = $1, verified_at = $2 WHERE id = $3`,
-            [newStatus, now.toISOString(), f.id]
-          );
-        }
+      if (!agentExists) {
+        await this.batchUpdateStatus('feedbacks', 'id', feedbacks.map(f => f.id), 'ORPHANED', now);
+        this.stats.feedbacksOrphaned += feedbacks.length;
+        logger.warn({ agentId, count: feedbacks.length }, "Feedbacks orphaned - agent not found");
+        continue;
+      }
 
-        if (agentExists) {
-          this.stats.feedbacksVerified++;
-        } else {
-          this.stats.feedbacksOrphaned++;
-          logger.warn({ feedbackId: f.id }, "Feedback orphaned - agent not found");
-        }
-      } catch (error: any) {
-        logger.error({ feedbackId: f.id, error: error.message }, "Feedback verification failed");
+      // Hash-chain verification: compare DB digest with on-chain
+      const digestOk = await this.checkDigestMatch(agentId, 'feedback');
+
+      if (digestOk) {
+        await this.batchUpdateStatus('feedbacks', 'id', feedbacks.map(f => f.id), 'FINALIZED', now);
+        this.stats.feedbacksVerified += feedbacks.length;
+      } else {
+        // Mismatch → leave as PENDING for re-verification next cycle
+        logger.warn({ agentId, count: feedbacks.length }, "Feedbacks left PENDING due to hash-chain mismatch");
       }
     }
   }
 
+  /**
+   * Verify feedback responses using hash-chain digests + existence checks.
+   */
   private async verifyFeedbackResponses(cutoffSlot: bigint): Promise<void> {
-    if (this.prisma) {
-      await this.verifyFeedbackResponsesPrisma(cutoffSlot);
-    } else if (this.pool) {
-      await this.verifyFeedbackResponsesSupabase(cutoffSlot);
-    }
-  }
+    let pending: Array<{ id: string; agentId: string; feedbackOrphaned: boolean }>;
 
-  private async verifyFeedbackResponsesPrisma(cutoffSlot: bigint): Promise<void> {
-    const pending = await this.prisma!.feedbackResponse.findMany({
-      where: {
-        status: "PENDING",
-        slot: { lte: cutoffSlot },
-      },
-      take: config.verifyBatchSize,
-      include: { feedback: { select: { agentId: true, status: true } } },
-    });
+    if (this.prisma) {
+      const rows = await this.prisma.feedbackResponse.findMany({
+        where: { status: "PENDING", slot: { lte: cutoffSlot } },
+        take: config.verifyBatchSize,
+        include: { feedback: { select: { agentId: true, status: true } } },
+      });
+      pending = rows.map(r => ({
+        id: r.id,
+        agentId: r.feedback.agentId,
+        feedbackOrphaned: r.feedback.status === "ORPHANED",
+      }));
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT fr.id, fr.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+         FROM feedback_responses fr
+         LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
+         WHERE fr.status = 'PENDING' AND fr.block_slot <= $1
+         LIMIT $2`,
+        [cutoffSlot.toString(), config.verifyBatchSize]
+      );
+      pending = result.rows.map((r: any) => ({
+        id: r.id,
+        agentId: r.agentId,
+        feedbackOrphaned: r.feedbackStatus === "ORPHANED",
+      }));
+    } else {
+      return;
+    }
 
     if (pending.length === 0) return;
 
     logger.debug({ count: pending.length }, "Verifying feedback responses");
 
-    const orphanedResponses: typeof pending = [];
-    const needsAgentCheck: typeof pending = [];
-
-    for (const r of pending) {
-      if (r.feedback.status === "ORPHANED") {
-        orphanedResponses.push(r);
-      } else {
-        needsAgentCheck.push(r);
-      }
-    }
-
     const now = new Date();
 
-    for (const r of orphanedResponses) {
-      if (!this.isRunning) break;
-      try {
-        await this.prisma!.feedbackResponse.update({
-          where: { id: r.id },
-          data: { status: "ORPHANED", verifiedAt: now },
-        });
-        this.stats.feedbacksOrphaned++;
-      } catch (error: any) {
-        logger.error({ responseId: r.id, error: error.message }, "Response orphan update failed");
-      }
+    // Separate orphaned from valid
+    const orphaned = pending.filter(r => r.feedbackOrphaned);
+    const valid = pending.filter(r => !r.feedbackOrphaned);
+
+    if (orphaned.length > 0) {
+      await this.batchUpdateStatus('feedback_responses', 'id', orphaned.map(r => r.id), 'ORPHANED', now);
+      this.stats.responsesOrphaned += orphaned.length;
     }
 
-    if (needsAgentCheck.length > 0) {
-      const agentIds = [...new Set(needsAgentCheck.map(r => r.feedback.agentId))];
+    if (valid.length > 0) {
+      // Group by agent
+      const byAgent = new Map<string, string[]>();
+      for (const r of valid) {
+        const arr = byAgent.get(r.agentId) || [];
+        arr.push(r.id);
+        byAgent.set(r.agentId, arr);
+      }
+
+      const agentIds = [...byAgent.keys()];
       const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
 
-      for (const r of needsAgentCheck) {
+      for (const [agentId, ids] of byAgent) {
         if (!this.isRunning) break;
 
-        try {
-          const agentExists = existsMap.get(r.feedback.agentId) ?? false;
-          const newStatus = agentExists ? "FINALIZED" : "ORPHANED";
+        const agentExists = existsMap.get(agentId) ?? false;
 
-          await this.prisma!.feedbackResponse.update({
-            where: { id: r.id },
-            data: { status: newStatus, verifiedAt: now },
-          });
+        if (!agentExists) {
+          await this.batchUpdateStatus('feedback_responses', 'id', ids, 'ORPHANED', now);
+          this.stats.responsesOrphaned += ids.length;
+          continue;
+        }
 
-          if (agentExists) {
-            this.stats.feedbacksVerified++;
-          } else {
-            this.stats.feedbacksOrphaned++;
-          }
-        } catch (error: any) {
-          logger.error({ responseId: r.id, error: error.message }, "Response verification failed");
+        // Hash-chain verification for response chain
+        const digestOk = await this.checkDigestMatch(agentId, 'response');
+
+        if (digestOk) {
+          await this.batchUpdateStatus('feedback_responses', 'id', ids, 'FINALIZED', now);
+          this.stats.responsesVerified += ids.length;
+        } else {
+          logger.warn({ agentId, count: ids.length }, "Responses left PENDING due to hash-chain mismatch");
         }
       }
     }
   }
 
-  private async verifyFeedbackResponsesSupabase(cutoffSlot: bigint): Promise<void> {
-    // Supabase feedback_responses has asset directly, join with feedbacks for orphan detection
-    const result = await this.pool!.query(
-      `SELECT fr.id, fr.asset AS "agentId", f.status AS "feedbackStatus"
-       FROM feedback_responses fr
-       LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
-       WHERE fr.status = 'PENDING' AND fr.block_slot <= $1
-       LIMIT $2`,
-      [cutoffSlot.toString(), config.verifyBatchSize]
-    );
+  /**
+   * Verify revocations using hash-chain digests + existence checks.
+   */
+  private async verifyRevocations(cutoffSlot: bigint): Promise<void> {
+    let pending: Array<{ id: string; agentId: string }>;
 
-    const pending = result.rows as Array<{ id: string; agentId: string; feedbackStatus: string | null }>;
+    if (this.prisma) {
+      const rows = await this.prisma.revocation.findMany({
+        where: { status: "PENDING", slot: { lte: cutoffSlot } },
+        take: config.verifyBatchSize,
+        select: { id: true, agentId: true },
+      });
+      pending = rows;
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT id, asset AS "agentId" FROM revocations WHERE status = 'PENDING' AND slot <= $1 LIMIT $2`,
+        [cutoffSlot.toString(), config.verifyBatchSize]
+      );
+      pending = result.rows;
+    } else {
+      return;
+    }
+
     if (pending.length === 0) return;
 
-    logger.debug({ count: pending.length }, "Verifying feedback responses (Supabase)");
+    logger.debug({ count: pending.length }, "Verifying revocations");
 
-    const orphanedResponses: typeof pending = [];
-    const needsAgentCheck: typeof pending = [];
-
+    const byAgent = new Map<string, string[]>();
     for (const r of pending) {
-      if (r.feedbackStatus === "ORPHANED" || !r.feedbackStatus) {
-        orphanedResponses.push(r);
-      } else {
-        needsAgentCheck.push(r);
-      }
+      const arr = byAgent.get(r.agentId) || [];
+      arr.push(r.id);
+      byAgent.set(r.agentId, arr);
     }
+
+    const agentIds = [...byAgent.keys()];
+    const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
 
     const now = new Date();
 
-    for (const r of orphanedResponses) {
+    for (const [agentId, ids] of byAgent) {
       if (!this.isRunning) break;
-      try {
-        await this.pool!.query(
-          `UPDATE feedback_responses SET status = 'ORPHANED', verified_at = $1 WHERE id = $2`,
-          [now.toISOString(), r.id]
-        );
-        this.stats.feedbacksOrphaned++;
-      } catch (error: any) {
-        logger.error({ responseId: r.id, error: error.message }, "Response orphan update failed");
+
+      const agentExists = existsMap.get(agentId) ?? false;
+
+      if (!agentExists) {
+        await this.batchUpdateStatus('revocations', 'id', ids, 'ORPHANED', now);
+        this.stats.revocationsOrphaned += ids.length;
+        logger.warn({ agentId, count: ids.length }, "Revocations orphaned - agent not found");
+        continue;
       }
-    }
 
-    if (needsAgentCheck.length > 0) {
-      const agentIds = [...new Set(needsAgentCheck.map(r => r.agentId))];
-      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      // Hash-chain verification for revoke chain
+      const digestOk = await this.checkDigestMatch(agentId, 'revoke');
 
-      for (const r of needsAgentCheck) {
-        if (!this.isRunning) break;
-
-        try {
-          const agentExists = existsMap.get(r.agentId) ?? false;
-          const newStatus = agentExists ? "FINALIZED" : "ORPHANED";
-
-          await this.pool!.query(
-            `UPDATE feedback_responses SET status = $1, verified_at = $2 WHERE id = $3`,
-            [newStatus, now.toISOString(), r.id]
-          );
-
-          if (agentExists) {
-            this.stats.feedbacksVerified++;
-          } else {
-            this.stats.feedbacksOrphaned++;
-          }
-        } catch (error: any) {
-          logger.error({ responseId: r.id, error: error.message }, "Response verification failed");
-        }
+      if (digestOk) {
+        await this.batchUpdateStatus('revocations', 'id', ids, 'FINALIZED', now);
+        this.stats.revocationsVerified += ids.length;
+      } else {
+        logger.warn({ agentId, count: ids.length }, "Revocations left PENDING due to hash-chain mismatch");
       }
     }
   }
@@ -790,12 +824,220 @@ export class DataVerifier {
   }
 
   // =========================================================================
-  // Future: Full Hash-Chain Verification
+  // Hash-Chain Verification Helpers
   // =========================================================================
 
   /**
+   * Compare DB digest against on-chain digest for a specific chain type.
+   * Logs mismatches and increments hashChainMismatches counter.
+   */
+  /**
+   * Returns true if digest matches or is inconclusive (behind/unavailable).
+   * Returns false only on confirmed mismatch (same count, different digest).
+   */
+  private async checkDigestMatch(agentId: string, chain: ChainType): Promise<boolean> {
+    try {
+      // Use per-cycle cache to avoid redundant RPC calls for same agent
+      let onChain: OnChainDigests | null | undefined = this.digestCache.get(agentId);
+      if (onChain === undefined) {
+        onChain = await this.fetchOnChainDigests(agentId);
+        this.digestCache.set(agentId, onChain);
+      }
+      if (!onChain) return true;
+
+      const dbState = await this.getLastDbDigests(agentId);
+
+      let onChainDigest: Uint8Array;
+      let onChainCount: bigint;
+      let dbDigest: Buffer | null;
+      let dbCount: bigint;
+
+      switch (chain) {
+        case 'feedback':
+          onChainDigest = onChain.feedbackDigest;
+          onChainCount = onChain.feedbackCount;
+          dbDigest = dbState.feedbackDigest;
+          dbCount = dbState.feedbackCount;
+          break;
+        case 'response':
+          onChainDigest = onChain.responseDigest;
+          onChainCount = onChain.responseCount;
+          dbDigest = dbState.responseDigest;
+          dbCount = dbState.responseCount;
+          break;
+        case 'revoke':
+          onChainDigest = onChain.revokeDigest;
+          onChainCount = onChain.revokeCount;
+          dbDigest = dbState.revokeDigest;
+          dbCount = dbState.revokeCount;
+          break;
+      }
+
+      // No DB digest data → can't verify (old data without running_digest)
+      if (!dbDigest) return true;
+
+      // DB count < on-chain → indexer behind, skip
+      if (dbCount < onChainCount) {
+        logger.debug({ agentId, chain, dbCount: Number(dbCount), onChainCount: Number(onChainCount) },
+          "Hash-chain behind on-chain, skipping digest check");
+        return true;
+      }
+
+      // DB count > on-chain → possible reorg
+      if (dbCount > onChainCount) {
+        this.stats.hashChainMismatches++;
+        logger.warn({ agentId, chain, dbCount: Number(dbCount), onChainCount: Number(onChainCount) },
+          "Hash-chain count EXCEEDS on-chain (possible reorg)");
+        return false;
+      }
+
+      // Counts match → compare digests
+      const onChainBuf = Buffer.from(onChainDigest);
+      if (onChainBuf.equals(dbDigest)) {
+        logger.debug({ agentId, chain, count: Number(dbCount) },
+          "Hash-chain VERIFIED");
+        return true;
+      } else {
+        this.stats.hashChainMismatches++;
+        logger.warn({
+          agentId, chain,
+          count: Number(dbCount),
+          dbDigest: dbDigest.toString('hex').slice(0, 16) + '...',
+          onChainDigest: onChainBuf.toString('hex').slice(0, 16) + '...',
+        }, "Hash-chain MISMATCH - digests differ at same count");
+        return false;
+      }
+    } catch (error: any) {
+      logger.warn({ agentId, chain, error: error.message },
+        "Hash-chain check failed, keeping PENDING");
+      return false;
+    }
+  }
+
+  /**
+   * Get the last running_digest and event count from DB for each chain type.
+   */
+  private async getLastDbDigests(agentId: string): Promise<DbDigestState> {
+    const zero: DbDigestState = {
+      feedbackDigest: null, feedbackCount: 0n,
+      responseDigest: null, responseCount: 0n,
+      revokeDigest: null, revokeCount: 0n,
+    };
+
+    if (this.prisma) {
+      const notOrphaned = { not: 'ORPHANED' };
+      const [lastFb, fbCount, lastResp, respCount, lastRev, revCount] = await Promise.all([
+        this.prisma.feedback.findFirst({
+          where: { agentId, runningDigest: { not: null }, status: notOrphaned },
+          orderBy: { feedbackIndex: 'desc' },
+          select: { runningDigest: true },
+        }),
+        this.prisma.feedback.count({ where: { agentId, status: notOrphaned } }),
+        this.prisma.feedbackResponse.findFirst({
+          where: { feedback: { agentId }, runningDigest: { not: null }, status: notOrphaned },
+          orderBy: { slot: 'desc' },
+          select: { runningDigest: true },
+        }),
+        this.prisma.feedbackResponse.count({ where: { feedback: { agentId }, status: notOrphaned } }),
+        this.prisma.revocation.findFirst({
+          where: { agentId, runningDigest: { not: null }, status: notOrphaned },
+          orderBy: { revokeCount: 'desc' },
+          select: { runningDigest: true },
+        }),
+        this.prisma.revocation.count({ where: { agentId, status: notOrphaned } }),
+      ]);
+
+      return {
+        feedbackDigest: lastFb?.runningDigest ? Buffer.from(lastFb.runningDigest) : null,
+        feedbackCount: BigInt(fbCount),
+        responseDigest: lastResp?.runningDigest ? Buffer.from(lastResp.runningDigest) : null,
+        responseCount: BigInt(respCount),
+        revokeDigest: lastRev?.runningDigest ? Buffer.from(lastRev.runningDigest) : null,
+        revokeCount: BigInt(revCount),
+      };
+    } else if (this.pool) {
+      const [fbRes, fbCnt, respRes, respCnt, revRes, revCnt] = await Promise.all([
+        this.pool.query(
+          `SELECT running_digest FROM feedbacks WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY feedback_index DESC LIMIT 1`,
+          [agentId]
+        ),
+        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedbacks WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+        this.pool.query(
+          `SELECT running_digest FROM feedback_responses WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY block_slot DESC, tx_index DESC LIMIT 1`,
+          [agentId]
+        ),
+        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedback_responses WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+        this.pool.query(
+          `SELECT running_digest FROM revocations WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY revoke_count DESC LIMIT 1`,
+          [agentId]
+        ),
+        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM revocations WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+      ]);
+
+      return {
+        feedbackDigest: fbRes.rows[0]?.running_digest ?? null,
+        feedbackCount: BigInt(fbCnt.rows[0]?.cnt ?? 0),
+        responseDigest: respRes.rows[0]?.running_digest ?? null,
+        responseCount: BigInt(respCnt.rows[0]?.cnt ?? 0),
+        revokeDigest: revRes.rows[0]?.running_digest ?? null,
+        revokeCount: BigInt(revCnt.rows[0]?.cnt ?? 0),
+      };
+    }
+
+    return zero;
+  }
+
+  /**
+   * Batch-update status for multiple rows in a table.
+   */
+  private static readonly ALLOWED_TABLES: Record<string, string> = {
+    'feedbacks': 'feedbacks',
+    'feedback_responses': 'feedback_responses',
+    'revocations': 'revocations',
+  };
+
+  private static readonly ALLOWED_ID_COLUMNS: Record<string, string> = {
+    'id': 'id',
+  };
+
+  private async batchUpdateStatus(
+    table: string,
+    idColumn: string,
+    ids: string[],
+    status: string,
+    verifiedAt: Date,
+  ): Promise<void> {
+    if (ids.length === 0) return;
+
+    if (this.prisma) {
+      const modelMap: Record<string, any> = {
+        'feedbacks': this.prisma.feedback,
+        'feedback_responses': this.prisma.feedbackResponse,
+        'revocations': this.prisma.revocation,
+      };
+      const model = modelMap[table];
+      if (model) {
+        await model.updateMany({
+          where: { id: { in: ids } },
+          data: { status, verifiedAt },
+        });
+      }
+    } else if (this.pool) {
+      const safeTable = DataVerifier.ALLOWED_TABLES[table];
+      const safeColumn = DataVerifier.ALLOWED_ID_COLUMNS[idColumn];
+      if (!safeTable || !safeColumn) {
+        logger.error({ table, idColumn }, "Invalid table or column name in batchUpdateStatus");
+        return;
+      }
+      await this.pool.query(
+        `UPDATE ${safeTable} SET status = $1, verified_at = $2 WHERE ${safeColumn} = ANY($3::text[])`,
+        [status, verifiedAt.toISOString(), ids]
+      );
+    }
+  }
+
+  /**
    * Fetch on-chain digests from AgentAccount at finalized commitment.
-   * Used for hash-chain verification to compare computed digest against on-chain value.
    * Public for testing and external verification tools.
    */
   async fetchOnChainDigests(agentId: string): Promise<OnChainDigests | null> {
@@ -809,17 +1051,19 @@ export class DataVerifier {
 
       if (!accountInfo) return null;
 
-      // Parse AgentAccount to extract digests
-      // This is simplified - full implementation would use borsh deserialization
       const data = accountInfo.data;
-      if (data.length < 227) return null; // Minimum AgentAccount size
+      // Minimum: discriminator(8) + collection(32) + owner(32) + asset(32) + bump(1) + atom_enabled(1) + Option::None(1) + 3*(digest(32)+count(8)) = 227
+      if (data.length < 227) return null;
 
-      // Skip discriminator (8) + collection(32) + owner(32) + asset(32) + bump(1) + atom_enabled(1) + agent_wallet option
+      // Skip discriminator(8) + collection(32) + owner(32) + asset(32) + bump(1) + atom_enabled(1) + agent_wallet Option<Pubkey>
       let offset = 8 + 32 + 32 + 32 + 1 + 1;
       const optionTag = data[offset];
-      offset += optionTag === 1 ? 33 : 1; // Option<Pubkey>
+      offset += optionTag === 1 ? 33 : 1;
 
-      // Read digests and counts
+      // Verify buffer has enough data for 3 digest+count triplets (3 * 40 = 120 bytes)
+      if (data.length < offset + 120) return null;
+
+      // Read digest+count triplets (feedback, response, revoke)
       const feedbackDigest = data.slice(offset, offset + 32);
       offset += 32;
       const feedbackCount = data.readBigUInt64LE(offset);
@@ -832,8 +1076,6 @@ export class DataVerifier {
       offset += 32;
       const revokeCount = data.readBigUInt64LE(offset);
 
-      const slot = await this.connection.getSlot("finalized");
-
       return {
         feedbackDigest: new Uint8Array(feedbackDigest),
         feedbackCount,
@@ -841,7 +1083,6 @@ export class DataVerifier {
         responseCount,
         revokeDigest: new Uint8Array(revokeDigest),
         revokeCount,
-        slot: BigInt(slot),
       };
     } catch (error: any) {
       logger.warn({ agentId, error: error.message }, "Failed to fetch on-chain digests");
