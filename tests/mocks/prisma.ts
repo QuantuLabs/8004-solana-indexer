@@ -86,6 +86,13 @@ export function createMockPrismaClient(): PrismaClient {
       findUnique: vi.fn(),
       upsert: vi.fn(),
     },
+    hashChainCheckpoint: {
+      findFirst: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      create: vi.fn(),
+      upsert: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
+    },
   };
   return mockClient as unknown as PrismaClient;
 }

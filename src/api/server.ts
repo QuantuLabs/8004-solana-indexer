@@ -10,6 +10,7 @@ import { Server } from 'http';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { logger } from '../logger.js';
 import { decompressFromStorage } from '../utils/compression.js';
+import { ReplayVerifier } from '../services/replay-verifier.js';
 import cors from 'cors';
 
 // Security constants
@@ -392,6 +393,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -445,11 +447,16 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
       }
 
+      const orderBy: Prisma.FeedbackResponseOrderByWithRelationInput =
+        order === 'response_count.asc' ? { responseCount: 'asc' } :
+        order === 'response_count.desc' ? { responseCount: 'desc' } :
+        { createdAt: 'desc' };
+
       const needsCount = wantsCount(req);
       const [responses, totalCount] = await Promise.all([
         prisma.feedbackResponse.findMany({
           where,
-          orderBy: { createdAt: 'desc' },
+          orderBy,
           take: limit,
           skip: offset,
           include: { feedback: true },
@@ -473,6 +480,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         response_uri: r.responseUri,
         response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
         running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+        response_count: r.responseCount ? Number(r.responseCount) : null,
         status: r.status,
         verified_at: r.verifiedAt?.toISOString() || null,
         block_slot: r.slot ? Number(r.slot) : Number(r.feedback.createdSlot || 0),
@@ -954,6 +962,198 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json(withScores.slice(0, limit));
     } catch (error) {
       logger.error({ error }, 'Error fetching leaderboard');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/checkpoints/:asset - All checkpoints for an agent
+  app.get('/rest/v1/checkpoints/:asset', async (req: Request, res: Response) => {
+    try {
+      const asset = safeQueryString(req.params.asset);
+      if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
+      const chainType = safeQueryString(req.query.chainType);
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+
+      const where: Prisma.HashChainCheckpointWhereInput = { agentId: asset };
+      if (chainType) where.chainType = chainType;
+
+      const checkpoints = await prisma.hashChainCheckpoint.findMany({
+        where,
+        orderBy: { eventCount: 'asc' },
+        take: limit,
+        skip: offset,
+      });
+
+      res.json(checkpoints.map(cp => ({
+        agent_id: cp.agentId,
+        chain_type: cp.chainType,
+        event_count: cp.eventCount,
+        digest: cp.digest,
+        created_at: cp.createdAt.toISOString(),
+      })));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching checkpoints');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/checkpoints/:asset/latest - Latest checkpoint per chain type
+  app.get('/rest/v1/checkpoints/:asset/latest', async (req: Request, res: Response) => {
+    try {
+      const asset = safeQueryString(req.params.asset);
+      if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
+
+      const [feedback, response, revoke] = await Promise.all(
+        ['feedback', 'response', 'revoke'].map(ct =>
+          prisma.hashChainCheckpoint.findFirst({
+            where: { agentId: asset, chainType: ct },
+            orderBy: { eventCount: 'desc' },
+          })
+        )
+      );
+
+      const fmt = (cp: typeof feedback) => cp ? {
+        event_count: cp.eventCount,
+        digest: cp.digest,
+        created_at: cp.createdAt.toISOString(),
+      } : null;
+
+      res.json({ feedback: fmt(feedback), response: fmt(response), revoke: fmt(revoke) });
+    } catch (error) {
+      logger.error({ error }, 'Error fetching latest checkpoints');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/verify/replay/:asset - Trigger full replay verification
+  app.get('/rest/v1/verify/replay/:asset', async (req: Request, res: Response) => {
+    try {
+      const asset = safeQueryString(req.params.asset);
+      if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
+      const verifier = new ReplayVerifier(prisma);
+      const result = await verifier.fullReplay(asset);
+      res.json(result);
+    } catch (error) {
+      logger.error({ error }, 'Error during replay verification');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/events/:asset/replay-data - Events ordered for client-side replay
+  app.get('/rest/v1/events/:asset/replay-data', async (req: Request, res: Response) => {
+    try {
+      const asset = safeQueryString(req.params.asset);
+      if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
+      const chainType = safeQueryString(req.query.chainType) || 'feedback';
+      const fromCount = parseInt(safeQueryString(req.query.fromCount) || '0', 10);
+      const toCountStr = safeQueryString(req.query.toCount);
+      const toCount = toCountStr ? parseInt(toCountStr, 10) : undefined;
+      const limit = safePaginationLimit(req.query.limit);
+
+      if (!['feedback', 'response', 'revoke'].includes(chainType)) {
+        res.status(400).json({ error: 'Invalid chainType. Must be feedback, response, or revoke.' });
+        return;
+      }
+
+      if (chainType === 'feedback') {
+        const where: Prisma.FeedbackWhereInput = {
+          agentId: asset,
+          feedbackIndex: { gte: BigInt(fromCount) },
+        };
+        if (toCount !== undefined) {
+          where.feedbackIndex = { gte: BigInt(fromCount), lt: BigInt(toCount) };
+        }
+
+        const events = await prisma.feedback.findMany({
+          where,
+          orderBy: { feedbackIndex: 'asc' },
+          take: limit,
+        });
+
+        res.json({
+          events: events.map(f => ({
+            asset: f.agentId,
+            client: f.client,
+            feedback_index: f.feedbackIndex.toString(),
+            feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
+            slot: f.createdSlot ? Number(f.createdSlot) : 0,
+            running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
+          })),
+          hasMore: events.length === limit,
+          nextFromCount: events.length > 0
+            ? Number(events[events.length - 1].feedbackIndex) + 1
+            : fromCount,
+        });
+      } else if (chainType === 'response') {
+        const where: Prisma.FeedbackResponseWhereInput = {
+          feedback: { agentId: asset },
+        };
+        const rcFilter: { gte: bigint; lt?: bigint } = { gte: BigInt(fromCount) };
+        if (toCount !== undefined) rcFilter.lt = BigInt(toCount);
+        where.responseCount = rcFilter;
+
+        const events = await prisma.feedbackResponse.findMany({
+          where,
+          orderBy: { responseCount: 'asc' },
+          take: limit,
+          include: {
+            feedback: {
+              select: { agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
+            },
+          },
+        });
+
+        res.json({
+          events: events.map(r => ({
+            asset: r.feedback.agentId,
+            client: r.feedback.client,
+            feedback_index: r.feedback.feedbackIndex.toString(),
+            responder: r.responder,
+            response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
+            feedback_hash: r.feedback.feedbackHash ? Buffer.from(r.feedback.feedbackHash).toString('hex') : null,
+            slot: r.slot ? Number(r.slot) : 0,
+            running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+            response_count: r.responseCount != null ? Number(r.responseCount) : null,
+          })),
+          hasMore: events.length === limit,
+          nextFromCount: events.length > 0
+            ? Number(events[events.length - 1].responseCount ?? 0) + 1
+            : fromCount,
+        });
+      } else {
+        const where: Prisma.RevocationWhereInput = {
+          agentId: asset,
+          revokeCount: { gte: BigInt(fromCount) },
+        };
+        if (toCount !== undefined) {
+          where.revokeCount = { gte: BigInt(fromCount), lt: BigInt(toCount) };
+        }
+
+        const events = await prisma.revocation.findMany({
+          where,
+          orderBy: { revokeCount: 'asc' },
+          take: limit,
+        });
+
+        res.json({
+          events: events.map(r => ({
+            asset: r.agentId,
+            client: r.client,
+            feedback_index: r.feedbackIndex.toString(),
+            feedback_hash: r.feedbackHash ? Buffer.from(r.feedbackHash).toString('hex') : null,
+            slot: Number(r.slot),
+            running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+            revoke_count: Number(r.revokeCount),
+          })),
+          hasMore: events.length === limit,
+          nextFromCount: events.length > 0
+            ? Number(events[events.length - 1].revokeCount) + 1
+            : fromCount,
+        });
+      }
+    } catch (error) {
+      logger.error({ error }, 'Error fetching replay data');
       res.status(500).json({ error: 'Internal server error' });
     }
   });

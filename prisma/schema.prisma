@@ -87,6 +87,7 @@ model Feedback {
   createdAt          DateTime @default(now())
   createdTxSignature String?
   createdSlot        BigInt?
+  txIndex            Int?
   revokedTxSignature String?
   revokedSlot        BigInt?
   status             String   @default("PENDING")
@@ -111,9 +112,11 @@ model FeedbackResponse {
   responseUri   String
   responseHash  Bytes?
   runningDigest Bytes?
+  responseCount BigInt?
   createdAt     DateTime @default(now())
   txSignature   String?
   slot          BigInt?
+  txIndex       Int?
   status        String   @default("PENDING")
   verifiedAt    DateTime?
 
@@ -122,6 +125,7 @@ model FeedbackResponse {
   @@unique([feedbackId, responder, txSignature])
   @@index([feedbackId])
   @@index([feedbackId, responder])
+  @@index([feedbackId, responseCount])
   @@index([status])
 }
 
@@ -138,6 +142,7 @@ model Revocation {
   runningDigest Bytes?
   revokeCount   BigInt
   txSignature   String?
+  txIndex       Int?
   createdAt     DateTime @default(now())
   status        String   @default("PENDING")
   verifiedAt    DateTime?
@@ -244,6 +249,18 @@ model AgentDigestCache {
   lastVerifiedSlot BigInt?
   needsGapFill     Boolean   @default(false)
   gapFillFromSlot  BigInt?
+}
+
+model HashChainCheckpoint {
+  id         Int      @id @default(autoincrement())
+  agentId    String
+  chainType  String
+  eventCount Int
+  digest     String
+  createdAt  DateTime @default(now())
+
+  @@unique([agentId, chainType, eventCount])
+  @@index([agentId, chainType])
 }
 
 // Event log for debugging and replay
