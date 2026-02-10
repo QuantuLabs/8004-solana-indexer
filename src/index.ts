@@ -80,15 +80,15 @@ async function main() {
   const pool = config.dbMode === "supabase" ? getPool() : null;
   const processor = new Processor(prisma, pool);
 
-  await processor.start();
-
-  // Start REST API server in local mode
+  // Start REST API server before processor (available during backfill)
   let apiServer: Server | null = null;
   if (config.dbMode === "local" && prisma) {
     const apiPort = parseInt(process.env.API_PORT || "3001");
     apiServer = await startApiServer({ prisma, port: apiPort });
     logger.info({ apiPort }, "REST API available at http://localhost:" + apiPort + "/rest/v1");
   }
+
+  await processor.start();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutdown signal received");
