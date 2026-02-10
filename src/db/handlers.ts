@@ -139,9 +139,9 @@ async function updateCursorAtomic(
     select: { lastSlot: true },
   });
 
-  // Monotonic check: reject backward slot movement, allow same-slot advancement
+  // Monotonic guard: reject backward slot movement
   if (current && current.lastSlot !== null && ctx.slot < current.lastSlot) {
-    return; // Already processed a later slot
+    return;
   }
 
   await tx.indexerState.upsert({
@@ -923,12 +923,14 @@ async function handleFeedbackRevokedTx(
     select: { feedbackHash: true },
   });
 
+  let sealMismatch = false;
   if (!feedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
     );
   } else if (!hashesMatch(eventSealHash, feedback.feedbackHash)) {
+    sealMismatch = true;
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
@@ -940,6 +942,7 @@ async function handleFeedbackRevokedTx(
     data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
 
+  const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
   await tx.revocation.upsert({
     where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
     create: {
@@ -955,12 +958,12 @@ async function handleFeedbackRevokedTx(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
-      status: !feedback ? "ORPHANED" : DEFAULT_STATUS,
+      status: revokeStatus,
     },
     update: {},
   });
 
-  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback }, "Feedback revoked");
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }
 
 async function handleFeedbackRevoked(
@@ -983,12 +986,14 @@ async function handleFeedbackRevoked(
     select: { feedbackHash: true },
   });
 
+  let sealMismatch = false;
   if (!feedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
     );
   } else if (!hashesMatch(eventSealHash, feedback.feedbackHash)) {
+    sealMismatch = true;
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
@@ -1000,6 +1005,7 @@ async function handleFeedbackRevoked(
     data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
 
+  const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
   await prisma.revocation.upsert({
     where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
     create: {
@@ -1015,12 +1021,12 @@ async function handleFeedbackRevoked(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
-      status: !feedback ? "ORPHANED" : DEFAULT_STATUS,
+      status: revokeStatus,
     },
     update: {},
   });
 
-  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback }, "Feedback revoked");
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }
 
 async function handleResponseAppendedTx(
@@ -1415,8 +1421,19 @@ async function digestAndStoreUriMetadataLocal(
     return;
   }
 
+  const result = await digestUri(uri);
+
+  // Re-check URI freshness after network fetch (TOCTOU protection)
+  const agentRecheck = await prisma.agent.findUnique({
+    where: { id: assetId },
+    select: { uri: true },
+  });
+  if (!agentRecheck || agentRecheck.uri !== uri) {
+    logger.debug({ assetId, uri }, "URI changed during fetch, discarding stale results");
+    return;
+  }
+
   // Purge old URI-derived metadata before storing new ones
-  // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
   try {
     await prisma.agentMetadata.deleteMany({
       where: {
@@ -1428,8 +1445,6 @@ async function digestAndStoreUriMetadataLocal(
   } catch (error: any) {
     logger.warn({ assetId, error: error.message }, "Failed to purge old URI metadata");
   }
-
-  const result = await digestUri(uri);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");

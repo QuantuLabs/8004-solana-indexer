@@ -195,12 +195,11 @@ export class ReplayVerifier {
     let checkpointsStored = 0;
 
     if (chainType === "feedback") {
-      let skip = 0;
+      let lastIndex = startCount > 0 ? BigInt(startCount - 1) : -1n;
       while (true) {
         const feedbacks = await this.prisma.feedback.findMany({
-          where: { agentId, feedbackIndex: { gte: BigInt(startCount) } },
+          where: { agentId, feedbackIndex: { gt: lastIndex }, status: { not: "ORPHANED" } },
           orderBy: { feedbackIndex: "asc" },
-          skip,
           take: BATCH_SIZE,
         });
         if (feedbacks.length === 0) break;
@@ -229,19 +228,19 @@ export class ReplayVerifier {
             checkpointsStored++;
           }
         }
-        skip += feedbacks.length;
+        lastIndex = feedbacks[feedbacks.length - 1].feedbackIndex;
         if (feedbacks.length < BATCH_SIZE) break;
       }
     } else if (chainType === "response") {
-      let skip = 0;
+      let lastResponseCount = startCount > 0 ? BigInt(startCount - 1) : -1n;
       while (true) {
         const responses = await this.prisma.feedbackResponse.findMany({
           where: {
             feedback: { agentId },
-            responseCount: { gte: BigInt(startCount) },
+            responseCount: { gt: lastResponseCount },
+            status: { not: "ORPHANED" },
           },
           orderBy: { responseCount: "asc" },
-          skip,
           take: BATCH_SIZE,
           include: {
             feedback: {
@@ -277,16 +276,15 @@ export class ReplayVerifier {
             checkpointsStored++;
           }
         }
-        skip += responses.length;
+        lastResponseCount = responses[responses.length - 1].responseCount ?? lastResponseCount;
         if (responses.length < BATCH_SIZE) break;
       }
     } else {
-      let skip = 0;
+      let lastRevokeCount = startCount > 0 ? BigInt(startCount - 1) : -1n;
       while (true) {
         const revocations = await this.prisma.revocation.findMany({
-          where: { agentId, revokeCount: { gte: BigInt(startCount) } },
+          where: { agentId, revokeCount: { gt: lastRevokeCount }, status: { not: "ORPHANED" } },
           orderBy: { revokeCount: "asc" },
-          skip,
           take: BATCH_SIZE,
         });
         if (revocations.length === 0) break;
@@ -315,7 +313,7 @@ export class ReplayVerifier {
             checkpointsStored++;
           }
         }
-        skip += revocations.length;
+        lastRevokeCount = revocations[revocations.length - 1].revokeCount;
         if (revocations.length < BATCH_SIZE) break;
       }
     }

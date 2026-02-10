@@ -21,6 +21,7 @@ const logger = createChildLogger("metadata-queue");
 const CONCURRENCY = 10;        // Max parallel URI fetches
 const INTERVAL = 100;          // Min 100ms between operations (rate limiting)
 const TIMEOUT_MS = 30000;      // 30s timeout per operation
+const MAX_QUEUE_SIZE = 5000;   // Max pending tasks in queue (memory protection)
 
 // Standard URI fields that should NOT be compressed
 const STANDARD_URI_FIELDS = new Set([
@@ -93,6 +94,12 @@ class MetadataQueue {
     if (existing && existing.uri === uri) {
       this.stats.skippedDuplicate++;
       logger.debug({ assetId }, "Skipped duplicate metadata task");
+      return;
+    }
+
+    // Reject if queue is at capacity
+    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
+      logger.warn({ assetId, queueSize: this.queue.size }, "Metadata queue full, rejecting task");
       return;
     }
 

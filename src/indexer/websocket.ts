@@ -353,24 +353,34 @@ export class WebSocketIndexer {
         return;
       }
 
-      // Update state - both local and Supabase modes
+      // Update state - both local and Supabase modes (with monotonic guard)
       try {
+        const newSlot = BigInt(ctx.slot);
         if (this.prisma) {
-          await this.prisma.indexerState.upsert({
+          const current = await this.prisma.indexerState.findUnique({
             where: { id: "main" },
-            create: {
-              id: "main",
-              lastSignature: logs.signature,
-              lastSlot: BigInt(ctx.slot),
-            },
-            update: {
-              lastSignature: logs.signature,
-              lastSlot: BigInt(ctx.slot),
-            },
+            select: { lastSlot: true },
           });
+          if (current && current.lastSlot !== null && newSlot < current.lastSlot) {
+            logger.debug({ slot: ctx.slot, currentSlot: Number(current.lastSlot) },
+              "WS cursor update skipped — slot behind current");
+          } else {
+            await this.prisma.indexerState.upsert({
+              where: { id: "main" },
+              create: {
+                id: "main",
+                lastSignature: logs.signature,
+                lastSlot: newSlot,
+              },
+              update: {
+                lastSignature: logs.signature,
+                lastSlot: newSlot,
+              },
+            });
+          }
         } else {
-          // Supabase mode - persist cursor for recovery
-          await saveIndexerState(logs.signature, BigInt(ctx.slot));
+          // Supabase mode — saveIndexerState already has SQL-level monotonic guard
+          await saveIndexerState(logs.signature, newSlot);
         }
       } catch (stateError) {
         logger.error({

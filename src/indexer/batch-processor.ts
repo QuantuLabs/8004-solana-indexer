@@ -304,18 +304,21 @@ export class EventBuffer {
         const now = Date.now();
         const spaceAvailable = MAX_DEAD_LETTER - this.deadLetterQueue.length;
         if (spaceAvailable <= 0) {
-          logger.error({ dropped: eventsToFlush.length }, "Dead letter queue full, dropping events");
+          logger.error({ eventCount: eventsToFlush.length }, "Dead letter queue full, halting ingestion");
+          this.buffer = [...eventsToFlush, ...this.buffer];
+          this.retryCount = 0;
+          throw error;
         } else if (eventsToFlush.length > spaceAvailable) {
           const toKeep = eventsToFlush.slice(0, spaceAvailable);
-          const dropped = eventsToFlush.length - toKeep.length;
+          const overflow = eventsToFlush.slice(spaceAvailable);
           this.deadLetterQueue.push(...toKeep.map(e => ({ event: e, addedAt: now })));
-          logger.error({ dropped, kept: toKeep.length }, "Dead letter queue nearly full, some events dropped");
+          this.buffer = [...overflow, ...this.buffer];
+          logger.error({ deadLettered: toKeep.length, requeued: overflow.length }, "Dead letter queue nearly full, requeuing overflow");
         } else {
           this.deadLetterQueue.push(...eventsToFlush.map(e => ({ event: e, addedAt: now })));
         }
         this.stats.deadLettered += eventsToFlush.length;
         this.retryCount = 0;
-        // Don't re-throw - continue processing new events
       } else {
         // Re-add events to buffer for retry (limited retries)
         this.buffer = [...eventsToFlush, ...this.buffer];

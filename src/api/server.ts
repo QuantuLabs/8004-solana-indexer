@@ -354,8 +354,13 @@ export function createApiServer(options: ApiServerOptions): Express {
         const tag1Match = orFilter.match(/tag1\.eq\.([^,)]+)/);
         const tag2Match = orFilter.match(/tag2\.eq\.([^,)]+)/);
         const orConditions: Prisma.FeedbackWhereInput[] = [];
-        if (tag1Match) orConditions.push({ tag1: decodeURIComponent(tag1Match[1]) });
-        if (tag2Match) orConditions.push({ tag2: decodeURIComponent(tag2Match[1]) });
+        try {
+          if (tag1Match) orConditions.push({ tag1: decodeURIComponent(tag1Match[1]) });
+          if (tag2Match) orConditions.push({ tag2: decodeURIComponent(tag2Match[1]) });
+        } catch {
+          res.status(400).json({ error: 'Invalid percent-encoding in filter' });
+          return;
+        }
         if (orConditions.length > 0) where.OR = orConditions;
       }
 
@@ -1080,8 +1085,13 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
       if (!BASE58_REGEX.test(asset)) { res.status(400).json({ error: 'Invalid asset: must be a base58-encoded public key (32-44 chars)' }); return; }
       const chainType = safeQueryString(req.query.chainType) || 'feedback';
-      const fromCount = parseInt(safeQueryString(req.query.fromCount) || '0', 10);
+      const fromCountStr = safeQueryString(req.query.fromCount) || '0';
       const toCountStr = safeQueryString(req.query.toCount);
+      if (!/^\d+$/.test(fromCountStr) || (toCountStr && !/^\d+$/.test(toCountStr))) {
+        res.status(400).json({ error: 'fromCount and toCount must be non-negative integers' });
+        return;
+      }
+      const fromCount = parseInt(fromCountStr, 10);
       const toCount = toCountStr ? parseInt(toCountStr, 10) : undefined;
       const limit = safePaginationLimit(req.query.limit);
 

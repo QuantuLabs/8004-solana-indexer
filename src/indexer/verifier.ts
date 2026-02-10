@@ -843,7 +843,10 @@ export class DataVerifier {
         onChain = await this.fetchOnChainDigests(agentId);
         this.digestCache.set(agentId, onChain);
       }
-      if (!onChain) return true;
+      if (!onChain) {
+        logger.debug({ agentId, chain }, "On-chain digests unavailable, keeping PENDING");
+        return false;
+      }
 
       const dbState = await this.getLastDbDigests(agentId);
 
@@ -873,8 +876,11 @@ export class DataVerifier {
           break;
       }
 
-      // No DB digest data → can't verify (old data without running_digest)
-      if (!dbDigest) return true;
+      // No DB events and on-chain count is also zero → legitimate empty chain
+      if (!dbDigest && onChainCount === 0n) return true;
+
+      // No DB digest but on-chain has events → can't verify, keep PENDING
+      if (!dbDigest) return false;
 
       // DB count < on-chain → indexer behind, skip
       if (dbCount < onChainCount) {

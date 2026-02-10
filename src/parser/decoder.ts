@@ -17,11 +17,10 @@ function parseBigInt(value: unknown): bigint {
   if (typeof value === 'bigint') return value;
   if (typeof value === 'string') return BigInt(value);
   if (typeof value === 'number') {
-    // Warn if number exceeds safe integer range (potential precision loss)
     if (!Number.isSafeInteger(value)) {
-      logger.warn({ value }, "Unsafe integer conversion to BigInt - potential precision loss");
+      throw new Error(`Unsafe integer ${value} exceeds MAX_SAFE_INTEGER, use string or BN`);
     }
-    return BigInt(Math.trunc(value)); // Use trunc to avoid fractional issues
+    return BigInt(Math.trunc(value));
   }
   if (value && typeof value === 'object' && 'negative' in value && 'words' in value) {
     const bn = value as { negative: number; words: number[] };
@@ -298,7 +297,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
-            nonce: BigInt(data.nonce as string | number),                      // u64 on-chain
+            nonce: BigInt(data.nonce as string | number),
             requestUri: data.request_uri as string,                            // snake_case from IDL
             requestHash: new Uint8Array(data.request_hash as number[]),        // snake_case from IDL
             requester: new PublicKey(data.requester as string),
@@ -311,7 +310,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
           data: {
             asset: new PublicKey(data.asset as string),
             validatorAddress: new PublicKey(data.validator_address as string), // snake_case from IDL
-            nonce: BigInt(data.nonce as string | number),                      // u64 on-chain
+            nonce: BigInt(data.nonce as string | number),
             response: data.response as number,
             responseUri: data.response_uri as string,                          // snake_case from IDL
             responseHash: new Uint8Array(data.response_hash as number[]),      // snake_case from IDL
