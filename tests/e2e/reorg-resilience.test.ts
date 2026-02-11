@@ -5,19 +5,16 @@
  * 1. Status columns on all models (PENDING default)
  * 2. Atomic ingestion (event + cursor in single transaction)
  * 3. Verification worker (PENDING → FINALIZED / ORPHANED transitions)
- * 4. API status filtering (default excludes ORPHANED)
- * 5. Reentrancy guard for verifier
- * 6. Verification stats endpoint
+ * 4. Reentrancy guard for verifier
+ * 5. Verification stats endpoint
  */
 
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { PublicKey, Connection } from "@solana/web3.js";
 import { handleEvent, handleEventAtomic, EventContext } from "../../src/db/handlers.js";
-import { createApiServer } from "../../src/api/server.js";
 import { DataVerifier } from "../../src/indexer/verifier.js";
+import { getAgentPda } from "../../src/utils/pda.js";
 import type { ProgramEvent } from "../../src/parser/types.js";
-import type { Express } from "express";
-import type { Server } from "http";
 import { prisma } from "./setup.js";
 
 // Test fixtures - valid generated pubkeys
@@ -30,24 +27,6 @@ const TEST_CLIENT = new PublicKey("J7iPcZnFVyHs7ipu7YVgzacYz4MMLhD7p57B8jRjmtqk"
 const TEST_VALIDATOR = new PublicKey("EvpsgCGoqhMUjxFaYouj9KKhqQ4RoknmPjnvsrRUU2ND");
 
 describe("E2E: Reorg Resilience", () => {
-  let app: Express;
-  let server: Server;
-  const PORT = 4200;
-
-  beforeAll(async () => {
-    app = createApiServer({ prisma });
-    server = app.listen(PORT);
-  });
-
-  afterAll(async () => {
-    server?.close();
-  });
-
-  async function restGet(path: string) {
-    const response = await fetch(`http://localhost:${PORT}${path}`);
-    return response.json();
-  }
-
   // =========================================================================
   // Phase 1: Status Columns - All models default to PENDING
   // =========================================================================
@@ -321,11 +300,12 @@ describe("E2E: Reorg Resilience", () => {
   describe("3. Verification Worker", () => {
     it("should finalize agent when it exists on-chain", async () => {
       // Mock connection that returns account info for TEST_AGENT_REORG
+      const [expectedAgentPda] = getAgentPda(TEST_AGENT_REORG);
       const mockConnection = {
         getSlot: vi.fn().mockResolvedValue(300000),
         getAccountInfo: vi.fn().mockImplementation(async (pubkey: PublicKey) => {
           const key = pubkey.toBase58();
-          if (key === TEST_AGENT_REORG.toBase58()) {
+          if (key === expectedAgentPda.toBase58()) {
             return { data: Buffer.alloc(100), lamports: 1000000 };
           }
           return null;
@@ -470,99 +450,10 @@ describe("E2E: Reorg Resilience", () => {
   });
 
   // =========================================================================
-  // Phase 4: API Status Filtering
+  // Phase 4: Verification Stats
   // =========================================================================
 
-  describe("4. API Status Filtering", () => {
-    beforeAll(async () => {
-      // Ensure we have agents in different states
-      // FINALIZED agent
-      await prisma.agent.update({
-        where: { id: TEST_AGENT_REORG.toBase58() },
-        data: { status: "FINALIZED" },
-      });
-
-      // ORPHANED agent
-      await prisma.agent.update({
-        where: { id: TEST_AGENT_ORPHAN.toBase58() },
-        data: { status: "ORPHANED" },
-      });
-    });
-
-    it("should exclude ORPHANED agents by default", async () => {
-      const result = await restGet("/rest/v1/agents");
-
-      // Should not include orphaned agent (API maps id to asset)
-      const orphanedAgent = result.find(
-        (a: any) => a.asset === TEST_AGENT_ORPHAN.toBase58()
-      );
-      expect(orphanedAgent).toBeUndefined();
-
-      // Should include finalized agent
-      const finalizedAgent = result.find(
-        (a: any) => a.asset === TEST_AGENT_REORG.toBase58()
-      );
-      expect(finalizedAgent).toBeDefined();
-    });
-
-    it("should filter by status=FINALIZED", async () => {
-      const result = await restGet("/rest/v1/agents?status=eq.FINALIZED");
-
-      // All returned agents should be FINALIZED
-      for (const agent of result) {
-        expect(agent.status).toBe("FINALIZED");
-      }
-    });
-
-    it("should filter by status=PENDING", async () => {
-      const result = await restGet("/rest/v1/agents?status=eq.PENDING");
-
-      // All returned agents should be PENDING
-      for (const agent of result) {
-        expect(agent.status).toBe("PENDING");
-      }
-    });
-
-    it("should include ORPHANED when explicitly requested", async () => {
-      const result = await restGet("/rest/v1/agents?status=eq.ORPHANED");
-
-      // Should only return orphaned agents
-      expect(result.length).toBeGreaterThan(0);
-      for (const agent of result) {
-        expect(agent.status).toBe("ORPHANED");
-      }
-    });
-
-    it("should filter feedbacks by status", async () => {
-      // Update a feedback to FINALIZED
-      await prisma.feedback.updateMany({
-        where: { agentId: TEST_AGENT_REORG.toBase58() },
-        data: { status: "FINALIZED" },
-      });
-
-      const result = await restGet(
-        `/rest/v1/feedbacks?asset=eq.${TEST_AGENT_REORG.toBase58()}&status=eq.FINALIZED`
-      );
-
-      for (const feedback of result) {
-        expect(feedback.status).toBe("FINALIZED");
-      }
-    });
-
-    it("should filter validations by chainStatus", async () => {
-      const result = await restGet("/rest/v1/validations?chain_status=eq.PENDING");
-
-      for (const validation of result) {
-        expect(validation.chain_status).toBe("PENDING");
-      }
-    });
-  });
-
-  // =========================================================================
-  // Phase 5: Verification Stats
-  // =========================================================================
-
-  describe("5. Verification Stats", () => {
+  describe("4. Verification Stats", () => {
     it("should count records by status", async () => {
       // Check agent counts by status directly
       const pending = await prisma.agent.count({ where: { status: "PENDING" } });
@@ -717,6 +608,7 @@ describe("E2E: Reorg Resilience", () => {
 
       const verifier = new DataVerifier(mockConnection, prisma, null, 60000);
       (verifier as any).isRunning = true;
+      (verifier as any).checkDigestMatch = vi.fn().mockResolvedValue(true);
 
       // Ensure agent exists first (for FK constraint)
       await prisma.agent.upsert({
@@ -780,6 +672,7 @@ describe("E2E: Reorg Resilience", () => {
 
       const verifier = new DataVerifier(mockConnection, prisma, null, 60000);
       (verifier as any).isRunning = true;
+      (verifier as any).checkDigestMatch = vi.fn().mockResolvedValue(true);
 
       // Ensure agent exists first (for FK constraint)
       await prisma.agent.upsert({
@@ -970,7 +863,7 @@ describe("E2E: Reorg Resilience", () => {
       expect(attempts).toBe(3);
     });
 
-    it("should return false when all retries exhausted (persistent failure)", async () => {
+    it("should return null when all retries exhausted (persistent RPC errors)", async () => {
       const mockConnection = {
         getSlot: vi.fn().mockResolvedValue(400000),
         getAccountInfo: vi.fn().mockRejectedValue(new Error("Persistent RPC failure")),
@@ -979,14 +872,14 @@ describe("E2E: Reorg Resilience", () => {
       const verifier = new DataVerifier(mockConnection, prisma, null, 60000);
       (verifier as any).isRunning = true;
 
-      // verifyWithRetry should return false after all retries fail
+      // verifyWithRetry returns null when every attempt is inconclusive (RPC errors).
       const result = await (verifier as any).verifyWithRetry(
         TEST_AGENT_REORG.toBase58(),
         "finalized",
         3
       );
 
-      expect(result).toBe(false);
+      expect(result).toBeNull();
     });
 
     it("should return false when account consistently null (not just error)", async () => {

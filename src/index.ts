@@ -73,20 +73,26 @@ async function main() {
   } else {
     logger.info(
       { supabaseUrl: config.supabaseUrl },
-      "Using Supabase for database (API via REST)"
+      "Using Supabase for database (API via GraphQL)"
     );
   }
 
   const pool = config.dbMode === "supabase" ? getPool() : null;
   const processor = new Processor(prisma, pool);
 
-  // Start REST API server before processor (available during backfill)
-  let apiServer: Server | null = null;
-  if (config.dbMode === "local" && prisma) {
-    const apiPort = parseInt(process.env.API_PORT || "3001");
-    apiServer = await startApiServer({ prisma, port: apiPort });
-    logger.info({ apiPort }, "REST API available at http://localhost:" + apiPort + "/rest/v1");
+  if (!pool) {
+    logger.fatal(
+      { dbMode: config.dbMode },
+      "GraphQL mode requires DB_MODE=supabase (PostgreSQL pool)"
+    );
+    process.exit(1);
   }
+
+  // Start GraphQL API server before processor (available during backfill)
+  let apiServer: Server | null = null;
+  const apiPort = parseInt(process.env.API_PORT || "3001");
+  apiServer = await startApiServer({ prisma, pool, port: apiPort });
+  logger.info({ apiPort }, `GraphQL endpoint: http://localhost:${apiPort}/graphql`);
 
   await processor.start();
 
@@ -117,7 +123,7 @@ async function main() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   logger.info("8004 Solana Indexer is running");
-  logger.info("API available via Supabase REST: " + (config.supabaseUrl || "N/A"));
+  logger.info("API available via Supabase GraphQL: " + (config.supabaseUrl || "N/A"));
 }
 
 main().catch((error) => {
