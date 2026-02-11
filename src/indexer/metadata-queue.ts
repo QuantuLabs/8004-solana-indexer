@@ -23,21 +23,7 @@ const INTERVAL = 100;          // Min 100ms between operations (rate limiting)
 const TIMEOUT_MS = 30000;      // 30s timeout per operation
 const MAX_QUEUE_SIZE = 5000;   // Max pending tasks in queue (memory protection)
 
-// Standard URI fields that should NOT be compressed
-const STANDARD_URI_FIELDS = new Set([
-  "_uri:type",
-  "_uri:name",
-  "_uri:description",
-  "_uri:image",
-  "_uri:services",
-  "_uri:registrations",
-  "_uri:supported_trust",
-  "_uri:active",
-  "_uri:x402_support",
-  "_uri:skills",
-  "_uri:domains",
-  "_uri:_status",
-]);
+import { STANDARD_URI_FIELDS } from "../constants.js";
 
 export interface MetadataTask {
   assetId: string;

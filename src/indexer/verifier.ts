@@ -63,6 +63,8 @@ interface VerificationStats {
   registriesVerified: number;
   registriesOrphaned: number;
   hashChainMismatches: number;
+  skippedRpcErrors: number;
+  orphansRecovered: number;
   lastRunAt: Date | null;
   lastRunDurationMs: number;
 }
@@ -87,9 +89,12 @@ export class DataVerifier {
     registriesVerified: 0,
     registriesOrphaned: 0,
     hashChainMismatches: 0,
+    skippedRpcErrors: 0,
+    orphansRecovered: 0,
     lastRunAt: null,
     lastRunDurationMs: 0,
   };
+  private cycleCount = 0;
   // Per-cycle cache for on-chain digests (cleared each cycle)
   private digestCache = new Map<string, OnChainDigests | null>();
 
@@ -170,6 +175,12 @@ export class DataVerifier {
         this.verifyRevocations(cutoffSlot),
       ]);
 
+      // Periodically attempt to recover incorrectly orphaned records
+      this.cycleCount++;
+      if (config.verifyRecoveryCycles > 0 && this.cycleCount % config.verifyRecoveryCycles === 0) {
+        await this.recoverOrphaned();
+      }
+
       const duration = Date.now() - startTime;
       this.stats.lastRunAt = new Date();
       this.stats.lastRunDurationMs = duration;
@@ -179,6 +190,8 @@ export class DataVerifier {
         agents: this.stats.agentsVerified,
         feedbacks: this.stats.feedbacksVerified,
         validations: this.stats.validationsVerified,
+        skippedRpcErrors: this.stats.skippedRpcErrors,
+        orphansRecovered: this.stats.orphansRecovered,
       }, "Verification cycle complete");
     } catch (error: any) {
       logger.error({ error: error.message }, "Verification cycle failed");
@@ -214,16 +227,35 @@ export class DataVerifier {
 
     logger.debug({ count: pending.length }, "Verifying agents");
 
-    const pubkeys = pending.map(a => a.id);
+    // Verify Agent PDAs (not raw asset mint accounts) for registry-level existence.
+    const pdaMap = new Map<string, typeof pending[0]>();
+    for (const agent of pending) {
+      try {
+        const assetPubkey = parseAssetPubkey(agent.id);
+        const [agentPda] = getAgentPda(assetPubkey);
+        pdaMap.set(agentPda.toBase58(), agent);
+      } catch (error: any) {
+        logger.error({ agentId: agent.id, error: error.message }, "Failed to derive agent PDA");
+      }
+    }
+
+    if (pdaMap.size === 0) return;
+
+    const pubkeys = Array.from(pdaMap.keys());
     const existsMap = await this.batchVerifyAccounts(pubkeys, "finalized");
 
     const now = new Date();
 
-    for (const agent of pending) {
+    for (const [agentPda, agent] of pdaMap) {
       if (!this.isRunning) break;
 
       try {
-        const exists = existsMap.get(agent.id) ?? false;
+        const exists = existsMap.get(agentPda);
+
+        if (exists === null || exists === undefined) {
+          this.stats.skippedRpcErrors++;
+          continue;
+        }
 
         if (this.prisma) {
           await this.prisma.agent.update({
@@ -250,7 +282,7 @@ export class DataVerifier {
           this.stats.agentsVerified++;
         } else {
           this.stats.agentsOrphaned++;
-          logger.warn({ agentId: agent.id }, "Agent orphaned - not found at finalized");
+          logger.warn({ agentId: agent.id, agentPda }, "Agent orphaned - PDA not found at finalized");
         }
       } catch (error: any) {
         logger.error({ agentId: agent.id, error: error.message }, "Agent verification failed");
@@ -309,7 +341,13 @@ export class DataVerifier {
       if (!this.isRunning) break;
 
       try {
-        const exists = existsMap.get(pda) ?? false;
+        const exists = existsMap.get(pda);
+
+        if (exists === null || exists === undefined) {
+          this.stats.skippedRpcErrors++;
+          continue;
+        }
+
         const newStatus = exists ? "FINALIZED" : "ORPHANED";
 
         if (this.prisma) {
@@ -415,7 +453,13 @@ export class DataVerifier {
         if (!this.isRunning) break;
 
         try {
-          const exists = existsMap.get(pda) ?? false;
+          const exists = existsMap.get(pda);
+
+          if (exists === null || exists === undefined) {
+            this.stats.skippedRpcErrors++;
+            continue;
+          }
+
           const newStatus = exists ? "FINALIZED" : "ORPHANED";
 
           if (this.prisma) {
@@ -490,7 +534,13 @@ export class DataVerifier {
       if (!this.isRunning) break;
 
       try {
-        const exists = existsMap.get(pda) ?? false;
+        const exists = existsMap.get(pda);
+
+        if (exists === null || exists === undefined) {
+          this.stats.skippedRpcErrors++;
+          continue;
+        }
+
         const newStatus = exists ? "FINALIZED" : "ORPHANED";
 
         if (this.prisma) {
@@ -514,6 +564,157 @@ export class DataVerifier {
       } catch (error: any) {
         logger.error({ registryId: r.id, error: error.message }, "Registry verification failed");
       }
+    }
+  }
+
+  // =========================================================================
+  // ORPHANED Recovery (re-check previously orphaned records)
+  // =========================================================================
+
+  private async recoverOrphaned(): Promise<void> {
+    if (!this.isRunning) return;
+
+    const batchSize = config.verifyRecoveryBatchSize;
+    const recoveredBefore = this.stats.orphansRecovered;
+
+    // Recover orphaned agents
+    let orphanedAgents: Array<{ id: string }> = [];
+    if (this.prisma) {
+      orphanedAgents = await this.prisma.agent.findMany({
+        where: { status: "ORPHANED" },
+        take: batchSize,
+        select: { id: true },
+      });
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT asset AS id FROM agents WHERE status = 'ORPHANED' LIMIT $1`,
+        [batchSize]
+      );
+      orphanedAgents = result.rows;
+    }
+
+    if (orphanedAgents.length > 0) {
+      const pubkeys = orphanedAgents.map(a => a.id);
+      const existsMap = await this.batchVerifyAccounts(pubkeys, "finalized");
+      const now = new Date();
+
+      for (const agent of orphanedAgents) {
+        const exists = existsMap.get(agent.id);
+        if (exists === true) {
+          if (this.prisma) {
+            await this.prisma.agent.update({
+              where: { id: agent.id },
+              data: { status: "PENDING", verifiedAt: now },
+            });
+          } else if (this.pool) {
+            await this.pool.query(
+              `UPDATE agents SET status = 'PENDING', verified_at = $1 WHERE asset = $2`,
+              [now.toISOString(), agent.id]
+            );
+          }
+          this.stats.orphansRecovered++;
+          logger.info({ agentId: agent.id }, "Recovered orphaned agent → PENDING");
+        }
+      }
+    }
+
+    // Recover orphaned feedbacks (grouped by agent)
+    let orphanedFeedbacks: Array<{ id: string; agentId: string }> = [];
+    if (this.prisma) {
+      orphanedFeedbacks = await this.prisma.feedback.findMany({
+        where: { status: "ORPHANED" },
+        take: batchSize,
+        select: { id: true, agentId: true },
+      });
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT id, asset AS "agentId" FROM feedbacks WHERE status = 'ORPHANED' LIMIT $1`,
+        [batchSize]
+      );
+      orphanedFeedbacks = result.rows;
+    }
+
+    if (orphanedFeedbacks.length > 0) {
+      const agentIds = [...new Set(orphanedFeedbacks.map(f => f.agentId))];
+      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const now = new Date();
+
+      for (const fb of orphanedFeedbacks) {
+        const exists = existsMap.get(fb.agentId);
+        if (exists === true) {
+          await this.batchUpdateStatus('feedbacks', 'id', [fb.id], 'PENDING', now);
+          this.stats.orphansRecovered++;
+          logger.info({ feedbackId: fb.id, agentId: fb.agentId }, "Recovered orphaned feedback → PENDING");
+        }
+      }
+    }
+
+    // Recover orphaned revocations
+    let orphanedRevocations: Array<{ id: string; agentId: string }> = [];
+    if (this.prisma) {
+      orphanedRevocations = await this.prisma.revocation.findMany({
+        where: { status: "ORPHANED" },
+        take: batchSize,
+        select: { id: true, agentId: true },
+      });
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT id, asset AS "agentId" FROM revocations WHERE status = 'ORPHANED' LIMIT $1`,
+        [batchSize]
+      );
+      orphanedRevocations = result.rows;
+    }
+
+    if (orphanedRevocations.length > 0) {
+      const agentIds = [...new Set(orphanedRevocations.map(r => r.agentId))];
+      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const now = new Date();
+
+      for (const rev of orphanedRevocations) {
+        const exists = existsMap.get(rev.agentId);
+        if (exists === true) {
+          await this.batchUpdateStatus('revocations', 'id', [rev.id], 'PENDING', now);
+          this.stats.orphansRecovered++;
+          logger.info({ revocationId: rev.id, agentId: rev.agentId }, "Recovered orphaned revocation → PENDING");
+        }
+      }
+    }
+
+    // Recover orphaned responses
+    let orphanedResponses: Array<{ id: string; agentId: string }> = [];
+    if (this.prisma) {
+      const rows = await this.prisma.feedbackResponse.findMany({
+        where: { status: "ORPHANED" },
+        take: batchSize,
+        include: { feedback: { select: { agentId: true } } },
+      });
+      orphanedResponses = rows.map(r => ({ id: r.id, agentId: r.feedback.agentId }));
+    } else if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT fr.id, fr.asset AS "agentId" FROM feedback_responses fr WHERE fr.status = 'ORPHANED' LIMIT $1`,
+        [batchSize]
+      );
+      orphanedResponses = result.rows;
+    }
+
+    if (orphanedResponses.length > 0) {
+      const agentIds = [...new Set(orphanedResponses.map(r => r.agentId))];
+      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const now = new Date();
+
+      for (const resp of orphanedResponses) {
+        const exists = existsMap.get(resp.agentId);
+        if (exists === true) {
+          await this.batchUpdateStatus('feedback_responses', 'id', [resp.id], 'PENDING', now);
+          this.stats.orphansRecovered++;
+          logger.info({ responseId: resp.id, agentId: resp.agentId }, "Recovered orphaned response → PENDING");
+        }
+      }
+    }
+
+    const total = orphanedAgents.length + orphanedFeedbacks.length + orphanedRevocations.length + orphanedResponses.length;
+    if (total > 0) {
+      logger.info({ checked: total, recovered: this.stats.orphansRecovered - recoveredBefore }, "Orphan recovery cycle complete");
     }
   }
 
@@ -568,7 +769,12 @@ export class DataVerifier {
     for (const [agentId, feedbacks] of byAgent) {
       if (!this.isRunning) break;
 
-      const agentExists = existsMap.get(agentId) ?? false;
+      const agentExists = existsMap.get(agentId);
+
+      if (agentExists === null || agentExists === undefined) {
+        this.stats.skippedRpcErrors++;
+        continue;
+      }
 
       if (!agentExists) {
         await this.batchUpdateStatus('feedbacks', 'id', feedbacks.map(f => f.id), 'ORPHANED', now);
@@ -655,7 +861,12 @@ export class DataVerifier {
       for (const [agentId, ids] of byAgent) {
         if (!this.isRunning) break;
 
-        const agentExists = existsMap.get(agentId) ?? false;
+        const agentExists = existsMap.get(agentId);
+
+        if (agentExists === null || agentExists === undefined) {
+          this.stats.skippedRpcErrors++;
+          continue;
+        }
 
         if (!agentExists) {
           await this.batchUpdateStatus('feedback_responses', 'id', ids, 'ORPHANED', now);
@@ -718,7 +929,12 @@ export class DataVerifier {
     for (const [agentId, ids] of byAgent) {
       if (!this.isRunning) break;
 
-      const agentExists = existsMap.get(agentId) ?? false;
+      const agentExists = existsMap.get(agentId);
+
+      if (agentExists === null || agentExists === undefined) {
+        this.stats.skippedRpcErrors++;
+        continue;
+      }
 
       if (!agentExists) {
         await this.batchUpdateStatus('revocations', 'id', ids, 'ORPHANED', now);
@@ -750,8 +966,8 @@ export class DataVerifier {
   private async batchVerifyAccounts(
     pubkeys: string[],
     commitment: Commitment = "finalized"
-  ): Promise<Map<string, boolean>> {
-    const results = new Map<string, boolean>();
+  ): Promise<Map<string, boolean | null>> {
+    const results = new Map<string, boolean | null>();
     if (pubkeys.length === 0) return results;
 
     const BATCH_SIZE = 100; // Solana RPC limit
@@ -775,7 +991,6 @@ export class DataVerifier {
         }
       } catch (error: any) {
         logger.warn({ batchSize: batch.length, error: error.message }, "Batch verification failed, falling back to individual checks");
-        // Fallback to individual checks for this batch
         for (const pk of batch) {
           if (!this.isRunning) break;
           const exists = await this.verifyWithRetry(pk, commitment);
@@ -796,7 +1011,8 @@ export class DataVerifier {
     pubkey: string,
     commitment: Commitment,
     maxRetries = config.verifyMaxRetries
-  ): Promise<boolean> {
+  ): Promise<boolean | null> {
+    let confirmedAbsent = false;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const info = await this.connection.getAccountInfo(
@@ -804,6 +1020,9 @@ export class DataVerifier {
           { commitment }
         );
         if (info !== null) return true;
+
+        // RPC returned successfully with null = account confirmed not found
+        confirmedAbsent = true;
 
         // Exponential backoff: 1s, 2s, 4s
         if (attempt < maxRetries - 1) {
@@ -816,7 +1035,9 @@ export class DataVerifier {
         }
       }
     }
-    return false;
+    // If ANY attempt confirmed not-found, return false (definitive)
+    // Only return null if every attempt was an RPC error (inconclusive)
+    return confirmedAbsent ? false : null;
   }
 
   private sleep(ms: number): Promise<void> {
@@ -882,11 +1103,11 @@ export class DataVerifier {
       // No DB digest but on-chain has events → can't verify, keep PENDING
       if (!dbDigest) return false;
 
-      // DB count < on-chain → indexer behind, skip
+      // DB count < on-chain → indexer behind, keep PENDING until caught up
       if (dbCount < onChainCount) {
         logger.debug({ agentId, chain, dbCount: Number(dbCount), onChainCount: Number(onChainCount) },
-          "Hash-chain behind on-chain, skipping digest check");
-        return true;
+          "Hash-chain behind on-chain, keeping PENDING until caught up");
+        return false;
       }
 
       // DB count > on-chain → possible reorg

@@ -86,6 +86,8 @@ vi.mock("../../../src/config.js", () => ({
 import { Processor } from "../../../src/indexer/processor.js";
 import { Poller } from "../../../src/indexer/poller.js";
 import { WebSocketIndexer, testWebSocketConnection } from "../../../src/indexer/websocket.js";
+import { config } from "../../../src/config.js";
+import { DataVerifier } from "../../../src/indexer/verifier.js";
 
 describe("Processor", () => {
   let mockPrisma: ReturnType<typeof createMockPrismaClient>;
@@ -332,6 +334,218 @@ describe("Processor", () => {
       expect(mockPollerInstance.stop).not.toHaveBeenCalled();
 
       vi.useRealTimers();
+    });
+
+    it("should clear existing monitor interval before creating new one", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // wsMonitorInterval is now set from monitorWebSocket call in startAuto
+      expect((processor as any).wsMonitorInterval).not.toBeNull();
+
+      // Call monitorWebSocket again directly to cover the branch that
+      // clears the existing interval before scheduling a new one
+      (processor as any).monitorWebSocket();
+
+      // Should still have an interval (new one was created after clearing old)
+      expect((processor as any).wsMonitorInterval).not.toBeNull();
+
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should early-return from runWebSocketCheck when not running", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // Stop the processor but keep a reference to trigger the check manually
+      (processor as any).isRunning = false;
+
+      // WS inactive to ensure we'd enter fallback if not guarded
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+
+      // Directly invoke runWebSocketCheck
+      await (processor as any).runWebSocketCheck();
+
+      // Poller should NOT be restarted since isRunning is false
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+
+      // Clean up: restore isRunning so stop() works, then clear intervals manually
+      (processor as any).isRunning = true;
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should skip check when wsMonitorInProgress is true", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // Set the reentrancy guard directly to simulate an in-progress check
+      (processor as any).wsMonitorInProgress = true;
+
+      // WS inactive to ensure we'd enter the fallback path if not guarded
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+
+      // Advance to trigger monitor check
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Poller should NOT be restarted since wsMonitorInProgress blocks entry
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+
+      // Reset the guard so stop() works cleanly
+      (processor as any).wsMonitorInProgress = false;
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should wait for self-heal when wsIndexer is recovering", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // WS inactive but in recovery mode
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+      mockWsIndexerInstance.isRecovering.mockReturnValue(true);
+
+      // Advance to trigger check
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Poller should NOT be restarted since WS is recovering
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should catch errors during poller fallback", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // WS inactive and not recovering
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+      mockWsIndexerInstance.isRecovering.mockReturnValue(false);
+
+      // Make poller.stop throw
+      mockPollerInstance.stop.mockRejectedValueOnce(new Error("poller stop failed"));
+
+      // Advance to trigger check -- should not throw
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Processor should still be running (error was caught)
+      expect(processor.getStatus().running).toBe(true);
+
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should not schedule next check when not running (scheduleNextWsCheck)", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      // WS is active, processor runs normally
+      mockWsIndexerInstance.isActive.mockReturnValue(true);
+
+      // Advance to trigger one check cycle
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Now stop the processor
+      await processor.stop();
+
+      // Clear mocks to track any new calls
+      vi.clearAllMocks();
+
+      // Advance further -- no more checks should fire
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      expect(mockWsIndexerInstance.isActive).not.toHaveBeenCalled();
+
+      vi.useRealTimers();
+    });
+
+    it("should not schedule initial check when isRunning is false", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+
+      // Set isRunning to false before calling monitorWebSocket directly
+      (processor as any).isRunning = false;
+      (processor as any).monitorWebSocket();
+
+      // No timeout should be scheduled since isRunning is false
+      expect((processor as any).wsMonitorInterval).toBeNull();
+
+      vi.useRealTimers();
+    });
+  });
+
+  describe("verifier lifecycle", () => {
+    it("should start verifier when verificationEnabled is true", async () => {
+      (config as any).verificationEnabled = true;
+
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
+      await processor.start();
+
+      expect(DataVerifier).toHaveBeenCalledWith(
+        expect.anything(),
+        mockPrisma,
+        null,
+        config.verifyIntervalMs
+      );
+      expect(mockVerifierInstance.start).toHaveBeenCalled();
+
+      const status = processor.getStatus();
+      expect(status.verifierActive).toBe(true);
+      expect(status.verifierStats).toEqual({});
+
+      await processor.stop();
+
+      // Restore
+      (config as any).verificationEnabled = false;
+    });
+
+    it("should stop verifier on processor stop", async () => {
+      (config as any).verificationEnabled = true;
+
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
+      await processor.start();
+
+      expect(mockVerifierInstance.start).toHaveBeenCalled();
+
+      await processor.stop();
+
+      expect(mockVerifierInstance.stop).toHaveBeenCalled();
+      expect(processor.getStatus().verifierActive).toBe(false);
+
+      // Restore
+      (config as any).verificationEnabled = false;
+    });
+
+    it("should return verifierStats in getStatus when verifier is active", async () => {
+      (config as any).verificationEnabled = true;
+      const fakeStats = { checked: 10, mismatches: 0 };
+      mockVerifierInstance.getStats.mockReturnValue(fakeStats);
+
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
+      await processor.start();
+
+      const status = processor.getStatus();
+      expect(status.verifierStats).toEqual(fakeStats);
+
+      await processor.stop();
+
+      // Restore
+      (config as any).verificationEnabled = false;
     });
   });
 });

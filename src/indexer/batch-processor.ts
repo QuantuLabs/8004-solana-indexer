@@ -16,6 +16,7 @@ import { config } from "../config.js";
 import { metadataQueue } from "./metadata-queue.js";
 import { compressForStorage } from "../utils/compression.js";
 import { stripNullBytes } from "../utils/sanitize.js";
+import { DEFAULT_PUBKEY } from "../constants.js";
 
 const logger = createChildLogger("batch-processor");
 
@@ -32,6 +33,16 @@ const DEAD_LETTER_MAX_AGE_MS = 5 * 60 * 1000; // Evict entries older than 5 minu
 function isAllZeroHash(hash: Uint8Array | undefined | null): boolean {
   if (!hash) return true;
   return hash.every(b => b === 0);
+}
+
+const ZERO_HASH_HEX = "0".repeat(64);
+
+function hashesMatchHex(stored: string | null, event: string | null): boolean {
+  const sEmpty = !stored || stored === ZERO_HASH_HEX;
+  const eEmpty = !event || event === ZERO_HASH_HEX;
+  if (sEmpty && eEmpty) return true;
+  if (sEmpty || eEmpty) return false;
+  return stored === event;
 }
 
 // EventData type for batch event data - uses Record for type safety while allowing runtime values
@@ -440,7 +451,12 @@ export class EventBuffer {
       case "MetadataSet":
         await this.insertMetadataSupabase(client, data, ctx);
         break;
-      // Add other event types as needed
+      case "MetadataDeleted":
+        await this.deleteMetadataSupabase(client, data, ctx);
+        break;
+      case "AgentOwnerSynced":
+        await this.updateAgentOwnerSupabase(client, data, ctx);
+        break;
       default:
         logger.debug({ type }, "Unhandled event type in batch processor");
     }
@@ -527,11 +543,21 @@ export class EventBuffer {
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
     const id = `${asset}:${client_addr}:${feedbackIndex}`;
 
-    // Validate seal_hash against stored feedback
     const feedbackCheck = await client.query(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`, [id]
     );
     const isOrphan = feedbackCheck.rowCount === 0;
+
+    if (!isOrphan) {
+      const storedHash = feedbackCheck.rows[0].feedback_hash;
+      const eventHash = !isAllZeroHash(data.sealHash)
+        ? Buffer.from(data.sealHash).toString("hex")
+        : null;
+      if (!hashesMatchHex(storedHash, eventHash)) {
+        logger.warn({ asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
+          "seal_hash mismatch: revocation sealHash does not match stored feedbackHash");
+      }
+    }
 
     // Mark feedback as revoked
     await client.query(`
@@ -668,7 +694,8 @@ export class EventBuffer {
 
   private async updateAgentWalletSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
-    const wallet = data.newWallet?.toBase58?.() || data.newWallet;
+    const walletRaw = data.newWallet?.toBase58?.() || data.newWallet;
+    const wallet = walletRaw === DEFAULT_PUBKEY ? null : walletRaw;
     await client.query(`
       UPDATE agents SET agent_wallet = $1, updated_at = $2 WHERE asset = $3
     `, [wallet, ctx.blockTime.toISOString(), asset]);
@@ -711,6 +738,21 @@ export class EventBuffer {
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
+  }
+
+  private async deleteMetadataSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
+    const asset = data.asset?.toBase58?.() || data.asset;
+    const key = data.key || "";
+    await client.query(`DELETE FROM metadata WHERE asset = $1 AND key = $2`, [asset, key]);
+  }
+
+  private async updateAgentOwnerSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
+    const asset = data.asset?.toBase58?.() || data.asset;
+    const newOwner = data.newOwner?.toBase58?.() || data.newOwner;
+    await client.query(
+      `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
+      [newOwner, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+    );
   }
 
   /**

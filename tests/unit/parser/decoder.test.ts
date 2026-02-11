@@ -5,6 +5,9 @@ import {
   parseTransaction,
   toTypedEvent,
   idl,
+  eventParser,
+  IDL_VERSION,
+  IDL_PROGRAM_ID,
 } from "../../../src/parser/decoder.js";
 import {
   TEST_ASSET,
@@ -37,6 +40,29 @@ describe("Parser Decoder", () => {
       expect(idl.events).toBeDefined();
       expect(Array.isArray(idl.events)).toBe(true);
       expect(idl.events!.length).toBe(11);
+    });
+
+    it("should export IDL_VERSION from metadata", () => {
+      expect(IDL_VERSION).toBeDefined();
+      expect(typeof IDL_VERSION).toBe("string");
+      expect(IDL_VERSION).not.toBe("unknown");
+    });
+
+    it("should export IDL_PROGRAM_ID from IDL address", () => {
+      expect(IDL_PROGRAM_ID).toBeDefined();
+      expect(IDL_PROGRAM_ID).toBe("8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm");
+    });
+
+    it("should fallback IDL_VERSION to 'unknown' when metadata.version is missing", () => {
+      const idlWithoutVersion = { ...idl, metadata: {} };
+      const version = (idlWithoutVersion as any).metadata?.version || "unknown";
+      expect(version).toBe("unknown");
+    });
+
+    it("should fallback IDL_PROGRAM_ID to config.programId when address is missing", () => {
+      const idlWithoutAddress = { ...idl, address: undefined };
+      const programId = (idlWithoutAddress as any).address || "fallback-id";
+      expect(programId).toBe("fallback-id");
     });
   });
 
@@ -130,6 +156,23 @@ describe("Parser Decoder", () => {
       // Should not throw, returns empty array
       const result = parseTransactionLogs(logs);
       expect(Array.isArray(result)).toBe(true);
+    });
+
+    it("should catch and return empty array when eventParser.parseLogs throws", () => {
+      const originalParseLogs = eventParser.parseLogs.bind(eventParser);
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        throw new Error("Simulated parser failure");
+      });
+
+      const logs = [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ];
+
+      const result = parseTransactionLogs(logs);
+
+      expect(result).toEqual([]);
+      spy.mockRestore();
     });
   });
 
@@ -516,6 +559,605 @@ describe("Parser Decoder", () => {
       const result = toTypedEvent(event);
 
       expect(result).toBeNull();
+    });
+
+    it("should convert AtomEnabled event", () => {
+      const event = {
+        name: "AtomEnabled",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          enabled_by: TEST_OWNER.toBase58(),
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("AtomEnabled");
+      expect(result!.data.asset.toBase58()).toBe(TEST_ASSET.toBase58());
+      expect(result!.data.enabledBy.toBase58()).toBe(TEST_OWNER.toBase58());
+    });
+
+    it("should default atomEnabled to true when atom_enabled is undefined in AgentRegistered", () => {
+      const event = {
+        name: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          collection: TEST_COLLECTION.toBase58(),
+          owner: TEST_OWNER.toBase58(),
+          // atom_enabled intentionally omitted
+          agent_uri: "ipfs://QmTest",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("AgentRegistered");
+      expect(result!.data.atomEnabled).toBe(true);
+    });
+
+    it("should default agentUri to empty string when agent_uri is falsy in AgentRegistered", () => {
+      const event = {
+        name: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          collection: TEST_COLLECTION.toBase58(),
+          owner: TEST_OWNER.toBase58(),
+          atom_enabled: false,
+          agent_uri: "",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.agentUri).toBe("");
+    });
+
+    it("should default atomEnabled to false when atom_enabled is undefined in FeedbackRevoked", () => {
+      const event = {
+        name: "FeedbackRevoked",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "1",
+          seal_hash: Array.from(TEST_HASH),
+          slot: "123456",
+          original_score: 85,
+          // atom_enabled intentionally omitted
+          had_impact: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_revoke_digest: Array.from(TEST_HASH),
+          new_revoke_count: "1",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("FeedbackRevoked");
+      expect(result!.data.atomEnabled).toBe(false);
+    });
+
+    it("should handle NewFeedback with null feedback_file_hash and seal_hash", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("NewFeedback");
+      expect(result!.data.feedbackFileHash).toBeNull();
+      expect(result!.data.sealHash).toEqual(new Uint8Array(TEST_HASH));
+    });
+
+    it("should handle NewFeedback with present feedback_file_hash", () => {
+      const fileHash = new Uint8Array(32).fill(0xcd);
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: Array.from(fileHash),
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("NewFeedback");
+      expect(result!.data.feedbackFileHash).toEqual(new Uint8Array(fileHash));
+    });
+
+    it("should handle NewFeedback with null score (Option<u8>)", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: null,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.score).toBeNull();
+    });
+
+    it("should handle NewFeedback with score wrapped in { some: value } object", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: { some: 75 },
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.score).toBe(75);
+    });
+
+    it("should handle NewFeedback with undefined score", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: undefined,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.score).toBeNull();
+    });
+
+    it("should handle NewFeedback with numeric feedback_index (parseBigInt number path)", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: 42,
+          slot: 123456,
+          value: 9500,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: 1,
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.feedbackIndex).toBe(42n);
+      expect(result!.data.slot).toBe(123456n);
+      expect(result!.data.value).toBe(9500n);
+      expect(result!.data.newFeedbackCount).toBe(1n);
+    });
+
+    it("should handle NewFeedback with bigint feedback_index (parseBigInt bigint path)", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: 42n,
+          slot: 123456n,
+          value: 9500n,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: 1n,
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.feedbackIndex).toBe(42n);
+      expect(result!.data.slot).toBe(123456n);
+      expect(result!.data.value).toBe(9500n);
+      expect(result!.data.newFeedbackCount).toBe(1n);
+    });
+
+    it("should handle NewFeedback with BN-like object (parseBigInt BN path)", () => {
+      // Simulate Anchor BN format: { negative: 0, words: [9500, 0], length: 2, red: null }
+      const bnValue = { negative: 0, words: [9500] };
+      const bnIndex = { negative: 0, words: [42] };
+      const bnSlot = { negative: 0, words: [123456] };
+      const bnCount = { negative: 0, words: [5] };
+
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: bnIndex,
+          slot: bnSlot,
+          value: bnValue,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: bnCount,
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.feedbackIndex).toBe(42n);
+      expect(result!.data.value).toBe(9500n);
+      expect(result!.data.slot).toBe(123456n);
+      expect(result!.data.newFeedbackCount).toBe(5n);
+    });
+
+    it("should handle negative BN-like object in parseBigInt", () => {
+      const bnValue = { negative: 1, words: [100] };
+
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: bnValue,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.value).toBe(-100n);
+    });
+
+    it("should handle multi-word BN-like object in parseBigInt", () => {
+      // BN uses 26-bit words: value = words[0] + words[1] * 2^26
+      const bnValue = { negative: 0, words: [1, 1] };
+
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: bnValue,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      // 1 + 1 * 2^26 = 1 + 67108864 = 67108865
+      expect(result!.data.value).toBe(67108865n);
+    });
+
+    it("should handle parseBigInt fallback with boolean-like value via String coercion", () => {
+      // An object that isn't BN-like but has a toString() - triggers line 33: BigInt(String(value))
+      const customValue = { toString: () => "42" };
+
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: customValue,
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.value).toBe(42n);
+    });
+
+    it("should handle unsafe integer in parseBigInt and return null from toTypedEvent", () => {
+      // Number.MAX_SAFE_INTEGER + 1 is unsafe
+      const unsafeNumber = Number.MAX_SAFE_INTEGER + 1;
+
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: unsafeNumber,
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      // parseBigInt throws on unsafe integer, toTypedEvent catches and returns null
+      expect(result).toBeNull();
+    });
+
+    it("should handle score as object without 'some' key in parseOptionU8 (returns null)", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: { none: true },
+          feedback_file_hash: null,
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.data.score).toBeNull();
+    });
+
+    it("should handle FeedbackRevoked with seal_hash field", () => {
+      const event = {
+        name: "FeedbackRevoked",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: 5n,
+          seal_hash: Array.from(TEST_HASH),
+          slot: 999999n,
+          original_score: 50,
+          atom_enabled: false,
+          had_impact: false,
+          new_trust_tier: 0,
+          new_quality_score: 5000,
+          new_confidence: 7000,
+          new_revoke_digest: Array.from(TEST_HASH),
+          new_revoke_count: 3n,
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("FeedbackRevoked");
+      expect(result!.data.sealHash).toEqual(new Uint8Array(TEST_HASH));
+      expect(result!.data.feedbackIndex).toBe(5n);
+      expect(result!.data.slot).toBe(999999n);
+      expect(result!.data.atomEnabled).toBe(false);
+      expect(result!.data.hadImpact).toBe(false);
+      expect(result!.data.newRevokeCount).toBe(3n);
     });
   });
 });

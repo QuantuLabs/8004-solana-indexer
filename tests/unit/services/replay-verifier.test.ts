@@ -331,8 +331,8 @@ describe("ReplayVerifier", () => {
       expect(prisma.hashChainCheckpoint.upsert).toHaveBeenCalledTimes(1);
       expect(prisma.hashChainCheckpoint.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { agentId_chainType_eventCount: { agentId: AGENT_ID, chainType: "feedback", eventCount: 2 } },
-          create: expect.objectContaining({ agentId: AGENT_ID, chainType: "feedback", eventCount: 2 }),
+          where: { agentId_chainType_eventCount: { agentId: AGENT_ID, chainType: "feedback", eventCount: 2n } },
+          create: expect.objectContaining({ agentId: AGENT_ID, chainType: "feedback", eventCount: 2n }),
           update: expect.any(Object),
         }),
       );
@@ -453,7 +453,7 @@ describe("ReplayVerifier", () => {
       expect(result).toEqual(cp);
 
       expect(prisma.hashChainCheckpoint.findFirst).toHaveBeenCalledWith({
-        where: { agentId: AGENT_ID, chainType: "feedback", eventCount: { lte: 4000 } },
+        where: { agentId: AGENT_ID, chainType: "feedback", eventCount: { lte: 4000n } },
         orderBy: { eventCount: "desc" },
       });
     });
@@ -566,6 +566,498 @@ describe("ReplayVerifier", () => {
       expect(result.feedback.valid).toBe(true);
       expect(result.response.valid).toBe(true);
       expect(result.revoke.valid).toBe(false);
+    });
+  });
+
+  describe("response chain checkpoints", () => {
+    it("should store checkpoints for response chain at interval", async () => {
+      verifier.CHECKPOINT_INTERVAL = 2;
+
+      const rows = Array.from({ length: 3 }, (_, i) => makeResponseRow(i, i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(rows)
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.count).toBe(3);
+      expect(result.response.checkpointsStored).toBe(1); // at count=2
+      expect(prisma.hashChainCheckpoint.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { agentId_chainType_eventCount: { agentId: AGENT_ID, chainType: "response", eventCount: 2n } },
+        }),
+      );
+    });
+  });
+
+  describe("revoke chain checkpoints", () => {
+    it("should store checkpoints for revoke chain at interval", async () => {
+      verifier.CHECKPOINT_INTERVAL = 2;
+
+      const rows = Array.from({ length: 3 }, (_, i) => makeRevocationRow(i, i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(rows)
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.count).toBe(3);
+      expect(result.revoke.checkpointsStored).toBe(1); // at count=2
+      expect(prisma.hashChainCheckpoint.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { agentId_chainType_eventCount: { agentId: AGENT_ID, chainType: "revoke", eventCount: 2n } },
+        }),
+      );
+    });
+  });
+
+  describe("response chain batching", () => {
+    it("should handle multiple batches of responses", async () => {
+      const batch1 = Array.from({ length: 1000 }, (_, i) => makeResponseRow(i, i));
+      const batch2 = Array.from({ length: 5 }, (_, i) => makeResponseRow(1000 + i, 1000 + i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(batch1)
+        .mockResolvedValueOnce(batch2)
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.count).toBe(1005);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledTimes(2);
+    });
+
+    it("should stop response batching when batch is smaller than BATCH_SIZE", async () => {
+      const smallBatch = Array.from({ length: 500 }, (_, i) => makeResponseRow(i, i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(smallBatch);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.count).toBe(500);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("revoke chain batching", () => {
+    it("should handle multiple batches of revocations", async () => {
+      const batch1 = Array.from({ length: 1000 }, (_, i) => makeRevocationRow(i, i));
+      const batch2 = Array.from({ length: 5 }, (_, i) => makeRevocationRow(1000 + i, 1000 + i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(batch1)
+        .mockResolvedValueOnce(batch2)
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.count).toBe(1005);
+      expect(prisma.revocation.findMany).toHaveBeenCalledTimes(2);
+    });
+
+    it("should stop revoke batching when batch is smaller than BATCH_SIZE", async () => {
+      const smallBatch = Array.from({ length: 500 }, (_, i) => makeRevocationRow(i, i));
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(smallBatch);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.count).toBe(500);
+      expect(prisma.revocation.findMany).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("hashBytesToBuffer null handling", () => {
+    it("should handle null feedbackHash in feedback (returns 32-zero buffer)", async () => {
+      const row = {
+        ...makeFeedbackRow(0),
+        feedbackHash: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.feedback.count).toBe(1);
+    });
+
+    it("should handle null responseHash in response (returns 32-zero buffer)", async () => {
+      const row = {
+        ...makeResponseRow(0, 0),
+        responseHash: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.response.count).toBe(1);
+    });
+
+    it("should handle null feedbackHash on response's feedback (returns 32-zero buffer)", async () => {
+      const row = {
+        ...makeResponseRow(0, 0),
+        feedback: {
+          ...makeResponseRow(0, 0).feedback,
+          feedbackHash: null,
+        },
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.response.count).toBe(1);
+    });
+
+    it("should handle null feedbackHash in revocation (returns 32-zero buffer)", async () => {
+      const row = {
+        ...makeRevocationRow(0, 0),
+        feedbackHash: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.revoke.count).toBe(1);
+    });
+  });
+
+  describe("null slot handling", () => {
+    it("should handle null createdSlot in feedback (defaults to 0n)", async () => {
+      const row = {
+        ...makeFeedbackRow(0),
+        createdSlot: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.feedback.count).toBe(1);
+    });
+
+    it("should handle null slot in response (defaults to 0n)", async () => {
+      const row = {
+        ...makeResponseRow(0, 0),
+        slot: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.valid).toBe(true);
+      expect(result.response.count).toBe(1);
+    });
+  });
+
+  describe("incrementalVerify with all checkpoints", () => {
+    it("should use checkpoints for all three chains", async () => {
+      // Compute reference digests first
+      const fbRow = makeFeedbackRow(0);
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([fbRow])
+        .mockResolvedValueOnce([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const refResult = await verifier.fullReplay(AGENT_ID);
+
+      // Now incremental with checkpoints for all 3 chains
+      const prisma2 = createMockPrismaClient();
+      const verifier2 = new ReplayVerifier(prisma2);
+      (prisma2.hashChainCheckpoint.findFirst as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({ eventCount: 1, digest: refResult.feedback.finalDigest }) // feedback checkpoint
+        .mockResolvedValueOnce({ eventCount: 0, digest: ZERO_DIGEST_HEX }) // response checkpoint
+        .mockResolvedValueOnce({ eventCount: 0, digest: ZERO_DIGEST_HEX }); // revoke checkpoint
+      (prisma2.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const incResult = await verifier2.incrementalVerify(AGENT_ID);
+
+      expect(incResult.valid).toBe(true);
+      expect(incResult.feedback.finalDigest).toBe(refResult.feedback.finalDigest);
+    });
+  });
+
+  describe("response chain with null responseCount in pagination", () => {
+    it("should handle null responseCount on last response in batch", async () => {
+      const row = {
+        ...makeResponseRow(0, 0),
+        responseCount: null,
+      };
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.count).toBe(1);
+      expect(result.response.valid).toBe(true);
+    });
+  });
+
+  describe("response chain with valid running digest", () => {
+    it("should validate correct running digest in response chain", async () => {
+      // First pass: get correct digest
+      const row = makeResponseRow(0, 0);
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const refResult = await verifier.fullReplay(AGENT_ID);
+      const correctDigest = Buffer.from(refResult.response.finalDigest, "hex");
+
+      // Second pass: with correct stored digest
+      const prisma2 = createMockPrismaClient();
+      const verifier2 = new ReplayVerifier(prisma2);
+      const rowWithDigest = makeResponseRow(0, 0, { runningDigest: correctDigest });
+      (prisma2.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([rowWithDigest])
+        .mockResolvedValueOnce([]);
+      (prisma2.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const result = await verifier2.fullReplay(AGENT_ID);
+
+      expect(result.response.valid).toBe(true);
+    });
+  });
+
+  describe("revoke chain with valid running digest", () => {
+    it("should validate correct running digest in revoke chain", async () => {
+      // First pass: get correct digest
+      const row = makeRevocationRow(0, 0);
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      const refResult = await verifier.fullReplay(AGENT_ID);
+      const correctDigest = Buffer.from(refResult.revoke.finalDigest, "hex");
+
+      // Second pass: with correct stored digest
+      const prisma2 = createMockPrismaClient();
+      const verifier2 = new ReplayVerifier(prisma2);
+      const rowWithDigest = makeRevocationRow(0, 0, { runningDigest: correctDigest });
+      (prisma2.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([rowWithDigest])
+        .mockResolvedValueOnce([]);
+      const result = await verifier2.fullReplay(AGENT_ID);
+
+      expect(result.revoke.valid).toBe(true);
+    });
+  });
+
+  describe("incrementalVerify with non-zero startCount for response chain", () => {
+    it("should resume response chain from checkpoint with startCount > 0", async () => {
+      // First: full replay of 3 responses to get the reference digest
+      const allRows = Array.from({ length: 3 }, (_, i) => makeResponseRow(i, i));
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(allRows)
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const fullResult = await verifier.fullReplay(AGENT_ID);
+
+      // Get the digest at count=2 by replaying just first 2
+      const prisma2 = createMockPrismaClient();
+      const verifier2 = new ReplayVerifier(prisma2);
+      const firstTwo = allRows.slice(0, 2);
+      (prisma2.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(firstTwo)
+        .mockResolvedValueOnce([]);
+      (prisma2.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const midResult = await verifier2.fullReplay(AGENT_ID);
+
+      // Incremental from checkpoint at count=2 for response chain
+      const prisma3 = createMockPrismaClient();
+      const verifier3 = new ReplayVerifier(prisma3);
+      (prisma3.hashChainCheckpoint.findFirst as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(null) // feedback - no checkpoint
+        .mockResolvedValueOnce({ eventCount: 2, digest: midResult.response.finalDigest }) // response checkpoint at count=2
+        .mockResolvedValueOnce(null); // revoke - no checkpoint
+      (prisma3.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const lastOne = allRows.slice(2);
+      (prisma3.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(lastOne)
+        .mockResolvedValueOnce([]);
+      (prisma3.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const incResult = await verifier3.incrementalVerify(AGENT_ID);
+
+      expect(incResult.valid).toBe(true);
+      expect(incResult.response.count).toBe(3);
+      expect(incResult.response.finalDigest).toBe(fullResult.response.finalDigest);
+    });
+  });
+
+  describe("incrementalVerify with non-zero startCount for revoke chain", () => {
+    it("should resume revoke chain from checkpoint with startCount > 0", async () => {
+      // First: full replay of 3 revocations to get the reference digest
+      const allRows = Array.from({ length: 3 }, (_, i) => makeRevocationRow(i, i));
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(allRows)
+        .mockResolvedValueOnce([]);
+      const fullResult = await verifier.fullReplay(AGENT_ID);
+
+      // Get the digest at count=2 by replaying just first 2
+      const prisma2 = createMockPrismaClient();
+      const verifier2 = new ReplayVerifier(prisma2);
+      const firstTwo = allRows.slice(0, 2);
+      (prisma2.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma2.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(firstTwo)
+        .mockResolvedValueOnce([]);
+      const midResult = await verifier2.fullReplay(AGENT_ID);
+
+      // Incremental from checkpoint at count=2 for revoke chain
+      const prisma3 = createMockPrismaClient();
+      const verifier3 = new ReplayVerifier(prisma3);
+      (prisma3.hashChainCheckpoint.findFirst as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(null) // feedback - no checkpoint
+        .mockResolvedValueOnce(null) // response - no checkpoint
+        .mockResolvedValueOnce({ eventCount: 2, digest: midResult.revoke.finalDigest }); // revoke checkpoint at count=2
+      (prisma3.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma3.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      const lastOne = allRows.slice(2);
+      (prisma3.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(lastOne)
+        .mockResolvedValueOnce([]);
+      const incResult = await verifier3.incrementalVerify(AGENT_ID);
+
+      expect(incResult.valid).toBe(true);
+      expect(incResult.revoke.count).toBe(3);
+      expect(incResult.revoke.finalDigest).toBe(fullResult.revoke.finalDigest);
+    });
+  });
+
+  describe("response chain skips validation when runningDigest is null", () => {
+    it("should skip digest validation when response runningDigest is null", async () => {
+      const row = makeResponseRow(0, 0); // null runningDigest by default
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.valid).toBe(true);
+      expect(result.response.count).toBe(1);
+    });
+  });
+
+  describe("revoke chain skips validation when runningDigest is null", () => {
+    it("should skip digest validation when revoke runningDigest is null", async () => {
+      const row = makeRevocationRow(0, 0); // null runningDigest by default
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.valid).toBe(true);
+      expect(result.revoke.count).toBe(1);
+    });
+  });
+
+  describe("multiple responses and revokes with digest mismatch", () => {
+    it("should report first mismatch only in response chain", async () => {
+      const wrongDigest = Buffer.alloc(32, 0xff);
+      const rows = Array.from({ length: 3 }, (_, i) =>
+        makeResponseRow(i, i, { runningDigest: wrongDigest }),
+      );
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(rows)
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.valid).toBe(false);
+      expect(result.response.mismatchAt).toBe(1); // First mismatch
+      expect(result.response.count).toBe(3); // Still processes all
+    });
+
+    it("should report first mismatch only in revoke chain", async () => {
+      const wrongDigest = Buffer.alloc(32, 0xff);
+      const rows = Array.from({ length: 3 }, (_, i) =>
+        makeRevocationRow(i, i, { runningDigest: wrongDigest }),
+      );
+
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(rows)
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.valid).toBe(false);
+      expect(result.revoke.mismatchAt).toBe(1);
+      expect(result.revoke.count).toBe(3);
     });
   });
 });

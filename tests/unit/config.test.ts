@@ -31,6 +31,7 @@ describe("Config", () => {
       delete process.env.LOG_LEVEL;
       delete process.env.INDEX_METADATA;
       delete process.env.PROGRAM_ID;
+      delete process.env.GRAPHQL_STATS_CACHE_TTL_MS;
 
       const { config } = await import("../../src/config.js");
 
@@ -45,6 +46,7 @@ describe("Config", () => {
       expect(config.wsReconnectInterval).toBe(3000);
       expect(config.wsMaxRetries).toBe(5);
       expect(config.logLevel).toBe("info");
+      expect(config.graphqlStatsCacheTtlMs).toBe(60000);
     });
 
     it("should use custom env values when set", async () => {
@@ -57,6 +59,7 @@ describe("Config", () => {
       process.env.WS_RECONNECT_INTERVAL = "5000";
       process.env.WS_MAX_RETRIES = "10";
       process.env.LOG_LEVEL = "debug";
+      process.env.GRAPHQL_STATS_CACHE_TTL_MS = "45000";
 
       const { config } = await import("../../src/config.js");
 
@@ -71,6 +74,7 @@ describe("Config", () => {
       expect(config.wsReconnectInterval).toBe(5000);
       expect(config.wsMaxRetries).toBe(10);
       expect(config.logLevel).toBe("debug");
+      expect(config.graphqlStatsCacheTtlMs).toBe(45000);
     });
 
     it("should support websocket mode", async () => {
@@ -79,6 +83,32 @@ describe("Config", () => {
       const { config } = await import("../../src/config.js");
 
       expect(config.indexerMode).toBe("websocket");
+    });
+  });
+
+  describe("parse-time validation", () => {
+    it("should throw when DB_MODE is invalid", async () => {
+      process.env.DB_MODE = "invalid_db";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid DB_MODE 'invalid_db'/
+      );
+    });
+
+    it("should throw when INDEXER_MODE is invalid", async () => {
+      process.env.INDEXER_MODE = "invalid";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid INDEXER_MODE/
+      );
+    });
+
+    it("should throw when INDEX_METADATA is invalid", async () => {
+      process.env.INDEX_METADATA = "bogus";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid INDEX_METADATA 'bogus'/
+      );
     });
   });
 
@@ -94,13 +124,147 @@ describe("Config", () => {
       expect(() => validateConfig()).not.toThrow();
     });
 
-    it("should throw when INDEXER_MODE is invalid", async () => {
-      process.env.DATABASE_URL = "file:./data/test.db";
-      process.env.RPC_URL = "https://api.devnet.solana.com";
-      process.env.INDEXER_MODE = "invalid";
+    it("should warn when SUPABASE_SSL_VERIFY is false", async () => {
+      process.env.SUPABASE_SSL_VERIFY = "false";
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-      // INDEXER_MODE is validated at config parse time (import throws)
-      await expect(import("../../src/config.js")).rejects.toThrow(/Invalid INDEXER_MODE/);
+      const { validateConfig } = await import("../../src/config.js");
+      validateConfig();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("SUPABASE_SSL_VERIFY=false")
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("should throw when DB_MODE=supabase without SUPABASE_DSN", async () => {
+      process.env.DB_MODE = "supabase";
+      delete process.env.SUPABASE_DSN;
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "SUPABASE_DSN required when DB_MODE=supabase"
+      );
+    });
+
+    it("should not throw when DB_MODE=supabase with SUPABASE_DSN set", async () => {
+      process.env.DB_MODE = "supabase";
+      process.env.SUPABASE_DSN = "postgresql://user:pass@host:5432/db";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).not.toThrow();
+    });
+
+    it("should throw when VERIFY_INTERVAL_MS is below 5000", async () => {
+      process.env.VERIFY_INTERVAL_MS = "1000";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_INTERVAL_MS must be at least 5000ms"
+      );
+    });
+
+    it("should throw when VERIFY_BATCH_SIZE is below 1", async () => {
+      process.env.VERIFY_BATCH_SIZE = "0";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_BATCH_SIZE must be between 1 and 1000"
+      );
+    });
+
+    it("should throw when VERIFY_BATCH_SIZE exceeds 1000", async () => {
+      process.env.VERIFY_BATCH_SIZE = "1001";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_BATCH_SIZE must be between 1 and 1000"
+      );
+    });
+
+    it("should throw when VERIFY_SAFETY_MARGIN_SLOTS is negative", async () => {
+      process.env.VERIFY_SAFETY_MARGIN_SLOTS = "-1";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_SAFETY_MARGIN_SLOTS must be between 0 and 150"
+      );
+    });
+
+    it("should throw when VERIFY_SAFETY_MARGIN_SLOTS exceeds 150", async () => {
+      process.env.VERIFY_SAFETY_MARGIN_SLOTS = "200";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_SAFETY_MARGIN_SLOTS must be between 0 and 150"
+      );
+    });
+
+    it("should throw when VERIFY_RECOVERY_CYCLES is negative", async () => {
+      process.env.VERIFY_RECOVERY_CYCLES = "-5";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_RECOVERY_CYCLES must be between 0 and 1000"
+      );
+    });
+
+    it("should throw when VERIFY_RECOVERY_CYCLES exceeds 1000", async () => {
+      process.env.VERIFY_RECOVERY_CYCLES = "5000";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_RECOVERY_CYCLES must be between 0 and 1000"
+      );
+    });
+
+    it("should throw when VERIFY_RECOVERY_BATCH_SIZE is below 1", async () => {
+      process.env.VERIFY_RECOVERY_BATCH_SIZE = "0";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_RECOVERY_BATCH_SIZE must be between 1 and 1000"
+      );
+    });
+
+    it("should throw when VERIFY_RECOVERY_BATCH_SIZE exceeds 1000", async () => {
+      process.env.VERIFY_RECOVERY_BATCH_SIZE = "9999";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "VERIFY_RECOVERY_BATCH_SIZE must be between 1 and 1000"
+      );
+    });
+
+    it("should throw when GRAPHQL_STATS_CACHE_TTL_MS is below 1000", async () => {
+      process.env.GRAPHQL_STATS_CACHE_TTL_MS = "500";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "GRAPHQL_STATS_CACHE_TTL_MS must be between 1000 and 3600000"
+      );
+    });
+
+    it("should throw when GRAPHQL_STATS_CACHE_TTL_MS exceeds 3600000", async () => {
+      process.env.GRAPHQL_STATS_CACHE_TTL_MS = "3600001";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "GRAPHQL_STATS_CACHE_TTL_MS must be between 1000 and 3600000"
+      );
     });
   });
 });

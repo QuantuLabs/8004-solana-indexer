@@ -63,9 +63,9 @@ describe('Fixes Verification', () => {
       "_uri:name",
       "_uri:description",
       "_uri:image",
-      "_uri:endpoints",
+      "_uri:services",
       "_uri:registrations",
-      "_uri:supported_trusts",
+      "_uri:supported_trust",
       "_uri:active",
       "_uri:x402_support",
       "_uri:skills",
@@ -76,7 +76,7 @@ describe('Fixes Verification', () => {
     it('should not compress standard fields', () => {
       expect(STANDARD_URI_FIELDS.has("_uri:name")).toBe(true);
       expect(STANDARD_URI_FIELDS.has("_uri:description")).toBe(true);
-      expect(STANDARD_URI_FIELDS.has("_uri:endpoints")).toBe(true);
+      expect(STANDARD_URI_FIELDS.has("_uri:services")).toBe(true);
     });
 
     it('should compress custom fields', () => {

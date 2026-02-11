@@ -168,9 +168,9 @@ export class ReplayVerifier {
   }
 
   async getCheckpoint(agentId: string, chainType: string, targetCount?: number): Promise<Checkpoint | null> {
-    const where: { agentId: string; chainType: string; eventCount?: { lte: number } } = { agentId, chainType };
+    const where: { agentId: string; chainType: string; eventCount?: { lte: bigint } } = { agentId, chainType };
     if (targetCount !== undefined) {
-      where.eventCount = { lte: targetCount };
+      where.eventCount = { lte: BigInt(targetCount) };
     }
 
     const cp = await this.prisma.hashChainCheckpoint.findFirst({
@@ -179,7 +179,7 @@ export class ReplayVerifier {
     });
 
     if (!cp) return null;
-    return { eventCount: cp.eventCount, digest: cp.digest };
+    return { eventCount: Number(cp.eventCount), digest: cp.digest };
   }
 
   private async replayChainFromDB(
@@ -329,9 +329,10 @@ export class ReplayVerifier {
   }
 
   private async storeCheckpoint(agentId: string, chainType: string, eventCount: number, digest: string): Promise<void> {
+    const eventCountBigInt = BigInt(eventCount);
     await this.prisma.hashChainCheckpoint.upsert({
-      where: { agentId_chainType_eventCount: { agentId, chainType, eventCount } },
-      create: { agentId, chainType, eventCount, digest },
+      where: { agentId_chainType_eventCount: { agentId, chainType, eventCount: eventCountBigInt } },
+      create: { agentId, chainType, eventCount: eventCountBigInt, digest },
       update: { digest },
     });
   }

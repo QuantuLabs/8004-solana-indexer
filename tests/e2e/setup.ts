@@ -9,7 +9,11 @@ const testDbPath = join(__dirname, '../../prisma/test.db');
 
 // Set environment BEFORE any other imports
 process.env.DATABASE_URL = `file:${testDbPath}`;
-process.env.RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
+process.env.RPC_URL =
+  process.env.HELIUS_DEVNET_URL ||
+  process.env.DEVNET_RPC_URL ||
+  process.env.RPC_URL ||
+  "https://api.devnet.solana.com";
 process.env.WS_URL = process.env.WS_URL || "wss://api.devnet.solana.com";
 process.env.PROGRAM_ID = process.env.PROGRAM_ID || "3GGkAWC3mYYdud8GVBsKXK5QC9siXtFkWVZFYtbueVbC";
 process.env.LOG_LEVEL = "silent";
@@ -43,7 +47,7 @@ beforeAll(async () => {
   }
 
   // Push schema to create fresh test database
-  execSync('npx prisma db push --skip-generate', {
+  execSync('bunx prisma db push --skip-generate', {
     cwd: join(__dirname, '../..'),
     env: { ...process.env, DATABASE_URL: `file:${testDbPath}` },
     stdio: 'pipe',
