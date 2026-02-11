@@ -35,6 +35,8 @@
     "bench:vitest:full": "bun scripts/benchmark-vitest-runtime.mjs",
     "bench:hashchain": "bunx tsx scripts/benchmark-hashchain.ts",
     "bench:hashchain:massive": "HASHCHAIN_SCALES=100000,500000,1000000 HASHCHAIN_ITERATIONS=1 HASHCHAIN_WARMUP=0 bunx tsx scripts/benchmark-hashchain.ts",
+    "bench:hashchain:retrieval": "bunx tsx scripts/benchmark-hashchain-retrieval.ts",
+    "bench:hashchain:retrieval:massive": "HASHCHAIN_SCALES=100000,1000000,2000000 HASHCHAIN_ITERATIONS=1 HASHCHAIN_WARMUP=0 bunx tsx scripts/benchmark-hashchain-retrieval.ts",
     "bench:graphql:sql": "node scripts/benchmark-graphql-sql.mjs",
     "check:graphql:coherence": "node scripts/check-graphql-coherence.mjs",
     "lint": "bunx eslint src --ext .ts",
