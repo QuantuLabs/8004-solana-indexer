@@ -27,31 +27,51 @@ const {
 }));
 
 // Mock the modules BEFORE importing Processor
-vi.mock("@solana/web3.js", () => ({
-  Connection: vi.fn().mockImplementation(() => ({
-    getSlot: vi.fn().mockResolvedValue(12345),
-    getSignaturesForAddress: vi.fn().mockResolvedValue([]),
-    getParsedTransaction: vi.fn().mockResolvedValue(null),
-    onLogs: vi.fn().mockReturnValue(1),
-    removeOnLogsListener: vi.fn().mockResolvedValue(undefined),
-  })),
-  PublicKey: vi.fn().mockImplementation((key: string) => ({
-    toBase58: () => (typeof key === "string" ? key : "mocked-key"),
-    toBytes: () => new Uint8Array(32),
-  })),
-}));
+vi.mock("@solana/web3.js", () => {
+  class MockConnection {
+    getSlot = vi.fn().mockResolvedValue(12345);
+    getSignaturesForAddress = vi.fn().mockResolvedValue([]);
+    getParsedTransaction = vi.fn().mockResolvedValue(null);
+    onLogs = vi.fn().mockReturnValue(1);
+    removeOnLogsListener = vi.fn().mockResolvedValue(undefined);
+  }
+
+  class MockPublicKey {
+    private readonly key: string;
+
+    constructor(key: string) {
+      this.key = key;
+    }
+
+    toBase58() {
+      return typeof this.key === "string" ? this.key : "mocked-key";
+    }
+
+    toBytes() {
+      return new Uint8Array(32);
+    }
+  }
+
+  return { Connection: MockConnection, PublicKey: MockPublicKey };
+});
 
 vi.mock("../../../src/indexer/poller.js", () => ({
-  Poller: vi.fn(() => mockPollerInstance),
+  Poller: vi.fn(function MockPoller() {
+    return mockPollerInstance;
+  }),
 }));
 
 vi.mock("../../../src/indexer/websocket.js", () => ({
-  WebSocketIndexer: vi.fn(() => mockWsIndexerInstance),
+  WebSocketIndexer: vi.fn(function MockWebSocketIndexer() {
+    return mockWsIndexerInstance;
+  }),
   testWebSocketConnection: mockTestWebSocketConnection,
 }));
 
 vi.mock("../../../src/indexer/verifier.js", () => ({
-  DataVerifier: vi.fn(() => mockVerifierInstance),
+  DataVerifier: vi.fn(function MockDataVerifier() {
+    return mockVerifierInstance;
+  }),
 }));
 
 vi.mock("../../../src/logger.js", () => ({

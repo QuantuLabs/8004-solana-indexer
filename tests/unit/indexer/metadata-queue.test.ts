@@ -14,9 +14,14 @@ const { capturedTasks, mockPQueueInstance } = vi.hoisted(() => {
   return { capturedTasks, mockPQueueInstance };
 });
 
-vi.mock("p-queue", () => ({
-  default: vi.fn().mockImplementation(() => mockPQueueInstance),
-}));
+vi.mock("p-queue", () => {
+  class MockPQueue {
+    constructor() {
+      return mockPQueueInstance as any;
+    }
+  }
+  return { default: MockPQueue };
+});
 
 vi.mock("../../../src/config.js", () => ({
   config: {

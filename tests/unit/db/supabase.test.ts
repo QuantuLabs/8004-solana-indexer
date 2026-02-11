@@ -38,9 +38,14 @@ const { mockPoolInstance, mockClientInstance } = vi.hoisted(() => {
   return { mockPoolInstance, mockClientInstance };
 });
 
-vi.mock("pg", () => ({
-  Pool: vi.fn().mockImplementation(() => mockPoolInstance),
-}));
+vi.mock("pg", () => {
+  class MockPool {
+    constructor() {
+      return mockPoolInstance as any;
+    }
+  }
+  return { Pool: MockPool };
+});
 
 // ─── Mock config ─────────────────────────────────────────────────────────────
 

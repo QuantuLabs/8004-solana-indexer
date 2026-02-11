@@ -281,35 +281,35 @@ describe("API Security Headers", () => {
   });
 
   it("should set X-Content-Type-Options: nosniff", async () => {
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
     const res = await httpRequest(app, "GET", "/health");
 
     expect(res.headers["x-content-type-options"]).toBe("nosniff");
   });
 
   it("should set X-Frame-Options: DENY", async () => {
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
     const res = await httpRequest(app, "GET", "/health");
 
     expect(res.headers["x-frame-options"]).toBe("DENY");
   });
 
   it("should set X-XSS-Protection: 0", async () => {
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
     const res = await httpRequest(app, "GET", "/health");
 
     expect(res.headers["x-xss-protection"]).toBe("0");
   });
 
   it("should set Referrer-Policy header", async () => {
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
     const res = await httpRequest(app, "GET", "/health");
 
     expect(res.headers["referrer-policy"]).toBe("strict-origin-when-cross-origin");
   });
 
   it("should return healthy status on /health", async () => {
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
     const res = await httpRequest(app, "GET", "/health");
 
     expect(res.status).toBe(200);
@@ -358,7 +358,7 @@ describe("CORS and Body Size Limit", () => {
     vi.resetModules();
 
     const { createApiServer } = await import("../../src/api/server.js");
-    const app = createApiServer({ prisma: {} as any });
+    const app = createApiServer({ prisma: {} as any, pool: { query: vi.fn() } as any });
 
     // Build a JSON body larger than 100kb
     const oversizedBody = JSON.stringify({ data: "x".repeat(200 * 1024) });

@@ -29,9 +29,14 @@ const { mockPoolInstance } = vi.hoisted(() => {
   return { mockPoolInstance };
 });
 
-vi.mock("pg", () => ({
-  Pool: vi.fn().mockImplementation(() => mockPoolInstance),
-}));
+vi.mock("pg", () => {
+  class MockPool {
+    constructor() {
+      return mockPoolInstance as any;
+    }
+  }
+  return { Pool: MockPool };
+});
 
 vi.mock("../../../src/config.js", async (importOriginal) => {
   const original = (await importOriginal()) as any;
