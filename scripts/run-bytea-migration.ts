@@ -1,10 +1,19 @@
-import pg from 'pg';
+import { Client } from 'pg';
 
-// Try direct connection (not pooler)
-const dsn = "postgresql://postgres:[password]@db.uhjytdjxvfbppgjicfly.supabase.co:5432/postgres";
+// Prefer a direct DB connection (not the pooler) for migrations.
+const dsn = process.env.SUPABASE_DSN_DIRECT || process.env.SUPABASE_DSN;
+if (!dsn) {
+  console.error(
+    'Missing SUPABASE_DSN (or SUPABASE_DSN_DIRECT). Example: export SUPABASE_DSN="postgresql://..."'
+  );
+  process.exit(1);
+}
+
+const sslVerify = process.env.SUPABASE_SSL_VERIFY !== 'false';
+const ssl = { rejectUnauthorized: sslVerify };
 
 async function runMigration() {
-  const client = new pg.Client({ connectionString: dsn });
+  const client = new Client({ connectionString: dsn, ssl });
   
   try {
     await client.connect();
