@@ -9,3 +9,10 @@ dist
 .idea
 coverage
 *.log
+tests
+deploy
+supabase
+scripts
+vitest*.ts
+nixpacks.toml
+railway.json
