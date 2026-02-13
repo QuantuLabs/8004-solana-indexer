@@ -45,7 +45,7 @@ vi.mock("../../../src/config.js", async (importOriginal) => {
     config: {
       ...original.config,
       dbMode: "supabase",
-      supabaseDsn: "postgresql://test:test@localhost:5432/test",
+      supabaseDsn: "POSTGRES_DSN_REDACTED",
       supabaseSslVerify: false,
     },
   };

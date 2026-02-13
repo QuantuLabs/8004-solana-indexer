@@ -4,7 +4,7 @@ import { Client } from 'pg';
 const dsn = process.env.SUPABASE_DSN_DIRECT || process.env.SUPABASE_DSN;
 if (!dsn) {
   console.error(
-    'Missing SUPABASE_DSN (or SUPABASE_DSN_DIRECT). Example: export SUPABASE_DSN="postgresql://..."'
+    'Missing SUPABASE_DSN (or SUPABASE_DSN_DIRECT). Example: export SUPABASE_DSN="POSTGRES_DSN_REDACTED"'
   );
   process.exit(1);
 }

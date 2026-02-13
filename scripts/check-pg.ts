@@ -6,7 +6,7 @@ const dsn = process.env.SUPABASE_DSN;
 
 if (!dsn) {
   console.log('Missing SUPABASE_DSN');
-  console.log('Set it in .env or run: export SUPABASE_DSN="postgresql://..."');
+  console.log('Set it in .env or run: export SUPABASE_DSN="POSTGRES_DSN_REDACTED"');
   process.exit(1);
 }
 

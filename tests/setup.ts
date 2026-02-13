@@ -1,7 +1,7 @@
 import { vi, beforeEach, afterEach } from "vitest";
 
 // Mock environment variables
-process.env.DATABASE_URL = "postgresql://test:test@localhost:5432/test";
+process.env.DATABASE_URL = "POSTGRES_DSN_REDACTED";
 process.env.RPC_URL = "https://api.devnet.solana.com";
 process.env.WS_URL = "wss://api.devnet.solana.com";
 process.env.PROGRAM_ID = "8oo48pya1SZD23ZhzoNMhxR2UGb8BRa41Su4qP9EuaWm";

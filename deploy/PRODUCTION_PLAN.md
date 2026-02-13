@@ -284,7 +284,7 @@ source /root/.secrets/indexer.env
 **Environment** (`/etc/indexer-8004.env`):
 ```bash
 # Database (password injected at runtime)
-DATABASE_URL=postgresql://indexer:${DB_PASSWORD}@127.0.0.1:6432/indexer_8004
+DATABASE_URL=POSTGRES_DSN_REDACTED
 
 # Solana RPC (dedicated provider)
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}

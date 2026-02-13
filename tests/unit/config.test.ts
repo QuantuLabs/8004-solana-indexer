@@ -50,7 +50,7 @@ describe("Config", () => {
     });
 
     it("should use custom env values when set", async () => {
-      process.env.DATABASE_URL = "postgresql://custom:custom@localhost/custom";
+      process.env.DATABASE_URL = "POSTGRES_DSN_REDACTED";
       process.env.RPC_URL = "https://custom.rpc.com";
       process.env.WS_URL = "wss://custom.ws.com";
       process.env.INDEXER_MODE = "polling";
@@ -63,7 +63,7 @@ describe("Config", () => {
 
       const { config } = await import("../../src/config.js");
 
-      expect(config.databaseUrl).toBe("postgresql://custom:custom@localhost/custom");
+      expect(config.databaseUrl).toBe("POSTGRES_DSN_REDACTED");
       expect(config.rpcUrl).toBe("https://custom.rpc.com");
       expect(config.wsUrl).toBe("wss://custom.ws.com");
       // programId always comes from SDK, not configurable via env
@@ -150,7 +150,7 @@ describe("Config", () => {
 
     it("should not throw when DB_MODE=supabase with SUPABASE_DSN set", async () => {
       process.env.DB_MODE = "supabase";
-      process.env.SUPABASE_DSN = "postgresql://user:pass@host:5432/db";
+      process.env.SUPABASE_DSN = "POSTGRES_DSN_REDACTED";
 
       const { validateConfig } = await import("../../src/config.js");
 

@@ -34,7 +34,7 @@ http://localhost:3001/v2/graphql
 
 ```bash
 DB_MODE=supabase
-SUPABASE_DSN=postgresql://...
+SUPABASE_DSN=POSTGRES_DSN_REDACTED
 SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_KEY=<service_role_key>
 RPC_URL=https://api.devnet.solana.com

@@ -2,7 +2,11 @@ import { Pool } from 'pg';
 import { performance } from 'node:perf_hooks';
 import fs from 'node:fs';
 
-const conn = process.env.BENCH_DSN || 'postgresql://true@localhost:5432/bench_graphql_8004';
+const conn = process.env.BENCH_DSN;
+if (!conn) {
+  console.error('Missing BENCH_DSN. Set BENCH_DSN to your PostgreSQL DSN.');
+  process.exit(1);
+}
 const outFile = process.env.BENCH_OUT || '/tmp/bench_graphql_sql_results.json';
 const iterations = Number(process.env.BENCH_ITERS || 20);
 const warmup = Number(process.env.BENCH_WARMUP || 3);
