@@ -1,8 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python3", "gcc", "gnumake", "bun"]
+nixPkgs = ["nodejs_20", "python3", "gcc", "gnumake"]
+
+[phases.install]
+cmds = ["npm ci --include=dev"]
 
 [phases.build]
-cmds = ["bun install --frozen-lockfile", "bunx prisma generate"]
+cmds = ["npx prisma generate"]
 
 [start]
-cmd = "bunx tsx src/index.ts"
+cmd = "npx tsx src/index.ts"
