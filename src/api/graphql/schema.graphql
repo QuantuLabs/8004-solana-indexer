@@ -90,8 +90,8 @@ type Agent {
   cursor: String!
   chainId: Int!
   agentId: BigInt!
-  agentURI: String!
-  agentURIType: URIType!
+  agentURI: String
+  agentURIType: URIType
   owner: String!
   agentWallet: String
   operators: [String!]!
@@ -119,8 +119,8 @@ type Feedback {
   clientAddress: String!
   feedbackIndex: BigInt!
   value: BigDecimal!
-  tag1: String!
-  tag2: String!
+  tag1: String
+  tag2: String
   endpoint: String
   feedbackURI: String
   feedbackURIType: URIType
@@ -137,7 +137,7 @@ type FeedbackResponse {
   cursor: String!
   feedback: Feedback!
   responder: String!
-  responseUri: String!
+  responseUri: String
   responseHash: Bytes
   createdAt: BigInt!
   solana: SolanaResponseExtension
@@ -212,7 +212,7 @@ type AgentRegistrationFile {
 
 type SolanaAgentExtension {
   assetPubkey: String!
-  collection: String!
+  collection: String
   atomEnabled: Boolean!
   trustTier: Int
   qualityScore: Int

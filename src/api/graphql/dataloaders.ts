@@ -4,10 +4,10 @@ import type { Pool } from 'pg';
 export interface AgentRow {
   asset: string;
   owner: string;
-  agent_uri: string;
+  agent_uri: string | null;
   agent_wallet: string | null;
-  collection: string;
-  nft_name: string;
+  collection: string | null;
+  nft_name: string | null;
   atom_enabled: boolean;
   trust_tier: number | null;
   quality_score: number | null;
@@ -37,10 +37,10 @@ export interface FeedbackRow {
   value: string;
   value_decimals: number;
   score: number | null;
-  tag1: string;
-  tag2: string;
-  endpoint: string;
-  feedback_uri: string;
+  tag1: string | null;
+  tag2: string | null;
+  endpoint: string | null;
+  feedback_uri: string | null;
   feedback_hash: string | null;
   running_digest: string | null;
   is_revoked: boolean;
@@ -58,7 +58,7 @@ export interface ResponseRow {
   client_address: string;
   feedback_index: string;
   responder: string;
-  response_uri: string;
+  response_uri: string | null;
   response_hash: string | null;
   running_digest: string | null;
   response_count: string | null;

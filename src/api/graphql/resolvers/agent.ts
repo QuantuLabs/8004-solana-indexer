@@ -9,7 +9,8 @@ const FEEDBACK_ORDER_MAP: Record<string, 'created_at' | 'value' | 'feedback_inde
   feedbackIndex: 'feedback_index',
 };
 
-function detectUriType(uri: string): string {
+function detectUriType(uri: string | null): string | null {
+  if (!uri) return null;
   if (uri.startsWith('ipfs://') || uri.startsWith('Qm') || uri.startsWith('bafy')) return 'IPFS';
   if (uri.startsWith('ar://')) return 'ARWEAVE';
   return 'HTTP';
