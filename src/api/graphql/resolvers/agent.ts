@@ -1,7 +1,7 @@
 import type { GraphQLContext } from '../context.js';
 import type { AgentRow } from '../dataloaders.js';
 import { encodeAgentId, numericAgentId } from '../utils/ids.js';
-import { clampFirst, clampSkip } from '../utils/pagination.js';
+import { clampFirst, clampSkip, encodeCursor } from '../utils/pagination.js';
 
 const FEEDBACK_ORDER_MAP: Record<string, 'created_at' | 'value' | 'feedback_index'> = {
   createdAt: 'created_at',
@@ -29,6 +29,10 @@ export const agentResolvers = {
   Agent: {
     id(parent: AgentRow) {
       return encodeAgentId(parent.asset);
+    },
+    cursor(parent: AgentRow) {
+      // Opaque cursor used by Query.agents(after: ...)
+      return encodeCursor({ created_at: parent.created_at, asset: parent.asset });
     },
     chainId(_parent: AgentRow, _args: unknown, ctx: GraphQLContext) {
       return resolveChainId(ctx);

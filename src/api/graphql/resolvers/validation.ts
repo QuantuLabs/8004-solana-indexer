@@ -18,6 +18,13 @@ export const validationResolvers = {
     id(parent: ValidationRow) {
       return encodeValidationId(parent.asset, parent.validator, parent.nonce);
     },
+    cursor(parent: ValidationRow) {
+      // Opaque cursor used by Query.validations(after: ...)
+      return Buffer.from(
+        JSON.stringify({ created_at: parent.created_at, id: parent.id }),
+        'utf-8'
+      ).toString('base64');
+    },
     async agent(parent: ValidationRow, _args: unknown, ctx: GraphQLContext) {
       return ctx.loaders.agentById.load(parent.asset);
     },

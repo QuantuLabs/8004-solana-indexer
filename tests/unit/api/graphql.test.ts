@@ -22,6 +22,10 @@ import { buildWhereClause } from '../../../src/api/graphql/utils/filters.js';
 import { clampFirst, clampSkip, encodeCursor, decodeCursor, MAX_FIRST, MAX_SKIP } from '../../../src/api/graphql/utils/pagination.js';
 import { scalarResolvers } from '../../../src/api/graphql/resolvers/scalars.js';
 import { queryResolvers, resetAggregatedStatsCacheForTests } from '../../../src/api/graphql/resolvers/query.js';
+import { agentResolvers } from '../../../src/api/graphql/resolvers/agent.js';
+import { feedbackResolvers } from '../../../src/api/graphql/resolvers/feedback.js';
+import { responseResolvers } from '../../../src/api/graphql/resolvers/response.js';
+import { validationResolvers } from '../../../src/api/graphql/resolvers/validation.js';
 
 describe('GraphQL Complexity Analysis', () => {
   it('allows simple queries', () => {
@@ -193,6 +197,10 @@ describe('Filter Builder', () => {
 });
 
 describe('Pagination Utilities', () => {
+  function decodeBase64Json(cursor: string): Record<string, unknown> {
+    return JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8')) as Record<string, unknown>;
+  }
+
   it('clamps first to MAX_FIRST', () => {
     expect(clampFirst(1000)).toBe(MAX_FIRST);
     expect(clampFirst(50)).toBe(50);
@@ -224,6 +232,30 @@ describe('Pagination Utilities', () => {
     expect(decodeCursor('not-base64-json')).toBeNull();
     expect(decodeCursor(Buffer.from('{}').toString('base64'))).toBeNull();
     expect(decodeCursor(Buffer.from('{"created_at": 123}').toString('base64'))).toBeNull();
+  });
+
+  it('exposes Agent.cursor compatible with Query.agents(after: ...)', () => {
+    const parent = { asset: 'agent1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const cursor = agentResolvers.Agent.cursor(parent);
+    expect(decodeCursor(cursor)).toEqual({ created_at: parent.created_at, asset: parent.asset });
+  });
+
+  it('exposes Feedback.cursor compatible with Query.feedbacks(after: ...)', () => {
+    const parent = { id: 'fb1', asset: 'agent1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const cursor = feedbackResolvers.Feedback.cursor(parent);
+    expect(decodeBase64Json(cursor)).toEqual({ created_at: parent.created_at, asset: parent.asset, id: parent.id });
+  });
+
+  it('exposes FeedbackResponse.cursor compatible with Query.feedbackResponses(after: ...)', () => {
+    const parent = { id: 'resp1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const cursor = responseResolvers.FeedbackResponse.cursor(parent);
+    expect(decodeBase64Json(cursor)).toEqual({ created_at: parent.created_at, id: parent.id });
+  });
+
+  it('exposes Validation.cursor compatible with Query.validations(after: ...)', () => {
+    const parent = { id: 'val1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const cursor = validationResolvers.Validation.cursor(parent);
+    expect(decodeBase64Json(cursor)).toEqual({ created_at: parent.created_at, id: parent.id });
   });
 });
 

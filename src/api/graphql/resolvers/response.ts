@@ -19,6 +19,13 @@ export const responseResolvers = {
         parent.tx_signature ?? ''
       );
     },
+    cursor(parent: ResponseRow) {
+      // Opaque cursor used by Query.feedbackResponses(after: ...)
+      return Buffer.from(
+        JSON.stringify({ created_at: parent.created_at, id: parent.id }),
+        'utf-8'
+      ).toString('base64');
+    },
     async feedback(parent: ResponseRow, _args: unknown, ctx: GraphQLContext) {
       return ctx.loaders.feedbackByLookup.load(`${parent.asset}:${parent.client_address}:${parent.feedback_index}`);
     },

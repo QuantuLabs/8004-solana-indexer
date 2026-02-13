@@ -32,6 +32,13 @@ export const feedbackResolvers = {
     id(parent: FeedbackRow) {
       return encodeFeedbackId(parent.asset, parent.client_address, parent.feedback_index);
     },
+    cursor(parent: FeedbackRow) {
+      // Opaque cursor used by Query.feedbacks(after: ...)
+      return Buffer.from(
+        JSON.stringify({ created_at: parent.created_at, asset: parent.asset, id: parent.id }),
+        'utf-8'
+      ).toString('base64');
+    },
     async agent(parent: FeedbackRow, _args: unknown, ctx: GraphQLContext) {
       return ctx.loaders.agentById.load(parent.asset);
     },

@@ -87,6 +87,7 @@ input AgentRegistrationFileFilter {
 
 type Agent {
   id: ID!
+  cursor: String!
   chainId: Int!
   agentId: BigInt!
   agentURI: String!
@@ -113,6 +114,7 @@ type Agent {
 
 type Feedback {
   id: ID!
+  cursor: String!
   agent: Agent!
   clientAddress: String!
   feedbackIndex: BigInt!
@@ -132,6 +134,7 @@ type Feedback {
 
 type FeedbackResponse {
   id: ID!
+  cursor: String!
   feedback: Feedback!
   responder: String!
   responseUri: String!
@@ -142,6 +145,7 @@ type FeedbackResponse {
 
 type Validation {
   id: ID!
+  cursor: String!
   agent: Agent!
   validatorAddress: String!
   requestUri: String
