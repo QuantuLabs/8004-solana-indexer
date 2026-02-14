@@ -37,6 +37,12 @@ enum URIType {
   ARWEAVE
 }
 
+enum HashChainType {
+  FEEDBACK
+  RESPONSE
+  REVOKE
+}
+
 input AgentFilter {
   id: ID
   id_in: [ID!]
@@ -243,6 +249,48 @@ type SolanaResponseExtension {
   blockSlot: BigInt
 }
 
+type HashChainHead {
+  digest: String
+  count: BigInt!
+}
+
+type HashChainHeads {
+  feedback: HashChainHead!
+  response: HashChainHead!
+  revoke: HashChainHead!
+}
+
+type HashChainCheckpoint {
+  eventCount: BigInt!
+  digest: String!
+  createdAt: BigInt!
+}
+
+type HashChainCheckpointSet {
+  feedback: HashChainCheckpoint
+  response: HashChainCheckpoint
+  revoke: HashChainCheckpoint
+}
+
+type HashChainReplayEvent {
+  asset: String!
+  client: String!
+  feedbackIndex: BigInt!
+  slot: BigInt!
+  runningDigest: String
+  feedbackHash: String
+  responder: String
+  responseHash: String
+  responseCount: BigInt
+  revokeCount: BigInt
+}
+
+type HashChainReplayPage {
+  events: [HashChainReplayEvent!]!
+  hasMore: Boolean!
+  nextFromCount: BigInt!
+}
+
 type Query {
   agent(id: ID!): Agent
   agents(
@@ -293,4 +341,14 @@ type Query {
     skip: Int = 0
     where: AgentRegistrationFileFilter
   ): [AgentRegistrationFile!]!
+  hashChainHeads(agent: ID!): HashChainHeads!
+  hashChainLatestCheckpoints(agent: ID!): HashChainCheckpointSet!
+  hashChainReplayData(
+    agent: ID!
+    chainType: HashChainType!
+    fromCount: BigInt = 0
+    toCount: BigInt
+    first: Int = 1000
+  ): HashChainReplayPage!
+
 }

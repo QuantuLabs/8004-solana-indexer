@@ -22,12 +22,16 @@ const FIELD_COSTS: Record<string, number> = {
   protocols: 5,
   agentSearch: 3,
   agentRegistrationFiles: 2,
+  hashChainHeads: 5,
+  hashChainLatestCheckpoints: 5,
+  hashChainReplayData: 8,
 };
 
 const LIST_FIELDS = new Set([
   'agents', 'feedbacks', 'feedbackResponses', 'validations',
   'agentMetadatas', 'protocols', 'agentSearch', 'agentRegistrationFiles',
   'feedback', 'responses', 'metadata',
+  'hashChainReplayData',
 ]);
 
 function getFirstArg(node: FieldNode): number {
