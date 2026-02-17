@@ -610,7 +610,7 @@ function createAgentStatsByAgentLoader(pool: Pool) {
          GREATEST(f.last_fb, v.last_val)::text as last_activity
        FROM (SELECT unnest($1::text[]) as asset) a
        LEFT JOIN (
-         SELECT asset, COUNT(*) as cnt, AVG(value) as avg_val, MAX(created_at) as last_fb
+         SELECT asset, COUNT(*) as cnt, AVG(value::numeric / POWER(10, COALESCE(value_decimals, 0))) as avg_val, MAX(created_at) as last_fb
          FROM feedbacks WHERE asset = ANY($1::text[]) AND NOT is_revoked AND status != 'ORPHANED'
          GROUP BY asset
        ) f ON f.asset = a.asset
