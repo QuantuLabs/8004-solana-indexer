@@ -17,12 +17,25 @@ datasource db {
 model Agent {
   id         String   @id // asset pubkey (base58)
   owner      String   // current owner pubkey
+  creator    String?  // immutable creator snapshot
   wallet     String?  // agent operational wallet (optional)
   uri        String   // agent URI (IPFS/Arweave/HTTP)
   nftName    String   // NFT display name
   collection String   // collection pubkey
+  collectionPointer String @default("") // canonical collection pointer (c1:<cid>)
+  colLocked  Boolean  @default(false)
+  parentAsset String?
+  parentCreator String?
+  parentLocked Boolean @default(false)
   registry   String   // registry config pubkey
   atomEnabled Boolean @default(true)
+  trustTier  Int      @default(0)
+  qualityScore Int    @default(0)
+  confidence Int      @default(0)
+  riskScore  Int      @default(0)
+  diversityRatio Int  @default(0)
+  feedbackCount Int   @default(0)
+  rawAvgScore Int     @default(0)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -41,9 +54,36 @@ model Agent {
   validations Validation[]
 
   @@index([owner])
+  @@index([creator])
   @@index([collection])
+  @@index([collectionPointer])
+  @@index([collectionPointer, status])
+  @@index([collectionPointer, creator, createdAt])
+  @@index([parentAsset])
+  @@index([parentAsset, status])
   @@index([registry])
   @@index([status])
+}
+
+// Canonical collection pointer registry (c1:<cid>)
+// Tracks first on-chain sighting for each unique pointer.
+model CollectionPointer {
+  col                  String
+  creator              String
+  firstSeenAsset       String
+  firstSeenAt          DateTime @default(now())
+  firstSeenSlot        BigInt
+  firstSeenTxSignature String?
+  lastSeenAt           DateTime @default(now())
+  lastSeenSlot         BigInt
+  lastSeenTxSignature  String?
+  assetCount           BigInt   @default(0)
+
+  @@id([col, creator])
+  @@index([col])
+  @@index([creator])
+  @@index([firstSeenAt])
+  @@index([lastSeenAt])
 }
 
 // Agent metadata entries (individual PDAs)
@@ -74,7 +114,7 @@ model Feedback {
   agentId            String
   client             String
   feedbackIndex      BigInt
-  value              BigInt   @default(0)
+  value              String   @default("0")
   valueDecimals      Int      @default(0)
   score              Int?
   tag1               String

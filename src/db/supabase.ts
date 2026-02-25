@@ -12,9 +12,12 @@ import {
   AgentOwnerSynced,
   UriUpdated,
   WalletUpdated,
+  WalletResetOnOwnerSync,
   MetadataSet,
   MetadataDeleted,
   RegistryInitialized,
+  CollectionPointerSet,
+  ParentAssetSet,
   NewFeedback,
   FeedbackRevoked,
   ResponseAppended,
@@ -172,6 +175,9 @@ export async function handleEvent(
       case "WalletUpdated":
         await handleWalletUpdated(event.data, ctx);
         break;
+      case "WalletResetOnOwnerSync":
+        await handleWalletResetOnOwnerSync(event.data, ctx);
+        break;
 
       case "MetadataSet":
         await handleMetadataSet(event.data, ctx);
@@ -184,6 +190,12 @@ export async function handleEvent(
 
       case "RegistryInitialized":
         await handleRegistryInitialized(event.data, ctx);
+        break;
+      case "CollectionPointerSet":
+        await handleCollectionPointerSet(event.data, ctx);
+        break;
+      case "ParentAssetSet":
+        await handleParentAssetSet(event.data, ctx);
         break;
 
       case "NewFeedback":
@@ -313,6 +325,9 @@ async function handleEventInTx(
     case "WalletUpdated":
       await handleWalletUpdatedTx(client, event.data, ctx);
       break;
+    case "WalletResetOnOwnerSync":
+      await handleWalletResetOnOwnerSyncTx(client, event.data, ctx);
+      break;
     case "MetadataSet":
       await handleMetadataSetTx(client, event.data, ctx);
       eventStats.metadataSet++;
@@ -322,6 +337,12 @@ async function handleEventInTx(
       break;
     case "RegistryInitialized":
       await handleRegistryInitializedTx(client, event.data, ctx);
+      break;
+    case "CollectionPointerSet":
+      await handleCollectionPointerSetTx(client, event.data, ctx);
+      break;
+    case "ParentAssetSet":
+      await handleParentAssetSetTx(client, event.data, ctx);
       break;
     case "NewFeedback":
       await handleNewFeedbackTx(client, event.data, ctx);
@@ -397,16 +418,34 @@ async function handleAgentRegisteredTx(
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection);
   await client.query(
-    `INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (asset) DO UPDATE SET
        owner = EXCLUDED.owner,
+       creator = COALESCE(agents.creator, EXCLUDED.creator),
        agent_uri = EXCLUDED.agent_uri,
        atom_enabled = EXCLUDED.atom_enabled,
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        updated_at = EXCLUDED.created_at`,
-    [assetId, data.owner.toBase58(), agentUri, collection, data.atomEnabled, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+    [
+      assetId,
+      data.owner.toBase58(),
+      data.owner.toBase58(),
+      agentUri,
+      collection,
+      "",
+      false,
+      null,
+      null,
+      false,
+      data.atomEnabled,
+      ctx.slot.toString(),
+      ctx.txIndex ?? null,
+      ctx.signature,
+      ctx.blockTime.toISOString(),
+      DEFAULT_STATUS,
+    ]
   );
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
@@ -474,6 +513,109 @@ async function handleWalletUpdatedTx(
     [newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
+}
+
+async function handleWalletResetOnOwnerSyncTx(
+  client: PoolClient,
+  data: WalletResetOnOwnerSync,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
+  await client.query(
+    `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
+    [data.ownerAfterSync.toBase58(), newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+  );
+  logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
+}
+
+async function handleCollectionPointerSetTx(
+  client: PoolClient,
+  data: CollectionPointerSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const pointer = data.col;
+  const setBy = data.setBy.toBase58();
+  await client.query(
+    `WITH previous AS (
+       SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
+       FROM agents
+       WHERE asset = $1
+     ),
+     updated AS (
+       UPDATE agents
+       SET canonical_col = $2,
+           creator = COALESCE(creator, $3),
+           block_slot = $4,
+           updated_at = $5
+       WHERE asset = $1
+       RETURNING 1
+     ),
+     upserted AS (
+       INSERT INTO collection_pointers (
+         col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
+         last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
+       )
+       VALUES ($2, $3, $1, $5, $4, $6, $5, $4, $6, 0)
+       ON CONFLICT (col, creator) DO UPDATE SET
+         last_seen_at = EXCLUDED.last_seen_at,
+         last_seen_slot = EXCLUDED.last_seen_slot,
+         last_seen_tx_signature = EXCLUDED.last_seen_tx_signature
+       RETURNING col
+     ),
+     dec_old AS (
+       UPDATE collection_pointers cp
+       SET asset_count = GREATEST(0, cp.asset_count - 1)
+       WHERE cp.col = COALESCE((SELECT prev_col FROM previous), '')
+         AND cp.creator = COALESCE((SELECT prev_creator FROM previous), '')
+         AND cp.col <> ''
+         AND (cp.col <> $2 OR cp.creator <> $3)
+         AND EXISTS (SELECT 1 FROM updated)
+       RETURNING 1
+     )
+     UPDATE collection_pointers cp
+     SET asset_count = cp.asset_count + 1
+     WHERE cp.col = $2
+       AND cp.creator = $3
+       AND EXISTS (SELECT 1 FROM updated)
+       AND (
+         COALESCE((SELECT prev_col FROM previous), '') <> $2
+         OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+       )`,
+    [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature]
+  );
+  logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
+}
+
+async function handleParentAssetSetTx(
+  client: PoolClient,
+  data: ParentAssetSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  await client.query(
+    `UPDATE agents
+     SET parent_asset = $1,
+         parent_creator = $2,
+         block_slot = $3,
+         updated_at = $4
+     WHERE asset = $5`,
+    [
+      data.parentAsset.toBase58(),
+      data.parentCreator.toBase58(),
+      ctx.slot.toString(),
+      ctx.blockTime.toISOString(),
+      assetId,
+    ]
+  );
+  logger.info({
+    assetId,
+    parentAsset: data.parentAsset.toBase58(),
+    parentCreator: data.parentCreator.toBase58(),
+    setBy: data.setBy.toBase58(),
+  }, "Parent asset set");
 }
 
 async function handleMetadataSetTx(
@@ -658,7 +800,16 @@ async function handleFeedbackRevokedTx(
   await client.query(
     `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-     ON CONFLICT (asset, client_address, feedback_index) DO NOTHING`,
+     ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+       feedback_hash = EXCLUDED.feedback_hash,
+       slot = EXCLUDED.slot,
+       original_score = EXCLUDED.original_score,
+       atom_enabled = EXCLUDED.atom_enabled,
+       had_impact = EXCLUDED.had_impact,
+       running_digest = EXCLUDED.running_digest,
+       revoke_count = EXCLUDED.revoke_count,
+       tx_signature = EXCLUDED.tx_signature,
+       status = EXCLUDED.status`,
     [revokeId, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
      data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
      revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
@@ -723,11 +874,11 @@ async function handleResponseAppendedTx(
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
     await client.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash, responseRunningDigest,
+       responseHash, responseRunningDigest, data.newResponseCount.toString(),
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
@@ -749,11 +900,11 @@ async function handleResponseAppendedTx(
   const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
 
   await client.query(
-    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (id) DO NOTHING`,
     [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-     responseHash, responseRunningDigest,
+     responseHash, responseRunningDigest, data.newResponseCount.toString(),
      ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
   );
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
@@ -821,16 +972,33 @@ async function handleAgentRegistered(
 
   try {
     await db.query(
-      `INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_index, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        ON CONFLICT (asset) DO UPDATE SET
          owner = EXCLUDED.owner,
+         creator = COALESCE(agents.creator, EXCLUDED.creator),
          agent_uri = EXCLUDED.agent_uri,
          atom_enabled = EXCLUDED.atom_enabled,
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          updated_at = EXCLUDED.created_at`,
-      [assetId, data.owner.toBase58(), agentUri, collection, data.atomEnabled, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [
+        assetId,
+        data.owner.toBase58(),
+        data.owner.toBase58(),
+        agentUri,
+        collection,
+        "",
+        false,
+        null,
+        null,
+        false,
+        data.atomEnabled,
+        ctx.slot.toString(),
+        ctx.txIndex ?? null,
+        ctx.signature,
+        ctx.blockTime.toISOString(),
+      ]
     );
     logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
@@ -925,6 +1093,124 @@ async function handleWalletUpdated(
     logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to update wallet");
+  }
+}
+
+async function handleWalletResetOnOwnerSync(
+  data: WalletResetOnOwnerSync,
+  ctx: EventContext
+): Promise<void> {
+  const db = getPool();
+  const assetId = data.asset.toBase58();
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
+
+  try {
+    await db.query(
+      `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
+      [data.ownerAfterSync.toBase58(), newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    );
+    logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed wallet reset on owner sync");
+  }
+}
+
+async function handleCollectionPointerSet(
+  data: CollectionPointerSet,
+  ctx: EventContext
+): Promise<void> {
+  const db = getPool();
+  const assetId = data.asset.toBase58();
+  const pointer = data.col;
+  const setBy = data.setBy.toBase58();
+
+  try {
+    await db.query(
+      `WITH previous AS (
+         SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
+         FROM agents
+         WHERE asset = $1
+       ),
+       updated AS (
+         UPDATE agents
+         SET canonical_col = $2,
+             creator = COALESCE(creator, $3),
+             block_slot = $4,
+             updated_at = $5
+         WHERE asset = $1
+         RETURNING 1
+       ),
+       upserted AS (
+         INSERT INTO collection_pointers (
+           col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
+           last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
+         )
+         VALUES ($2, $3, $1, $5, $4, $6, $5, $4, $6, 0)
+         ON CONFLICT (col, creator) DO UPDATE SET
+           last_seen_at = EXCLUDED.last_seen_at,
+           last_seen_slot = EXCLUDED.last_seen_slot,
+           last_seen_tx_signature = EXCLUDED.last_seen_tx_signature
+         RETURNING col
+       ),
+       dec_old AS (
+         UPDATE collection_pointers cp
+         SET asset_count = GREATEST(0, cp.asset_count - 1)
+         WHERE cp.col = COALESCE((SELECT prev_col FROM previous), '')
+           AND cp.creator = COALESCE((SELECT prev_creator FROM previous), '')
+           AND cp.col <> ''
+           AND (cp.col <> $2 OR cp.creator <> $3)
+           AND EXISTS (SELECT 1 FROM updated)
+         RETURNING 1
+       )
+       UPDATE collection_pointers cp
+       SET asset_count = cp.asset_count + 1
+       WHERE cp.col = $2
+         AND cp.creator = $3
+         AND EXISTS (SELECT 1 FROM updated)
+         AND (
+           COALESCE((SELECT prev_col FROM previous), '') <> $2
+           OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+         )`,
+      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature]
+    );
+    logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed collection pointer set");
+  }
+}
+
+async function handleParentAssetSet(
+  data: ParentAssetSet,
+  ctx: EventContext
+): Promise<void> {
+  const db = getPool();
+  const assetId = data.asset.toBase58();
+
+  try {
+    await db.query(
+      `UPDATE agents
+       SET parent_asset = $1,
+           parent_creator = $2,
+           block_slot = $3,
+           updated_at = $4
+       WHERE asset = $5`,
+      [
+        data.parentAsset.toBase58(),
+        data.parentCreator.toBase58(),
+        ctx.slot.toString(),
+        ctx.blockTime.toISOString(),
+        assetId,
+      ]
+    );
+    logger.info({
+      assetId,
+      parentAsset: data.parentAsset.toBase58(),
+      parentCreator: data.parentCreator.toBase58(),
+      setBy: data.setBy.toBase58(),
+    }, "Parent asset set");
+  } catch (error: any) {
+    logger.error({ error: error.message, assetId }, "Failed parent asset set");
   }
 }
 
@@ -1139,7 +1425,16 @@ async function handleFeedbackRevoked(
     await db.query(
       `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-       ON CONFLICT (asset, client_address, feedback_index) DO NOTHING`,
+       ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+         feedback_hash = EXCLUDED.feedback_hash,
+         slot = EXCLUDED.slot,
+         original_score = EXCLUDED.original_score,
+         atom_enabled = EXCLUDED.atom_enabled,
+         had_impact = EXCLUDED.had_impact,
+         running_digest = EXCLUDED.running_digest,
+         revoke_count = EXCLUDED.revoke_count,
+         tx_signature = EXCLUDED.tx_signature,
+         status = EXCLUDED.status`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
        data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
        revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
@@ -1212,11 +1507,11 @@ async function handleResponseAppended(
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
       await db.query(
-        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          ON CONFLICT (id) DO NOTHING`,
         [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-         responseHash, responseRunningDigest,
+         responseHash, responseRunningDigest, data.newResponseCount.toString(),
          ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
       );
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
@@ -1238,11 +1533,11 @@ async function handleResponseAppended(
     const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
 
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash, responseRunningDigest,
+       responseHash, responseRunningDigest, data.newResponseCount.toString(),
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");

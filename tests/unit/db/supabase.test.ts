@@ -768,6 +768,35 @@ describe("supabase.ts", () => {
         expect(revokeInsert![1]).toContain("ORPHANED");
       });
 
+      it("should keep revocation insert idempotent for parallel duplicate events", async () => {
+        mockPoolInstance.query.mockImplementation((queryText: any) => {
+          if (typeof queryText === "string" && queryText.includes("SELECT id, feedback_hash FROM feedbacks")) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        const event = {
+          type: "FeedbackRevoked" as const,
+          data: makeRevokeData(),
+        };
+
+        await Promise.all([
+          handleEvent(event, ctx),
+          handleEvent(event, ctx),
+        ]);
+
+        const revokeInsertCalls = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO revocations")
+        );
+
+        expect(revokeInsertCalls).toHaveLength(2);
+        for (const call of revokeInsertCalls) {
+          expect(call[0]).toContain("ON CONFLICT (asset, client_address, feedback_index)");
+          expect(call[0]).toMatch(/DO (NOTHING|UPDATE SET)/);
+        }
+      });
+
       it("should warn on seal_hash mismatch", async () => {
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: "ff".repeat(32) }], rowCount: 1 }) // mismatched hash
@@ -2943,7 +2972,7 @@ describe("supabase.ts", () => {
       );
       expect(insertCall).toBeDefined();
       // txIndex should be null
-      expect(insertCall![1][6]).toBeNull();
+      expect(insertCall![1][12]).toBeNull();
     });
 
     it("should handle ValidationRequested with null requestUri and requestHash", async () => {

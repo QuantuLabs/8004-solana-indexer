@@ -7,9 +7,12 @@ import {
   AgentOwnerSynced,
   UriUpdated,
   WalletUpdated,
+  WalletResetOnOwnerSync,
   MetadataSet,
   MetadataDeleted,
   RegistryInitialized,
+  CollectionPointerSet,
+  ParentAssetSet,
   NewFeedback,
   FeedbackRevoked,
   ResponseAppended,
@@ -71,6 +74,77 @@ function hashesMatch(a: Uint8Array | Uint8Array<ArrayBuffer> | null | undefined,
     if (a![i] !== b![i]) return false;
   }
   return true;
+}
+
+function toRoundedScore(avg: number | null | undefined): number {
+  if (avg === null || avg === undefined || Number.isNaN(avg)) return 0;
+  return Math.round(avg);
+}
+
+interface AgentAtomPatch {
+  trustTier?: number;
+  qualityScore?: number;
+  confidence?: number;
+  riskScore?: number;
+  diversityRatio?: number;
+}
+
+async function syncAgentFeedbackStatsTx(
+  tx: PrismaTransactionClient,
+  assetId: string,
+  blockTime: Date,
+  atomPatch?: AgentAtomPatch
+): Promise<void> {
+  const aggregate = await tx.feedback.aggregate({
+    where: {
+      agentId: assetId,
+      revoked: false,
+    },
+    _count: { _all: true },
+    _avg: { score: true },
+  });
+
+  const feedbackCount = Number(aggregate?._count?._all ?? 0);
+  const avgScore = aggregate?._avg?.score;
+  const baseData = {
+    feedbackCount,
+    rawAvgScore: toRoundedScore(avgScore),
+    updatedAt: blockTime,
+  };
+
+  await tx.agent.updateMany({
+    where: { id: assetId },
+    data: atomPatch ? { ...baseData, ...atomPatch } : baseData,
+  });
+}
+
+async function syncAgentFeedbackStats(
+  prisma: PrismaClient,
+  assetId: string,
+  blockTime: Date,
+  atomPatch?: AgentAtomPatch
+): Promise<void> {
+  const aggregate = await prisma.feedback.aggregate({
+    where: {
+      agentId: assetId,
+      revoked: false,
+    },
+    _count: { _all: true },
+    _avg: { score: true },
+  });
+
+  const feedbackCount = Number(aggregate?._count?._all ?? 0);
+  const avgScore = aggregate?._avg?.score;
+  const baseData = {
+    feedbackCount,
+    rawAvgScore: toRoundedScore(avgScore),
+    updatedAt: blockTime,
+  };
+
+  await prisma.agent.updateMany({
+    where: { id: assetId },
+    data: atomPatch ? { ...baseData, ...atomPatch } : baseData,
+  });
 }
 
 export interface EventContext {
@@ -211,6 +285,9 @@ async function handleEventInner(
     case "WalletUpdated":
       await handleWalletUpdatedTx(tx, event.data, ctx);
       break;
+    case "WalletResetOnOwnerSync":
+      await handleWalletResetOnOwnerSyncTx(tx, event.data, ctx);
+      break;
     case "MetadataSet":
       await handleMetadataSetTx(tx, event.data, ctx);
       break;
@@ -219,6 +296,12 @@ async function handleEventInner(
       break;
     case "RegistryInitialized":
       await handleRegistryInitializedTx(tx, event.data, ctx);
+      break;
+    case "CollectionPointerSet":
+      await handleCollectionPointerSetTx(tx, event.data, ctx);
+      break;
+    case "ParentAssetSet":
+      await handleParentAssetSetTx(tx, event.data, ctx);
       break;
     case "NewFeedback":
       await handleNewFeedbackTx(tx, event.data, ctx);
@@ -280,6 +363,9 @@ export async function handleEvent(
     case "WalletUpdated":
       await handleWalletUpdated(prisma, event.data, ctx);
       break;
+    case "WalletResetOnOwnerSync":
+      await handleWalletResetOnOwnerSync(prisma, event.data, ctx);
+      break;
 
     case "MetadataSet":
       await handleMetadataSet(prisma, event.data, ctx);
@@ -291,6 +377,12 @@ export async function handleEvent(
 
     case "RegistryInitialized":
       await handleRegistryInitialized(prisma, event.data, ctx);
+      break;
+    case "CollectionPointerSet":
+      await handleCollectionPointerSet(prisma, event.data, ctx);
+      break;
+    case "ParentAssetSet":
+      await handleParentAssetSet(prisma, event.data, ctx);
       break;
 
     case "NewFeedback":
@@ -334,9 +426,13 @@ async function handleAgentRegisteredCore(
     create: {
       id: assetId,
       owner: data.owner.toBase58(),
+      creator: data.owner.toBase58(),
       uri: agentUri,
       nftName: "",
       collection: collectionId,
+      collectionPointer: "",
+      colLocked: false,
+      parentLocked: false,
       registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
       atomEnabled: data.atomEnabled,
       createdTxSignature: ctx.signature,
@@ -348,6 +444,7 @@ async function handleAgentRegisteredCore(
       registry: collectionId, // v0.6.0: registry = collection
       atomEnabled: data.atomEnabled,
       uri: agentUri,
+      creator: data.owner.toBase58(),
     },
   });
 
@@ -584,6 +681,266 @@ async function handleWalletUpdated(
   );
 }
 
+async function handleWalletResetOnOwnerSyncTx(
+  tx: PrismaTransactionClient,
+  data: WalletResetOnOwnerSync,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
+  const ownerAfterSync = data.ownerAfterSync.toBase58();
+
+  const result = await tx.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      owner: ownerAfterSync,
+      wallet: newWallet,
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for wallet reset on owner sync, event may be out of order");
+    return;
+  }
+
+  logger.info({ assetId, ownerAfterSync, newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
+}
+
+async function handleWalletResetOnOwnerSync(
+  prisma: PrismaClient,
+  data: WalletResetOnOwnerSync,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const newWalletRaw = data.newWallet.toBase58();
+  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
+  const ownerAfterSync = data.ownerAfterSync.toBase58();
+
+  const result = await prisma.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      owner: ownerAfterSync,
+      wallet: newWallet,
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for wallet reset on owner sync, event may be out of order");
+    return;
+  }
+
+  logger.info({ assetId, ownerAfterSync, newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
+}
+
+async function handleCollectionPointerSetTx(
+  tx: PrismaTransactionClient,
+  data: CollectionPointerSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const pointer = data.col;
+  const setBy = data.setBy.toBase58();
+  const existing = await tx.agent.findUnique({
+    where: { id: assetId },
+    select: { collectionPointer: true, creator: true },
+  });
+  const creator = existing?.creator ?? setBy;
+
+  await tx.collectionPointer.upsert({
+    where: { col_creator: { col: pointer, creator } },
+    create: {
+      col: pointer,
+      creator,
+      firstSeenAsset: assetId,
+      firstSeenAt: ctx.blockTime,
+      firstSeenSlot: ctx.slot,
+      firstSeenTxSignature: ctx.signature,
+      lastSeenAt: ctx.blockTime,
+      lastSeenSlot: ctx.slot,
+      lastSeenTxSignature: ctx.signature,
+      assetCount: 0n,
+    },
+    update: {
+      lastSeenAt: ctx.blockTime,
+      lastSeenSlot: ctx.slot,
+      lastSeenTxSignature: ctx.signature,
+    },
+  });
+
+  const result = await tx.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      collectionPointer: pointer,
+      creator,
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count > 0) {
+    const previousPointer = existing?.collectionPointer ?? "";
+    const previousCreator = existing?.creator ?? creator;
+    if (previousPointer !== pointer) {
+      if (previousPointer !== "") {
+        await tx.collectionPointer.updateMany({
+          where: {
+            col: previousPointer,
+            creator: previousCreator,
+            assetCount: { gt: 0n },
+          },
+          data: {
+            assetCount: { decrement: 1n },
+          },
+        });
+      }
+
+      await tx.collectionPointer.update({
+        where: { col_creator: { col: pointer, creator } },
+        data: {
+          assetCount: { increment: 1n },
+        },
+      });
+    }
+  } else {
+    logger.warn({ assetId }, "Agent not found for collection pointer set, event may be out of order");
+  }
+
+  logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
+}
+
+async function handleCollectionPointerSet(
+  prisma: PrismaClient,
+  data: CollectionPointerSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const pointer = data.col;
+  const setBy = data.setBy.toBase58();
+  const existing = await prisma.agent.findUnique({
+    where: { id: assetId },
+    select: { collectionPointer: true, creator: true },
+  });
+  const creator = existing?.creator ?? setBy;
+
+  await prisma.collectionPointer.upsert({
+    where: { col_creator: { col: pointer, creator } },
+    create: {
+      col: pointer,
+      creator,
+      firstSeenAsset: assetId,
+      firstSeenAt: ctx.blockTime,
+      firstSeenSlot: ctx.slot,
+      firstSeenTxSignature: ctx.signature,
+      lastSeenAt: ctx.blockTime,
+      lastSeenSlot: ctx.slot,
+      lastSeenTxSignature: ctx.signature,
+      assetCount: 0n,
+    },
+    update: {
+      lastSeenAt: ctx.blockTime,
+      lastSeenSlot: ctx.slot,
+      lastSeenTxSignature: ctx.signature,
+    },
+  });
+
+  const result = await prisma.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      collectionPointer: pointer,
+      creator,
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count > 0) {
+    const previousPointer = existing?.collectionPointer ?? "";
+    const previousCreator = existing?.creator ?? creator;
+    if (previousPointer !== pointer) {
+      if (previousPointer !== "") {
+        await prisma.collectionPointer.updateMany({
+          where: {
+            col: previousPointer,
+            creator: previousCreator,
+            assetCount: { gt: 0n },
+          },
+          data: {
+            assetCount: { decrement: 1n },
+          },
+        });
+      }
+
+      await prisma.collectionPointer.update({
+        where: { col_creator: { col: pointer, creator } },
+        data: {
+          assetCount: { increment: 1n },
+        },
+      });
+    }
+  } else {
+    logger.warn({ assetId }, "Agent not found for collection pointer set, event may be out of order");
+  }
+
+  logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
+}
+
+async function handleParentAssetSetTx(
+  tx: PrismaTransactionClient,
+  data: ParentAssetSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const result = await tx.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      parentAsset: data.parentAsset.toBase58(),
+      parentCreator: data.parentCreator.toBase58(),
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for parent asset set, event may be out of order");
+    return;
+  }
+
+  logger.info({
+    assetId,
+    parentAsset: data.parentAsset.toBase58(),
+    parentCreator: data.parentCreator.toBase58(),
+    setBy: data.setBy.toBase58(),
+  }, "Parent asset set");
+}
+
+async function handleParentAssetSet(
+  prisma: PrismaClient,
+  data: ParentAssetSet,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const result = await prisma.agent.updateMany({
+    where: { id: assetId },
+    data: {
+      parentAsset: data.parentAsset.toBase58(),
+      parentCreator: data.parentCreator.toBase58(),
+      updatedAt: ctx.blockTime,
+    },
+  });
+
+  if (result.count === 0) {
+    logger.warn({ assetId }, "Agent not found for parent asset set, event may be out of order");
+    return;
+  }
+
+  logger.info({
+    assetId,
+    parentAsset: data.parentAsset.toBase58(),
+    parentCreator: data.parentCreator.toBase58(),
+    setBy: data.setBy.toBase58(),
+  }, "Parent asset set");
+}
+
 async function handleMetadataSetTx(
   tx: PrismaTransactionClient,
   data: MetadataSet,
@@ -772,7 +1129,7 @@ async function handleNewFeedbackTx(
       agentId: assetId,
       client: clientAddress,
       feedbackIndex: data.feedbackIndex,
-      value: data.value,
+      value: data.value.toString(),
       valueDecimals: data.valueDecimals,
       score: data.score,
       tag1: data.tag1,
@@ -818,6 +1175,22 @@ async function handleNewFeedbackTx(
   if (orphans.length > 0) {
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), count: orphans.length }, "Reconciled orphan responses");
   }
+
+  await syncAgentFeedbackStatsTx(
+    tx,
+    assetId,
+    ctx.blockTime,
+    data.atomEnabled
+      ? {
+          trustTier: data.newTrustTier,
+          qualityScore: data.newQualityScore,
+          confidence: data.newConfidence,
+          riskScore: data.newRiskScore,
+          diversityRatio: data.newDiversityRatio,
+        }
+      : undefined
+  );
+
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score }, "New feedback");
 }
 
@@ -841,7 +1214,7 @@ async function handleNewFeedback(
       agentId: assetId,
       client: clientAddress,
       feedbackIndex: data.feedbackIndex,
-      value: data.value,
+      value: data.value.toString(),
       valueDecimals: data.valueDecimals,
       score: data.score,
       tag1: data.tag1,
@@ -890,6 +1263,21 @@ async function handleNewFeedback(
   if (orphans.length > 0) {
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), count: orphans.length }, "Reconciled orphan responses");
   }
+
+  await syncAgentFeedbackStats(
+    prisma,
+    assetId,
+    ctx.blockTime,
+    data.atomEnabled
+      ? {
+          trustTier: data.newTrustTier,
+          qualityScore: data.newQualityScore,
+          confidence: data.newConfidence,
+          riskScore: data.newRiskScore,
+          diversityRatio: data.newDiversityRatio,
+        }
+      : undefined
+  );
 
   logger.info(
     {
@@ -958,8 +1346,32 @@ async function handleFeedbackRevokedTx(
       txIndex: ctx.txIndex ?? null,
       status: revokeStatus,
     },
-    update: {},
+    update: {
+      feedbackHash: eventSealHash,
+      slot: data.slot,
+      originalScore: data.originalScore,
+      atomEnabled: data.atomEnabled,
+      hadImpact: data.hadImpact,
+      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+      revokeCount: data.newRevokeCount,
+      txSignature: ctx.signature,
+      txIndex: ctx.txIndex ?? null,
+      status: revokeStatus,
+    },
   });
+
+  await syncAgentFeedbackStatsTx(
+    tx,
+    assetId,
+    ctx.blockTime,
+    data.atomEnabled && data.hadImpact
+      ? {
+          trustTier: data.newTrustTier,
+          qualityScore: data.newQualityScore,
+          confidence: data.newConfidence,
+        }
+      : undefined
+  );
 
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }
@@ -1021,8 +1433,32 @@ async function handleFeedbackRevoked(
       txIndex: ctx.txIndex ?? null,
       status: revokeStatus,
     },
-    update: {},
+    update: {
+      feedbackHash: eventSealHash,
+      slot: data.slot,
+      originalScore: data.originalScore,
+      atomEnabled: data.atomEnabled,
+      hadImpact: data.hadImpact,
+      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+      revokeCount: data.newRevokeCount,
+      txSignature: ctx.signature,
+      txIndex: ctx.txIndex ?? null,
+      status: revokeStatus,
+    },
   });
+
+  await syncAgentFeedbackStats(
+    prisma,
+    assetId,
+    ctx.blockTime,
+    data.atomEnabled && data.hadImpact
+      ? {
+          trustTier: data.newTrustTier,
+          qualityScore: data.newQualityScore,
+          confidence: data.newConfidence,
+        }
+      : undefined
+  );
 
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }

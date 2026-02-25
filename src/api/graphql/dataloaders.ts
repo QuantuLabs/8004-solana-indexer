@@ -4,9 +4,15 @@ import type { Pool } from 'pg';
 export interface AgentRow {
   asset: string;
   owner: string;
+  creator: string | null;
   agent_uri: string | null;
   agent_wallet: string | null;
   collection: string | null;
+  collection_pointer: string | null;
+  col_locked: boolean;
+  parent_asset: string | null;
+  parent_creator: string | null;
+  parent_locked: boolean;
   nft_name: string | null;
   atom_enabled: boolean;
   trust_tier: number | null;
@@ -175,9 +181,15 @@ function createAgentByIdLoader(pool: Pool) {
       `SELECT
               a.asset,
               a.owner,
+              a.creator,
               a.agent_uri,
               a.agent_wallet,
               a.collection,
+              a.canonical_col AS collection_pointer,
+              a.col_locked,
+              a.parent_asset,
+              a.parent_creator,
+              a.parent_locked,
               a.nft_name,
               a.atom_enabled,
               a.trust_tier,
@@ -390,7 +402,7 @@ function createResponsesPageByFeedbackLoader(pool: Pool) {
                fr.response_uri,
                fr.response_hash,
                fr.running_digest,
-               NULL::bigint AS response_count,
+               fr.response_count,
                fr.status,
                fr.verified_at,
                fr.tx_signature,

@@ -445,6 +445,15 @@ export class EventBuffer {
       case "WalletUpdated":
         await this.updateAgentWalletSupabase(client, data, ctx);
         break;
+      case "WalletResetOnOwnerSync":
+        await this.updateWalletResetOnOwnerSyncSupabase(client, data, ctx);
+        break;
+      case "CollectionPointerSet":
+        await this.updateCollectionPointerSupabase(client, data, ctx);
+        break;
+      case "ParentAssetSet":
+        await this.updateParentAssetSupabase(client, data, ctx);
+        break;
       case "AtomEnabled":
         await this.updateAtomEnabledSupabase(client, data, ctx);
         break;
@@ -469,17 +478,32 @@ export class EventBuffer {
     const collection = data.collection?.toBase58?.() || data.collection;
 
     await client.query(`
-      INSERT INTO agents (asset, owner, agent_uri, collection, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
+      INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PENDING')
       ON CONFLICT (asset) DO UPDATE SET
         owner = EXCLUDED.owner,
+        creator = COALESCE(agents.creator, EXCLUDED.creator),
         agent_uri = EXCLUDED.agent_uri,
         atom_enabled = EXCLUDED.atom_enabled,
         block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
-        updated_at = $10
-    `, [asset, owner, data.agentUri || null, collection, data.atomEnabled || false,
-        ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString(),
+        updated_at = $16
+    `, [
+        asset,
+        owner,
+        owner,
+        data.agentUri || null,
+        collection,
+        "",
+        false,
+        null,
+        null,
+        false,
+        data.atomEnabled || false,
+        ctx.slot.toString(),
+        ctx.txIndex || null,
+        ctx.signature,
+        ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
   }
 
@@ -576,7 +600,16 @@ export class EventBuffer {
     await client.query(`
       INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-      ON CONFLICT (asset, client_address, feedback_index) DO NOTHING
+      ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+        feedback_hash = EXCLUDED.feedback_hash,
+        slot = EXCLUDED.slot,
+        original_score = EXCLUDED.original_score,
+        atom_enabled = EXCLUDED.atom_enabled,
+        had_impact = EXCLUDED.had_impact,
+        running_digest = EXCLUDED.running_digest,
+        revoke_count = EXCLUDED.revoke_count,
+        tx_signature = EXCLUDED.tx_signature,
+        status = EXCLUDED.status
     `, [id, asset, client_addr, feedbackIndex.toString(), revokeSealHash,
         (data.slot || ctx.slot).toString(), data.originalScore ?? null,
         data.atomEnabled || false, data.hadImpact || false,
@@ -615,6 +648,7 @@ export class EventBuffer {
     const client_addr = data.client?.toBase58?.() || data.client;
     const responder = data.responder?.toBase58?.() || data.responder;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
+    const responseCount = BigInt(data.newResponseCount?.toString() || "0");
     const id = `${asset}:${client_addr}:${feedbackIndex}:${responder}:${ctx.signature}`;
 
     // Convert all-zero hash to NULL (consistent with supabase.ts)
@@ -626,11 +660,11 @@ export class EventBuffer {
       : null;
 
     await client.query(`
-      INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
+      INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PENDING')
       ON CONFLICT (id) DO NOTHING
     `, [id, asset, client_addr, feedbackIndex.toString(), responder,
-        data.responseUri || "", responseHash, responseRunningDigest,
+        data.responseUri || "", responseHash, responseRunningDigest, responseCount.toString(),
         ctx.slot.toString(), ctx.txIndex || null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
@@ -699,6 +733,46 @@ export class EventBuffer {
     await client.query(`
       UPDATE agents SET agent_wallet = $1, updated_at = $2 WHERE asset = $3
     `, [wallet, ctx.blockTime.toISOString(), asset]);
+  }
+
+  private async updateWalletResetOnOwnerSyncSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
+    const asset = data.asset?.toBase58?.() || data.asset;
+    const walletRaw = data.newWallet?.toBase58?.() || data.newWallet;
+    const wallet = walletRaw === DEFAULT_PUBKEY ? null : walletRaw;
+    const ownerAfterSync = data.ownerAfterSync?.toBase58?.() || data.ownerAfterSync;
+    await client.query(
+      `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
+      [ownerAfterSync, wallet, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+    );
+  }
+
+  private async updateCollectionPointerSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
+    const asset = data.asset?.toBase58?.() || data.asset;
+    const setBy = data.setBy?.toBase58?.() || data.setBy;
+    await client.query(
+      `UPDATE agents
+       SET canonical_col = $1,
+           creator = COALESCE(creator, $2),
+           block_slot = $3,
+           updated_at = $4
+       WHERE asset = $5`,
+      [data.col || "", setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+    );
+  }
+
+  private async updateParentAssetSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
+    const asset = data.asset?.toBase58?.() || data.asset;
+    const parentAsset = data.parentAsset?.toBase58?.() || data.parentAsset;
+    const parentCreator = data.parentCreator?.toBase58?.() || data.parentCreator;
+    await client.query(
+      `UPDATE agents
+       SET parent_asset = $1,
+           parent_creator = $2,
+           block_slot = $3,
+           updated_at = $4
+       WHERE asset = $5`,
+      [parentAsset, parentCreator, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+    );
   }
 
   private async updateAtomEnabledSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {

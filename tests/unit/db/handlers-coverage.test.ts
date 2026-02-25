@@ -1302,6 +1302,42 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.feedback.upsert).toHaveBeenCalled();
     });
 
+    it("should store full i128 NewFeedback value as decimal string", async () => {
+      const event: ProgramEvent = {
+        type: "NewFeedback",
+        data: {
+          asset: TEST_ASSET,
+          clientAddress: TEST_CLIENT,
+          feedbackIndex: 0n,
+          value: 170141183460469231731687303715884105727n, // i128 max
+          valueDecimals: 0,
+          score: 100,
+          tag1: "max",
+          tag2: "",
+          endpoint: "",
+          feedbackUri: "ipfs://QmLarge",
+          feedbackFileHash: null,
+          sealHash: TEST_HASH,
+          slot: 123456n,
+          atomEnabled: true,
+          newFeedbackDigest: TEST_HASH,
+          newFeedbackCount: 1n,
+          newTrustTier: 0,
+          newQualityScore: 0,
+          newConfidence: 0,
+          newRiskScore: 0,
+          newDiversityRatio: 0,
+          isUniqueClient: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.feedback.upsert).toHaveBeenCalled();
+      const upsertArg = (prisma.feedback.upsert as any).mock.calls[0][0];
+      expect(upsertArg.create.value).toBe("170141183460469231731687303715884105727");
+    });
+
     it("should handle ResponseAppended atomically", async () => {
       (prisma.feedback.findUnique as any).mockResolvedValue({
         id: "fb-uuid",

@@ -61,9 +61,9 @@ describe('API Server (GraphQL-only)', () => {
     expect(res.status).toBe(410);
   });
 
-  it('throws when pool is missing', () => {
-    expect(() => createApiServer({ pool: null as any })).toThrow(
-      'GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)'
+  it('throws when no API backend is available', () => {
+    expect(() => createApiServer({ pool: null as any, prisma: null as any })).toThrow(
+      'No API backend available for API_MODE. Provide Prisma (REST), Supabase pool (GraphQL), or set API_MODE explicitly.'
     );
   });
 });

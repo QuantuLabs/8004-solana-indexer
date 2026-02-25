@@ -17,6 +17,7 @@ DROP TABLE IF EXISTS feedback_responses CASCADE;
 DROP TABLE IF EXISTS feedbacks CASCADE;
 DROP TABLE IF EXISTS metadata CASCADE;
 DROP TABLE IF EXISTS agents CASCADE;
+DROP TABLE IF EXISTS collection_pointers CASCADE;
 DROP TABLE IF EXISTS collections CASCADE;
 
 -- Extensions
@@ -39,15 +40,42 @@ CREATE INDEX idx_collections_authority ON collections(authority);
 CREATE INDEX idx_collections_status ON collections(status) WHERE status = 'PENDING';
 
 -- =============================================
+-- CANONICAL COLLECTION POINTERS (c1:<cid>)
+-- =============================================
+CREATE TABLE collection_pointers (
+  col TEXT NOT NULL,
+  creator TEXT NOT NULL,
+  first_seen_asset TEXT NOT NULL,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  first_seen_slot BIGINT NOT NULL,
+  first_seen_tx_signature TEXT,
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_slot BIGINT NOT NULL,
+  last_seen_tx_signature TEXT,
+  asset_count BIGINT NOT NULL DEFAULT 0 CHECK (asset_count >= 0),
+  PRIMARY KEY (col, creator)
+);
+
+CREATE INDEX idx_collection_pointers_creator ON collection_pointers(creator);
+CREATE INDEX idx_collection_pointers_first_seen_at ON collection_pointers(first_seen_at DESC);
+CREATE INDEX idx_collection_pointers_last_seen_at ON collection_pointers(last_seen_at DESC);
+
+-- =============================================
 -- AGENTS (Identity + ATOM Stats + Leaderboard)
 -- =============================================
 CREATE TABLE agents (
   asset TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
+  creator TEXT,
   agent_uri TEXT,
   agent_wallet TEXT,
   atom_enabled BOOLEAN DEFAULT TRUE,
   collection TEXT REFERENCES collections(collection),
+  canonical_col TEXT DEFAULT '',
+  col_locked BOOLEAN DEFAULT FALSE,
+  parent_asset TEXT,
+  parent_creator TEXT,
+  parent_locked BOOLEAN DEFAULT FALSE,
   nft_name TEXT,
 
   -- ATOM Stats (from chain) --
@@ -86,8 +114,15 @@ CREATE TABLE agents (
 -- Standard indexes
 CREATE INDEX idx_agents_owner ON agents(owner);
 CREATE INDEX idx_agents_collection ON agents(collection);
+CREATE INDEX idx_agents_canonical_col ON agents(canonical_col) WHERE canonical_col <> '';
+CREATE INDEX idx_agents_col_creator_active ON agents(canonical_col, creator, created_at DESC, asset DESC)
+  WHERE status != 'ORPHANED' AND canonical_col <> '';
 CREATE INDEX idx_agents_wallet ON agents(agent_wallet);
 CREATE INDEX idx_agents_status ON agents(status) WHERE status = 'PENDING';
+CREATE INDEX idx_agents_creator ON agents(creator);
+CREATE INDEX idx_agents_parent_asset ON agents(parent_asset);
+CREATE INDEX idx_agents_parent_active ON agents(parent_asset, created_at DESC, asset DESC)
+  WHERE status != 'ORPHANED' AND parent_asset IS NOT NULL;
 CREATE INDEX idx_agents_graphql_created_asset ON agents(created_at DESC, asset DESC) WHERE status != 'ORPHANED';
 CREATE INDEX idx_agents_graphql_nft_name_trgm ON agents USING gin (nft_name gin_trgm_ops) WHERE status != 'ORPHANED';
 CREATE INDEX idx_agents_graphql_asset_trgm ON agents USING gin (asset gin_trgm_ops) WHERE status != 'ORPHANED';
@@ -141,8 +176,8 @@ CREATE TABLE feedbacks (
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   client_address TEXT NOT NULL,
   feedback_index BIGINT NOT NULL,
-  value BIGINT DEFAULT 0,  -- v0.5.0: i64 raw metric value (e.g., profit in cents)
-  value_decimals SMALLINT DEFAULT 0 CHECK (value_decimals >= 0 AND value_decimals <= 6),  -- v0.5.0: decimal precision
+  value NUMERIC(39,0) DEFAULT 0,  -- v0.6.0: i128 raw metric value
+  value_decimals SMALLINT DEFAULT 0 CHECK (value_decimals >= 0 AND value_decimals <= 18),  -- v0.6.0: decimal precision
   score SMALLINT CHECK (score >= 0 AND score <= 100),  -- v0.5.0: nullable (NULL = ATOM skipped)
   tag1 TEXT,
   tag2 TEXT,
@@ -183,6 +218,7 @@ CREATE TABLE feedback_responses (
   response_uri TEXT,
   response_hash TEXT,
   running_digest BYTEA,
+  response_count BIGINT NOT NULL DEFAULT 0,
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
   tx_signature TEXT NOT NULL,

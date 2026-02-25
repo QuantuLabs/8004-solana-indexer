@@ -25,6 +25,7 @@ import { queryResolvers, resetAggregatedStatsCacheForTests } from '../../../src/
 import { agentResolvers } from '../../../src/api/graphql/resolvers/agent.js';
 import { feedbackResolvers } from '../../../src/api/graphql/resolvers/feedback.js';
 import { responseResolvers } from '../../../src/api/graphql/resolvers/response.js';
+import { solanaResolvers } from '../../../src/api/graphql/resolvers/solana.js';
 import { validationResolvers } from '../../../src/api/graphql/resolvers/validation.js';
 
 describe('GraphQL Complexity Analysis', () => {
@@ -162,6 +163,20 @@ describe('Filter Builder', () => {
     expect(result.sql).toContain("chain_status != 'ORPHANED'");
   });
 
+  it('maps collection and parent identity filters for agents', () => {
+    const result = buildWhereClause('agent', {
+      creator: 'Creator111',
+      collectionPointer: 'c1:bafy-test',
+      parentAsset: 'Parent111',
+      colLocked: true,
+    });
+    expect(result.sql).toContain('creator = $1');
+    expect(result.sql).toContain('canonical_col = $2');
+    expect(result.sql).toContain('parent_asset = $3');
+    expect(result.sql).toContain('col_locked = $4');
+    expect(result.params).toEqual(['Creator111', 'c1:bafy-test', 'Parent111', true]);
+  });
+
   it('handles multiple filters', () => {
     const result = buildWhereClause('feedback', {
       agent: 'sol:asset1',
@@ -286,6 +301,36 @@ describe('Scalar Resolvers', () => {
   });
 });
 
+describe('Feedback Field Resolvers', () => {
+  it('normalizes feedback.value to decimal string and preserves string output', () => {
+    const normalized = feedbackResolvers.Feedback.value({
+      value: '1234',
+      value_decimals: 2,
+    } as any);
+    expect(normalized).toBe('12.34');
+    expect(typeof normalized).toBe('string');
+
+    const negative = feedbackResolvers.Feedback.value({
+      value: '-1200',
+      value_decimals: 3,
+    } as any);
+    expect(negative).toBe('-1.2');
+
+    const padded = feedbackResolvers.Feedback.value({
+      value: '5',
+      value_decimals: 3,
+    } as any);
+    expect(padded).toBe('0.005');
+  });
+
+  it('passes through value_decimals on Solana feedback extension', () => {
+    const valueDecimals = solanaResolvers.SolanaFeedbackExtension.valueDecimals({
+      value_decimals: 18,
+    } as any);
+    expect(valueDecimals).toBe(18);
+  });
+});
+
 describe('Query Resolver User Input Errors', () => {
   it('returns BAD_USER_INPUT when combining after and skip', async () => {
     const poolQuery = vi.fn();
@@ -407,5 +452,386 @@ describe('Query Aggregated Stats Cache', () => {
     ]);
 
     expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Collection And Tree Queries', () => {
+  it('maps collectionPointers rows to GraphQL shape', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        col: 'c1:bafy-test',
+        creator: 'Creator111',
+        first_seen_asset: 'Asset111',
+        first_seen_at: '2026-02-25T12:00:00.000Z',
+        first_seen_slot: '123',
+        first_seen_tx_signature: 'sig1',
+        last_seen_at: '2026-02-25T12:10:00.000Z',
+        last_seen_slot: '130',
+        last_seen_tx_signature: 'sig2',
+        asset_count: '2',
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.collectionPointers(
+      {},
+      { first: 10, skip: 0, col: 'c1:bafy-test' },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        col: 'c1:bafy-test',
+        creator: 'Creator111',
+        firstSeenAsset: 'Asset111',
+        firstSeenSlot: '123',
+        lastSeenSlot: '130',
+        assetCount: '2',
+      }),
+    ]);
+    expect(typeof rows[0].firstSeenAt).toBe('string');
+    expect(typeof rows[0].lastSeenAt).toBe('string');
+  });
+
+  it('counts assets by creator+col scope', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ count: '42' }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const count = await queryResolvers.Query.collectionAssetCount(
+      {},
+      { col: 'c1:bafy-test', creator: 'Creator111' },
+      ctx
+    );
+
+    expect(count).toBe('42');
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111']);
+  });
+
+  it('lists collection assets with pagination and primes dataloader', async () => {
+    const row = {
+      asset: 'Asset111',
+      owner: 'Owner111',
+      creator: 'Creator111',
+      agent_uri: 'ipfs://asset',
+      agent_wallet: null,
+      collection: 'Collection111',
+      collection_pointer: 'c1:bafy-test',
+      col_locked: true,
+      parent_asset: null,
+      parent_creator: null,
+      parent_locked: false,
+      nft_name: 'asset',
+      atom_enabled: true,
+      trust_tier: null,
+      quality_score: null,
+      confidence: null,
+      risk_score: null,
+      diversity_ratio: null,
+      sort_key: null,
+      status: 'FINALIZED',
+      verified_at: null,
+      created_at: '2026-02-25T12:00:00.000Z',
+      updated_at: '2026-02-25T12:00:00.000Z',
+      created_tx_signature: null,
+      created_slot: null,
+      feedback_digest: null,
+      response_digest: null,
+      revoke_digest: null,
+      feedback_count: '0',
+      response_count: '0',
+      revoke_count: '0',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.collectionAssets(
+      {},
+      { col: 'c1:bafy-test', creator: 'Creator111', first: 25, skip: 5, orderBy: 'createdAt', orderDirection: 'desc' },
+      ctx
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111', 25, 5]);
+    expect(prime).toHaveBeenCalledWith('Asset111', expect.any(Object));
+  });
+
+  it('loads direct children and primes dataloader', async () => {
+    const childRow = {
+      asset: 'Child111',
+      owner: 'Owner111',
+      creator: 'Creator111',
+      agent_uri: 'ipfs://child',
+      agent_wallet: null,
+      collection: 'Collection111',
+      collection_pointer: 'c1:bafy-test',
+      col_locked: true,
+      parent_asset: 'Parent111',
+      parent_creator: 'ParentCreator111',
+      parent_locked: true,
+      nft_name: 'child',
+      atom_enabled: true,
+      trust_tier: null,
+      quality_score: null,
+      confidence: null,
+      risk_score: null,
+      diversity_ratio: null,
+      sort_key: null,
+      status: 'FINALIZED',
+      verified_at: null,
+      created_at: '2026-02-25T12:00:00.000Z',
+      updated_at: '2026-02-25T12:00:00.000Z',
+      created_tx_signature: null,
+      created_slot: null,
+      feedback_digest: null,
+      response_digest: null,
+      revoke_digest: null,
+      feedback_count: '0',
+      response_count: '0',
+      revoke_count: '0',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [childRow] });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentChildren(
+      {},
+      { parent: 'sol:Parent111', first: 10, skip: 0 },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1][0]).toBe('Parent111');
+    expect(rows).toHaveLength(1);
+    expect(prime).toHaveBeenCalledWith('Child111', expect.objectContaining({ parent_asset: 'Parent111' }));
+  });
+
+  it('builds agent lineage from root to asset', async () => {
+    const lineageRows = [
+      { asset: 'Root111', parent_asset: null, path: ['Child111', 'Root111'], depth: 1 },
+      { asset: 'Child111', parent_asset: 'Root111', path: ['Child111'], depth: 0 },
+    ];
+    const agentRows = [
+      {
+        asset: 'Root111',
+        owner: 'OwnerRoot',
+        creator: 'CreatorRoot',
+        agent_uri: 'ipfs://root',
+        agent_wallet: null,
+        collection: 'Collection111',
+        collection_pointer: 'c1:bafy-test',
+        col_locked: true,
+        parent_asset: null,
+        parent_creator: null,
+        parent_locked: false,
+        nft_name: 'root',
+        atom_enabled: true,
+        trust_tier: null,
+        quality_score: null,
+        confidence: null,
+        risk_score: null,
+        diversity_ratio: null,
+        sort_key: null,
+        status: 'FINALIZED',
+        verified_at: null,
+        created_at: '2026-02-25T12:00:00.000Z',
+        updated_at: '2026-02-25T12:00:00.000Z',
+        created_tx_signature: null,
+        created_slot: null,
+        feedback_digest: null,
+        response_digest: null,
+        revoke_digest: null,
+        feedback_count: '0',
+        response_count: '0',
+        revoke_count: '0',
+      },
+      {
+        asset: 'Child111',
+        owner: 'OwnerChild',
+        creator: 'CreatorRoot',
+        agent_uri: 'ipfs://child',
+        agent_wallet: null,
+        collection: 'Collection111',
+        collection_pointer: 'c1:bafy-test',
+        col_locked: true,
+        parent_asset: 'Root111',
+        parent_creator: 'CreatorRoot',
+        parent_locked: true,
+        nft_name: 'child',
+        atom_enabled: true,
+        trust_tier: null,
+        quality_score: null,
+        confidence: null,
+        risk_score: null,
+        diversity_ratio: null,
+        sort_key: null,
+        status: 'FINALIZED',
+        verified_at: null,
+        created_at: '2026-02-25T12:01:00.000Z',
+        updated_at: '2026-02-25T12:01:00.000Z',
+        created_tx_signature: null,
+        created_slot: null,
+        feedback_digest: null,
+        response_digest: null,
+        revoke_digest: null,
+        feedback_count: '0',
+        response_count: '0',
+        revoke_count: '0',
+      },
+    ];
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: lineageRows })
+      .mockResolvedValueOnce({ rows: agentRows });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentLineage(
+      {},
+      { asset: 'sol:Child111', includeSelf: true },
+      ctx
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].asset).toBe('Root111');
+    expect(rows[1].asset).toBe('Child111');
+    expect(prime).toHaveBeenCalledWith('Root111', expect.any(Object));
+    expect(prime).toHaveBeenCalledWith('Child111', expect.any(Object));
+  });
+
+  it('builds agentTree with depth/path and embedded agent rows', async () => {
+    const treeRows = [
+      { asset: 'Root111', parent_asset: null, path: ['Root111'], depth: 0 },
+      { asset: 'Child111', parent_asset: 'Root111', path: ['Root111', 'Child111'], depth: 1 },
+    ];
+    const agentRows = [
+      {
+        asset: 'Root111',
+        owner: 'OwnerRoot',
+        creator: 'CreatorRoot',
+        agent_uri: 'ipfs://root',
+        agent_wallet: null,
+        collection: 'Collection111',
+        collection_pointer: 'c1:bafy-test',
+        col_locked: true,
+        parent_asset: null,
+        parent_creator: null,
+        parent_locked: false,
+        nft_name: 'root',
+        atom_enabled: true,
+        trust_tier: null,
+        quality_score: null,
+        confidence: null,
+        risk_score: null,
+        diversity_ratio: null,
+        sort_key: null,
+        status: 'FINALIZED',
+        verified_at: null,
+        created_at: '2026-02-25T12:00:00.000Z',
+        updated_at: '2026-02-25T12:00:00.000Z',
+        created_tx_signature: null,
+        created_slot: null,
+        feedback_digest: null,
+        response_digest: null,
+        revoke_digest: null,
+        feedback_count: '0',
+        response_count: '0',
+        revoke_count: '0',
+      },
+      {
+        asset: 'Child111',
+        owner: 'OwnerChild',
+        creator: 'CreatorRoot',
+        agent_uri: 'ipfs://child',
+        agent_wallet: null,
+        collection: 'Collection111',
+        collection_pointer: 'c1:bafy-test',
+        col_locked: true,
+        parent_asset: 'Root111',
+        parent_creator: 'CreatorRoot',
+        parent_locked: true,
+        nft_name: 'child',
+        atom_enabled: true,
+        trust_tier: null,
+        quality_score: null,
+        confidence: null,
+        risk_score: null,
+        diversity_ratio: null,
+        sort_key: null,
+        status: 'FINALIZED',
+        verified_at: null,
+        created_at: '2026-02-25T12:01:00.000Z',
+        updated_at: '2026-02-25T12:01:00.000Z',
+        created_tx_signature: null,
+        created_slot: null,
+        feedback_digest: null,
+        response_digest: null,
+        revoke_digest: null,
+        feedback_count: '0',
+        response_count: '0',
+        revoke_count: '0',
+      },
+    ];
+
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: treeRows })
+      .mockResolvedValueOnce({ rows: agentRows });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentTree(
+      {},
+      { root: 'sol:Root111', maxDepth: 2, includeRoot: true },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[0][1][0]).toBe('Root111');
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toEqual(
+      expect.objectContaining({
+        depth: 1,
+        path: ['Root111', 'Child111'],
+        parentAsset: 'Root111',
+      })
+    );
+    expect(rows[1].agent).toEqual(expect.objectContaining({ asset: 'Child111' }));
+    expect(prime).toHaveBeenCalledWith('Root111', expect.any(Object));
+    expect(prime).toHaveBeenCalledWith('Child111', expect.any(Object));
   });
 });

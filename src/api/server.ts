@@ -7,7 +7,7 @@ import express, { Express, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { LRUCache } from 'lru-cache';
 import { Server } from 'http';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaClient, Prisma, Agent as PrismaAgent, CollectionPointer as PrismaCollectionPointer } from '@prisma/client';
 import { logger } from '../logger.js';
 import { decompressFromStorage } from '../utils/compression.js';
 import { ReplayVerifier } from '../services/replay-verifier.js';
@@ -29,6 +29,7 @@ const MAX_METADATA_LIMIT = 100; // Metadata limit lower due to large values (100
 const MAX_COLLECTION_STATS = 50; // Maximum collections in stats
 const LEADERBOARD_POOL_SIZE = 1000; // Pool size for leaderboard sorting (DB aggregation)
 const MAX_METADATA_AGGREGATE_BYTES = 10 * 1024 * 1024; // 10MB max aggregate decompressed size
+const MAX_TREE_DEPTH = 8; // Max recursive depth for parent/children traversal
 const LEADERBOARD_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minute cache for leaderboard
 const LEADERBOARD_CACHE_MAX_SIZE = 100; // Max collections to cache (LRU eviction)
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
@@ -182,6 +183,86 @@ function parsePostgRESTIn(value: unknown): string[] | undefined {
   return inner.split(',').map(v => v.trim());
 }
 
+function parsePostgRESTBoolean(value: unknown): boolean | undefined {
+  const parsed = parsePostgRESTValue(value);
+  if (parsed === undefined) return undefined;
+  if (parsed === 'true') return true;
+  if (parsed === 'false') return false;
+  return undefined;
+}
+
+type AgentApiRow = Pick<
+  PrismaAgent,
+  | 'id'
+  | 'owner'
+  | 'creator'
+  | 'uri'
+  | 'wallet'
+  | 'collection'
+  | 'collectionPointer'
+  | 'colLocked'
+  | 'parentAsset'
+  | 'parentCreator'
+  | 'parentLocked'
+  | 'nftName'
+  | 'atomEnabled'
+  | 'trustTier'
+  | 'qualityScore'
+  | 'confidence'
+  | 'riskScore'
+  | 'diversityRatio'
+  | 'feedbackCount'
+  | 'rawAvgScore'
+  | 'status'
+  | 'verifiedAt'
+  | 'createdAt'
+  | 'updatedAt'
+>;
+
+function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
+  return {
+    asset: a.id,
+    owner: a.owner,
+    creator: a.creator,
+    agent_uri: a.uri,
+    agent_wallet: a.wallet,
+    collection: a.collection,
+    collection_pointer: a.collectionPointer,
+    col_locked: a.colLocked,
+    parent_asset: a.parentAsset,
+    parent_creator: a.parentCreator,
+    parent_locked: a.parentLocked,
+    nft_name: a.nftName,
+    atom_enabled: a.atomEnabled,
+    trust_tier: a.trustTier,
+    quality_score: a.qualityScore,
+    confidence: a.confidence,
+    risk_score: a.riskScore,
+    diversity_ratio: a.diversityRatio,
+    feedback_count: a.feedbackCount,
+    raw_avg_score: a.rawAvgScore,
+    status: a.status,
+    verified_at: a.verifiedAt?.toISOString() || null,
+    created_at: a.createdAt.toISOString(),
+    updated_at: a.updatedAt.toISOString(),
+  };
+}
+
+function mapCollectionPointerToApi(pointer: PrismaCollectionPointer): Record<string, unknown> {
+  return {
+    col: pointer.col,
+    creator: pointer.creator,
+    first_seen_asset: pointer.firstSeenAsset,
+    first_seen_at: pointer.firstSeenAt.toISOString(),
+    first_seen_slot: pointer.firstSeenSlot.toString(),
+    first_seen_tx_signature: pointer.firstSeenTxSignature,
+    last_seen_at: pointer.lastSeenAt.toISOString(),
+    last_seen_slot: pointer.lastSeenSlot.toString(),
+    last_seen_tx_signature: pointer.lastSeenTxSignature,
+    asset_count: pointer.assetCount.toString(),
+  };
+}
+
 /**
  * Build status filter for verification status
  * Default: exclude ORPHANED (return PENDING + FINALIZED)
@@ -225,14 +306,21 @@ function isInvalidStatus(filter: ReturnType<typeof buildStatusFilter>): filter i
 }
 
 export function createApiServer(options: ApiServerOptions): Express {
-  const restEnabled = config.apiMode !== 'graphql';
-  const graphqlEnabled = config.apiMode !== 'rest' && config.enableGraphql;
+  const wantsRest = config.apiMode !== 'graphql';
+  const wantsGraphql = config.apiMode !== 'rest' && config.enableGraphql;
+  const restEnabled = wantsRest && !!options.prisma;
+  const graphqlEnabled = wantsGraphql && !!options.pool;
 
-  if (restEnabled && !options.prisma) {
+  if (config.apiMode === 'rest' && !options.prisma) {
     throw new Error('REST mode requires local Prisma client');
   }
-  if (graphqlEnabled && !options.pool) {
+  if (config.apiMode === 'graphql' && !options.pool) {
     throw new Error('GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)');
+  }
+  if (!restEnabled && !graphqlEnabled) {
+    throw new Error(
+      'No API backend available for API_MODE. Provide Prisma (REST), Supabase pool (GraphQL), or set API_MODE explicitly.'
+    );
   }
 
   const prisma = options.prisma as PrismaClient;
@@ -308,8 +396,15 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const id = parsePostgRESTValue(req.query.id);
       const owner = parsePostgRESTValue(req.query.owner);
+      const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
+      const collectionPointer = parsePostgRESTValue(req.query.canonical_col)
+        ?? parsePostgRESTValue(req.query.collection_pointer);
       const agent_wallet = parsePostgRESTValue(req.query.agent_wallet);
+      const parentAsset = parsePostgRESTValue(req.query.parent_asset);
+      const parentCreator = parsePostgRESTValue(req.query.parent_creator);
+      const colLocked = parsePostgRESTBoolean(req.query.col_locked);
+      const parentLocked = parsePostgRESTBoolean(req.query.parent_locked);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
@@ -321,8 +416,14 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.AgentWhereInput = { ...statusFilter };
       if (id) where.id = id;
       if (owner) where.owner = owner;
+      if (creator) where.creator = creator;
       if (collection) where.collection = collection;
+      if (collectionPointer) where.collectionPointer = collectionPointer;
       if (agent_wallet) where.wallet = agent_wallet;
+      if (parentAsset) where.parentAsset = parentAsset;
+      if (parentCreator) where.parentCreator = parentCreator;
+      if (colLocked !== undefined) where.colLocked = colLocked;
+      if (parentLocked !== undefined) where.parentLocked = parentLocked;
 
       const agents = await prisma.agent.findMany({
         where,
@@ -331,24 +432,176 @@ export function createApiServer(options: ApiServerOptions): Express {
         skip: offset,
       });
 
-      // Map to SDK expected format
-      const mapped = agents.map(a => ({
-        asset: a.id,
-        owner: a.owner,
-        agent_uri: a.uri,
-        agent_wallet: a.wallet,
-        collection: a.collection,
-        nft_name: a.nftName,
-        atom_enabled: a.atomEnabled,
-        status: a.status,
-        verified_at: a.verifiedAt?.toISOString() || null,
-        created_at: a.createdAt.toISOString(),
-        updated_at: a.updatedAt.toISOString(),
-      }));
+      const mapped = agents.map(mapAgentToApi);
 
       res.json(mapped);
     } catch (error) {
       logger.error({ error }, 'Error fetching agents');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/agents/children - Direct children for a given parent asset
+  app.get('/rest/v1/agents/children', async (req: Request, res: Response) => {
+    try {
+      const parentAsset = parsePostgRESTValue(req.query.parent_asset) ?? parsePostgRESTValue(req.query.parent);
+      if (!parentAsset) {
+        res.status(400).json({ error: 'Missing required query param: parent_asset' });
+        return;
+      }
+
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      const where: Prisma.AgentWhereInput = { ...statusFilter, parentAsset };
+      const children = await prisma.agent.findMany({
+        where,
+        orderBy: [
+          { createdAt: 'desc' },
+          { id: 'desc' },
+        ],
+        take: limit,
+        skip: offset,
+      });
+
+      res.json(children.map(mapAgentToApi));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching agent children');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/agents/tree - Reconstruct parent/children tree (bounded depth)
+  app.get('/rest/v1/agents/tree', async (req: Request, res: Response) => {
+    try {
+      const rootAsset = parsePostgRESTValue(req.query.root_asset)
+        ?? parsePostgRESTValue(req.query.root)
+        ?? parsePostgRESTValue(req.query.parent_asset);
+      if (!rootAsset) {
+        res.status(400).json({ error: 'Missing required query param: root_asset' });
+        return;
+      }
+
+      const maxDepthRaw = safeQueryString(req.query.max_depth);
+      const parsedMaxDepth = maxDepthRaw ? parseInt(maxDepthRaw, 10) : 5;
+      const maxDepth = Number.isFinite(parsedMaxDepth)
+        ? Math.min(Math.max(parsedMaxDepth, 0), MAX_TREE_DEPTH)
+        : 5;
+      const includeRoot = parsePostgRESTBoolean(req.query.include_root) !== false;
+      const limit = safePaginationLimit(req.query.limit, 1000);
+      const offset = safePaginationOffset(req.query.offset);
+
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      const root = await prisma.agent.findFirst({
+        where: { ...statusFilter, id: rootAsset },
+      });
+      if (!root) {
+        res.json([]);
+        return;
+      }
+
+      const visited = new Set<string>([root.id]);
+      const depthByAsset = new Map<string, number>([[root.id, 0]]);
+      const pathByAsset = new Map<string, string[]>([[root.id, [root.id]]]);
+      const orderedNodes: AgentApiRow[] = includeRoot ? [root] : [];
+
+      let frontier: string[] = [root.id];
+      for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+        const children = await prisma.agent.findMany({
+          where: {
+            ...statusFilter,
+            parentAsset: { in: frontier },
+          },
+          orderBy: [
+            { createdAt: 'asc' },
+            { id: 'asc' },
+          ],
+        });
+
+        const nextFrontier: string[] = [];
+        for (const child of children) {
+          if (visited.has(child.id)) continue;
+          const parent = child.parentAsset;
+          if (!parent) continue;
+          const parentPath = pathByAsset.get(parent);
+          if (!parentPath) continue;
+
+          visited.add(child.id);
+          depthByAsset.set(child.id, depth);
+          pathByAsset.set(child.id, [...parentPath, child.id]);
+          orderedNodes.push(child);
+          nextFrontier.push(child.id);
+        }
+        frontier = nextFrontier;
+      }
+
+      const paged = orderedNodes.slice(offset, offset + limit);
+      res.json(
+        paged.map((node) => ({
+          ...mapAgentToApi(node),
+          depth: depthByAsset.get(node.id) ?? 0,
+          path: pathByAsset.get(node.id) ?? [node.id],
+        }))
+      );
+    } catch (error) {
+      logger.error({ error }, 'Error building agent tree');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/agents/lineage - Parent chain for a given asset
+  app.get('/rest/v1/agents/lineage', async (req: Request, res: Response) => {
+    try {
+      const asset = parsePostgRESTValue(req.query.asset);
+      if (!asset) {
+        res.status(400).json({ error: 'Missing required query param: asset' });
+        return;
+      }
+
+      const includeSelf = parsePostgRESTBoolean(req.query.include_self) !== false;
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      const chain: AgentApiRow[] = [];
+      let cursorAsset: string | null = asset;
+      let depth = 0;
+      const seen = new Set<string>();
+
+      while (cursorAsset && depth <= MAX_TREE_DEPTH * 4) {
+        if (seen.has(cursorAsset)) break;
+        seen.add(cursorAsset);
+
+        const lineageNode: AgentApiRow | null = await prisma.agent.findFirst({
+          where: { ...statusFilter, id: cursorAsset },
+        });
+        if (!lineageNode) break;
+
+        chain.push(lineageNode);
+        cursorAsset = lineageNode.parentAsset;
+        depth++;
+      }
+
+      const ordered = chain.reverse();
+      const out = includeSelf ? ordered : ordered.slice(0, -1);
+      res.json(out.slice(offset, offset + limit).map(mapAgentToApi));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching agent lineage');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -427,8 +680,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         asset: f.agentId,
         client_address: f.client,
         feedback_index: f.feedbackIndex.toString(),
-        value: f.value.toString(),           // v0.5.0: i64 raw metric value
-        value_decimals: f.valueDecimals,     // v0.5.0: decimal precision 0-6
+        value: f.value.toString(),           // v0.6.0: i128 raw metric value (stringified)
+        value_decimals: f.valueDecimals,     // v0.6.0: decimal precision 0-18
         score: f.score,                      // v0.5.0: Option<u8>, null if ATOM skipped
         tag1: f.tag1,
         tag2: f.tag2,
@@ -714,6 +967,123 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json(mapped);
     } catch (error) {
       logger.error({ error }, 'Error fetching registries');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/collection_pointers - Canonical collection pointers (PostgREST format)
+  app.get('/rest/v1/collection_pointers', async (req: Request, res: Response) => {
+    try {
+      const col = parsePostgRESTValue(req.query.col) ?? parsePostgRESTValue(req.query.collection_pointer);
+      const creator = parsePostgRESTValue(req.query.creator);
+      const firstSeenAsset = parsePostgRESTValue(req.query.first_seen_asset);
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+
+      const where: Prisma.CollectionPointerWhereInput = {};
+      if (col) where.col = col;
+      if (creator) where.creator = creator;
+      if (firstSeenAsset) where.firstSeenAsset = firstSeenAsset;
+
+      const needsCount = wantsCount(req);
+      const [rows, totalCount] = await Promise.all([
+        prisma.collectionPointer.findMany({
+          where,
+          orderBy: [
+            { firstSeenAt: 'desc' },
+            { col: 'asc' },
+            { creator: 'asc' },
+          ],
+          take: limit,
+          skip: offset,
+        }),
+        needsCount ? prisma.collectionPointer.count({ where }) : Promise.resolve(0),
+      ]);
+
+      if (needsCount) {
+        setContentRange(res, offset, rows.length, totalCount);
+      }
+
+      res.json(rows.map(mapCollectionPointerToApi));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching collection pointers');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/collection_asset_count - Count assets for creator+col scope
+  app.get('/rest/v1/collection_asset_count', async (req: Request, res: Response) => {
+    try {
+      const col = parsePostgRESTValue(req.query.col) ?? parsePostgRESTValue(req.query.collection_pointer);
+      if (!col) {
+        res.status(400).json({ error: 'Missing required query param: col' });
+        return;
+      }
+      const creator = parsePostgRESTValue(req.query.creator);
+
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      const where: Prisma.AgentWhereInput = { ...statusFilter, collectionPointer: col };
+      if (creator) where.creator = creator;
+
+      const count = await prisma.agent.count({ where });
+      res.json({
+        col,
+        creator: creator || null,
+        asset_count: count,
+      });
+    } catch (error) {
+      logger.error({ error }, 'Error counting collection assets');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /rest/v1/collection_assets - Paginated assets for a canonical collection pointer
+  app.get('/rest/v1/collection_assets', async (req: Request, res: Response) => {
+    try {
+      const col = parsePostgRESTValue(req.query.col) ?? parsePostgRESTValue(req.query.collection_pointer);
+      if (!col) {
+        res.status(400).json({ error: 'Missing required query param: col' });
+        return;
+      }
+      const creator = parsePostgRESTValue(req.query.creator);
+      const limit = safePaginationLimit(req.query.limit);
+      const offset = safePaginationOffset(req.query.offset);
+
+      const statusFilter = buildStatusFilter(req);
+      if (isInvalidStatus(statusFilter)) {
+        res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      const where: Prisma.AgentWhereInput = { ...statusFilter, collectionPointer: col };
+      if (creator) where.creator = creator;
+
+      const needsCount = wantsCount(req);
+      const [agents, totalCount] = await Promise.all([
+        prisma.agent.findMany({
+          where,
+          orderBy: [
+            { createdAt: 'desc' },
+            { id: 'desc' },
+          ],
+          take: limit,
+          skip: offset,
+        }),
+        needsCount ? prisma.agent.count({ where }) : Promise.resolve(0),
+      ]);
+
+      if (needsCount) {
+        setContentRange(res, offset, agents.length, totalCount);
+      }
+
+      res.json(agents.map(mapAgentToApi));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching collection assets');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
