@@ -152,6 +152,13 @@ describe('Filter Builder', () => {
     expect(result.params).toEqual([1700000000]);
   });
 
+  it('handles updatedAt range filters', () => {
+    const result = buildWhereClause('agent', { updatedAt_gt: 1700000000, updatedAt_lt: 1700000500 });
+    expect(result.sql).toContain('updated_at > to_timestamp($1)');
+    expect(result.sql).toContain('updated_at < to_timestamp($2)');
+    expect(result.params).toEqual([1700000000, 1700000500]);
+  });
+
   it('ignores unknown filter fields', () => {
     const result = buildWhereClause('agent', { unknownField: 'value', owner: 'test' });
     expect(result.sql).toContain('owner = $1');

@@ -23,6 +23,8 @@ const AGENT_FILTERS: FilterConfig[] = [
   { graphqlField: 'trustTier_gte', dbColumn: 'trust_tier', operator: 'gte' },
   { graphqlField: 'createdAt_gt', dbColumn: 'created_at', operator: 'gt' },
   { graphqlField: 'createdAt_lt', dbColumn: 'created_at', operator: 'lt' },
+  { graphqlField: 'updatedAt_gt', dbColumn: 'updated_at', operator: 'gt' },
+  { graphqlField: 'updatedAt_lt', dbColumn: 'updated_at', operator: 'lt' },
 ];
 
 const FEEDBACK_FILTERS: FilterConfig[] = [

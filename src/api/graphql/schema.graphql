@@ -54,6 +54,8 @@ input AgentFilter {
   totalFeedback_gte: BigInt
   createdAt_gt: BigInt
   createdAt_lt: BigInt
+  updatedAt_gt: BigInt
+  updatedAt_lt: BigInt
   collection: String
   collectionPointer: String
   parentAsset: String
