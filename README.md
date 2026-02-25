@@ -52,9 +52,10 @@ WS_URL=wss://api.devnet.solana.com
 
 Notes:
 
-- `API_MODE=both` is default.
-- GraphQL requires `DB_MODE=supabase`.
-- REST v1 requires `DB_MODE=local` (Prisma).
+- GraphQL requires `DB_MODE=supabase` (recommended `API_MODE=graphql`).
+- REST v1 requires `DB_MODE=local` (Prisma; recommended `API_MODE=rest`).
+- `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
+- `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
 
 ## Commands
@@ -64,6 +65,12 @@ npm run dev
 npm run build
 npm test
 npm run test:e2e
+npm run localnet:start
+npm run localnet:init
+npm run test:localnet:only
+npm run test:localnet
+npm run localnet:stop
+npm run test:docker:ci
 npm run check:graphql:coherence
 npm run bench:graphql:sql
 npm run bench:hashchain
@@ -88,7 +95,7 @@ docker run --rm -p 3001:3001 --env-file .env 8004-indexer-classic:local
 CI test target in Docker:
 
 ```bash
-docker compose -f docker/ci/ci-classic.yml up --build --abort-on-container-exit
+npm run test:docker:ci
 ```
 
 Runtime stack (digest-pin friendly):
@@ -129,6 +136,13 @@ query Dashboard {
 
 - `tests/e2e/reorg-resilience.test.ts`
 - `tests/e2e/devnet-verification.test.ts`
+
+`npm run test:localnet` handles the full localnet flow:
+
+- start validator + deploy program
+- initialize on-chain localnet state
+- run `Localnet`-tagged E2E suite
+- stop validator (unless `KEEP_LOCALNET=1`)
 
 ## Project Structure
 

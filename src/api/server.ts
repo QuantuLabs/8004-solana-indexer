@@ -736,20 +736,25 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
 
-      if (feedback_id) {
-        where.feedbackId = feedback_id;
-      } else if (asset && client_address && feedback_index !== undefined) {
+      let parsedFeedbackIndex: bigint | undefined;
+      if (feedback_index !== undefined) {
         const idx = safeBigInt(feedback_index);
         if (idx === undefined) {
           res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
           return;
         }
+        parsedFeedbackIndex = idx;
+      }
+
+      if (feedback_id) {
+        where.feedbackId = feedback_id;
+      } else if (asset && client_address && parsedFeedbackIndex !== undefined) {
         // Find feedback first, then get responses
         const feedback = await prisma.feedback.findFirst({
           where: {
             agentId: asset,
             client: client_address,
-            feedbackIndex: idx,
+            feedbackIndex: parsedFeedbackIndex,
           },
         });
         if (feedback) {
@@ -757,7 +762,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         } else {
           // Check orphan responses (feedback not yet indexed)
           const orphans = await prisma.orphanResponse.findMany({
-            where: { agentId: asset, client: client_address, feedbackIndex: idx },
+            where: { agentId: asset, client: client_address, feedbackIndex: parsedFeedbackIndex },
             orderBy: { createdAt: 'desc' },
             take: limit,
             skip: offset,
@@ -778,6 +783,14 @@ export function createApiServer(options: ApiServerOptions): Express {
           }));
           res.json(mapped);
           return;
+        }
+      } else {
+        const feedbackWhere: Prisma.FeedbackWhereInput = {};
+        if (asset) feedbackWhere.agentId = asset;
+        if (client_address) feedbackWhere.client = client_address;
+        if (parsedFeedbackIndex !== undefined) feedbackWhere.feedbackIndex = parsedFeedbackIndex;
+        if (Object.keys(feedbackWhere).length > 0) {
+          where.feedback = feedbackWhere;
         }
       }
 
@@ -835,7 +848,8 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/revocations', async (req: Request, res: Response) => {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
-      const client = parsePostgRESTValue(req.query.client);
+      const client = parsePostgRESTValue(req.query.client_address) ?? parsePostgRESTValue(req.query.client);
+      const feedback_index = parsePostgRESTValue(req.query.feedback_index);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -848,16 +862,36 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.RevocationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
+      if (feedback_index !== undefined) {
+        const idx = safeBigInt(feedback_index);
+        if (idx === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+          return;
+        }
+        where.feedbackIndex = idx;
+      }
 
       const orderBy: { revokeCount?: 'asc' | 'desc'; createdAt?: 'asc' | 'desc' } =
-        order === 'revoke_count.desc' ? { revokeCount: 'desc' } : { createdAt: 'desc' };
+        order === 'revoke_count.asc'
+          ? { revokeCount: 'asc' }
+          : order === 'revoke_count.desc'
+            ? { revokeCount: 'desc' }
+            : { createdAt: 'desc' };
 
-      const revocations = await prisma.revocation.findMany({
-        where,
-        orderBy,
-        take: limit,
-        skip: offset,
-      });
+      const needsCount = wantsCount(req);
+      const [revocations, totalCount] = await Promise.all([
+        prisma.revocation.findMany({
+          where,
+          orderBy,
+          take: limit,
+          skip: offset,
+        }),
+        needsCount ? prisma.revocation.count({ where }) : Promise.resolve(0),
+      ]);
+
+      if (needsCount) {
+        setContentRange(res, offset, revocations.length, totalCount);
+      }
 
       const mapped = revocations.map(r => ({
         id: r.id,
@@ -1014,7 +1048,9 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const collection = parsePostgRESTValue(req.query.collection);
       const orderBy = safeQueryString(req.query.order);
-      const cacheKey = collection ? `c:${collection}` : '__global__';
+      const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+      const cacheScope = includeOrphaned ? 'all' : 'active';
+      const cacheKey = collection ? `${cacheScope}:c:${collection}` : `${cacheScope}:__global__`;
 
       // Check cache first (prevents repeated heavy aggregations)
       const cached = collectionStatsCache.get(cacheKey);
@@ -1027,20 +1063,31 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       // If collection specified, get stats for that collection only
       if (collection) {
+        const agentWhere: Prisma.AgentWhereInput = includeOrphaned
+          ? { collection }
+          : { collection, status: { not: 'ORPHANED' } };
+        const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned
+          ? { agent: { collection } }
+          : {
+              status: { not: 'ORPHANED' },
+              agent: { collection, status: { not: 'ORPHANED' } },
+            };
+        const registryWhere: Prisma.RegistryWhereInput = includeOrphaned
+          ? { collection }
+          : { collection, status: { not: 'ORPHANED' } };
+
         const agentCount = await prisma.agent.count({
-          where: { collection: collection },
+          where: agentWhere,
         });
 
         const feedbackAgg = await prisma.feedback.aggregate({
-          where: {
-            agent: { collection: collection },
-          },
+          where: feedbackWhere,
           _count: true,
           _avg: { score: true },
         });
 
         const registry = await prisma.registry.findFirst({
-          where: { collection: collection },
+          where: registryWhere,
         });
 
         const stats = [{
@@ -1058,36 +1105,71 @@ export function createApiServer(options: ApiServerOptions): Express {
         // Get stats for all collections using single SQL query (prevents N+1 DoS)
         // Instead of 50 registries × 2 queries = 100 queries, this does 1 query
         // Note: Table/column names match Prisma schema (Registry, Agent, Feedback)
-        const stats = await prisma.$queryRaw<Array<{
-          collection: string;
-          registry_type: string;
-          authority: string | null;
-          agent_count: bigint;
-          total_feedbacks: bigint;
-          avg_score: number | null;
-        }>>`
-          SELECT
-            r.collection,
-            r."registryType" as registry_type,
-            r.authority,
-            COALESCE(agent_stats.agent_count, 0) as agent_count,
-            COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
-            feedback_stats.avg_score
-          FROM "Registry" r
-          LEFT JOIN (
-            SELECT collection, COUNT(*) as agent_count
-            FROM "Agent"
-            GROUP BY collection
-          ) agent_stats ON agent_stats.collection = r.collection
-          LEFT JOIN (
-            SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
-            FROM "Feedback" f
-            JOIN "Agent" a ON a.id = f."agentId"
-            GROUP BY a.collection
-          ) feedback_stats ON feedback_stats.collection = r.collection
-          ORDER BY r."createdAt" DESC
-          LIMIT ${MAX_COLLECTION_STATS}
-        `;
+        const stats = includeOrphaned
+          ? await prisma.$queryRaw<Array<{
+              collection: string;
+              registry_type: string;
+              authority: string | null;
+              agent_count: bigint;
+              total_feedbacks: bigint;
+              avg_score: number | null;
+            }>>`
+              SELECT
+                r.collection,
+                r."registryType" as registry_type,
+                r.authority,
+                COALESCE(agent_stats.agent_count, 0) as agent_count,
+                COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
+                feedback_stats.avg_score
+              FROM "Registry" r
+              LEFT JOIN (
+                SELECT collection, COUNT(*) as agent_count
+                FROM "Agent"
+                GROUP BY collection
+              ) agent_stats ON agent_stats.collection = r.collection
+              LEFT JOIN (
+                SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
+                FROM "Feedback" f
+                JOIN "Agent" a ON a.id = f."agentId"
+                GROUP BY a.collection
+              ) feedback_stats ON feedback_stats.collection = r.collection
+              ORDER BY r."createdAt" DESC
+              LIMIT ${MAX_COLLECTION_STATS}
+            `
+          : await prisma.$queryRaw<Array<{
+              collection: string;
+              registry_type: string;
+              authority: string | null;
+              agent_count: bigint;
+              total_feedbacks: bigint;
+              avg_score: number | null;
+            }>>`
+              SELECT
+                r.collection,
+                r."registryType" as registry_type,
+                r.authority,
+                COALESCE(agent_stats.agent_count, 0) as agent_count,
+                COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
+                feedback_stats.avg_score
+              FROM "Registry" r
+              LEFT JOIN (
+                SELECT collection, COUNT(*) as agent_count
+                FROM "Agent"
+                WHERE status != 'ORPHANED'
+                GROUP BY collection
+              ) agent_stats ON agent_stats.collection = r.collection
+              LEFT JOIN (
+                SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
+                FROM "Feedback" f
+                JOIN "Agent" a ON a.id = f."agentId"
+                WHERE f.status != 'ORPHANED'
+                  AND a.status != 'ORPHANED'
+                GROUP BY a.collection
+              ) feedback_stats ON feedback_stats.collection = r.collection
+              WHERE r.status != 'ORPHANED'
+              ORDER BY r."createdAt" DESC
+              LIMIT ${MAX_COLLECTION_STATS}
+            `;
 
         // Convert BigInt to number for JSON serialization
         const formattedStats = stats.map(s => ({
@@ -1116,13 +1198,21 @@ export function createApiServer(options: ApiServerOptions): Express {
   });
 
   // GET /rest/v1/stats and /rest/v1/global_stats - Global stats
-  const globalStatsHandler = async (_req: Request, res: Response) => {
+  const globalStatsHandler = async (req: Request, res: Response) => {
     try {
+      const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+      const agentWhere: Prisma.AgentWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
+      const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
+      const registryWhere: Prisma.RegistryWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
+      const validationWhere: Prisma.ValidationWhereInput = includeOrphaned
+        ? {}
+        : { chainStatus: { not: 'ORPHANED' } };
+
       const [totalAgents, totalFeedbacks, totalRegistries, totalValidations] = await Promise.all([
-        prisma.agent.count(),
-        prisma.feedback.count(),
-        prisma.registry.count(),
-        prisma.validation.count(),
+        prisma.agent.count({ where: agentWhere }),
+        prisma.feedback.count({ where: feedbackWhere }),
+        prisma.registry.count({ where: registryWhere }),
+        prisma.validation.count({ where: validationWhere }),
       ]);
 
       // Return as array for SDK compatibility (PostgREST format)
@@ -1250,7 +1340,9 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const limit = safePaginationLimit(req.query.limit);
       const collection = parsePostgRESTValue(req.query.collection);
-      const cacheKey = collection ? `c:${collection}` : '__global__';
+      const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+      const cacheScope = includeOrphaned ? 'all' : 'active';
+      const cacheKey = collection ? `${cacheScope}:c:${collection}` : `${cacheScope}:__global__`;
 
       // Check LRU cache first (TTL handled by cache)
       const cached = leaderboardCache.get(cacheKey);
@@ -1264,54 +1356,96 @@ export function createApiServer(options: ApiServerOptions): Express {
         asset: string;
         owner: string;
         collection: string;
-        trust_score: number;
+        trust_score: number | bigint;
         feedback_count: bigint;
       };
 
       // Use separate queries to avoid dynamic SQL construction (safer pattern)
       // Note: CAST instead of ::int for SQLite/PostgreSQL compatibility
       // Note: Table names match Prisma model names (Agent, Feedback)
-      const result = collection
-        ? await prisma.$queryRaw<LeaderboardRow[]>`
-            SELECT
-              a.id as asset,
-              a.owner,
-              a.collection,
-              CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-              COUNT(f.id) as feedback_count
-            FROM "Agent" a
-            LEFT JOIN "Feedback" f ON f."agentId" = a.id
-              AND f.revoked = false
-              AND f.score IS NOT NULL
-            WHERE a.collection = ${collection}
-            GROUP BY a.id, a.owner, a.collection
-            HAVING COUNT(f.id) > 0
-            ORDER BY trust_score DESC, feedback_count DESC
-            LIMIT ${LEADERBOARD_POOL_SIZE}
-          `
-        : await prisma.$queryRaw<LeaderboardRow[]>`
-            SELECT
-              a.id as asset,
-              a.owner,
-              a.collection,
-              CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-              COUNT(f.id) as feedback_count
-            FROM "Agent" a
-            LEFT JOIN "Feedback" f ON f."agentId" = a.id
-              AND f.revoked = false
-              AND f.score IS NOT NULL
-            GROUP BY a.id, a.owner, a.collection
-            HAVING COUNT(f.id) > 0
-            ORDER BY trust_score DESC, feedback_count DESC
-            LIMIT ${LEADERBOARD_POOL_SIZE}
-          `;
+      let result: LeaderboardRow[];
+      if (collection && includeOrphaned) {
+        result = await prisma.$queryRaw<LeaderboardRow[]>`
+          SELECT
+            a.id as asset,
+            a.owner,
+            a.collection,
+            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
+            COUNT(f.id) as feedback_count
+          FROM "Agent" a
+          LEFT JOIN "Feedback" f ON f."agentId" = a.id
+            AND f.revoked = false
+            AND f.score IS NOT NULL
+          WHERE a.collection = ${collection}
+          GROUP BY a.id, a.owner, a.collection
+          HAVING COUNT(f.id) > 0
+          ORDER BY trust_score DESC, feedback_count DESC
+          LIMIT ${LEADERBOARD_POOL_SIZE}
+        `;
+      } else if (collection) {
+        result = await prisma.$queryRaw<LeaderboardRow[]>`
+          SELECT
+            a.id as asset,
+            a.owner,
+            a.collection,
+            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
+            COUNT(f.id) as feedback_count
+          FROM "Agent" a
+          LEFT JOIN "Feedback" f ON f."agentId" = a.id
+            AND f.revoked = false
+            AND f.score IS NOT NULL
+            AND f.status != 'ORPHANED'
+          WHERE a.collection = ${collection}
+            AND a.status != 'ORPHANED'
+          GROUP BY a.id, a.owner, a.collection
+          HAVING COUNT(f.id) > 0
+          ORDER BY trust_score DESC, feedback_count DESC
+          LIMIT ${LEADERBOARD_POOL_SIZE}
+        `;
+      } else if (includeOrphaned) {
+        result = await prisma.$queryRaw<LeaderboardRow[]>`
+          SELECT
+            a.id as asset,
+            a.owner,
+            a.collection,
+            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
+            COUNT(f.id) as feedback_count
+          FROM "Agent" a
+          LEFT JOIN "Feedback" f ON f."agentId" = a.id
+            AND f.revoked = false
+            AND f.score IS NOT NULL
+          GROUP BY a.id, a.owner, a.collection
+          HAVING COUNT(f.id) > 0
+          ORDER BY trust_score DESC, feedback_count DESC
+          LIMIT ${LEADERBOARD_POOL_SIZE}
+        `;
+      } else {
+        result = await prisma.$queryRaw<LeaderboardRow[]>`
+          SELECT
+            a.id as asset,
+            a.owner,
+            a.collection,
+            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
+            COUNT(f.id) as feedback_count
+          FROM "Agent" a
+          LEFT JOIN "Feedback" f ON f."agentId" = a.id
+            AND f.revoked = false
+            AND f.score IS NOT NULL
+            AND f.status != 'ORPHANED'
+          WHERE a.status != 'ORPHANED'
+          GROUP BY a.id, a.owner, a.collection
+          HAVING COUNT(f.id) > 0
+          ORDER BY trust_score DESC, feedback_count DESC
+          LIMIT ${LEADERBOARD_POOL_SIZE}
+        `;
+      }
 
       // Convert BigInt to number for JSON serialization
       const withScores = result.map(r => ({
         asset: r.asset,
         owner: r.owner,
         collection: r.collection,
-        trust_score: r.trust_score,
+        trust_score: Number(r.trust_score),
         feedback_count: Number(r.feedback_count),
       }));
 
