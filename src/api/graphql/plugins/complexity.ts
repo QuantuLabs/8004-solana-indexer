@@ -5,8 +5,25 @@ import {
   visit,
 } from 'graphql';
 
-const MAX_COMPLEXITY = parseInt(process.env.GRAPHQL_MAX_COMPLEXITY || '5000', 10);
-const MAX_FIRST_CAP = parseInt(process.env.GRAPHQL_MAX_FIRST_CAP || '1000', 10);
+const DEFAULT_MAX_COMPLEXITY = 500;
+const DEFAULT_MAX_FIRST_CAP = 250;
+
+function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+const MAX_COMPLEXITY = parsePositiveIntEnv(
+  process.env.GRAPHQL_MAX_COMPLEXITY,
+  DEFAULT_MAX_COMPLEXITY,
+);
+const MAX_FIRST_CAP = parsePositiveIntEnv(
+  process.env.GRAPHQL_MAX_FIRST_CAP,
+  DEFAULT_MAX_FIRST_CAP,
+);
 const MAX_ALIASES = 10;
 
 const FIELD_COSTS: Record<string, number> = {
@@ -39,7 +56,9 @@ function getFirstArg(node: FieldNode): number {
   const firstArg = node.arguments?.find(a => a.name.value === 'first');
   if (!firstArg) return 100;
   if (firstArg.value.kind === Kind.INT) {
-    return Math.min(parseInt(firstArg.value.value, 10), MAX_FIRST_CAP);
+    const requested = Number.parseInt(firstArg.value.value, 10);
+    if (!Number.isFinite(requested) || requested <= 0) return 0;
+    return Math.min(requested, MAX_FIRST_CAP);
   }
   if (firstArg.value.kind === Kind.VARIABLE) {
     // Variables are unknown at parse-time; assume worst-case page size.

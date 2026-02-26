@@ -16,7 +16,7 @@ vi.mock('../../../src/logger.js', () => {
   };
 });
 
-import { analyzeQuery, calculateComplexity, countAliases, MAX_COMPLEXITY, MAX_ALIASES } from '../../../src/api/graphql/plugins/complexity.js';
+import { analyzeQuery, calculateComplexity, countAliases, MAX_COMPLEXITY, MAX_FIRST_CAP, MAX_ALIASES } from '../../../src/api/graphql/plugins/complexity.js';
 import { analyzeDepth, calculateDepth, MAX_DEPTH } from '../../../src/api/graphql/plugins/depth-limit.js';
 import { buildWhereClause } from '../../../src/api/graphql/utils/filters.js';
 import { clampFirst, clampSkip, encodeCursor, decodeCursor, MAX_FIRST, MAX_SKIP } from '../../../src/api/graphql/utils/pagination.js';
@@ -66,6 +66,12 @@ describe('GraphQL Complexity Analysis', () => {
     const cost1 = calculateComplexity(doc1);
     const cost250 = calculateComplexity(doc250);
     expect(cost250).toBeGreaterThan(cost1);
+  });
+
+  it('caps first argument by MAX_FIRST_CAP', () => {
+    const capped = calculateComplexity(parse('{ agents(first: 999999) { id } }'));
+    const atCap = calculateComplexity(parse(`{ agents(first: ${MAX_FIRST_CAP}) { id } }`));
+    expect(capped).toBe(atCap);
   });
 
   it('applies nested list multipliers to complexity', () => {
