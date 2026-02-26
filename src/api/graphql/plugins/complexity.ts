@@ -6,6 +6,7 @@ import {
 } from 'graphql';
 
 const MAX_COMPLEXITY = parseInt(process.env.GRAPHQL_MAX_COMPLEXITY || '5000', 10);
+const MAX_FIRST_CAP = parseInt(process.env.GRAPHQL_MAX_FIRST_CAP || '1000', 10);
 const MAX_ALIASES = 10;
 
 const FIELD_COSTS: Record<string, number> = {
@@ -38,11 +39,11 @@ function getFirstArg(node: FieldNode): number {
   const firstArg = node.arguments?.find(a => a.name.value === 'first');
   if (!firstArg) return 100;
   if (firstArg.value.kind === Kind.INT) {
-    return Math.min(parseInt(firstArg.value.value, 10), 1000);
+    return Math.min(parseInt(firstArg.value.value, 10), MAX_FIRST_CAP);
   }
   if (firstArg.value.kind === Kind.VARIABLE) {
     // Variables are unknown at parse-time; assume worst-case page size.
-    return 1000;
+    return MAX_FIRST_CAP;
   }
   return 100;
 }
@@ -117,4 +118,4 @@ export function analyzeQuery(document: DocumentNode): ComplexityResult {
   return { allowed: true, cost, maxCost: MAX_COMPLEXITY };
 }
 
-export { MAX_COMPLEXITY, MAX_ALIASES };
+export { MAX_COMPLEXITY, MAX_FIRST_CAP, MAX_ALIASES };
