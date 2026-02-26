@@ -295,10 +295,11 @@ export class Poller {
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
+        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        if (txA !== txB) return txA - txB;
-        return a.sig.signature.localeCompare(b.sig.signature);
+        return txA - txB;
       });
 
       for (const { sig, txIndex } of sigsWithIndex) {
@@ -385,7 +386,7 @@ export class Poller {
           logger.warn({ slot, attempt, error: error instanceof Error ? error.message : String(error) }, "getBlock failed, retrying");
           await new Promise(r => setTimeout(r, 500 * attempt));
         } else {
-          logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index will be NULL (unordered)");
+          logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index will be NULL (signature-order fallback)");
           sigs.forEach(sig => txIndexMap.set(sig.signature, null));
         }
       }
@@ -525,15 +526,16 @@ export class Poller {
       const sigs = bySlot.get(slot)!;
       const txIndexMap = await this.getTxIndexMap(slot, sigs);
 
-      // Sort by tx_index within slot (NULL tx_index sorts last)
+      // Canonical within-slot ordering is by signature; tx_index is only a tie-break metadata field.
       const sigsWithIndex = sigs.map(sig => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
+        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        if (txA !== txB) return txA - txB;
-        return a.sig.signature.localeCompare(b.sig.signature);
+        return txA - txB;
       });
 
       let batchFailed = false;

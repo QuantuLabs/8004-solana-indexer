@@ -156,7 +156,7 @@ export interface EventContext {
   signature: string;
   slot: bigint;
   blockTime: Date;
-  txIndex?: number; // Transaction index within the block (for deterministic ordering)
+  txIndex?: number; // Transaction index within the block (captured as metadata/tie-break context)
   source?: "poller" | "websocket"; // Event source for cursor tracking
 }
 

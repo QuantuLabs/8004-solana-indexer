@@ -566,7 +566,7 @@ CREATE POLICY "Public read agent_digest_cache" ON agent_digest_cache FOR SELECT 
 
 -- =============================================
 -- DETERMINISTIC ORDERING INDEXES
--- Use (block_slot, tx_index NULLS LAST, tx_signature) for consistent re-indexing
+-- Canonical replay/backfill order is (block_slot, tx_signature); tx_index is retained as auxiliary metadata.
 -- =============================================
 
 -- Feedback ordering: deterministic per client

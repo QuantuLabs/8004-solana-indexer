@@ -38,7 +38,7 @@ export interface EventContext {
   signature: string;
   slot: bigint;
   blockTime: Date;
-  txIndex?: number; // Transaction index within the block (for deterministic ordering)
+  txIndex?: number; // Transaction index within the block (captured as metadata/tie-break context)
 }
 
 let pool: Pool | null = null;

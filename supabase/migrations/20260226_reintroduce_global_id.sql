@@ -18,10 +18,10 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS global_id BIGINT;
 CREATE SEQUENCE IF NOT EXISTS agent_global_id_seq START 1;
 
 -- Backfill existing agents in deterministic order
--- NULL tx_index sorts last within a slot via NULLS LAST
+-- Canonical ordering is (slot, tx_signature); tx_index is only a tertiary tie-break metadata field.
 WITH ordered_agents AS (
   SELECT asset, ROW_NUMBER() OVER (
-    ORDER BY block_slot, tx_index NULLS LAST, tx_signature
+    ORDER BY block_slot, tx_signature, tx_index NULLS LAST, asset
   ) AS rn
   FROM agents
   WHERE status != 'ORPHANED'

@@ -294,7 +294,7 @@ export class WebSocketIndexer {
       // Approximate block time for WebSocket events
       const blockTime = new Date();
 
-      // Resolve tx_index from block for deterministic ordering
+      // Resolve tx_index from block for metadata/tie-break parity with other indexers
       let txIndex: number | undefined;
       try {
         const block = await this.connection.getBlock(ctx.slot, {

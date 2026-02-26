@@ -1193,7 +1193,7 @@ export class DataVerifier {
         ),
         this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedbacks WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
         this.pool.query(
-          `SELECT running_digest FROM feedback_responses WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY block_slot DESC, tx_index DESC NULLS LAST, tx_signature DESC LIMIT 1`,
+          `SELECT running_digest FROM feedback_responses WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, id DESC LIMIT 1`,
           [agentId]
         ),
         this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedback_responses WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),

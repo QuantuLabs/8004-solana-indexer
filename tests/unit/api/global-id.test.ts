@@ -45,56 +45,60 @@ describe("Global ID formatting", () => {
 });
 
 describe("Global ID deterministic ordering", () => {
-  it("should sort by (block_slot, tx_index, tx_signature) for backfill", () => {
+  it("should sort by (block_slot, tx_signature) for backfill", () => {
     const agents = [
-      { asset: "C", block_slot: 100n, tx_index: 2, tx_signature: "sig_c" },
-      { asset: "A", block_slot: 100n, tx_index: 0, tx_signature: "sig_a" },
+      { asset: "C", block_slot: 100n, tx_index: 0, tx_signature: "sig_c" },
+      { asset: "A", block_slot: 100n, tx_index: 2, tx_signature: "sig_a" },
       { asset: "B", block_slot: 100n, tx_index: 1, tx_signature: "sig_b" },
       { asset: "D", block_slot: 200n, tx_index: 0, tx_signature: "sig_d" },
     ];
 
     const sorted = [...agents].sort((a, b) => {
       if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
+      const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
+      if (sigCmp !== 0) return sigCmp;
       const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
       const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-      if (txA !== txB) return txA - txB;
-      return a.tx_signature.localeCompare(b.tx_signature);
+      return txA - txB;
     });
 
     expect(sorted.map(a => a.asset)).toEqual(["A", "B", "C", "D"]);
+    expect(sorted.find(a => a.asset === "A")?.tx_index).toBe(2);
   });
 
-  it("should handle NULL tx_index by sorting last within slot", () => {
+  it("should keep NULL tx_index as metadata while sorting canonically by signature", () => {
     const agents = [
-      { asset: "X", block_slot: 100n, tx_index: null as number | null, tx_signature: "sig_x" },
-      { asset: "Y", block_slot: 100n, tx_index: 0, tx_signature: "sig_y" },
-      { asset: "Z", block_slot: 100n, tx_index: 1, tx_signature: "sig_z" },
+      { asset: "X", block_slot: 100n, tx_index: null as number | null, tx_signature: "sig_b" },
+      { asset: "Y", block_slot: 100n, tx_index: 0, tx_signature: "sig_c" },
+      { asset: "Z", block_slot: 100n, tx_index: 1, tx_signature: "sig_a" },
     ];
 
     const sorted = [...agents].sort((a, b) => {
       if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
+      const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
+      if (sigCmp !== 0) return sigCmp;
       const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
       const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-      if (txA !== txB) return txA - txB;
-      return a.tx_signature.localeCompare(b.tx_signature);
+      return txA - txB;
     });
 
-    // NULL tx_index sorts last
-    expect(sorted.map(a => a.asset)).toEqual(["Y", "Z", "X"]);
+    expect(sorted.map(a => a.asset)).toEqual(["Z", "X", "Y"]);
+    expect(sorted.find(a => a.asset === "X")?.tx_index).toBeNull();
   });
 
-  it("should use tx_signature as tiebreaker when tx_index matches", () => {
+  it("should use tx_index only as tertiary tie-breaker when signatures collide", () => {
     const agents = [
-      { asset: "B", block_slot: 100n, tx_index: 0, tx_signature: "sig_b" },
-      { asset: "A", block_slot: 100n, tx_index: 0, tx_signature: "sig_a" },
+      { asset: "B", block_slot: 100n, tx_index: 1, tx_signature: "sig_same" },
+      { asset: "A", block_slot: 100n, tx_index: 0, tx_signature: "sig_same" },
     ];
 
     const sorted = [...agents].sort((a, b) => {
       if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
+      const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
+      if (sigCmp !== 0) return sigCmp;
       const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
       const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-      if (txA !== txB) return txA - txB;
-      return a.tx_signature.localeCompare(b.tx_signature);
+      return txA - txB;
     });
 
     expect(sorted.map(a => a.asset)).toEqual(["A", "B"]);

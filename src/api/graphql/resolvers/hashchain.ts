@@ -69,7 +69,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedbacks
          WHERE asset = $1 AND status != 'ORPHANED'
-         ORDER BY block_slot DESC, tx_index DESC NULLS LAST, tx_signature DESC, id DESC
+         ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
       ),
@@ -91,7 +91,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedback_responses
          WHERE asset = $1 AND status != 'ORPHANED'
-         ORDER BY block_slot DESC, tx_index DESC NULLS LAST, tx_signature DESC, id DESC
+         ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
       ),
@@ -158,7 +158,7 @@ async function fetchLatestCheckpoint(
          SELECT
            (ROW_NUMBER() OVER (
              PARTITION BY asset
-             ORDER BY block_slot ASC, tx_index ASC NULLS LAST, tx_signature ASC, id ASC
+             ORDER BY block_slot ASC, tx_signature ASC, tx_index ASC NULLS LAST, id ASC
            ) - 1)::bigint AS response_count,
            encode(running_digest, 'hex') AS digest,
            ${epochSecondsExpr('created_at')} AS created_at
@@ -348,7 +348,7 @@ export const hashChainResolvers = {
                fr.block_slot::text AS slot,
                (ROW_NUMBER() OVER (
                  PARTITION BY fr.asset
-                 ORDER BY fr.block_slot ASC, fr.tx_index ASC NULLS LAST, fr.tx_signature ASC, fr.id ASC
+                 ORDER BY fr.block_slot ASC, fr.tx_signature ASC, fr.tx_index ASC NULLS LAST, fr.id ASC
                ) - 1)::bigint::text AS response_count
              FROM feedback_responses fr
              WHERE fr.asset = $1

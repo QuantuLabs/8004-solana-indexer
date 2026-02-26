@@ -3,43 +3,44 @@ import { describe, it, expect } from "vitest";
 /**
  * Cross-indexer determinism tests.
  *
- * Proves that the ordering composite key (block_slot, tx_index, tx_signature)
+ * Proves that canonical ordering (block_slot, tx_signature, tx_index)
  * produces identical global_id assignments regardless of which indexer runs:
  *   - RPC Poller (getBlock → enumerate → tx_index)
  *   - Substreams  (block.transactions.iter().enumerate() → tx_index)
  *   - WebSocket   (onLogs → no tx_index, NULL fallback)
  *
  * Also validates that the SQL ordering
- *   ORDER BY block_slot, COALESCE(tx_index, 2147483647), tx_signature
- * matches the TypeScript in-memory ordering
- *   (a.tx_index ?? Number.MAX_SAFE_INTEGER) - (b.tx_index ?? Number.MAX_SAFE_INTEGER)
+ *   ORDER BY block_slot, tx_signature, tx_index NULLS LAST
+ * matches the TypeScript in-memory ordering.
  */
 
 // ── Helpers (mirror production logic) ──────────────────────────────────────
 
-/** Deterministic sort matching the SQL ORDER BY used in migration backfill */
+/** Deterministic sort matching canonical SQL ORDER BY used in replay/backfill */
 function deterministicSort<T extends { block_slot: bigint; tx_index: number | null; tx_signature: string }>(
   agents: T[],
 ): T[] {
   return [...agents].sort((a, b) => {
     if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
+    const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
+    if (sigCmp !== 0) return sigCmp;
     const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
     const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-    if (txA !== txB) return txA - txB;
-    return a.tx_signature.localeCompare(b.tx_signature);
+    return txA - txB;
   });
 }
 
-/** SQL-equivalent sort using COALESCE(tx_index, 2147483647) */
+/** SQL-equivalent sort with signature-first ordering and NULLS LAST tx_index tie-break */
 function sqlEquivalentSort<T extends { block_slot: bigint; tx_index: number | null; tx_signature: string }>(
   agents: T[],
 ): T[] {
   return [...agents].sort((a, b) => {
     if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
+    const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
+    if (sigCmp !== 0) return sigCmp;
     const txA = a.tx_index ?? 2147483647;
     const txB = b.tx_index ?? 2147483647;
-    if (txA !== txB) return txA - txB;
-    return a.tx_signature.localeCompare(b.tx_signature);
+    return txA - txB;
   });
 }
 
@@ -208,10 +209,8 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     ]);
   });
 
-  it("WebSocket ordering DIVERGES from Poller/Substreams ordering (known limitation)", () => {
-    // This test documents the known divergence: when WebSocket doesn't resolve
-    // tx_index, the ordering within a slot is by tx_signature (alphabetical)
-    // instead of by block position.
+  it("WebSocket ordering matches Poller/Substreams under canonical signature ordering", () => {
+    // With canonical (slot, signature) ordering, missing tx_index does not change ordering.
     const pollerResult = simulatePollerOutput(BLOCK_DATA);
     const wsResult = simulateWebSocketOutput(BLOCK_DATA);
 
@@ -229,16 +228,16 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
       if (count > 1) slotsWithMultiple.add(slot);
     }
 
-    // For agents in multi-tx slots, global_ids may differ
+    // Compare ids for all agents across indexers
     let hasDivergence = false;
     for (const [asset, pollerId] of pollerIds) {
       const wsId = wsIds.get(asset);
       if (pollerId !== wsId) hasDivergence = true;
     }
 
-    // We EXPECT divergence for multi-agent slots when WS has no tx_index
+    // No divergence expected, even in multi-agent slots.
     expect(slotsWithMultiple.size).toBeGreaterThan(0);
-    expect(hasDivergence).toBe(true);
+    expect(hasDivergence).toBe(false);
   });
 });
 
@@ -259,7 +258,7 @@ describe("Cross-indexer determinism: SQL vs TypeScript equivalence", () => {
     expect(jsSorted.map(a => a.asset)).toEqual(["A", "B", "C", "N"]);
   });
 
-  it("NULL tx_index sorts last in both SQL and JS semantics", () => {
+  it("canonical signature ordering applies before NULL tx_index handling", () => {
     const agents: AgentRecord[] = [
       { asset: "Null1", block_slot: 100n, tx_index: null, tx_signature: "aaa" },
       { asset: "Null2", block_slot: 100n, tx_index: null, tx_signature: "zzz" },
@@ -269,9 +268,9 @@ describe("Cross-indexer determinism: SQL vs TypeScript equivalence", () => {
     const jsSorted = deterministicSort(agents);
     const sqlSorted = sqlEquivalentSort(agents);
 
-    // Known (tx_index=0) sorts first, then nulls by tx_signature
-    expect(jsSorted.map(a => a.asset)).toEqual(["Known", "Null1", "Null2"]);
-    expect(sqlSorted.map(a => a.asset)).toEqual(["Known", "Null1", "Null2"]);
+    // Signature order is primary ("aaa" < "mmm" < "zzz"), tx_index only breaks ties.
+    expect(jsSorted.map(a => a.asset)).toEqual(["Null1", "Known", "Null2"]);
+    expect(sqlSorted.map(a => a.asset)).toEqual(["Null1", "Known", "Null2"]);
   });
 
   it("tx_signature tiebreaker is lexicographic in both SQL and JS", () => {
@@ -332,8 +331,8 @@ describe("Cross-indexer determinism: getBlock fallback scenarios", () => {
     expect(slot100.every(a => a.tx_index === null)).toBe(true);
   });
 
-  it("NULL tx_index agents sort after known-index agents in same slot", () => {
-    // Mixed scenario: some agents have tx_index, others don't
+  it("mixed NULL tx_index data remains deterministic in canonical ordering", () => {
+    // Mixed scenario: some agents have tx_index, others don't.
     const agents: AgentRecord[] = [
       { asset: "Known1", block_slot: 100n, tx_index: 0, tx_signature: "sig_k1" },
       { asset: "Unknown1", block_slot: 100n, tx_index: null, tx_signature: "sig_u1" },
@@ -342,7 +341,7 @@ describe("Cross-indexer determinism: getBlock fallback scenarios", () => {
     ];
 
     const sorted = deterministicSort(agents);
-    // Known agents first (by tx_index), then unknown (by tx_signature)
+    // Signature order remains deterministic.
     expect(sorted.map(a => a.asset)).toEqual(["Known1", "Known2", "Unknown1", "Unknown2"]);
   });
 
@@ -424,22 +423,22 @@ describe("Cross-indexer determinism: sequence safety", () => {
     // will get unique global_ids, but the id order may not match on-chain order.
     // This is acceptable because:
     // 1. The poller processes slots sequentially (sorted)
-    // 2. Within a slot, txs are sorted by tx_index before INSERT
+    // 2. Within a slot, txs are sorted by signature before INSERT (tx_index tie-break only)
     // 3. Concurrent inserts only happen across different poll cycles
     let sequence = 100;
     const nextval = () => ++sequence;
 
-    // Simulate: TX at slot=1000, tx_index=0 and TX at slot=1000, tx_index=1
+    // Simulate: TX at slot=1000 with canonical signature order
     // If processed in correct order:
-    const id1 = nextval(); // Agent at tx_index=0 → 101
-    const id2 = nextval(); // Agent at tx_index=1 → 102
+    const id1 = nextval(); // Earlier canonical record → 101
+    const id2 = nextval(); // Later canonical record → 102
     expect(id1).toBeLessThan(id2); // Correct: earlier tx gets lower id
 
     // If processed out of order (hypothetical race):
-    const id3 = nextval(); // Agent at tx_index=1 → 103
-    const id4 = nextval(); // Agent at tx_index=0 → 104
+    const id3 = nextval(); // Later canonical record → 103
+    const id4 = nextval(); // Earlier canonical record → 104
     expect(id3).not.toBe(id4); // Always unique
-    // But id3 < id4 even though tx_index order is reversed → acceptable trade-off
+    // But id3 < id4 even though canonical order is reversed by race → acceptable trade-off
   });
 });
 
@@ -456,11 +455,11 @@ describe("Cross-indexer determinism: migration backfill correctness", () => {
 
     const ids = assignGlobalIds(agents);
 
-    expect(ids.get("First")).toBe(1);     // slot 100, tx_index 0
-    expect(ids.get("MidSlot")).toBe(2);   // slot 300, tx_index 0
-    expect(ids.get("Middle")).toBe(3);    // slot 300, tx_index 2
-    expect(ids.get("NullIdx")).toBe(4);   // slot 300, tx_index NULL → sorts last
-    expect(ids.get("Late")).toBe(5);      // slot 500, tx_index 0
+    expect(ids.get("First")).toBe(1);     // slot 100
+    expect(ids.get("Middle")).toBe(2);    // slot 300, signature sig_mid
+    expect(ids.get("MidSlot")).toBe(3);   // slot 300, signature sig_midslot
+    expect(ids.get("NullIdx")).toBe(4);   // slot 300, signature sig_nullidx
+    expect(ids.get("Late")).toBe(5);      // slot 500
   });
 
   it("setval after backfill prevents duplicate global_ids", () => {
@@ -500,10 +499,10 @@ describe("Cross-indexer determinism: txIndex=0 falsy guard", () => {
     expect(fixed).toBe(0); // Correct behavior
   });
 
-  it("txIndex=0 agent must sort before txIndex=1 agent", () => {
+  it("txIndex=0 agent must sort before txIndex=1 agent when signature ties", () => {
     const agents: AgentRecord[] = [
-      { asset: "Second", block_slot: 100n, tx_index: 1, tx_signature: "sig_b" },
-      { asset: "First", block_slot: 100n, tx_index: 0, tx_signature: "sig_a" },
+      { asset: "Second", block_slot: 100n, tx_index: 1, tx_signature: "sig_same" },
+      { asset: "First", block_slot: 100n, tx_index: 0, tx_signature: "sig_same" },
     ];
 
     const sorted = deterministicSort(agents);
@@ -511,14 +510,14 @@ describe("Cross-indexer determinism: txIndex=0 falsy guard", () => {
     expect(sorted[0].tx_index).toBe(0);
   });
 
-  it("txIndex=0 must NOT be treated as NULL in sort", () => {
+  it("txIndex=0 must NOT be treated as NULL when signature ties", () => {
     const agents: AgentRecord[] = [
-      { asset: "NullIdx", block_slot: 100n, tx_index: null, tx_signature: "aaa" },
-      { asset: "ZeroIdx", block_slot: 100n, tx_index: 0, tx_signature: "zzz" },
+      { asset: "NullIdx", block_slot: 100n, tx_index: null, tx_signature: "sig_same" },
+      { asset: "ZeroIdx", block_slot: 100n, tx_index: 0, tx_signature: "sig_same" },
     ];
 
     const sorted = deterministicSort(agents);
-    // tx_index=0 sorts BEFORE tx_index=null (null sorts last)
+    // tx_index=0 sorts BEFORE tx_index=null when primary keys are tied
     expect(sorted[0].asset).toBe("ZeroIdx");
     expect(sorted[1].asset).toBe("NullIdx");
   });
@@ -554,7 +553,7 @@ describe("Cross-indexer determinism: edge cases", () => {
     expect(ids.size).toBe(0);
   });
 
-  it("large tx_index values sort correctly", () => {
+  it("large tx_index values do not override signature-primary ordering", () => {
     const agents: AgentRecord[] = [
       { asset: "Last", block_slot: 100n, tx_index: 1399, tx_signature: "sig_last" },
       { asset: "First", block_slot: 100n, tx_index: 0, tx_signature: "sig_first" },
@@ -562,7 +561,7 @@ describe("Cross-indexer determinism: edge cases", () => {
     ];
 
     const sorted = deterministicSort(agents);
-    expect(sorted.map(a => a.asset)).toEqual(["First", "Mid", "Last"]);
+    expect(sorted.map(a => a.asset)).toEqual(["First", "Last", "Mid"]);
   });
 
   it("bigint block_slot comparison doesn't overflow", () => {
