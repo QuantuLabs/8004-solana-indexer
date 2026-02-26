@@ -39,6 +39,7 @@ export interface EventContext {
   slot: bigint;
   blockTime: Date;
   txIndex?: number; // Transaction index within the block (captured as metadata/tie-break context)
+  eventOrdinal?: number; // Event index within parsed transaction events (deterministic intra-tx tie-break)
 }
 
 let pool: Pool | null = null;
@@ -250,7 +251,7 @@ export async function handleEvent(
  */
 export async function handleEventAtomic(
   event: ProgramEvent,
-  ctx: EventContext & { source?: "poller" | "websocket" }
+  ctx: EventContext & { source?: "poller" | "websocket" | "substreams" }
 ): Promise<void> {
   const db = getPool();
   const client = await db.connect();
@@ -419,8 +420,8 @@ async function handleAgentRegisteredTx(
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection);
   await client.query(
-    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      ON CONFLICT (asset) DO UPDATE SET
        owner = EXCLUDED.owner,
        creator = COALESCE(agents.creator, EXCLUDED.creator),
@@ -428,6 +429,7 @@ async function handleAgentRegisteredTx(
        atom_enabled = EXCLUDED.atom_enabled,
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
        updated_at = EXCLUDED.created_at`,
     [
       assetId,
@@ -443,6 +445,7 @@ async function handleAgentRegisteredTx(
       data.atomEnabled,
       ctx.slot.toString(),
       ctx.txIndex ?? null,
+      ctx.eventOrdinal ?? null,
       ctx.signature,
       ctx.blockTime.toISOString(),
       DEFAULT_STATUS,
@@ -637,15 +640,16 @@ async function handleMetadataSetTx(
   const id = `${assetId}:${keyHash}`;
   const compressedValue = await compressForStorage(stripNullBytes(data.value));
   await client.query(
-    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, updated_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, updated_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (id) DO UPDATE SET
        value = EXCLUDED.value,
        immutable = metadata.immutable OR EXCLUDED.immutable,
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
        updated_at = EXCLUDED.updated_at`,
-    [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+    [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, key: data.key }, "Metadata set");
 }
@@ -695,15 +699,15 @@ async function handleNewFeedbackTx(
     : null;
   const insertResult = await client.query(
     `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-       running_digest, is_revoked, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+       running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
      ON CONFLICT (id) DO NOTHING`,
     [
       id, assetId, clientAddress, data.feedbackIndex.toString(),
       data.value.toString(), data.valueDecimals, data.score,
       data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
       feedbackHash, runningDigest,
-      false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
+      false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
     ]
   );
   if (insertResult.rowCount === 0) {
@@ -803,8 +807,8 @@ async function handleFeedbackRevokedTx(
     : null;
   const revokeId = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
   await client.query(
-    `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
        feedback_hash = EXCLUDED.feedback_hash,
        slot = EXCLUDED.slot,
@@ -813,11 +817,13 @@ async function handleFeedbackRevokedTx(
        had_impact = EXCLUDED.had_impact,
        running_digest = EXCLUDED.running_digest,
        revoke_count = EXCLUDED.revoke_count,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
        tx_signature = EXCLUDED.tx_signature,
        status = EXCLUDED.status`,
     [revokeId, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
      data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
-     revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
+     revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
      isOrphan ? "ORPHANED" : DEFAULT_STATUS]
   );
 
@@ -879,12 +885,12 @@ async function handleResponseAppendedTx(
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
     await client.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash, responseRunningDigest, data.newResponseCount.toString(),
-       ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
+       ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
     return;
@@ -905,12 +911,12 @@ async function handleResponseAppendedTx(
   const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
 
   await client.query(
-    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (id) DO NOTHING`,
     [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
      responseHash, responseRunningDigest, data.newResponseCount.toString(),
-     ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
+     ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
   );
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
 }
@@ -924,15 +930,19 @@ async function handleValidationRequestedTx(
   const validatorAddress = data.validatorAddress.toBase58();
   const id = `${assetId}:${validatorAddress}:${data.nonce}`;
   await client.query(
-    `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, tx_signature, created_at, chain_status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, chain_status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (id) DO UPDATE SET
        requester = EXCLUDED.requester,
        request_uri = EXCLUDED.request_uri,
-       request_hash = EXCLUDED.request_hash`,
+       request_hash = EXCLUDED.request_hash,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature`,
     [id, assetId, validatorAddress, data.nonce.toString(), data.requester.toBase58(),
      data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-     "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+     "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, validator: validatorAddress, nonce: data.nonce }, "Validation requested");
 }
@@ -946,20 +956,24 @@ async function handleValidationRespondedTx(
   const validatorAddress = data.validatorAddress.toBase58();
   const id = `${assetId}:${validatorAddress}:${data.nonce}`;
   await client.query(
-    `INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, tx_signature, created_at, updated_at, chain_status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14)
+    `INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, chain_status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, $15)
      ON CONFLICT (id) DO UPDATE SET
        response = EXCLUDED.response,
        response_uri = EXCLUDED.response_uri,
        response_hash = EXCLUDED.response_hash,
        tag = EXCLUDED.tag,
        status = EXCLUDED.status,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature,
        updated_at = EXCLUDED.updated_at`,
     [id, assetId, validatorAddress, data.nonce.toString(), data.response,
      data.responseUri || null,
      data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
      data.tag || null, "RESPONDED",
-     ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+     ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, validator: validatorAddress, nonce: data.nonce, response: data.response }, "Validation responded");
 }
@@ -977,8 +991,8 @@ async function handleAgentRegistered(
 
   try {
     await db.query(
-      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (asset) DO UPDATE SET
          owner = EXCLUDED.owner,
          creator = COALESCE(agents.creator, EXCLUDED.creator),
@@ -986,6 +1000,7 @@ async function handleAgentRegistered(
          atom_enabled = EXCLUDED.atom_enabled,
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
          updated_at = EXCLUDED.created_at`,
       [
         assetId,
@@ -1001,6 +1016,7 @@ async function handleAgentRegistered(
         data.atomEnabled,
         ctx.slot.toString(),
         ctx.txIndex ?? null,
+        ctx.eventOrdinal ?? null,
         ctx.signature,
         ctx.blockTime.toISOString(),
       ]
@@ -1244,15 +1260,16 @@ async function handleMetadataSet(
     const compressedValue = await compressForStorage(stripNullBytes(data.value));
 
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
          immutable = metadata.immutable OR EXCLUDED.immutable,
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
          updated_at = EXCLUDED.updated_at`,
-      [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
   } catch (error: any) {
@@ -1317,15 +1334,15 @@ async function handleNewFeedback(
       : null;
     const insertResult = await db.query(
       `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
-         running_digest, is_revoked, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+         running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
        ON CONFLICT (id) DO NOTHING`,
       [
         id, assetId, clientAddress, data.feedbackIndex.toString(),
         data.value.toString(), data.valueDecimals, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         feedbackHash, runningDigest,
-        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
+        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
       ]
     );
 
@@ -1432,8 +1449,8 @@ async function handleFeedbackRevoked(
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
     await db.query(
-      `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
          feedback_hash = EXCLUDED.feedback_hash,
          slot = EXCLUDED.slot,
@@ -1442,11 +1459,13 @@ async function handleFeedbackRevoked(
          had_impact = EXCLUDED.had_impact,
          running_digest = EXCLUDED.running_digest,
          revoke_count = EXCLUDED.revoke_count,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
        data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
-       revokeDigest, data.newRevokeCount.toString(), ctx.signature, ctx.blockTime.toISOString(),
+       revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
        isOrphan ? "ORPHANED" : DEFAULT_STATUS]
     );
 
@@ -1516,12 +1535,12 @@ async function handleResponseAppended(
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
       await db.query(
-        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          ON CONFLICT (id) DO NOTHING`,
         [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
          responseHash, responseRunningDigest, data.newResponseCount.toString(),
-         ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
+         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
       );
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
       return;
@@ -1542,12 +1561,12 @@ async function handleResponseAppended(
     const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
 
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        ON CONFLICT (id) DO NOTHING`,
       [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash, responseRunningDigest, data.newResponseCount.toString(),
-       ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
+       ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
   } catch (error: any) {
@@ -1566,15 +1585,19 @@ async function handleValidationRequested(
 
   try {
     await db.query(
-      `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, tx_signature, created_at, chain_status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      `INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, chain_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (id) DO UPDATE SET
          requester = EXCLUDED.requester,
          request_uri = EXCLUDED.request_uri,
-         request_hash = EXCLUDED.request_hash`,
+         request_hash = EXCLUDED.request_hash,
+         block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature`,
       [id, assetId, validatorAddress, data.nonce.toString(), data.requester.toBase58(),
        data.requestUri || null, data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-       "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+       "PENDING", ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, validator: validatorAddress, nonce: data.nonce }, "Validation requested");
   } catch (error: any) {
@@ -1594,20 +1617,24 @@ async function handleValidationResponded(
   try {
     // Use UPSERT to handle case where request wasn't indexed (DB reset, late start, etc.)
     await db.query(
-      `INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, tx_signature, created_at, updated_at, chain_status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14)
+      `INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, chain_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, $15)
        ON CONFLICT (id) DO UPDATE SET
          response = EXCLUDED.response,
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
          tag = EXCLUDED.tag,
          status = EXCLUDED.status,
+         block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature,
          updated_at = EXCLUDED.updated_at`,
       [id, assetId, validatorAddress, data.nonce.toString(), data.response,
        data.responseUri || null,
        data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
        data.tag || null, "RESPONDED",
-       ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+       ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, validator: validatorAddress, nonce: data.nonce, response: data.response }, "Validation responded");
   } catch (error: any) {

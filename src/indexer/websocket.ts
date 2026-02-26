@@ -316,7 +316,7 @@ export class WebSocketIndexer {
 
       let allEventsProcessed = true;
 
-      for (const event of events) {
+      for (const [eventOrdinal, event] of events.entries()) {
         const typedEvent = toTypedEvent(event);
         if (!typedEvent) continue;
 
@@ -325,6 +325,7 @@ export class WebSocketIndexer {
           slot: BigInt(ctx.slot),
           blockTime,
           txIndex,
+          eventOrdinal,
         };
 
         let eventProcessed = true;

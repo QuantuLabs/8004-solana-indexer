@@ -156,8 +156,9 @@ export interface EventContext {
   signature: string;
   slot: bigint;
   blockTime: Date;
-  txIndex?: number; // Transaction index within the block (captured as metadata/tie-break context)
-  source?: "poller" | "websocket"; // Event source for cursor tracking
+  txIndex?: number; // Transaction index within the block (metadata / tertiary tie-breaker)
+  eventOrdinal?: number; // Event index within the transaction (deterministic intra-tx ordering)
+  source?: "poller" | "websocket" | "substreams"; // Event source for cursor tracking
 }
 
 /**
@@ -463,6 +464,8 @@ async function handleAgentRegisteredCore(
       atomEnabled: data.atomEnabled,
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: DEFAULT_STATUS,
     },
     update: {
@@ -471,6 +474,8 @@ async function handleAgentRegisteredCore(
       atomEnabled: data.atomEnabled,
       uri: agentUri,
       creator: data.owner.toBase58(),
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
 
@@ -1017,6 +1022,8 @@ async function handleMetadataSetTx(
       immutable: data.immutable,
       txSignature: ctx.signature,
       slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: DEFAULT_STATUS,
     },
     update: {
@@ -1024,6 +1031,8 @@ async function handleMetadataSetTx(
       immutable: data.immutable,
       txSignature: ctx.signature,
       slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
   logger.info({ assetId, key: data.key }, "Metadata set");
@@ -1069,6 +1078,8 @@ async function handleMetadataSet(
       immutable: data.immutable,
       txSignature: ctx.signature,
       slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: DEFAULT_STATUS,
     },
     update: {
@@ -1076,6 +1087,8 @@ async function handleMetadataSet(
       immutable: data.immutable,
       txSignature: ctx.signature,
       slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
 
@@ -1188,6 +1201,7 @@ async function handleNewFeedbackTx(
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: DEFAULT_STATUS,
     },
     update: {},
@@ -1273,6 +1287,7 @@ async function handleNewFeedback(
       createdTxSignature: ctx.signature,
       createdSlot: ctx.slot,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: DEFAULT_STATUS,
     },
     update: {},
@@ -1391,6 +1406,7 @@ async function handleFeedbackRevokedTx(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: revokeStatus,
     },
     update: {
@@ -1403,6 +1419,7 @@ async function handleFeedbackRevokedTx(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: revokeStatus,
     },
   });
@@ -1478,6 +1495,7 @@ async function handleFeedbackRevoked(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: revokeStatus,
     },
     update: {
@@ -1490,6 +1508,7 @@ async function handleFeedbackRevoked(
       revokeCount: data.newRevokeCount,
       txSignature: ctx.signature,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: revokeStatus,
     },
   });
@@ -1588,6 +1607,7 @@ async function handleResponseAppendedTx(
       txSignature: ctx.signature,
       slot: ctx.slot,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: responseStatus,
     },
     update: {},
@@ -1680,6 +1700,7 @@ async function handleResponseAppended(
       txSignature: ctx.signature,
       slot: ctx.slot,
       txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
       status: responseStatus,
     },
     update: {},
@@ -1711,6 +1732,8 @@ async function handleValidationRequestedTx(
       requestHash: normalizeHash(data.requestHash),
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
       chainStatus: DEFAULT_STATUS,
     },
     update: {
@@ -1719,6 +1742,8 @@ async function handleValidationRequestedTx(
       requestHash: normalizeHash(data.requestHash),
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
   logger.info({ assetId, validator: data.validatorAddress.toBase58(), nonce: data.nonce }, "Validation requested");
@@ -1748,6 +1773,8 @@ async function handleValidationRequested(
       requestHash: normalizeHash(data.requestHash),
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
       chainStatus: DEFAULT_STATUS,
     },
     update: {
@@ -1757,6 +1784,8 @@ async function handleValidationRequested(
       requestHash: normalizeHash(data.requestHash),
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
 
@@ -1793,6 +1822,8 @@ async function handleValidationRespondedTx(
       requestHash: null,
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
       response: data.response,
       responseUri: data.responseUri,
       responseHash: normalizeHash(data.responseHash),
@@ -1800,6 +1831,8 @@ async function handleValidationRespondedTx(
       respondedAt: ctx.blockTime,
       responseTxSignature: ctx.signature,
       responseSlot: ctx.slot,
+      responseTxIndex: ctx.txIndex ?? null,
+      responseEventOrdinal: ctx.eventOrdinal ?? null,
       chainStatus: DEFAULT_STATUS,
     },
     update: {
@@ -1810,6 +1843,8 @@ async function handleValidationRespondedTx(
       respondedAt: ctx.blockTime,
       responseTxSignature: ctx.signature,
       responseSlot: ctx.slot,
+      responseTxIndex: ctx.txIndex ?? null,
+      responseEventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
   logger.info({ assetId, validator: data.validatorAddress.toBase58(), nonce: data.nonce, response: data.response }, "Validation responded");
@@ -1839,6 +1874,8 @@ async function handleValidationResponded(
       requestHash: null,
       requestTxSignature: ctx.signature,
       requestSlot: ctx.slot,
+      requestTxIndex: ctx.txIndex ?? null,
+      requestEventOrdinal: ctx.eventOrdinal ?? null,
       response: data.response,
       responseUri: data.responseUri,
       responseHash: normalizeHash(data.responseHash),
@@ -1846,6 +1883,8 @@ async function handleValidationResponded(
       respondedAt: ctx.blockTime,
       responseTxSignature: ctx.signature,
       responseSlot: ctx.slot,
+      responseTxIndex: ctx.txIndex ?? null,
+      responseEventOrdinal: ctx.eventOrdinal ?? null,
       chainStatus: DEFAULT_STATUS,
     },
     update: {
@@ -1856,6 +1895,8 @@ async function handleValidationResponded(
       respondedAt: ctx.blockTime,
       responseTxSignature: ctx.signature,
       responseSlot: ctx.slot,
+      responseTxIndex: ctx.txIndex ?? null,
+      responseEventOrdinal: ctx.eventOrdinal ?? null,
     },
   });
 

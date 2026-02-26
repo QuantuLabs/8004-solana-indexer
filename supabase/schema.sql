@@ -118,6 +118,7 @@ CREATE TABLE agents (
   -- Chain reference --
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
+  event_ordinal INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -189,6 +190,8 @@ CREATE TABLE metadata (
   value BYTEA,  -- binary with compression prefix (0x00=raw, 0x01=zstd)
   immutable BOOLEAN DEFAULT FALSE,
   block_slot BIGINT NOT NULL,
+  tx_index INTEGER,
+  event_ordinal INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -227,7 +230,8 @@ CREATE TABLE feedbacks (
   is_revoked BOOLEAN DEFAULT FALSE,
   revoked_at TIMESTAMPTZ,
   block_slot BIGINT NOT NULL,
-  tx_index INTEGER,  -- for deterministic ordering
+  tx_index INTEGER,  -- metadata / tertiary tie-breaker for deterministic ordering
+  event_ordinal INTEGER, -- quaternary tie-breaker for deterministic intra-tx ordering
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   -- Verification status (reorg resilience) --
@@ -260,6 +264,7 @@ CREATE TABLE feedback_responses (
   response_count BIGINT NOT NULL DEFAULT 0,
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
+  event_ordinal INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   -- Verification status (reorg resilience) --
@@ -293,6 +298,7 @@ CREATE TABLE validations (
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RESPONDED')),
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
+  event_ordinal INTEGER,
   tx_signature TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -566,16 +572,25 @@ CREATE POLICY "Public read agent_digest_cache" ON agent_digest_cache FOR SELECT 
 
 -- =============================================
 -- DETERMINISTIC ORDERING INDEXES
--- Canonical replay/backfill order is (block_slot, tx_signature); tx_index is retained as auxiliary metadata.
+-- Canonical order uses:
+-- (block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, technical tie-breaker)
 -- =============================================
+
+-- Agent ordering: deterministic global-id/backfill key
+CREATE INDEX idx_agents_ordering_canonical
+ON agents(block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, asset);
 
 -- Feedback ordering: deterministic per client
 CREATE INDEX idx_feedbacks_deterministic_order
-ON feedbacks(asset, client_address, block_slot, tx_index NULLS LAST, tx_signature);
+ON feedbacks(asset, client_address, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
 
 -- Feedback ordering: global within agent
 CREATE INDEX idx_feedbacks_global_order
-ON feedbacks(asset, block_slot, tx_index NULLS LAST, tx_signature);
+ON feedbacks(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+
+-- Feedback response ordering: canonical replay/head resolution
+CREATE INDEX idx_feedback_responses_canonical_order
+ON feedback_responses(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
 
 -- Grant read access to metadata views
 GRANT SELECT ON metadata_decoded TO anon;

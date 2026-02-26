@@ -4,7 +4,7 @@
  * Tests run against LOCAL test validator with 8004 programs deployed.
  * Registers multiple agents (same block + cross-block), then validates:
  *   1. tx_index is resolved correctly via getBlock
- *   2. Agents are ordered by canonical key (block_slot, tx_signature, tx_index NULLS LAST)
+ *   2. Agents are ordered by composite key (block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST)
  *   3. global_id is assigned deterministically based on insertion order
  *   4. Re-ingesting produces the same ordering
  *   5. Orphaned agents do NOT receive a global_id
@@ -248,7 +248,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   // =========================================================================
 
   describe("2. Composite Key Ordering", () => {
-    it("should sort agents by canonical (block_slot, tx_signature) with tx_index tie-break", () => {
+    it("should sort agents by (block_slot, tx_signature, tx_index NULLS LAST)", () => {
       // Sort using the same logic as both indexers
       const sorted = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
@@ -272,7 +272,8 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       expect(sorted.map((a) => a.assetId)).toEqual(reSorted.map((a) => a.assetId));
     });
 
-    it("should produce identical sort for SQL/JS tx_index tie-break handling", () => {
+    it("should produce identical sort for SQL NULLS LAST and JS MAX_SAFE_INTEGER", () => {
+      // Simulate SQL ordering: signature first, then COALESCE(tx_index, 2147483647)
       const sqlSort = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
         const sigCmp = a.signature.localeCompare(b.signature);
@@ -293,6 +294,53 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       });
 
       expect(sqlSort.map((a) => a.assetId)).toEqual(jsSort.map((a) => a.assetId));
+    });
+
+    it("should use event_ordinal as deterministic intra-tx tie-breaker", () => {
+      const base = registeredAgents[0];
+      if (!base) return;
+
+      const sameTxEvents = [
+        {
+          assetId: "agent-event-2",
+          slot: base.slot,
+          signature: "sig-same",
+          txIndex: 4,
+          eventOrdinal: 2,
+        },
+        {
+          assetId: "agent-event-null",
+          slot: base.slot,
+          signature: "sig-same",
+          txIndex: 4,
+          eventOrdinal: null as number | null,
+        },
+        {
+          assetId: "agent-event-0",
+          slot: base.slot,
+          signature: "sig-same",
+          txIndex: 4,
+          eventOrdinal: 0,
+        },
+      ];
+
+      const sorted = [...sameTxEvents].sort((a, b) => {
+        if (a.slot !== b.slot) return a.slot - b.slot;
+        const sigCmp = a.signature.localeCompare(b.signature);
+        if (sigCmp !== 0) return sigCmp;
+        const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
+        if (txA !== txB) return txA - txB;
+        const eventA = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const eventB = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        return eventA - eventB;
+      });
+
+      expect(sorted.map((a) => a.assetId)).toEqual([
+        "agent-event-0",
+        "agent-event-2",
+        "agent-event-null",
+      ]);
     });
   });
 
@@ -528,8 +576,8 @@ describe("E2E: Localnet Deterministic Ordering", () => {
         },
         orderBy: [
           { createdSlot: "asc" },
-          { createdTxSignature: "asc" },
           { txIndex: "asc" },
+          { createdTxSignature: "asc" },
         ],
       });
 
@@ -583,8 +631,8 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       }
     }, 30000);
 
-    it("WebSocket path without tx_index should still sort canonically by signature", () => {
-      // Simulate WebSocket scenario: agent has no tx_index
+    it("WebSocket path without tx_index should use tx_index only as signature-level tie-breaker", () => {
+      // Simulate WebSocket scenario: same slot + same signature, but no tx_index
       const wsAgent = {
         ...registeredAgents[0],
         txIndex: null, // WebSocket doesn't resolve tx_index
@@ -601,11 +649,12 @@ describe("E2E: Localnet Deterministic Ordering", () => {
         return txA - txB;
       });
 
-      const sameSlotSignatures = sorted
-        .filter((a) => a.slot === wsAgent.slot)
-        .map((a) => a.signature);
-      const sortedSignatures = [...sameSlotSignatures].sort((a, b) => a.localeCompare(b));
-      expect(sameSlotSignatures).toEqual(sortedSignatures);
+      // For same slot + same signature, NULL tx_index should sort after concrete tx_index.
+      const tieGroup = sorted.filter(
+        (a) => a.slot === wsAgent.slot && a.signature === wsAgent.signature
+      );
+      const lastAgent = tieGroup[tieGroup.length - 1];
+      expect(lastAgent.txIndex).toBeNull();
     });
 
     it("WebSocket fallback should order multiple NULL tx_index by signature", () => {
@@ -657,7 +706,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   // =========================================================================
 
   describe("8. Feedback Deterministic Ordering", () => {
-    it("should order feedbacks by canonical (createdSlot, createdTxSignature) with txIndex tie-break", async () => {
+    it("should order feedbacks by (createdSlot, createdTxSignature, txIndex NULLS LAST)", async () => {
       const base = registeredAgents[0];
       if (!base) return;
 
@@ -673,20 +722,20 @@ describe("E2E: Localnet Deterministic Ordering", () => {
         {
           feedbackIndex: BigInt(`${seed}1`),
           createdSlot: BigInt(base.slot),
-          txIndex: 1,
-          createdTxSignature: "sig-b-middle",
+          txIndex: 0,
+          createdTxSignature: "sig-z-low-index",
         },
         {
           feedbackIndex: BigInt(`${seed}2`),
           createdSlot: BigInt(base.slot),
-          txIndex: null,
-          createdTxSignature: "sig-z-null-last",
+          txIndex: 5,
+          createdTxSignature: "sig-a-high-index",
         },
         {
           feedbackIndex: BigInt(`${seed}3`),
           createdSlot: BigInt(base.slot),
-          txIndex: 0,
-          createdTxSignature: "sig-a-first",
+          txIndex: null,
+          createdTxSignature: "sig-b-null-index",
         },
         {
           feedbackIndex: BigInt(`${seed}4`),

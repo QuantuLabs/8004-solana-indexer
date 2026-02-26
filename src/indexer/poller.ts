@@ -728,7 +728,7 @@ export class Poller {
       "Parsed transaction"
     );
 
-    for (const event of parsed.events) {
+    for (const [eventOrdinal, event] of parsed.events.entries()) {
       const typedEvent = toTypedEvent(event);
       if (!typedEvent) continue;
 
@@ -739,6 +739,7 @@ export class Poller {
           ? new Date(sig.blockTime * 1000)
           : new Date(),
         txIndex,
+        eventOrdinal,
       };
 
       await handleEventAtomic(this.prisma, typedEvent, ctx);
@@ -791,7 +792,7 @@ export class Poller {
       "Parsed transaction (batch mode)"
     );
 
-    for (const event of parsed.events) {
+    for (const [eventOrdinal, event] of parsed.events.entries()) {
       const typedEvent = toTypedEvent(event);
       if (!typedEvent) continue;
 
@@ -802,6 +803,7 @@ export class Poller {
           ? new Date(sig.blockTime * 1000)
           : new Date(),
         txIndex,
+        eventOrdinal,
       };
 
       // Add to event buffer instead of direct DB write

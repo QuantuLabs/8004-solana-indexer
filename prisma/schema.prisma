@@ -39,13 +39,12 @@ model Agent {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  // Sequential registration number (auto-assigned by DB trigger in PostgreSQL)
-  globalId   BigInt?
-
   // Transaction reference
   createdTxSignature String?
   createdSlot        BigInt?
-  txIndex            Int?
+  txIndex            Int?     // Transaction index within block (deterministic ordering)
+  eventOrdinal       Int?     // Event index within transaction (deterministic intra-tx ordering)
+  globalId           BigInt?  // Sequential registration ID (auto-assigned, permanent)
 
   // Verification status (reorg resilience)
   status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
@@ -115,6 +114,8 @@ model AgentMetadata {
   // Transaction reference
   txSignature String?
   slot        BigInt?
+  txIndex     Int?
+  eventOrdinal Int?
 
   // Verification status (reorg resilience)
   status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
@@ -146,6 +147,7 @@ model Feedback {
   createdTxSignature String?
   createdSlot        BigInt?
   txIndex            Int?
+  eventOrdinal       Int?
   revokedTxSignature String?
   revokedSlot        BigInt?
   status             String   @default("PENDING")
@@ -175,6 +177,7 @@ model FeedbackResponse {
   txSignature   String?
   slot          BigInt?
   txIndex       Int?
+  eventOrdinal  Int?
   status        String   @default("PENDING")
   verifiedAt    DateTime?
 
@@ -201,6 +204,7 @@ model Revocation {
   revokeCount   BigInt
   txSignature   String?
   txIndex       Int?
+  eventOrdinal  Int?
   createdAt     DateTime @default(now())
   status        String   @default("PENDING")
   verifiedAt    DateTime?
@@ -247,8 +251,12 @@ model Validation {
   // Transaction references
   requestTxSignature  String?
   requestSlot         BigInt?
+  requestTxIndex      Int?
+  requestEventOrdinal Int?
   responseTxSignature String?
   responseSlot        BigInt?
+  responseTxIndex     Int?
+  responseEventOrdinal Int?
 
   // Verification status (reorg resilience - existence verified)
   // Named chainStatus to avoid conflict with existing validation status field

@@ -58,6 +58,7 @@ export interface BatchEvent {
     slot: bigint;
     blockTime: Date;
     txIndex?: number;
+    eventOrdinal?: number;
   };
 }
 
@@ -486,8 +487,8 @@ export class EventBuffer {
     const collection = data.collection?.toBase58?.() || data.collection;
 
     await client.query(`
-      INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PENDING')
+      INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'PENDING')
       ON CONFLICT (asset) DO UPDATE SET
         owner = EXCLUDED.owner,
         creator = COALESCE(agents.creator, EXCLUDED.creator),
@@ -495,7 +496,8 @@ export class EventBuffer {
         atom_enabled = EXCLUDED.atom_enabled,
         block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
-        updated_at = $16
+        event_ordinal = EXCLUDED.event_ordinal,
+        updated_at = $17
     `, [
         asset,
         owner,
@@ -510,6 +512,7 @@ export class EventBuffer {
         data.atomEnabled || false,
         ctx.slot.toString(),
         ctx.txIndex ?? null,
+        ctx.eventOrdinal ?? null,
         ctx.signature,
         ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
@@ -530,14 +533,14 @@ export class EventBuffer {
       : null;
 
     const insertResult = await client.query(`
-      INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'PENDING')
+      INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'PENDING')
       ON CONFLICT (id) DO NOTHING
     `, [id, asset, client_addr, feedbackIndex.toString(),
         data.value?.toString() || "0", data.valueDecimals || 0, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null,
         data.feedbackUri || null, feedbackHash, runningDigest,
-        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]);
+        false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
 
     if (insertResult.rowCount === 0) return;
 
@@ -606,8 +609,8 @@ export class EventBuffer {
       : null;
 
     await client.query(`
-      INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
         feedback_hash = EXCLUDED.feedback_hash,
         slot = EXCLUDED.slot,
@@ -616,13 +619,15 @@ export class EventBuffer {
         had_impact = EXCLUDED.had_impact,
         running_digest = EXCLUDED.running_digest,
         revoke_count = EXCLUDED.revoke_count,
+        tx_index = EXCLUDED.tx_index,
+        event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
         status = EXCLUDED.status
     `, [id, asset, client_addr, feedbackIndex.toString(), revokeSealHash,
         (data.slot || ctx.slot).toString(), data.originalScore ?? null,
         data.atomEnabled || false, data.hadImpact || false,
         revokeDigest, (data.newRevokeCount || 0).toString(),
-        ctx.signature, ctx.blockTime.toISOString(),
+        ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
         isOrphan ? "ORPHANED" : "PENDING"]);
 
     // Re-aggregate agent stats
@@ -668,12 +673,12 @@ export class EventBuffer {
       : null;
 
     await client.query(`
-      INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PENDING')
+      INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'PENDING')
       ON CONFLICT (id) DO NOTHING
     `, [id, asset, client_addr, feedbackIndex.toString(), responder,
         data.responseUri || "", responseHash, responseRunningDigest, responseCount.toString(),
-        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]);
+        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   private async insertValidationRequestSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
@@ -684,12 +689,19 @@ export class EventBuffer {
     const id = `${asset}:${validator}:${nonce}`;
 
     await client.query(`
-      INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING')
-      ON CONFLICT (id) DO NOTHING
+      INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
+      ON CONFLICT (id) DO UPDATE SET
+        requester = EXCLUDED.requester,
+        request_uri = EXCLUDED.request_uri,
+        request_hash = EXCLUDED.request_hash,
+        block_slot = EXCLUDED.block_slot,
+        tx_index = EXCLUDED.tx_index,
+        event_ordinal = EXCLUDED.event_ordinal,
+        tx_signature = EXCLUDED.tx_signature
     `, [id, asset, validator, nonce.toString(), requester, data.requestUri || "",
         data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
-        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]);
+        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   private async updateValidationResponseSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
@@ -700,19 +712,23 @@ export class EventBuffer {
 
     // Use UPSERT to handle case where request wasn't indexed (DB reset, late start, etc.)
     await client.query(`
-      INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, tx_signature, created_at, updated_at, chain_status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, 'PENDING')
+      INSERT INTO validations (id, asset, validator_address, nonce, response, response_uri, response_hash, tag, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, chain_status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, 'PENDING')
       ON CONFLICT (id) DO UPDATE SET
         response = EXCLUDED.response,
         response_uri = EXCLUDED.response_uri,
         response_hash = EXCLUDED.response_hash,
         tag = EXCLUDED.tag,
         status = EXCLUDED.status,
+        block_slot = EXCLUDED.block_slot,
+        tx_index = EXCLUDED.tx_index,
+        event_ordinal = EXCLUDED.event_ordinal,
+        tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
     `, [id, asset, validator, nonce.toString(), data.response || 0, data.responseUri || "",
         data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
         data.tag || "", "RESPONDED",
-        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString()]);
+        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   // v0.6.0: RegistryInitialized replaces BaseRegistryCreated/UserRegistryCreated
@@ -849,16 +865,18 @@ export class EventBuffer {
     const id = `${asset}:${keyHash}`;
 
     await client.query(`
-      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING')
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING')
       ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
         immutable = metadata.immutable OR EXCLUDED.immutable,
         block_slot = EXCLUDED.block_slot,
-        updated_at = $11
+        tx_index = EXCLUDED.tx_index,
+        event_ordinal = EXCLUDED.event_ordinal,
+        updated_at = $12
       WHERE NOT metadata.immutable
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
-        ctx.slot.toString(), ctx.txIndex ?? null, ctx.signature, ctx.blockTime.toISOString(),
+        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
   }
 

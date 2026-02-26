@@ -2,13 +2,9 @@
 -- 8004 Agent Registry - Reintroduce Global Agent ID
 -- Migration: 2026-02-26
 -- =============================================
--- Previous approach (materialized view + ROW_NUMBER) was removed because
--- new agents with earlier slots shifted all subsequent IDs.
---
 -- New approach: PostgreSQL sequence + BEFORE INSERT trigger.
 -- - ID is permanent once assigned (no shifting)
 -- - Gaps are acceptable (orphaned agents keep their ID slot)
--- - Re-indexing from scratch re-assigns in insertion order (acceptable trade-off)
 -- =============================================
 
 -- Add global_id column to agents table
@@ -17,11 +13,15 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS global_id BIGINT;
 -- Create sequence for global IDs
 CREATE SEQUENCE IF NOT EXISTS agent_global_id_seq START 1;
 
--- Backfill existing agents in deterministic order
--- Canonical ordering is (slot, tx_signature); tx_index is only a tertiary tie-break metadata field.
+-- Backfill existing agents in deterministic order:
+--   1) block_slot
+--   2) tx_signature
+--   3) tx_index NULLS LAST
+--   4) event_ordinal NULLS LAST
+--   5) asset (technical tie-breaker)
 WITH ordered_agents AS (
   SELECT asset, ROW_NUMBER() OVER (
-    ORDER BY block_slot, tx_signature, tx_index NULLS LAST, asset
+    ORDER BY block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, asset
   ) AS rn
   FROM agents
   WHERE status != 'ORPHANED'
