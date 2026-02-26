@@ -13,7 +13,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: quantulabs/8004-indexer-classic
+  IMAGE_NAME: ${{ github.repository_owner }}/8004-indexer-classic
 
 jobs:
   build-and-push:
@@ -53,6 +53,8 @@ jobs:
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
           build-args: |
@@ -68,5 +70,5 @@ jobs:
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
-          name: classic-image-digest
+          name: image-digest
           path: artifacts/image.digest
