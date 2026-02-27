@@ -141,7 +141,7 @@ export class BatchRpcFetcher {
       // Use getParsedTransactions (plural) for batch fetching
       const transactions = await this.connection.getParsedTransactions(
         signatures,
-        { maxSupportedTransactionVersion: 0 }
+        { maxSupportedTransactionVersion: config.maxSupportedTransactionVersion }
       );
 
       for (let i = 0; i < signatures.length; i++) {
@@ -157,7 +157,7 @@ export class BatchRpcFetcher {
       for (const sig of signatures) {
         try {
           const tx = await this.connection.getParsedTransaction(sig, {
-            maxSupportedTransactionVersion: 0
+            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion
           });
           if (tx) {
             results.set(sig, tx);

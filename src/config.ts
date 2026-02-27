@@ -120,6 +120,17 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+  if (!value || value.trim() === "") {
+    return fallback;
+  }
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 /**
  * Runtime configuration (populated at startup from on-chain data via SDK)
  */
@@ -150,6 +161,11 @@ export const config = {
   // Solana RPC (works with any provider)
   rpcUrl: process.env.RPC_URL || defaultRpcUrlForNetwork(resolvedSolanaNetwork),
   wsUrl: process.env.WS_URL || defaultWsUrlForNetwork(resolvedSolanaNetwork),
+  // Highest Solana transaction version accepted by RPC parsers.
+  maxSupportedTransactionVersion: parseNonNegativeInt(
+    process.env.MAX_SUPPORTED_TRANSACTION_VERSION,
+    0
+  ),
 
   // Program ID from SDK (source of truth)
   programId: resolvedProgramId,
@@ -255,5 +271,9 @@ export function validateConfig(): void {
 
   if (config.graphqlStatsCacheTtlMs < 1000 || config.graphqlStatsCacheTtlMs > 3600000) {
     throw new Error("GRAPHQL_STATS_CACHE_TTL_MS must be between 1000 and 3600000");
+  }
+
+  if (config.maxSupportedTransactionVersion < 0) {
+    throw new Error("MAX_SUPPORTED_TRANSACTION_VERSION must be >= 0");
   }
 }

@@ -3,11 +3,12 @@ import {
   PublicKey,
   Logs,
   Context,
+  ParsedTransactionWithMeta,
 } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
 import PQueue from "p-queue";
 import { config } from "../config.js";
-import { parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
+import { parseTransaction, parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
 import { handleEventAtomic, EventContext } from "../db/handlers.js";
 import { saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
@@ -291,7 +292,38 @@ export class WebSocketIndexer {
     const startTime = Date.now();
 
     try {
-      const events = parseTransactionLogs(logs.logs);
+      const logEvents = parseTransactionLogs(logs.logs);
+      let events = logEvents;
+      let parsedTx: ParsedTransactionWithMeta | null = null;
+      const shouldEnrichIdentityLocks = logEvents.some(
+        (event) =>
+          (event.name === "CollectionPointerSet" || event.name === "ParentAssetSet") &&
+          typeof event.data.lock !== "boolean"
+      );
+
+      if (shouldEnrichIdentityLocks) {
+        try {
+          parsedTx = await this.connection.getParsedTransaction(logs.signature, {
+            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+          });
+
+          if (parsedTx) {
+            const parsed = parseTransaction(parsedTx);
+            if (parsed?.events.length) {
+              events = parsed.events;
+            }
+          }
+        } catch (txFetchError) {
+          logger.debug(
+            {
+              signature: logs.signature,
+              error: txFetchError instanceof Error ? txFetchError.message : String(txFetchError),
+            },
+            "Failed to fetch parsed transaction for identity lock enrichment (non-fatal)"
+          );
+        }
+      }
+
       if (events.length === 0) return;
 
       logger.debug(
@@ -299,14 +331,17 @@ export class WebSocketIndexer {
         "Received logs"
       );
 
-      // Approximate block time for WebSocket events
-      const blockTime = new Date();
+      // Prefer confirmed blockTime from parsed transaction when available.
+      const blockTime =
+        parsedTx?.blockTime !== null && parsedTx?.blockTime !== undefined
+          ? new Date(parsedTx.blockTime * 1000)
+          : new Date();
 
       // Resolve tx_index from block for metadata/tie-break parity with other indexers
       let txIndex: number | undefined;
       try {
         const block = await this.connection.getBlock(ctx.slot, {
-          maxSupportedTransactionVersion: 0,
+          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
           transactionDetails: "full",
         });
         if (block?.transactions) {

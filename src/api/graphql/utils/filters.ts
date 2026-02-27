@@ -9,6 +9,8 @@ interface FilterConfig {
 const AGENT_FILTERS: FilterConfig[] = [
   { graphqlField: 'id', dbColumn: 'asset', operator: 'eq' },
   { graphqlField: 'id_in', dbColumn: 'asset', operator: 'in' },
+  { graphqlField: 'agentId', dbColumn: 'agent_id', operator: 'eq' },
+  { graphqlField: 'agentid', dbColumn: 'agent_id', operator: 'eq' },
   { graphqlField: 'owner', dbColumn: 'owner', operator: 'eq' },
   { graphqlField: 'owner_in', dbColumn: 'owner', operator: 'in' },
   { graphqlField: 'creator', dbColumn: 'creator', operator: 'eq' },

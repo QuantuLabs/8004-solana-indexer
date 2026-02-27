@@ -366,7 +366,7 @@ export class Poller {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         const block = await this.connection.getBlock(slot, {
-          maxSupportedTransactionVersion: 0,
+          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
           transactionDetails: "full",
         });
 
@@ -708,7 +708,7 @@ export class Poller {
 
   private async processTransaction(sig: ConfirmedSignatureInfo, txIndex?: number): Promise<void> {
     const tx = await this.connection.getParsedTransaction(sig.signature, {
-      maxSupportedTransactionVersion: 0,
+      maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
     });
 
     if (!tx) {
@@ -771,7 +771,7 @@ export class Poller {
       // Fallback to individual fetch if not in cache
       logger.debug({ signature: sig.signature }, "Transaction not in batch cache, fetching individually");
       tx = await this.connection.getParsedTransaction(sig.signature, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
       }) ?? undefined;
     }
 

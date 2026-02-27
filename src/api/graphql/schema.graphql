@@ -46,6 +46,10 @@ enum HashChainType {
 input AgentFilter {
   id: ID
   id_in: [ID!]
+  # Sequential DB registration id from agents.agent_id.
+  agentId: BigInt
+  # Legacy alias for agentId.
+  agentid: BigInt
   owner: String
   owner_in: [String!]
   creator: String

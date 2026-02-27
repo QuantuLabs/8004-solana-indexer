@@ -76,9 +76,11 @@ Notes:
 
 - GraphQL requires `DB_MODE=supabase` (recommended `API_MODE=graphql`).
 - REST v1 requires `DB_MODE=local` (Prisma; recommended `API_MODE=rest`).
+- Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
-- If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples).
+- `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
+- If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
 

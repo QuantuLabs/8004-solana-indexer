@@ -53,6 +53,7 @@ import {
   WebSocketIndexer,
   testWebSocketConnection,
 } from "../../../src/indexer/websocket.js";
+import * as decoder from "../../../src/parser/decoder.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
   createMockConnection,
@@ -354,6 +355,105 @@ describe("WebSocketIndexer Coverage", () => {
   });
 
   describe("handleLogs - event processing failures", () => {
+    it("should enrich identity lock hints via parsed transaction when available", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const parseLogsSpy = vi.spyOn(decoder, "parseTransactionLogs").mockReturnValue([
+        {
+          name: "CollectionPointerSet",
+          data: {
+            asset: TEST_ASSET.toBase58(),
+            set_by: TEST_OWNER.toBase58(),
+            col: "c1:test",
+          },
+        },
+      ]);
+      const parseTxSpy = vi.spyOn(decoder, "parseTransaction").mockReturnValue({
+        signature: TEST_SIGNATURE,
+        slot: Number(TEST_SLOT),
+        blockTime: null,
+        events: [
+          {
+            name: "CollectionPointerSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+              col: "c1:test",
+              lock: false,
+            },
+          },
+        ],
+      });
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        blockTime: null,
+      });
+      vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs: ["Program log: mock"] },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith(
+        TEST_SIGNATURE,
+        { maxSupportedTransactionVersion: 0 }
+      );
+      expect(handleEventAtomic).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          type: "CollectionPointerSet",
+          data: expect.objectContaining({ lock: false }),
+        }),
+        expect.any(Object)
+      );
+
+      parseLogsSpy.mockRestore();
+      parseTxSpy.mockRestore();
+    });
+
+    it("should preserve lock fallback when parsed transaction fetch fails", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const parseLogsSpy = vi.spyOn(decoder, "parseTransactionLogs").mockReturnValue([
+        {
+          name: "ParentAssetSet",
+          data: {
+            asset: TEST_ASSET.toBase58(),
+            parent_asset: TEST_COLLECTION.toBase58(),
+            parent_creator: TEST_OWNER.toBase58(),
+            set_by: TEST_OWNER.toBase58(),
+            lock: true,
+          },
+        },
+      ]);
+      const parseTxSpy = vi.spyOn(decoder, "parseTransaction").mockReturnValue(null);
+      (mockConnection.getParsedTransaction as any).mockRejectedValue(new Error("rpc timeout"));
+      vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs: ["Program log: Instruction: set_parent_asset"] },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(handleEventAtomic).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          type: "ParentAssetSet",
+          data: expect.objectContaining({ lock: true }),
+        }),
+        expect.any(Object)
+      );
+
+      parseLogsSpy.mockRestore();
+      parseTxSpy.mockRestore();
+    });
+
     it("should not advance cursor when event processing fails", async () => {
       createIndexer();
       await wsIndexer.start();

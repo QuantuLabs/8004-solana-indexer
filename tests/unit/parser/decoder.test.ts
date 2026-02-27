@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PublicKey } from "@solana/web3.js";
+import bs58 from "bs58";
 import {
   parseTransactionLogs,
   parseTransaction,
   toTypedEvent,
   idl,
+  coder,
   eventParser,
   IDL_VERSION,
   IDL_PROGRAM_ID,
@@ -175,7 +177,7 @@ describe("Parser Decoder", () => {
       spy.mockRestore();
     });
 
-    it("should derive collection lock=false from set_collection_pointer_with_options logs", () => {
+    it("should not derive lock from instruction log strings alone", () => {
       const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
         return (function* () {
           yield {
@@ -198,12 +200,12 @@ describe("Parser Decoder", () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe("CollectionPointerSet");
-      expect(result[0].data.lock).toBe(false);
+      expect(result[0].data.lock).toBeUndefined();
 
       spy.mockRestore();
     });
 
-    it("should derive parent lock=true from set_parent_asset logs", () => {
+    it("should infer lock=true from default parent instruction logs", () => {
       const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
         return (function* () {
           yield {
@@ -228,44 +230,6 @@ describe("Parser Decoder", () => {
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe("ParentAssetSet");
       expect(result[0].data.lock).toBe(true);
-
-      spy.mockRestore();
-    });
-
-    it("should derive lock hints from CamelCase instruction logs", () => {
-      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
-        return (function* () {
-          yield {
-            name: "CollectionPointerSet",
-            data: {
-              asset: TEST_ASSET.toBase58(),
-              set_by: TEST_OWNER.toBase58(),
-              col: "c1:test",
-            },
-          } as any;
-          yield {
-            name: "ParentAssetSet",
-            data: {
-              asset: TEST_ASSET.toBase58(),
-              parent_asset: TEST_COLLECTION.toBase58(),
-              parent_creator: TEST_OWNER.toBase58(),
-              set_by: TEST_OWNER.toBase58(),
-            },
-          } as any;
-        })();
-      });
-
-      const logs = [
-        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
-        "Program log: Instruction: SetCollectionPointer",
-        "Program log: Instruction: SetParentAssetWithOptions",
-        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
-      ];
-      const result = parseTransactionLogs(logs);
-
-      expect(result).toHaveLength(2);
-      expect(result[0].data.lock).toBe(true);
-      expect(result[1].data.lock).toBe(false);
 
       spy.mockRestore();
     });
@@ -319,6 +283,80 @@ describe("Parser Decoder", () => {
       expect(result!.slot).toBe(Number(TEST_SLOT));
       expect(result!.events.length).toBe(1);
       expect(result!.events[0].name).toBe("AgentRegistered");
+    });
+
+    it("should extract collection lock from decoded instruction data when available", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "CollectionPointerSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+              col: "c1:test",
+            },
+          } as any;
+        })();
+      });
+
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ]) as any;
+      const encodedIx = coder.instruction.encode("set_collection_pointer_with_options", {
+        col: "c1:test",
+        lock: false,
+      });
+      tx.transaction.message.instructions = [{
+        programId: TEST_PROGRAM_ID,
+        accounts: [],
+        data: bs58.encode(encodedIx),
+      }];
+
+      const result = parseTransaction(tx);
+      expect(result).not.toBeNull();
+      expect(result!.events).toHaveLength(1);
+      expect(result!.events[0].name).toBe("CollectionPointerSet");
+      expect(result!.events[0].data.lock).toBe(false);
+
+      spy.mockRestore();
+    });
+
+    it("should extract parent lock from decoded instruction data for default instruction", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "ParentAssetSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              parent_asset: TEST_COLLECTION.toBase58(),
+              parent_creator: TEST_OWNER.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+            },
+          } as any;
+        })();
+      });
+
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ]) as any;
+      const encodedIx = coder.instruction.encode("set_parent_asset", {
+        parent_asset: TEST_COLLECTION,
+      });
+      tx.transaction.message.instructions = [{
+        programId: TEST_PROGRAM_ID,
+        accounts: [],
+        data: bs58.encode(encodedIx),
+      }];
+
+      const result = parseTransaction(tx);
+      expect(result).not.toBeNull();
+      expect(result!.events).toHaveLength(1);
+      expect(result!.events[0].name).toBe("ParentAssetSet");
+      expect(result!.events[0].data.lock).toBe(true);
+
+      spy.mockRestore();
     });
 
     it("should handle transaction with null blockTime", () => {

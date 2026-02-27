@@ -140,6 +140,18 @@ describe('Filter Builder', () => {
     expect(result.params).toEqual(['myAssetPubkey']);
   });
 
+  it('maps agentId filter to sequential DB agent_id column', () => {
+    const result = buildWhereClause('agent', { agentId: 42n });
+    expect(result.sql).toContain('agent_id = $1');
+    expect(result.params).toEqual([42n]);
+  });
+
+  it('maps legacy agentid filter alias to sequential DB agent_id column', () => {
+    const result = buildWhereClause('agent', { agentid: 7n });
+    expect(result.sql).toContain('agent_id = $1');
+    expect(result.params).toEqual([7n]);
+  });
+
   it('accepts raw agent ID in feedback filter', () => {
     const result = buildWhereClause('feedback', { agent: 'myAssetPubkey' });
     expect(result.sql).toContain('asset = $1');

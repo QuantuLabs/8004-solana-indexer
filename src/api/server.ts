@@ -779,6 +779,48 @@ export function createApiServer(options: ApiServerOptions): Express {
         setContentRange(res, offset, feedbacks.length, totalCount);
       }
 
+      const revokedFeedbacks = feedbacks.filter((feedback) => feedback.revoked);
+      const revokedAtByFeedbackKey = new Map<string, Date>();
+      const revocationModel = (prisma as unknown as {
+        revocation?: {
+          findMany?: (args: unknown) => Promise<Array<{
+            agentId: string;
+            client: string;
+            feedbackIndex: bigint;
+            createdAt: Date;
+          }>>;
+        };
+      }).revocation;
+
+      if (
+        revokedFeedbacks.length > 0 &&
+        revocationModel &&
+        typeof revocationModel.findMany === 'function'
+      ) {
+        const revocations = await revocationModel.findMany({
+          where: {
+            OR: revokedFeedbacks.map((feedback) => ({
+              agentId: feedback.agentId,
+              client: feedback.client,
+              feedbackIndex: feedback.feedbackIndex,
+            })),
+          },
+          select: {
+            agentId: true,
+            client: true,
+            feedbackIndex: true,
+            createdAt: true,
+          },
+        });
+
+        for (const revocation of revocations) {
+          revokedAtByFeedbackKey.set(
+            `${revocation.agentId}:${revocation.client}:${revocation.feedbackIndex.toString()}`,
+            revocation.createdAt
+          );
+        }
+      }
+
       // Map to SDK expected format
       // Note: feedback_index as String to preserve BigInt precision (> 2^53)
       const mapped = feedbacks.map(f => ({
@@ -796,7 +838,9 @@ export function createApiServer(options: ApiServerOptions): Express {
         feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
         running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
         is_revoked: f.revoked,
-        revoked_at: null, // TODO: add revokedAt tracking
+        revoked_at: (
+          revokedAtByFeedbackKey.get(`${f.agentId}:${f.client}:${f.feedbackIndex.toString()}`) ?? null
+        )?.toISOString() ?? null,
         status: f.status,
         verified_at: f.verifiedAt?.toISOString() || null,
         block_slot: Number(f.createdSlot || 0),

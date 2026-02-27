@@ -80,11 +80,11 @@ export interface TransactionEvents {
 }
 
 interface IdentityLockHints {
-  collection: boolean[];
-  parent: boolean[];
+  collection: Array<boolean | undefined>;
+  parent: Array<boolean | undefined>;
 }
 
-function extractIdentityLockHintsFromLogs(logs: string[]): IdentityLockHints {
+function extractIdentityLockHintsFromLogs(logs: readonly string[]): IdentityLockHints {
   const hints: IdentityLockHints = {
     collection: [],
     parent: [],
@@ -94,36 +94,148 @@ function extractIdentityLockHintsFromLogs(logs: string[]): IdentityLockHints {
     const normalized = line.toLowerCase();
     if (!normalized.includes("instruction:")) continue;
 
-    const isCollectionWithOptions =
+    if (
       normalized.includes("set_collection_pointer_with_options") ||
-      normalized.includes("setcollectionpointerwithoptions");
-    const isCollectionDefault =
-      normalized.includes("set_collection_pointer") ||
-      normalized.includes("setcollectionpointer");
-    const isParentWithOptions =
-      normalized.includes("set_parent_asset_with_options") ||
-      normalized.includes("setparentassetwithoptions");
-    const isParentDefault =
-      normalized.includes("set_parent_asset") ||
-      normalized.includes("setparentasset");
-
-    if (isCollectionWithOptions) {
-      // SDK path uses *_with_options for lock=false.
-      hints.collection.push(false);
+      normalized.includes("setcollectionpointerwithoptions")
+    ) {
+      // lock flag is not encoded in the log line itself.
+      hints.collection.push(undefined);
       continue;
     }
-    if (isCollectionDefault) {
+    if (
+      normalized.includes("set_collection_pointer") ||
+      normalized.includes("setcollectionpointer")
+    ) {
       hints.collection.push(true);
       continue;
     }
-    if (isParentWithOptions) {
-      // SDK path uses *_with_options for lock=false.
-      hints.parent.push(false);
+
+    if (
+      normalized.includes("set_parent_asset_with_options") ||
+      normalized.includes("setparentassetwithoptions")
+    ) {
+      // lock flag is not encoded in the log line itself.
+      hints.parent.push(undefined);
       continue;
     }
-    if (isParentDefault) {
+    if (
+      normalized.includes("set_parent_asset") ||
+      normalized.includes("setparentasset")
+    ) {
       hints.parent.push(true);
     }
+  }
+
+  return hints;
+}
+
+function getInstructionProgramId(instruction: unknown): string | null {
+  if (!instruction || typeof instruction !== "object") return null;
+  const programId = (instruction as { programId?: unknown }).programId;
+  if (programId instanceof PublicKey) {
+    return programId.toBase58();
+  }
+  if (typeof programId === "string") {
+    return programId;
+  }
+  return null;
+}
+
+function getInstructionData(instruction: unknown): string | null {
+  if (!instruction || typeof instruction !== "object") return null;
+  const data = (instruction as { data?: unknown }).data;
+  return typeof data === "string" && data.length > 0 ? data : null;
+}
+
+function decodeIdentityLockInstruction(data: string): { kind: "collection" | "parent"; lock: boolean } | null {
+  let decodedInstruction: { name: string; data: Record<string, unknown> } | null = null;
+  try {
+    decodedInstruction = coder.instruction.decode(data, "base58") as {
+      name: string;
+      data: Record<string, unknown>;
+    } | null;
+  } catch {
+    return null;
+  }
+
+  if (!decodedInstruction) return null;
+
+  const instructionName = decodedInstruction.name.replace(/_/g, "").toLowerCase();
+  if (instructionName === "setcollectionpointer") {
+    return { kind: "collection", lock: true };
+  }
+  if (instructionName === "setparentasset") {
+    return { kind: "parent", lock: true };
+  }
+
+  const lock = decodedInstruction.data?.lock;
+  if (typeof lock !== "boolean") return null;
+
+  if (instructionName === "setcollectionpointerwithoptions") {
+    return { kind: "collection", lock };
+  }
+  if (instructionName === "setparentassetwithoptions") {
+    return { kind: "parent", lock };
+  }
+
+  return null;
+}
+
+function collectInstructionsInExecutionOrder(tx: ParsedTransactionWithMeta): unknown[] {
+  const orderedInstructions: unknown[] = [];
+  const message = (tx.transaction as { message?: unknown } | undefined)?.message;
+  const outerInstructions = (
+    message &&
+    typeof message === "object" &&
+    Array.isArray((message as { instructions?: unknown }).instructions)
+      ? (message as { instructions: unknown[] }).instructions
+      : []
+  );
+  const innerByOuterIndex = new Map<number, unknown[]>();
+  const innerInstructions = tx.meta?.innerInstructions ?? [];
+
+  for (const inner of innerInstructions) {
+    const innerIndex = (inner as { index?: unknown }).index;
+    const instructions = (inner as { instructions?: unknown }).instructions;
+    if (typeof innerIndex !== "number" || !Array.isArray(instructions)) {
+      continue;
+    }
+    innerByOuterIndex.set(innerIndex, instructions);
+  }
+
+  for (const [outerIndex, outer] of outerInstructions.entries()) {
+    orderedInstructions.push(outer);
+    const inner = innerByOuterIndex.get(outerIndex);
+    if (inner) {
+      orderedInstructions.push(...inner);
+    }
+  }
+
+  return orderedInstructions;
+}
+
+function extractIdentityLockHintsFromTransaction(tx: ParsedTransactionWithMeta): IdentityLockHints {
+  const hints: IdentityLockHints = {
+    collection: [],
+    parent: [],
+  };
+
+  for (const instruction of collectInstructionsInExecutionOrder(tx)) {
+    if (getInstructionProgramId(instruction) !== config.programId) {
+      continue;
+    }
+
+    const data = getInstructionData(instruction);
+    if (!data) continue;
+
+    const decoded = decodeIdentityLockInstruction(data);
+    if (!decoded) continue;
+
+    if (decoded.kind === "collection") {
+      hints.collection.push(decoded.lock);
+      continue;
+    }
+    hints.parent.push(decoded.lock);
   }
 
   return hints;
@@ -139,7 +251,7 @@ function applyIdentityLockHints(
   for (const event of events) {
     if (event.name === "CollectionPointerSet") {
       const lock = hints.collection[collectionIdx];
-      if (typeof lock === "boolean") {
+      if (typeof event.data.lock !== "boolean" && typeof lock === "boolean") {
         event.data.lock = lock;
       }
       collectionIdx += 1;
@@ -147,7 +259,7 @@ function applyIdentityLockHints(
     }
     if (event.name === "ParentAssetSet") {
       const lock = hints.parent[parentIdx];
-      if (typeof lock === "boolean") {
+      if (typeof event.data.lock !== "boolean" && typeof lock === "boolean") {
         event.data.lock = lock;
       }
       parentIdx += 1;
@@ -160,7 +272,7 @@ function applyIdentityLockHints(
  */
 export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
   const events: ParsedEvent[] = [];
-  const lockHints = extractIdentityLockHintsFromLogs(logs);
+  const logHints = extractIdentityLockHintsFromLogs(logs);
 
   try {
     const generator = eventParser.parseLogs(logs);
@@ -174,7 +286,7 @@ export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
     logger.debug({ error }, "Failed to parse some logs");
   }
 
-  applyIdentityLockHints(events, lockHints);
+  applyIdentityLockHints(events, logHints);
 
   return events;
 }
@@ -194,6 +306,9 @@ export function parseTransaction(
   if (events.length === 0) {
     return null;
   }
+
+  const lockHints = extractIdentityLockHintsFromTransaction(tx);
+  applyIdentityLockHints(events, lockHints);
 
   return {
     signature: tx.transaction.signatures[0],
