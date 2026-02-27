@@ -1501,6 +1501,249 @@ export class DataVerifier {
         [status, verifiedAt.toISOString(), ids]
       );
     }
+
+    if (table === 'revocations' && status !== 'ORPHANED') {
+      await this.backfillRevocationIds(ids);
+    }
+    if (table === 'feedback_responses' && status !== 'ORPHANED') {
+      await this.backfillResponseIds(ids);
+    }
+  }
+
+  private async backfillResponseIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+
+    if (this.prisma) {
+      const pending = await this.prisma.feedbackResponse.findMany({
+        where: {
+          id: { in: ids },
+          status: { not: 'ORPHANED' },
+          responseId: null,
+        },
+        select: {
+          id: true,
+          feedbackId: true,
+          responseCount: true,
+          slot: true,
+          txSignature: true,
+          txIndex: true,
+          eventOrdinal: true,
+        },
+      });
+      if (pending.length === 0) return;
+
+      pending.sort((a, b) => {
+        if (a.feedbackId !== b.feedbackId) return a.feedbackId.localeCompare(b.feedbackId);
+
+        const aResponseCount = a.responseCount ?? BigInt("9223372036854775807");
+        const bResponseCount = b.responseCount ?? BigInt("9223372036854775807");
+        if (aResponseCount !== bResponseCount) return aResponseCount < bResponseCount ? -1 : 1;
+
+        const aSlot = a.slot ?? BigInt("9223372036854775807");
+        const bSlot = b.slot ?? BigInt("9223372036854775807");
+        if (aSlot !== bSlot) return aSlot < bSlot ? -1 : 1;
+
+        const aSig = a.txSignature ?? "";
+        const bSig = b.txSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
+
+        const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
+        if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
+
+        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        return a.id.localeCompare(b.id);
+      });
+
+      const nextByFeedback = new Map<string, bigint>();
+      for (const row of pending) {
+        const scope = row.feedbackId;
+        let next = nextByFeedback.get(scope);
+        if (next === undefined) {
+          const last = await this.prisma.feedbackResponse.findFirst({
+            where: {
+              feedbackId: row.feedbackId,
+              responseId: { not: null },
+            },
+            select: { responseId: true },
+            orderBy: { responseId: 'desc' },
+          });
+          next = (last?.responseId ?? 0n) + 1n;
+        }
+
+        await this.prisma.feedbackResponse.updateMany({
+          where: {
+            id: row.id,
+            status: { not: 'ORPHANED' },
+            responseId: null,
+          },
+          data: { responseId: next },
+        });
+        nextByFeedback.set(scope, next + 1n);
+      }
+      return;
+    }
+
+    if (this.pool) {
+      const { rows } = await this.pool.query<{
+        id: string;
+        asset: string;
+        client_address: string;
+        feedback_index: string;
+      }>(
+        `SELECT id, asset, client_address, feedback_index::text AS feedback_index
+         FROM feedback_responses
+         WHERE id = ANY($1::text[])
+           AND status != 'ORPHANED'
+           AND response_id IS NULL
+         ORDER BY asset ASC, client_address ASC, feedback_index ASC,
+                  response_count ASC NULLS LAST, block_slot ASC NULLS LAST, tx_signature ASC,
+                  tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, id ASC`,
+        [ids]
+      );
+      if (rows.length === 0) return;
+
+      const nextByScope = new Map<string, bigint>();
+      for (const row of rows) {
+        const scope = `${row.asset}:${row.client_address}:${row.feedback_index}`;
+        let next = nextByScope.get(scope);
+        if (next === undefined) {
+          const maxRes = await this.pool.query<{ max_id: string | null }>(
+            `SELECT MAX(response_id)::text AS max_id
+             FROM feedback_responses
+             WHERE asset = $1
+               AND client_address = $2
+               AND feedback_index = $3
+               AND response_id IS NOT NULL`,
+            [row.asset, row.client_address, row.feedback_index]
+          );
+          const maxId = maxRes.rows[0]?.max_id ? BigInt(maxRes.rows[0].max_id) : 0n;
+          next = maxId + 1n;
+        }
+
+        await this.pool.query(
+          `UPDATE feedback_responses
+           SET response_id = $1::bigint
+           WHERE id = $2
+             AND status != 'ORPHANED'
+             AND response_id IS NULL`,
+          [next.toString(), row.id]
+        );
+        nextByScope.set(scope, next + 1n);
+      }
+    }
+  }
+
+  private async backfillRevocationIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+
+    if (this.prisma) {
+      const pending = await this.prisma.revocation.findMany({
+        where: {
+          id: { in: ids },
+          status: { not: 'ORPHANED' },
+          revocationId: null,
+        },
+        select: {
+          id: true,
+          agentId: true,
+          revokeCount: true,
+          slot: true,
+          txSignature: true,
+          txIndex: true,
+          eventOrdinal: true,
+        },
+      });
+      if (pending.length === 0) return;
+
+      pending.sort((a, b) => {
+        if (a.agentId !== b.agentId) return a.agentId.localeCompare(b.agentId);
+
+        if (a.revokeCount !== b.revokeCount) return a.revokeCount < b.revokeCount ? -1 : 1;
+
+        if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
+
+        const aSig = a.txSignature ?? "";
+        const bSig = b.txSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
+
+        const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
+        if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
+
+        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        return a.id.localeCompare(b.id);
+      });
+
+      const nextByAgent = new Map<string, bigint>();
+      for (const row of pending) {
+        let next = nextByAgent.get(row.agentId);
+        if (next === undefined) {
+          const last = await this.prisma.revocation.findFirst({
+            where: { agentId: row.agentId, revocationId: { not: null } },
+            select: { revocationId: true },
+            orderBy: { revocationId: 'desc' },
+          });
+          next = (last?.revocationId ?? 0n) + 1n;
+        }
+
+        await this.prisma.revocation.updateMany({
+          where: {
+            id: row.id,
+            status: { not: 'ORPHANED' },
+            revocationId: null,
+          },
+          data: { revocationId: next },
+        });
+        nextByAgent.set(row.agentId, next + 1n);
+      }
+      return;
+    }
+
+    if (this.pool) {
+      const { rows } = await this.pool.query<{ id: string; asset: string }>(
+        `SELECT id, asset
+         FROM revocations
+         WHERE id = ANY($1::text[])
+           AND status != 'ORPHANED'
+           AND revocation_id IS NULL
+         ORDER BY asset ASC, revoke_count ASC, block_slot ASC, tx_signature ASC,
+                  tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, id ASC`,
+        [ids]
+      );
+      if (rows.length === 0) return;
+
+      const nextByAgent = new Map<string, bigint>();
+      for (const row of rows) {
+        let next = nextByAgent.get(row.asset);
+        if (next === undefined) {
+          const maxRes = await this.pool.query<{ max_id: string | null }>(
+            `SELECT MAX(revocation_id)::text AS max_id
+             FROM revocations
+             WHERE asset = $1 AND revocation_id IS NOT NULL`,
+            [row.asset]
+          );
+          const maxId = maxRes.rows[0]?.max_id ? BigInt(maxRes.rows[0].max_id) : 0n;
+          next = maxId + 1n;
+        }
+
+        await this.pool.query(
+          `UPDATE revocations
+           SET revocation_id = $1::bigint
+           WHERE id = $2
+             AND status != 'ORPHANED'
+             AND revocation_id IS NULL`,
+          [next.toString(), row.id]
+        );
+        nextByAgent.set(row.asset, next + 1n);
+      }
+    }
   }
 
   /**

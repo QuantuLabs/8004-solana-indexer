@@ -1484,6 +1484,173 @@ describe("DataVerifier", () => {
       expect(mockPrisma.feedback.updateMany).not.toHaveBeenCalled();
       await verifier.stop();
     });
+
+    it("backfills missing response_id when feedback responses become non-orphaned (prisma path)", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedbackResponse.findMany.mockResolvedValueOnce([
+        {
+          id: "resp-1",
+          feedbackId: "fb-1",
+          responseCount: 1n,
+          slot: 10n,
+          txSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValueOnce({ responseId: 9n });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedback_responses",
+        "id",
+        ["resp-1"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedbackResponse.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "resp-1" }),
+          data: { responseId: 10n },
+        })
+      );
+    });
+
+    it("assigns response_id in canonical on-chain order, not UUID order (prisma path)", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedbackResponse.findMany.mockResolvedValueOnce([
+        {
+          id: "uuid-z",
+          feedbackId: "fb-ordered",
+          responseCount: 2n,
+          slot: 11n,
+          txSignature: "sig-b",
+          txIndex: 1,
+          eventOrdinal: 0,
+        },
+        {
+          id: "uuid-a",
+          feedbackId: "fb-ordered",
+          responseCount: 1n,
+          slot: 10n,
+          txSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValueOnce({ responseId: 7n });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedback_responses",
+        "id",
+        ["uuid-z", "uuid-a"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedbackResponse.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "uuid-a" }),
+          data: { responseId: 8n },
+        })
+      );
+      expect(mockPrisma.feedbackResponse.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "uuid-z" }),
+          data: { responseId: 9n },
+        })
+      );
+    });
+
+    it("backfills missing response_id when feedback responses become non-orphaned (pool path)", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      const assigned: string[] = [];
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("UPDATE feedback_responses SET status")) return { rows: [], rowCount: 1 };
+        if (sql.includes("SELECT id, asset, client_address, feedback_index::text AS feedback_index")) {
+          return {
+            rows: [
+              {
+                id: "resp-2",
+                asset: AGENT_KEY.toBase58(),
+                client_address: VALIDATOR_KEY.toBase58(),
+                feedback_index: "7",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes("SELECT MAX(response_id)::text AS max_id")) {
+          return { rows: [{ max_id: "4" }], rowCount: 1 };
+        }
+        if (sql.includes("UPDATE feedback_responses") && sql.includes("SET response_id")) {
+          assigned.push(params[0]);
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedback_responses",
+        "id",
+        ["resp-2"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(assigned).toEqual(["5"]);
+    });
+
+    it("assigns revocation_id in canonical on-chain order, not UUID order (prisma path)", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.revocation.findMany.mockResolvedValueOnce([
+        {
+          id: "rev-z",
+          agentId: AGENT_KEY.toBase58(),
+          revokeCount: 4n,
+          slot: 22n,
+          txSignature: "sig-z",
+          txIndex: 1,
+          eventOrdinal: 0,
+        },
+        {
+          id: "rev-a",
+          agentId: AGENT_KEY.toBase58(),
+          revokeCount: 3n,
+          slot: 21n,
+          txSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.revocation.findFirst.mockResolvedValueOnce({ revocationId: 12n });
+
+      await (verifier as any).batchUpdateStatus(
+        "revocations",
+        "id",
+        ["rev-z", "rev-a"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.revocation.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "rev-a" }),
+          data: { revocationId: 13n },
+        })
+      );
+      expect(mockPrisma.revocation.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "rev-z" }),
+          data: { revocationId: 14n },
+        })
+      );
+    });
   });
 
   describe("digest cache", () => {
