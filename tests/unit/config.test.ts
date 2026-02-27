@@ -35,6 +35,8 @@ describe("Config", () => {
       delete process.env.PROGRAM_ID;
       delete process.env.SOLANA_NETWORK;
       delete process.env.GRAPHQL_STATS_CACHE_TTL_MS;
+      delete process.env.IPFS_GATEWAY_BASE;
+      delete process.env.URI_DIGEST_TRUSTED_HOSTS;
 
       const { config } = await import("../../src/config.js");
 
@@ -52,6 +54,8 @@ describe("Config", () => {
       expect(config.logLevel).toBe("info");
       expect(config.apiMode).toBe("both");
       expect(config.graphqlStatsCacheTtlMs).toBe(60000);
+      expect(config.ipfsGatewayBase).toBe("https://ipfs.io");
+      expect(config.uriDigestTrustedHosts).toEqual([]);
     });
 
     it("should use custom env values when set", async () => {
@@ -66,6 +70,8 @@ describe("Config", () => {
       process.env.LOG_LEVEL = "debug";
       process.env.API_MODE = "rest";
       process.env.GRAPHQL_STATS_CACHE_TTL_MS = "45000";
+      process.env.IPFS_GATEWAY_BASE = "https://gateway.example.com/";
+      process.env.URI_DIGEST_TRUSTED_HOSTS = " localhost,127.0.0.1 ";
 
       const { config } = await import("../../src/config.js");
 
@@ -82,6 +88,8 @@ describe("Config", () => {
       expect(config.logLevel).toBe("debug");
       expect(config.apiMode).toBe("rest");
       expect(config.graphqlStatsCacheTtlMs).toBe(45000);
+      expect(config.ipfsGatewayBase).toBe("https://gateway.example.com");
+      expect(config.uriDigestTrustedHosts).toEqual(["localhost", "127.0.0.1"]);
     });
 
     it("should support websocket mode", async () => {
@@ -180,6 +188,22 @@ describe("Config", () => {
 
       await expect(import("../../src/config.js")).rejects.toThrow(
         /Invalid SOLANA_NETWORK 'mainnet'/
+      );
+    });
+
+    it("should throw when IPFS_GATEWAY_BASE is invalid", async () => {
+      process.env.IPFS_GATEWAY_BASE = "not-a-url";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid IPFS_GATEWAY_BASE/
+      );
+    });
+
+    it("should throw when URI_DIGEST_TRUSTED_HOSTS contains non-local hosts", async () => {
+      process.env.URI_DIGEST_TRUSTED_HOSTS = "example.com";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid URI_DIGEST_TRUSTED_HOSTS entry/
       );
     });
   });

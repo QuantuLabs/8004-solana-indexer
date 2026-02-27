@@ -84,6 +84,8 @@ Notes:
 - If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
+- `IPFS_GATEWAY_BASE` sets the gateway base used for `ipfs://` URI digest fetches and canonical collection pointer (`c1:<cid>`) fetches (default `https://ipfs.io`).
+- `URI_DIGEST_TRUSTED_HOSTS` is optional and only accepts `localhost`/`127.0.0.1` to allow local IPFS gateway tests without disabling SSRF protections globally.
 - Validation module is archived on-chain in v0.5.0+; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
 - Validation API surface remains archived/deprecated: REST `/rest/v1/validations` returns `410`, and GraphQL `validation`/`validations` return `null`/`[]` for backward compatibility.
 

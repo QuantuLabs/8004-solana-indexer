@@ -6,6 +6,7 @@ vi.mock("../../../src/config.js", () => ({
   config: {
     metadataMaxBytes: 1024,
     metadataTimeoutMs: 25,
+    ipfsGatewayBase: "https://ipfs.io",
   },
 }));
 
@@ -92,6 +93,40 @@ describe("collectionDigest", () => {
       socialX: "@collection",
       socialDiscord: "https://discord.gg/collection",
     });
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://ipfs.io/ipfs/bafy123",
+      expect.any(Object)
+    );
+  });
+
+  it("uses configured IPFS gateway base for canonical pointers", async () => {
+    vi.resetModules();
+    vi.doMock("../../../src/config.js", () => ({
+      config: {
+        metadataMaxBytes: 1024,
+        metadataTimeoutMs: 25,
+        ipfsGatewayBase: "http://127.0.0.1:8080",
+      },
+    }));
+    vi.doMock("../../../src/logger.js", () => ({
+      createChildLogger: () => ({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: mockWarn,
+        error: vi.fn(),
+      }),
+    }));
+    const { digestCollectionPointerDoc: digestWithCustomGateway } = await import("../../../src/indexer/collectionDigest.js");
+
+    const fetchSpy = vi.fn().mockResolvedValue(mockStreamResponse(JSON.stringify({ name: "Local Collection" })));
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    await digestWithCustomGateway("c1:bafy123");
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080/ipfs/bafy123",
+      expect.any(Object)
+    );
   });
 
   it("returns invalid_json when payload is not valid JSON", async () => {

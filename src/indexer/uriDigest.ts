@@ -286,6 +286,41 @@ const BLOCKED_HOSTS = new Set([
   "metadata.google.internal",
   "169.254.169.254", // AWS/GCP metadata
 ]);
+const ALWAYS_TRUSTED_HOSTS = new Set(["ipfs.io", "arweave.net"]);
+const LOCALHOST_TRUST_OVERRIDE_ALLOWLIST = new Set(["localhost", "127.0.0.1"]);
+
+function getConfiguredIpfsGatewayHost(): string | null {
+  try {
+    return new URL(config.ipfsGatewayBase).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+const configuredIpfsGatewayHost = getConfiguredIpfsGatewayHost();
+const trustedLocalOverrideHosts = new Set(
+  (config.uriDigestTrustedHosts ?? [])
+    .map((host) => host.toLowerCase())
+    .filter((host) => LOCALHOST_TRUST_OVERRIDE_ALLOWLIST.has(host))
+);
+
+function shouldAllowTrustedLocalHostForUri(uri: string, hostname: string): boolean {
+  if (!configuredIpfsGatewayHost || configuredIpfsGatewayHost !== hostname.toLowerCase()) {
+    return false;
+  }
+  if (!trustedLocalOverrideHosts.has(hostname.toLowerCase())) {
+    return false;
+  }
+  return uri.startsWith("ipfs://") || uri.startsWith("/ipfs/");
+}
+
+function isTrustedHost(hostname: string, allowTrustedLocalHostOverride: boolean): boolean {
+  const normalized = hostname.toLowerCase();
+  if (ALWAYS_TRUSTED_HOSTS.has(normalized)) {
+    return true;
+  }
+  return allowTrustedLocalHostOverride && trustedLocalOverrideHosts.has(normalized);
+}
 
 // IPv4 private ranges (dotted-decimal only - normalization handles other forms)
 const PRIVATE_IPV4_RANGES = [
@@ -533,11 +568,13 @@ function isPrivateIP(ip: string): boolean {
  * Returns the first valid public IP for pinning, or null if blocked
  * Prevents DNS rebinding attacks by returning the resolved IP to use for fetch
  */
-async function validateHostResolution(hostname: string): Promise<{ ip: string; family: number } | null> {
+async function validateHostResolution(
+  hostname: string,
+  allowTrustedLocalHostOverride: boolean
+): Promise<{ ip: string; family: number } | null> {
   try {
-    // Skip validation and pinning for known safe gateways
-    // These are trusted CDNs that handle their own security
-    if (hostname === "ipfs.io" || hostname === "arweave.net") {
+    // Skip validation and pinning for known safe gateways and explicit local test overrides.
+    if (isTrustedHost(hostname, allowTrustedLocalHostOverride)) {
       return { ip: hostname, family: 0 }; // family 0 = use hostname directly
     }
 
@@ -608,7 +645,11 @@ const MAX_REDIRECT_DEPTH = 3;
  * @param redirectDepth - Current redirect depth (internal use)
  * @returns Digest result with status, fields, and metadata
  */
-export async function digestUri(uri: string, redirectDepth: number = 0): Promise<UriDigestResult> {
+export async function digestUri(
+  uri: string,
+  redirectDepth: number = 0,
+  allowTrustedLocalHostOverride: boolean = false
+): Promise<UriDigestResult> {
   if (!uri) {
     return { status: "error", error: "Empty URI" };
   }
@@ -626,9 +667,11 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
 
   // SSRF protection: block private/internal hosts
   let url: URL;
+  let effectiveAllowTrustedLocalHostOverride = allowTrustedLocalHostOverride;
   try {
     url = new URL(fetchUrl);
-    if (isBlockedHost(url.hostname)) {
+    effectiveAllowTrustedLocalHostOverride ||= shouldAllowTrustedLocalHostForUri(uri, url.hostname);
+    if (isBlockedHost(url.hostname) && !isTrustedHost(url.hostname, effectiveAllowTrustedLocalHostOverride)) {
       logger.warn({ uri, hostname: url.hostname }, "Blocked SSRF attempt");
       return { status: "blocked", error: "Internal host blocked" };
     }
@@ -637,7 +680,7 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
   }
 
   // DNS resolution check to prevent rebinding attacks - returns pinned IP
-  const resolved = await validateHostResolution(url.hostname);
+  const resolved = await validateHostResolution(url.hostname, effectiveAllowTrustedLocalHostOverride);
   if (!resolved) {
     return { status: "blocked", error: "DNS resolved to private IP" };
   }
@@ -673,7 +716,7 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
     // Post-connect SSRF validation for HTTPS (can't IP-pin due to TLS/SNI)
     // Re-resolve DNS and validate the connected IP hasn't rebounded to a private address
     if (isHttps && resolved.family !== 0) {
-      const recheck = await validateHostResolution(url.hostname);
+      const recheck = await validateHostResolution(url.hostname, effectiveAllowTrustedLocalHostOverride);
       if (!recheck) {
         return { status: "blocked", error: "DNS rebinding detected on HTTPS" };
       }
@@ -687,17 +730,24 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
       }
       try {
         const redirectUrl = new URL(location, fetchUrl);
-        if (isBlockedHost(redirectUrl.hostname)) {
+        if (isBlockedHost(redirectUrl.hostname) && !isTrustedHost(redirectUrl.hostname, effectiveAllowTrustedLocalHostOverride)) {
           logger.warn({ uri, redirectTo: redirectUrl.hostname }, "Blocked redirect to internal host");
           return { status: "blocked", error: "Redirect to internal host blocked" };
         }
         // Validate redirect target DNS
-        const redirectDnsValid = await validateHostResolution(redirectUrl.hostname);
+        const redirectDnsValid = await validateHostResolution(
+          redirectUrl.hostname,
+          effectiveAllowTrustedLocalHostOverride
+        );
         if (!redirectDnsValid) {
           return { status: "blocked", error: "Redirect DNS resolved to private IP" };
         }
         // Follow the redirect with same safety checks (increment depth)
-        return digestUri(redirectUrl.toString(), redirectDepth + 1);
+        return digestUri(
+          redirectUrl.toString(),
+          redirectDepth + 1,
+          effectiveAllowTrustedLocalHostOverride
+        );
       } catch {
         return { status: "error", error: "Invalid redirect URL" };
       }
@@ -811,16 +861,22 @@ export async function digestUri(uri: string, redirectDepth: number = 0): Promise
 /**
  * Convert various URI formats to fetchable URLs
  */
+export function buildIpfsGatewayUrl(ipfsPath: string): string {
+  const base = (config.ipfsGatewayBase || "https://ipfs.io").replace(/\/+$/, "");
+  const normalizedPath = ipfsPath.startsWith("/") ? ipfsPath : `/${ipfsPath}`;
+  return `${base}${normalizedPath}`;
+}
+
 function convertToFetchUrl(uri: string): string | null {
   // IPFS URI
   if (uri.startsWith("ipfs://")) {
     const cid = uri.slice(7);
-    return `https://ipfs.io/ipfs/${cid}`;
+    return buildIpfsGatewayUrl(`/ipfs/${cid}`);
   }
 
   // IPFS path
   if (uri.startsWith("/ipfs/")) {
-    return `https://ipfs.io${uri}`;
+    return buildIpfsGatewayUrl(uri);
   }
 
   // Arweave

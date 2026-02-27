@@ -12,6 +12,8 @@ vi.mock("../../src/config.js", () => ({
     metadataIndexMode: "normal",
     metadataMaxBytes: 262144, // 256KB
     metadataTimeoutMs: 5000,
+    ipfsGatewayBase: "https://ipfs.io",
+    uriDigestTrustedHosts: [],
   },
 }));
 
@@ -215,6 +217,8 @@ describe("URI Digest Module", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
     });
@@ -227,6 +231,8 @@ describe("URI Digest Module", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
 
@@ -277,6 +283,8 @@ describe("URI Digest Module", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
 

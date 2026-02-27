@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
-import { sanitizeText, sanitizeUrl } from "./uriDigest.js";
+import { buildIpfsGatewayUrl, sanitizeText, sanitizeUrl } from "./uriDigest.js";
 
 const logger = createChildLogger("collection-digest");
 
@@ -40,7 +40,7 @@ function parseCollectionPointerToFetchUrl(pointer: string): string | null {
     return null;
   }
 
-  return `https://ipfs.io/ipfs/${cidPath}`;
+  return buildIpfsGatewayUrl(`/ipfs/${cidPath}`);
 }
 
 function sanitizeOptionalText(value: unknown, maxLen: number): string | null {

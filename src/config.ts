@@ -15,6 +15,8 @@ const VALID_API_MODES: ApiMode[] = ["graphql", "rest", "both"];
 const VALID_INDEXER_MODES: IndexerMode[] = ["auto", "polling", "websocket"];
 const VALID_METADATA_MODES: MetadataIndexMode[] = ["off", "normal", "full"];
 const VALID_SOLANA_NETWORKS: SolanaNetwork[] = ["devnet", "mainnet-beta", "testnet", "localnet"];
+const DEFAULT_IPFS_GATEWAY_BASE = "https://ipfs.io";
+const TRUSTED_LOCAL_URI_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
 function parseSolanaNetwork(value: string | undefined): SolanaNetwork {
   const network = (value || "devnet").trim().toLowerCase();
@@ -55,6 +57,8 @@ function defaultWsUrlForNetwork(network: SolanaNetwork): string {
 }
 
 const resolvedSolanaNetwork = parseSolanaNetwork(process.env.SOLANA_NETWORK);
+const resolvedIpfsGatewayBase = parseIpfsGatewayBase(process.env.IPFS_GATEWAY_BASE);
+const resolvedUriDigestTrustedHosts = parseUriDigestTrustedHosts(process.env.URI_DIGEST_TRUSTED_HOSTS);
 
 function parseDbMode(value: string | undefined): DbMode {
   const mode = value || "local";
@@ -129,6 +133,54 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
     return fallback;
   }
   return parsed;
+}
+
+function parseIpfsGatewayBase(value: string | undefined): string {
+  const raw = (value || DEFAULT_IPFS_GATEWAY_BASE).trim();
+  if (!raw) {
+    return DEFAULT_IPFS_GATEWAY_BASE;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid IPFS_GATEWAY_BASE '${raw}'. Must be an absolute http(s) URL.`);
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`Invalid IPFS_GATEWAY_BASE protocol '${parsed.protocol}'. Must be http or https.`);
+  }
+
+  parsed.hash = "";
+  parsed.search = "";
+
+  const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+  const basePath = normalizedPath === "/" ? "" : normalizedPath;
+  return `${parsed.protocol}//${parsed.host}${basePath}`;
+}
+
+function parseUriDigestTrustedHosts(value: string | undefined): string[] {
+  if (!value || value.trim() === "") {
+    return [];
+  }
+
+  const hosts = value
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+
+  const uniqueHosts = new Set<string>();
+  for (const host of hosts) {
+    if (!TRUSTED_LOCAL_URI_HOSTS.has(host)) {
+      throw new Error(
+        `Invalid URI_DIGEST_TRUSTED_HOSTS entry '${host}'. Only localhost and 127.0.0.1 are allowed.`
+      );
+    }
+    uniqueHosts.add(host);
+  }
+
+  return Array.from(uniqueHosts);
 }
 
 /**
@@ -210,6 +262,10 @@ export const config = {
   metadataMaxValueBytes: parseInt(process.env.METADATA_MAX_VALUE_BYTES || "10000", 10), // 10KB
   // Fixed timeout for URI fetch (security: no user-configurable timeout)
   metadataTimeoutMs: 5000,
+  // Base URL for resolving ipfs:// and /ipfs/* metadata documents
+  ipfsGatewayBase: resolvedIpfsGatewayBase,
+  // Local-only URI host overrides (localhost/127.0.0.1) for test gateways
+  uriDigestTrustedHosts: resolvedUriDigestTrustedHosts,
 
   // Verification config (reorg resilience)
   // Enable/disable background verification worker

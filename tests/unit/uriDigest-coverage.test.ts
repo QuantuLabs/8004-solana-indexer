@@ -17,6 +17,8 @@ vi.mock("../../src/config.js", () => ({
     metadataMaxBytes: 262144,
     metadataMaxValueBytes: 10000,
     metadataTimeoutMs: 5000,
+    ipfsGatewayBase: "https://ipfs.io",
+    uriDigestTrustedHosts: [],
   },
 }));
 
@@ -474,6 +476,8 @@ describe("URI Digest Coverage", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
       vi.doMock("../../src/logger.js", () => ({
@@ -499,6 +503,8 @@ describe("URI Digest Coverage", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
       vi.doMock("../../src/logger.js", () => ({
@@ -528,6 +534,8 @@ describe("URI Digest Coverage", () => {
           metadataIndexMode: "full",
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://ipfs.io",
+          uriDigestTrustedHosts: [],
         },
       }));
       vi.doMock("../../src/logger.js", () => ({
@@ -560,6 +568,76 @@ describe("URI Digest Coverage", () => {
         "https://ipfs.io/ipfs/QmTest123",
         expect.any(Object)
       );
+    });
+
+    it("should use configured IPFS gateway base for ipfs:// URI", async () => {
+      vi.resetModules();
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "normal",
+          metadataMaxBytes: 262144,
+          metadataMaxValueBytes: 10000,
+          metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "https://gateway.example",
+          uriDigestTrustedHosts: [],
+        },
+      }));
+      const { digestUri: digestUriCustomGateway } = await import("../../src/indexer/uriDigest.js");
+
+      global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Gateway" }));
+      await digestUriCustomGateway("ipfs://QmCustomGateway");
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        "https://gateway.example/ipfs/QmCustomGateway",
+        expect.any(Object)
+      );
+    });
+
+    it("should block local IPFS gateway host without trusted override", async () => {
+      vi.resetModules();
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "normal",
+          metadataMaxBytes: 262144,
+          metadataMaxValueBytes: 10000,
+          metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "http://127.0.0.1:8080",
+          uriDigestTrustedHosts: [],
+        },
+      }));
+      const { digestUri: digestUriCustomGateway } = await import("../../src/indexer/uriDigest.js");
+
+      global.fetch = vi.fn();
+      const result = await digestUriCustomGateway("ipfs://QmLocalBlocked");
+
+      expect(result.status).toBe("blocked");
+      expect(result.error).toBe("Internal host blocked");
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("should allow trusted local IPFS gateway host override", async () => {
+      vi.resetModules();
+      vi.doMock("../../src/config.js", () => ({
+        config: {
+          metadataIndexMode: "normal",
+          metadataMaxBytes: 262144,
+          metadataMaxValueBytes: 10000,
+          metadataTimeoutMs: 5000,
+          ipfsGatewayBase: "http://127.0.0.1:8080",
+          uriDigestTrustedHosts: ["127.0.0.1"],
+        },
+      }));
+      const { digestUri: digestUriCustomGateway } = await import("../../src/indexer/uriDigest.js");
+
+      global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Local Gateway" }));
+      const result = await digestUriCustomGateway("ipfs://QmLocalAllowed");
+
+      expect(result.status).toBe("ok");
+      expect(global.fetch).toHaveBeenCalledWith(
+        "http://127.0.0.1:8080/ipfs/QmLocalAllowed",
+        expect.any(Object)
+      );
+      expect(mockLookup).not.toHaveBeenCalled();
     });
 
     it("should reject HTTP URI by default", async () => {
