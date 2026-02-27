@@ -15,17 +15,20 @@ import {
 
 describe('GraphQL ID encoding/decoding', () => {
   describe('Agent IDs', () => {
-    it('encodes agent ID with sol prefix', () => {
-      expect(encodeAgentId('8xKzAbcDef')).toBe('sol:8xKzAbcDef');
+    it('encodes agent ID as raw asset', () => {
+      expect(encodeAgentId('8xKzAbcDef')).toBe('8xKzAbcDef');
     });
 
-    it('decodes valid agent ID', () => {
+    it('decodes raw agent ID', () => {
+      expect(decodeAgentId('8xKzAbcDef')).toBe('8xKzAbcDef');
+    });
+
+    it('decodes legacy sol-prefixed agent ID', () => {
       expect(decodeAgentId('sol:8xKzAbcDef')).toBe('8xKzAbcDef');
     });
 
     it('returns null for invalid agent ID', () => {
       expect(decodeAgentId('')).toBeNull();
-      expect(decodeAgentId('8xKzAbcDef')).toBeNull();
       expect(decodeAgentId('eth:0x123')).toBeNull();
       expect(decodeAgentId('sol:')).toBeNull();
       expect(decodeAgentId('sol:a:b')).toBeNull();

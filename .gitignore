@@ -11,10 +11,10 @@ dist/
 
 # Internal docs
 docs/SECURITY_AUDIT.md
-docs/*AUDIT*.md
-docs/*PLAN*.md
 REORG_RESILIENCE_PLAN.md
-deploy/
+deploy/PRODUCTION_PLAN.md
+docs/INTEGRITY-SUIVI.md
+docs/e2e-classic-indexer-runlog.md
 
 # IDE
 .vscode/

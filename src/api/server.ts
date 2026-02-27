@@ -286,7 +286,6 @@ function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
     diversity_ratio: a.diversityRatio,
     feedback_count: a.feedbackCount,
     raw_avg_score: a.rawAvgScore,
-    agentid: a.agentId !== null ? a.agentId.toString() : null,
     status: a.status,
     verified_at: a.verifiedAt?.toISOString() || null,
     created_at: a.createdAt.toISOString(),

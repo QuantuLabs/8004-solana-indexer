@@ -213,7 +213,7 @@ export const hashChainResolvers = {
     async hashChainHeads(_: unknown, args: { agent: string }, ctx: GraphQLContext) {
       const asset = decodeAgentId(args.agent);
       if (!asset) {
-        throw createBadUserInputError('Invalid agent id. Expected sol:<assetPubkey>.');
+        throw createBadUserInputError('Invalid agent id. Expected asset pubkey.');
       }
 
       const [feedback, response, revoke] = await Promise.all([
@@ -228,7 +228,7 @@ export const hashChainResolvers = {
     async hashChainLatestCheckpoints(_: unknown, args: { agent: string }, ctx: GraphQLContext) {
       const asset = decodeAgentId(args.agent);
       if (!asset) {
-        throw createBadUserInputError('Invalid agent id. Expected sol:<assetPubkey>.');
+        throw createBadUserInputError('Invalid agent id. Expected asset pubkey.');
       }
 
       const [feedback, response, revoke] = await Promise.all([
@@ -253,7 +253,7 @@ export const hashChainResolvers = {
     ) {
       const asset = decodeAgentId(args.agent);
       if (!asset) {
-        throw createBadUserInputError('Invalid agent id. Expected sol:<assetPubkey>.');
+        throw createBadUserInputError('Invalid agent id. Expected asset pubkey.');
       }
 
       const chainType = resolveChainType(args.chainType);

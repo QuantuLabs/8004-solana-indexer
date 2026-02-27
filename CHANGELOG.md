@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-02-27
+
+### Changed
+- Patch release for ID-model follow-up updates across API/GraphQL mappings and targeted tests.
+
 ## [1.7.0] - 2026-02-27
 
 ### Changed

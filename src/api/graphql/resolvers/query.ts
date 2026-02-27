@@ -12,7 +12,6 @@ const ORDER_MAP_AGENT: Record<string, string> = {
   totalFeedback: 'feedback_count',
   qualityScore: 'quality_score',
   trustTier: 'trust_tier',
-  agentid: 'agent_id',
 };
 
 const ORDER_MAP_FEEDBACK: Record<string, string> = {

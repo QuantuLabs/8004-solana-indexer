@@ -21,11 +21,6 @@ const AGENT_FILTERS: FilterConfig[] = [
   { graphqlField: 'colLocked', dbColumn: 'col_locked', operator: 'bool' },
   { graphqlField: 'parentLocked', dbColumn: 'parent_locked', operator: 'bool' },
   { graphqlField: 'trustTier_gte', dbColumn: 'trust_tier', operator: 'gte' },
-  { graphqlField: 'agentid', dbColumn: 'agent_id', operator: 'eq' },
-  { graphqlField: 'agentid_gt', dbColumn: 'agent_id', operator: 'gt' },
-  { graphqlField: 'agentid_lt', dbColumn: 'agent_id', operator: 'lt' },
-  { graphqlField: 'agentid_gte', dbColumn: 'agent_id', operator: 'gte' },
-  { graphqlField: 'agentid_lte', dbColumn: 'agent_id', operator: 'lte' },
   { graphqlField: 'createdAt_gt', dbColumn: 'created_at', operator: 'gt' },
   { graphqlField: 'createdAt_lt', dbColumn: 'created_at', operator: 'lt' },
   { graphqlField: 'updatedAt_gt', dbColumn: 'updated_at', operator: 'gt' },
@@ -90,7 +85,7 @@ export interface WhereClause {
 
 function resolveIdValue(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  return decodeAgentId(value) ?? value;
+  return decodeAgentId(value);
 }
 
 function resolveIdArray(values: unknown): string[] | null {
@@ -98,7 +93,9 @@ function resolveIdArray(values: unknown): string[] | null {
   const resolved: string[] = [];
   for (const v of values) {
     if (typeof v !== 'string') return null;
-    resolved.push(decodeAgentId(v) ?? v);
+    const decoded = decodeAgentId(v);
+    if (decoded === null) return null;
+    resolved.push(decoded);
   }
   return resolved;
 }

@@ -4,10 +4,16 @@ const SOL_PREFIX = 'sol';
 const SEP = ':';
 
 export function encodeAgentId(asset: string): string {
-  return `${SOL_PREFIX}${SEP}${asset}`;
+  return asset;
 }
 
 export function decodeAgentId(id: string): string | null {
+  if (!id) return null;
+
+  // Primary v2 model: Agent.id is the raw asset pubkey string.
+  if (!id.includes(SEP)) return id;
+
+  // Backward-compatible decode for legacy sol:<asset> inputs.
   const parts = id.split(SEP);
   if (parts.length !== 2 || parts[0] !== SOL_PREFIX || !parts[1]) return null;
   return parts[1];

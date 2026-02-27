@@ -41,18 +41,15 @@ Canonical API docs are maintained in:
 
 ## Agent ID Model
 
-The API intentionally exposes multiple identifiers:
+Canonical identity is asset-based:
 
-- `id` (GraphQL): canonical opaque id (`sol:<asset>`), used for entity references.
-- `agentId` (GraphQL): deterministic numeric id derived from the asset public key bytes (first 8 bytes, big-endian).
-- `agentid` (GraphQL + REST): registry sequence id backed by DB `agent_id` (`uint64` semantic).
-- `agentidFormatted` (GraphQL): display format of `agentid` (for example `#042`).
+- GraphQL `id`: raw agent asset pubkey (base58).
+- REST `asset`: same value as GraphQL `id`.
+- GraphQL `agentId`: deterministic bigint derived from the first 8 bytes of the asset pubkey (big-endian), serialized as a JSON string for precision safety.
 
-Precision note:
+Public API note:
 
-- `agentId` and `agentid` are serialized as `string` in API responses to avoid JSON `number` precision loss beyond `2^53-1`.
-- GraphQL filters/order for this field use `agentid`, `agentid_gt`, `agentid_lt`, `agentid_gte`, `agentid_lte`, and `orderBy: agentid`.
-- There is no `globalId` API field name; use `agentid` for the registry sequence value.
+- `global_id` / `globalId` / `agentid` are not public API fields.
 
 ## Required Environment
 
@@ -135,8 +132,8 @@ Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.6.0 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.6.0
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.1 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.1
 ```
 
 ## GraphQL Example

@@ -129,19 +129,19 @@ describe('Filter Builder', () => {
   });
 
   it('builds filter with array values', () => {
-    const result = buildWhereClause('agent', { id_in: ['sol:abc', 'sol:def'] });
+    const result = buildWhereClause('agent', { id_in: ['abc', 'def'] });
     expect(result.sql).toContain('ANY($1::text[])');
     expect(result.params[0]).toEqual(['abc', 'def']);
   });
 
-  it('decodes agent ID in filter', () => {
-    const result = buildWhereClause('agent', { id: 'sol:myAssetPubkey' });
+  it('accepts raw agent ID in filter', () => {
+    const result = buildWhereClause('agent', { id: 'myAssetPubkey' });
     expect(result.sql).toContain('asset = $1');
     expect(result.params).toEqual(['myAssetPubkey']);
   });
 
-  it('decodes agent ID in feedback filter', () => {
-    const result = buildWhereClause('feedback', { agent: 'sol:myAssetPubkey' });
+  it('accepts raw agent ID in feedback filter', () => {
+    const result = buildWhereClause('feedback', { agent: 'myAssetPubkey' });
     expect(result.sql).toContain('asset = $1');
     expect(result.params).toEqual(['myAssetPubkey']);
   });
@@ -192,7 +192,7 @@ describe('Filter Builder', () => {
 
   it('handles multiple filters', () => {
     const result = buildWhereClause('feedback', {
-      agent: 'sol:asset1',
+      agent: 'asset1',
       tag1: 'uptime',
       isRevoked: false,
     });
@@ -218,7 +218,7 @@ describe('Filter Builder', () => {
   });
 
   it('caps oversized _in filter arrays', () => {
-    const ids = Array.from({ length: 300 }, (_, i) => `sol:id${i}`);
+    const ids = Array.from({ length: 300 }, (_, i) => `id${i}`);
     const result = buildWhereClause('agent', { id_in: ids });
     expect((result.params[0] as string[]).length).toBe(250);
   });
@@ -684,7 +684,7 @@ describe('Collection And Tree Queries', () => {
 
     const rows = await queryResolvers.Query.agentChildren(
       {},
-      { parent: 'sol:Parent111', first: 10, skip: 0 },
+      { parent: 'Parent111', first: 10, skip: 0 },
       ctx
     );
 
@@ -780,7 +780,7 @@ describe('Collection And Tree Queries', () => {
 
     const rows = await queryResolvers.Query.agentLineage(
       {},
-      { asset: 'sol:Child111', includeSelf: true },
+      { asset: 'Child111', includeSelf: true },
       ctx
     );
 
@@ -878,7 +878,7 @@ describe('Collection And Tree Queries', () => {
 
     const rows = await queryResolvers.Query.agentTree(
       {},
-      { root: 'sol:Root111', maxDepth: 2, includeRoot: true },
+      { root: 'Root111', maxDepth: 2, includeRoot: true },
       ctx
     );
 
