@@ -1,6 +1,5 @@
 import type { GraphQLContext } from '../context.js';
 import type { ResponseRow } from '../dataloaders.js';
-import { encodeResponseId } from '../utils/ids.js';
 
 function toUnixTimestamp(dateStr: string | null): string | null {
   if (!dateStr) return null;
@@ -8,21 +7,22 @@ function toUnixTimestamp(dateStr: string | null): string | null {
   return isNaN(ms) ? null : String(Math.floor(ms / 1000));
 }
 
+function requireResponseId(parent: ResponseRow): string {
+  if (!parent.response_id) {
+    throw new Error(`Missing response_id for response row ${parent.id}`);
+  }
+  return parent.response_id;
+}
+
 export const responseResolvers = {
   FeedbackResponse: {
     id(parent: ResponseRow) {
-      return encodeResponseId(
-        parent.asset,
-        parent.client_address,
-        parent.feedback_index,
-        parent.responder,
-        parent.tx_signature ?? ''
-      );
+      return requireResponseId(parent);
     },
     cursor(parent: ResponseRow) {
       // Opaque cursor used by Query.feedbackResponses(after: ...)
       return Buffer.from(
-        JSON.stringify({ created_at: parent.created_at, id: parent.id }),
+        JSON.stringify({ created_at: parent.created_at, id: requireResponseId(parent), row_id: parent.id }),
         'utf-8'
       ).toString('base64');
     },

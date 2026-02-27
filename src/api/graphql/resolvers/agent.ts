@@ -3,8 +3,9 @@ import type { AgentRow } from '../dataloaders.js';
 import { encodeAgentId } from '../utils/ids.js';
 import { clampFirst, clampSkip, encodeCursor } from '../utils/pagination.js';
 
-const FEEDBACK_ORDER_MAP: Record<string, 'created_at' | 'value' | 'feedback_index'> = {
+const FEEDBACK_ORDER_MAP: Record<string, 'created_at' | 'feedback_id' | 'value' | 'feedback_index'> = {
   createdAt: 'created_at',
+  feedbackId: 'feedback_id',
   value: 'value',
   feedbackIndex: 'feedback_index',
 };

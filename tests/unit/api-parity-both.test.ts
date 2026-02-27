@@ -21,6 +21,7 @@ const ACTIVE_AGENT = {
 
 const ACTIVE_FEEDBACK = {
   id: "fb-row-1",
+  feedbackId: 7n,
   asset: ACTIVE_AGENT.asset,
   clientAddress: "ClientActive11111111111111111111111111111",
   feedbackIndex: 7n,
@@ -42,6 +43,7 @@ const ACTIVE_FEEDBACK = {
 
 const ACTIVE_RESPONSE = {
   id: "resp-row-1",
+  responseId: 1n,
   responder: "ResponderActive111111111111111111111111111",
   responseUri: "https://example.com/response/1.json",
   responseHashHex: "ddeeff00",
@@ -62,24 +64,6 @@ const ACTIVE_STATS = {
 function toUnixSeconds(value: string | Date): string {
   const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
   return String(Math.floor(ms / 1000));
-}
-
-function decodeFeedbackId(id: string): { asset: string; clientAddress: string; feedbackIndex: string } {
-  const parts = id.split(":");
-  return {
-    asset: parts[1] ?? "",
-    clientAddress: parts[2] ?? "",
-    feedbackIndex: parts[3] ?? "",
-  };
-}
-
-function decodeResponseId(id: string): { asset: string; clientAddress: string; feedbackIndex: string } {
-  const parts = id.split(":");
-  return {
-    asset: parts[1] ?? "",
-    clientAddress: parts[2] ?? "",
-    feedbackIndex: parts[3] ?? "",
-  };
 }
 
 function makePrismaStub() {
@@ -120,6 +104,7 @@ function makePrismaStub() {
       findMany: vi.fn().mockResolvedValue([
         {
           id: ACTIVE_FEEDBACK.id,
+          feedbackId: ACTIVE_FEEDBACK.feedbackId,
           agentId: ACTIVE_FEEDBACK.asset,
           client: ACTIVE_FEEDBACK.clientAddress,
           feedbackIndex: ACTIVE_FEEDBACK.feedbackIndex,
@@ -146,6 +131,7 @@ function makePrismaStub() {
       findMany: vi.fn().mockResolvedValue([
         {
           id: ACTIVE_RESPONSE.id,
+          responseId: ACTIVE_RESPONSE.responseId,
           feedbackId: ACTIVE_FEEDBACK.id,
           responder: ACTIVE_RESPONSE.responder,
           responseUri: ACTIVE_RESPONSE.responseUri,
@@ -158,6 +144,7 @@ function makePrismaStub() {
           txSignature: ACTIVE_RESPONSE.txSignature,
           createdAt: ACTIVE_RESPONSE.createdAt,
           feedback: {
+            feedbackId: ACTIVE_FEEDBACK.feedbackId,
             agentId: ACTIVE_FEEDBACK.asset,
             client: ACTIVE_FEEDBACK.clientAddress,
             feedbackIndex: ACTIVE_FEEDBACK.feedbackIndex,
@@ -201,12 +188,13 @@ function makePoolStub() {
       }
       if (
         sql.includes("FROM feedbacks") &&
-        sql.includes("SELECT id, asset, client_address, feedback_index")
+        sql.includes("SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index")
       ) {
         return {
           rows: [
             {
               id: ACTIVE_FEEDBACK.id,
+              feedback_id: ACTIVE_FEEDBACK.feedbackId.toString(),
               asset: ACTIVE_FEEDBACK.asset,
               client_address: ACTIVE_FEEDBACK.clientAddress,
               feedback_index: ACTIVE_FEEDBACK.feedbackIndex.toString(),
@@ -232,12 +220,13 @@ function makePoolStub() {
       }
       if (
         sql.includes("FROM feedback_responses") &&
-        sql.includes("SELECT id, asset, client_address, feedback_index, responder")
+        sql.includes("SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder")
       ) {
         return {
           rows: [
             {
               id: ACTIVE_RESPONSE.id,
+              response_id: ACTIVE_RESPONSE.responseId.toString(),
               asset: ACTIVE_FEEDBACK.asset,
               client_address: ACTIVE_FEEDBACK.clientAddress,
               feedback_index: ACTIVE_FEEDBACK.feedbackIndex.toString(),
@@ -334,14 +323,67 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       const restAgentsRes = await fetch(`${baseUrl}/rest/v1/agents`);
       expect(restAgentsRes.status).toBe(200);
       const restAgentsBody = await restAgentsRes.json();
+      expect((restAgentsBody as Array<Record<string, unknown>>)[0]?.agent_id).toBe("1");
+
+      const restAgentsByIdRes = await fetch(`${baseUrl}/rest/v1/agents?agent_id=1`);
+      expect(restAgentsByIdRes.status).toBe(200);
+
+      const restAgentsByIdInvalidRes = await fetch(`${baseUrl}/rest/v1/agents?agent_id=not-a-number`);
+      expect(restAgentsByIdInvalidRes.status).toBe(400);
 
       const restFeedbacksRes = await fetch(`${baseUrl}/rest/v1/feedbacks?limit=10`);
       expect(restFeedbacksRes.status).toBe(200);
       const restFeedbacksBody = await restFeedbacksRes.json();
+      const restFeedbackRow = (restFeedbacksBody as Array<Record<string, unknown>>)[0] ?? {};
+      expect(restFeedbackRow.id).toBe(ACTIVE_FEEDBACK.feedbackId.toString());
+      expect("row_id" in restFeedbackRow).toBe(false);
+
+      const restFeedbackByIdRes = await fetch(
+        `${baseUrl}/rest/v1/feedbacks?asset=${encodeURIComponent(ACTIVE_FEEDBACK.asset)}&feedback_id=${encodeURIComponent(ACTIVE_FEEDBACK.feedbackId.toString())}`
+      );
+      expect(restFeedbackByIdRes.status).toBe(200);
+      const restFeedbackByIdBody = await restFeedbackByIdRes.json();
+      expect((restFeedbackByIdBody as Array<Record<string, unknown>>)[0]?.feedback_id).toBe(
+        ACTIVE_FEEDBACK.feedbackId.toString()
+      );
+
+      const restFeedbackByIdInvalidRes = await fetch(
+        `${baseUrl}/rest/v1/feedbacks?feedback_id=${encodeURIComponent("not-a-number")}`
+      );
+      expect(restFeedbackByIdInvalidRes.status).toBe(400);
 
       const restResponsesRes = await fetch(`${baseUrl}/rest/v1/feedback_responses?limit=10`);
       expect(restResponsesRes.status).toBe(200);
       const restResponsesBody = await restResponsesRes.json();
+      const restResponseRow = (restResponsesBody as Array<Record<string, unknown>>)[0] ?? {};
+      expect(restResponseRow.id).toBe(ACTIVE_RESPONSE.responseId.toString());
+      expect(restResponseRow.feedback_id).toBe(ACTIVE_FEEDBACK.feedbackId.toString());
+      expect("row_id" in restResponseRow).toBe(false);
+      expect("feedback_row_id" in restResponseRow).toBe(false);
+
+      const restResponsesByCanonicalFeedbackIdRes = await fetch(
+        `${baseUrl}/rest/v1/feedback_responses?feedback_id=${encodeURIComponent(`${ACTIVE_FEEDBACK.asset}:${ACTIVE_FEEDBACK.clientAddress}:${ACTIVE_FEEDBACK.feedbackIndex.toString()}`)}`
+      );
+      expect(restResponsesByCanonicalFeedbackIdRes.status).toBe(400);
+
+      const restResponsesByScopedFeedbackIdWithoutAssetRes = await fetch(
+        `${baseUrl}/rest/v1/feedback_responses?feedback_id=${encodeURIComponent(ACTIVE_FEEDBACK.feedbackId.toString())}`
+      );
+      expect(restResponsesByScopedFeedbackIdWithoutAssetRes.status).toBe(400);
+
+      const restResponsesByFeedbackIdRes = await fetch(
+        `${baseUrl}/rest/v1/feedback_responses?asset=${encodeURIComponent(ACTIVE_FEEDBACK.asset)}&feedback_id=${encodeURIComponent(ACTIVE_FEEDBACK.feedbackId.toString())}`
+      );
+      expect(restResponsesByFeedbackIdRes.status).toBe(200);
+      const restResponsesByFeedbackIdBody = await restResponsesByFeedbackIdRes.json();
+      expect((restResponsesByFeedbackIdBody as Array<Record<string, unknown>>)[0]?.feedback_id).toBe(
+        ACTIVE_FEEDBACK.feedbackId.toString()
+      );
+
+      const restResponsesByFeedbackIdInvalidRes = await fetch(
+        `${baseUrl}/rest/v1/feedback_responses?feedback_id=${encodeURIComponent(`${ACTIVE_FEEDBACK.asset}:${ACTIVE_FEEDBACK.clientAddress}:not-a-number`)}`
+      );
+      expect(restResponsesByFeedbackIdInvalidRes.status).toBe(400);
 
       const restStatsRes = await fetch(`${baseUrl}/rest/v1/global_stats`);
       expect(restStatsRes.status).toBe(200);
@@ -442,7 +484,7 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       }));
 
       const restFeedbacksCanonical = (restFeedbacksBody as Array<Record<string, any>>).map((row) => ({
-        asset: row.asset,
+        id: row.id,
         clientAddress: row.client_address,
         feedbackIndex: row.feedback_index,
         value: row.value,
@@ -459,9 +501,8 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       }));
 
       const gqlFeedbacksCanonical = ((gqlBody?.data?.feedbacks ?? []) as Array<Record<string, any>>).map((row) => {
-        const decoded = decodeFeedbackId(String(row.id));
         return {
-          asset: decoded.asset,
+          id: row.id,
           clientAddress: row.clientAddress,
           feedbackIndex: row.feedbackIndex,
           value: row.value,
@@ -479,9 +520,7 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       });
 
       const restResponsesCanonical = (restResponsesBody as Array<Record<string, any>>).map((row) => ({
-        asset: row.asset,
-        clientAddress: row.client_address,
-        feedbackIndex: row.feedback_index,
+        id: row.id,
         responder: row.responder,
         responseUri: row.response_uri,
         responseHash: row.response_hash,
@@ -493,11 +532,8 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       }));
 
       const gqlResponsesCanonical = ((gqlBody?.data?.feedbackResponses ?? []) as Array<Record<string, any>>).map((row) => {
-        const decoded = decodeResponseId(String(row.id));
         return {
-          asset: decoded.asset,
-          clientAddress: decoded.clientAddress,
-          feedbackIndex: decoded.feedbackIndex,
+          id: row.id,
           responder: row.responder,
           responseUri: row.responseUri,
           responseHash: row.responseHash,
@@ -565,19 +601,19 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
         (call: unknown[]) =>
           typeof call[0] === "string" &&
           (call[0] as string).includes("FROM feedbacks") &&
-          (call[0] as string).includes("SELECT id, asset, client_address, feedback_index")
+          (call[0] as string).includes("SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index")
       );
       expect(gqlFeedbacksCall).toBeDefined();
       expect(gqlFeedbacksCall[0]).toContain("status != 'ORPHANED'");
       expect(gqlFeedbacksCall[0]).toContain(
-        "ORDER BY created_at DESC, asset ASC, client_address ASC, feedback_index ASC, id ASC"
+        "ORDER BY created_at DESC, asset ASC, client_address ASC, feedback_index ASC, feedback_id ASC NULLS LAST, id ASC"
       );
 
       const gqlResponsesCall = (pool.query as any).mock.calls.find(
         (call: unknown[]) =>
           typeof call[0] === "string" &&
           (call[0] as string).includes("FROM feedback_responses") &&
-          (call[0] as string).includes("SELECT id, asset, client_address, feedback_index, responder")
+          (call[0] as string).includes("SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder")
       );
       expect(gqlResponsesCall).toBeDefined();
       expect(gqlResponsesCall[0]).toContain("status != 'ORPHANED'");

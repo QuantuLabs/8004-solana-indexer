@@ -22,16 +22,25 @@ export function encodeFeedbackId(
   client: string,
   index: bigint | string,
 ): string {
-  return `${SOL_PREFIX}${SEP}${asset}${SEP}${client}${SEP}${String(index)}`;
+  return `${asset}${SEP}${client}${SEP}${String(index)}`;
 }
 
 export function decodeFeedbackId(
   id: string,
 ): { asset: string; client: string; index: string } | null {
   const parts = id.split(SEP);
-  if (parts.length !== 4 || parts[0] !== SOL_PREFIX) return null;
-  if (!parts[1] || !parts[2] || !parts[3]) return null;
-  return { asset: parts[1], client: parts[2], index: parts[3] };
+  if (parts.length === 3) {
+    const [asset, client, index] = parts;
+    if (asset === SOL_PREFIX) return null;
+    if (!asset || !client || !index) return null;
+    return { asset, client, index };
+  }
+  if (parts.length === 4 && parts[0] === SOL_PREFIX) {
+    const [, asset, client, index] = parts;
+    if (!asset || !client || !index) return null;
+    return { asset, client, index };
+  }
+  return null;
 }
 
 export function encodeResponseId(
@@ -39,24 +48,27 @@ export function encodeResponseId(
   client: string,
   index: bigint | string,
   responder: string,
-  txSig: string,
+  sequenceOrSig: bigint | string,
 ): string {
-  return `${SOL_PREFIX}${SEP}${asset}${SEP}${client}${SEP}${String(index)}${SEP}${responder}${SEP}${txSig}`;
+  return `${asset}${SEP}${client}${SEP}${String(index)}${SEP}${responder}${SEP}${String(sequenceOrSig)}`;
 }
 
 export function decodeResponseId(
   id: string,
 ): { asset: string; client: string; index: string; responder: string; sig: string } | null {
   const parts = id.split(SEP);
-  if (parts.length !== 6 || parts[0] !== SOL_PREFIX) return null;
-  if (!parts[1] || !parts[2] || !parts[3] || !parts[4]) return null;
-  return {
-    asset: parts[1],
-    client: parts[2],
-    index: parts[3],
-    responder: parts[4],
-    sig: parts[5] ?? '',
-  };
+  if (parts.length === 5) {
+    const [asset, client, index, responder, sig] = parts;
+    if (asset === SOL_PREFIX) return null;
+    if (!asset || !client || !index || !responder) return null;
+    return { asset, client, index, responder, sig: sig ?? '' };
+  }
+  if (parts.length === 6 && parts[0] === SOL_PREFIX) {
+    const [, asset, client, index, responder, sig] = parts;
+    if (!asset || !client || !index || !responder) return null;
+    return { asset, client, index, responder, sig: sig ?? '' };
+  }
+  return null;
 }
 
 export function encodeValidationId(
@@ -64,27 +76,45 @@ export function encodeValidationId(
   validator: string,
   nonce: bigint | string,
 ): string {
-  return `${SOL_PREFIX}${SEP}${asset}${SEP}${validator}${SEP}${String(nonce)}`;
+  return `${asset}${SEP}${validator}${SEP}${String(nonce)}`;
 }
 
 export function decodeValidationId(
   id: string,
 ): { asset: string; validator: string; nonce: string } | null {
   const parts = id.split(SEP);
-  if (parts.length !== 4 || parts[0] !== SOL_PREFIX) return null;
-  if (!parts[1] || !parts[2] || !parts[3]) return null;
-  return { asset: parts[1], validator: parts[2], nonce: parts[3] };
+  if (parts.length === 3) {
+    const [asset, validator, nonce] = parts;
+    if (asset === SOL_PREFIX) return null;
+    if (!asset || !validator || !nonce) return null;
+    return { asset, validator, nonce };
+  }
+  if (parts.length === 4 && parts[0] === SOL_PREFIX) {
+    const [, asset, validator, nonce] = parts;
+    if (!asset || !validator || !nonce) return null;
+    return { asset, validator, nonce };
+  }
+  return null;
 }
 
 export function encodeMetadataId(asset: string, key: string): string {
-  return `${SOL_PREFIX}${SEP}${asset}${SEP}${key}`;
+  return `${asset}${SEP}${key}`;
 }
 
 export function decodeMetadataId(
   id: string,
 ): { asset: string; key: string } | null {
   const parts = id.split(SEP);
-  if (parts.length !== 3 || parts[0] !== SOL_PREFIX) return null;
-  if (!parts[1] || !parts[2]) return null;
-  return { asset: parts[1], key: parts[2] };
+  if (parts.length === 2) {
+    const [asset, key] = parts;
+    if (asset === SOL_PREFIX) return null;
+    if (!asset || !key) return null;
+    return { asset, key };
+  }
+  if (parts.length === 3 && parts[0] === SOL_PREFIX) {
+    const [, asset, key] = parts;
+    if (!asset || !key) return null;
+    return { asset, key };
+  }
+  return null;
 }

@@ -1,6 +1,5 @@
 import type { GraphQLContext } from '../context.js';
 import type { FeedbackRow } from '../dataloaders.js';
-import { encodeFeedbackId } from '../utils/ids.js';
 import { clampFirst, clampSkip } from '../utils/pagination.js';
 
 function detectUriType(uri: string | null): string | null {
@@ -27,10 +26,17 @@ function normalizeValue(raw: string, decimals: number): string {
   return isNeg ? `-${result}` : result;
 }
 
+function requireFeedbackId(parent: FeedbackRow): string {
+  if (!parent.feedback_id) {
+    throw new Error(`Missing feedback_id for feedback row ${parent.id}`);
+  }
+  return parent.feedback_id;
+}
+
 export const feedbackResolvers = {
   Feedback: {
     id(parent: FeedbackRow) {
-      return encodeFeedbackId(parent.asset, parent.client_address, parent.feedback_index);
+      return requireFeedbackId(parent);
     },
     cursor(parent: FeedbackRow) {
       // Opaque cursor used by Query.feedbacks(after: ...)
@@ -40,7 +46,7 @@ export const feedbackResolvers = {
           asset: parent.asset,
           client_address: parent.client_address,
           feedback_index: parent.feedback_index,
-          id: parent.id,
+          id: requireFeedbackId(parent),
         }),
         'utf-8'
       ).toString('base64');

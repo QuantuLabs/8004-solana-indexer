@@ -12,12 +12,20 @@ enum AgentOrderBy {
 
 enum FeedbackOrderBy {
   createdAt
+  feedbackId
   value
   feedbackIndex
 }
 
 enum FeedbackResponseOrderBy {
   createdAt
+  responseId
+}
+
+enum RevocationOrderBy {
+  createdAt
+  revocationId
+  revokeCount
 }
 
 enum OrderDirection {
@@ -72,6 +80,11 @@ input AgentFilter {
 
 input FeedbackFilter {
   agent: ID
+  feedbackId: BigInt
+  feedbackId_gt: BigInt
+  feedbackId_gte: BigInt
+  feedbackId_lt: BigInt
+  feedbackId_lte: BigInt
   clientAddress: String
   tag1: String
   tag2: String
@@ -83,7 +96,25 @@ input FeedbackFilter {
 
 input FeedbackResponseFilter {
   feedback: ID
+  responseId: BigInt
+  responseId_gt: BigInt
+  responseId_gte: BigInt
+  responseId_lt: BigInt
+  responseId_lte: BigInt
   responder: String
+  createdAt_gt: BigInt
+  createdAt_lt: BigInt
+}
+
+input RevocationFilter {
+  agent: ID
+  revocationId: BigInt
+  revocationId_gt: BigInt
+  revocationId_gte: BigInt
+  revocationId_lt: BigInt
+  revocationId_lte: BigInt
+  clientAddress: String
+  feedbackIndex: BigInt
   createdAt_gt: BigInt
   createdAt_lt: BigInt
 }
@@ -166,6 +197,20 @@ type FeedbackResponse {
   responseHash: Bytes
   createdAt: BigInt!
   solana: SolanaResponseExtension
+}
+
+type Revocation {
+  id: ID!
+  cursor: String!
+  agent: Agent!
+  clientAddress: String!
+  feedbackIndex: BigInt!
+  feedbackHash: Bytes
+  originalScore: Int
+  atomEnabled: Boolean!
+  hadImpact: Boolean!
+  createdAt: BigInt!
+  solana: SolanaRevocationExtension
 }
 
 type Validation {
@@ -263,6 +308,14 @@ type SolanaFeedbackExtension {
 type SolanaResponseExtension {
   runningDigest: String
   responseCount: BigInt
+  verificationStatus: String
+  txSignature: String
+  blockSlot: BigInt
+}
+
+type SolanaRevocationExtension {
+  runningDigest: String
+  revokeCount: BigInt
   verificationStatus: String
   txSignature: String
   blockSlot: BigInt
@@ -371,6 +424,15 @@ type Query {
     orderBy: FeedbackResponseOrderBy
     orderDirection: OrderDirection
   ): [FeedbackResponse!]!
+  revocation(id: ID!): Revocation
+  revocations(
+    first: Int = 100
+    skip: Int = 0
+    after: String
+    where: RevocationFilter
+    orderBy: RevocationOrderBy
+    orderDirection: OrderDirection
+  ): [Revocation!]!
   validation(id: ID!): Validation @deprecated(reason: "Validation module is archived in agent-registry-8004 (v0.5.0+).")
   validations(
     first: Int = 100

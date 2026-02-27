@@ -25,6 +25,7 @@ import { queryResolvers, resetAggregatedStatsCacheForTests } from '../../../src/
 import { agentResolvers } from '../../../src/api/graphql/resolvers/agent.js';
 import { feedbackResolvers } from '../../../src/api/graphql/resolvers/feedback.js';
 import { responseResolvers } from '../../../src/api/graphql/resolvers/response.js';
+import { revocationResolvers } from '../../../src/api/graphql/resolvers/revocation.js';
 import { solanaResolvers } from '../../../src/api/graphql/resolvers/solana.js';
 import { validationResolvers } from '../../../src/api/graphql/resolvers/validation.js';
 
@@ -214,12 +215,43 @@ describe('Filter Builder', () => {
     expect(result.params).toEqual(['asset1', 'uptime', false]);
   });
 
-  it('builds response feedback filter from feedback ID', () => {
-    const result = buildWhereClause('response', { feedback: 'sol:asset1:clientA:9' });
+  it('maps sequential feedbackId range filters', () => {
+    const result = buildWhereClause('feedback', { feedbackId_gt: 10n, feedbackId_lte: 20n });
+    expect(result.sql).toContain('feedback_id > $1');
+    expect(result.sql).toContain('feedback_id <= $2');
+    expect(result.params).toEqual([10n, 20n]);
+  });
+
+  it('builds response feedback filter from sequential feedback ID', () => {
+    const result = buildWhereClause('response', { feedback: '9' });
+    expect(result.sql).toContain('EXISTS (');
+    expect(result.sql).toContain('f.feedback_id = $1::bigint');
+    expect(result.params).toEqual(['9']);
+  });
+
+  it('builds response feedback filter from canonical feedback ID', () => {
+    const result = buildWhereClause('response', { feedback: 'asset1:client1:9' });
+    expect(result.sql).toContain('asset = $1 AND client_address = $2 AND feedback_index = $3::bigint');
+    expect(result.params).toEqual(['asset1', 'client1', '9']);
+  });
+
+  it('maps sequential responseId range filters', () => {
+    const result = buildWhereClause('response', { responseId_gte: 3n, responseId_lt: 9n });
+    expect(result.sql).toContain('response_id >= $1');
+    expect(result.sql).toContain('response_id < $2');
+    expect(result.params).toEqual([3n, 9n]);
+  });
+
+  it('maps revocation filters to revocation_id and client_address', () => {
+    const result = buildWhereClause('revocation', {
+      agent: 'asset1',
+      revocationId_gt: 5n,
+      clientAddress: 'client1',
+    });
     expect(result.sql).toContain('asset = $1');
-    expect(result.sql).toContain('client_address = $2');
-    expect(result.sql).toContain('feedback_index = $3::bigint');
-    expect(result.params).toEqual(['asset1', 'clientA', '9']);
+    expect(result.sql).toContain('revocation_id > $2');
+    expect(result.sql).toContain('client_address = $3');
+    expect(result.params).toEqual(['asset1', 5n, 'client1']);
   });
 
   it('maps validation status filter to response nullability', () => {
@@ -282,7 +314,8 @@ describe('Pagination Utilities', () => {
 
   it('exposes Feedback.cursor compatible with Query.feedbacks(after: ...)', () => {
     const parent = {
-      id: 'fb1',
+      id: 'fb-row-1',
+      feedback_id: '7',
       asset: 'agent1',
       client_address: 'client1',
       feedback_index: '42',
@@ -294,14 +327,36 @@ describe('Pagination Utilities', () => {
       asset: parent.asset,
       client_address: parent.client_address,
       feedback_index: parent.feedback_index,
-      id: parent.id,
+      id: parent.feedback_id,
     });
   });
 
   it('exposes FeedbackResponse.cursor compatible with Query.feedbackResponses(after: ...)', () => {
-    const parent = { id: 'resp1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const parent = {
+      id: 'resp-row-1',
+      response_id: '9',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
     const cursor = responseResolvers.FeedbackResponse.cursor(parent);
-    expect(decodeBase64Json(cursor)).toEqual({ created_at: parent.created_at, id: parent.id });
+    expect(decodeBase64Json(cursor)).toEqual({
+      created_at: parent.created_at,
+      id: parent.response_id,
+      row_id: parent.id,
+    });
+  });
+
+  it('exposes Revocation.cursor compatible with Query.revocations(after: ...)', () => {
+    const parent = {
+      id: 'rev-row-1',
+      revocation_id: '12',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
+    const cursor = revocationResolvers.Revocation.cursor(parent);
+    expect(decodeBase64Json(cursor)).toEqual({
+      created_at: parent.created_at,
+      id: parent.revocation_id,
+      row_id: parent.id,
+    });
   });
 
   it('exposes Validation.cursor compatible with Query.validations(after: ...)', () => {
@@ -348,6 +403,27 @@ describe('Agent Field Resolvers', () => {
     const parent = { asset: 'asset2', agent_id: null } as any;
     expect(() => agentResolvers.Agent.agentId(parent)).toThrow('Missing agent_id');
   });
+
+  it('supports Agent.feedback ordering by sequential feedbackId', async () => {
+    const load = vi.fn().mockResolvedValue([]);
+    const ctx = {
+      loaders: {
+        feedbackPageByAgent: { load },
+      },
+    } as any;
+    await agentResolvers.Agent.feedback(
+      { asset: 'asset1' } as any,
+      { first: 5, skip: 1, orderBy: 'feedbackId', orderDirection: 'asc' },
+      ctx
+    );
+    expect(load).toHaveBeenCalledWith({
+      asset: 'asset1',
+      first: 5,
+      skip: 1,
+      orderBy: 'feedback_id',
+      orderDirection: 'ASC',
+    });
+  });
 });
 
 describe('Feedback Field Resolvers', () => {
@@ -377,6 +453,53 @@ describe('Feedback Field Resolvers', () => {
       value_decimals: 18,
     } as any);
     expect(valueDecimals).toBe(18);
+  });
+});
+
+describe('Resolver ID Invariants', () => {
+  it('throws when Feedback.feedback_id is null', () => {
+    const parent = {
+      id: 'fb-row-1',
+      feedback_id: null,
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '42',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
+
+    expect(() => feedbackResolvers.Feedback.id(parent)).toThrow('Missing feedback_id');
+    expect(() => feedbackResolvers.Feedback.cursor(parent)).toThrow('Missing feedback_id');
+  });
+
+  it('throws when FeedbackResponse.response_id is null', () => {
+    const parent = {
+      id: 'resp-row-1',
+      response_id: null,
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '42',
+      responder: 'responder1',
+      tx_signature: 'sig-abc',
+      response_count: '7',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
+
+    expect(() => responseResolvers.FeedbackResponse.id(parent)).toThrow('Missing response_id');
+    expect(() => responseResolvers.FeedbackResponse.cursor(parent)).toThrow('Missing response_id');
+  });
+
+  it('throws when Revocation.revocation_id is null', () => {
+    const parent = {
+      id: 'rev-row-1',
+      revocation_id: null,
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '42',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
+
+    expect(() => revocationResolvers.Revocation.id(parent)).toThrow('Missing revocation_id');
+    expect(() => revocationResolvers.Revocation.cursor(parent)).toThrow('Missing revocation_id');
   });
 });
 
@@ -463,6 +586,237 @@ describe('Query Resolver User Input Errors', () => {
     });
 
     expect(poolQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe('Query Resolver Canonical ID Lookup', () => {
+  it('resolves Query.feedback by canonical ID', async () => {
+    const row = {
+      id: 'asset1:client1:9',
+      feedback_id: '41',
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '9',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.feedback({}, { id: 'asset1:client1:9' }, ctx);
+
+    expect(result).toEqual(row);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM feedbacks');
+    expect(sql).toContain('asset = $1');
+    expect(sql).toContain('client_address = $2');
+    expect(sql).toContain('feedback_index = $3::bigint');
+    expect(params).toEqual(['asset1', 'client1', '9']);
+  });
+
+  it('resolves Query.feedbackResponse by canonical ID', async () => {
+    const row = {
+      id: 'asset1:client1:9:responder1:sig-abc',
+      response_id: '7',
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '9',
+      responder: 'responder1',
+      tx_signature: 'sig-abc',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.feedbackResponse(
+      {},
+      { id: 'asset1:client1:9:responder1:sig-abc' },
+      ctx
+    );
+
+    expect(result).toEqual(row);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM feedback_responses');
+    expect(sql).toContain('asset = $1');
+    expect(sql).toContain('client_address = $2');
+    expect(sql).toContain('feedback_index = $3::bigint');
+    expect(sql).toContain('responder = $4');
+    expect(sql).toContain('tx_signature = $5::text OR response_count::text = $5::text');
+    expect(params).toEqual(['asset1', 'client1', '9', 'responder1', 'sig-abc']);
+  });
+
+  it('resolves Query.revocation by canonical ID', async () => {
+    const row = {
+      id: 'asset1:client1:9',
+      revocation_id: '3',
+      asset: 'asset1',
+      client_address: 'client1',
+      feedback_index: '9',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.revocation({}, { id: 'asset1:client1:9' }, ctx);
+
+    expect(result).toEqual(row);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM revocations');
+    expect(sql).toContain('asset = $1');
+    expect(sql).toContain('client_address = $2');
+    expect(sql).toContain('feedback_index = $3::bigint');
+    expect(params).toEqual(['asset1', 'client1', '9']);
+  });
+
+  it('throws when Query.feedback loads a non-orphan row without feedback_id', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        id: 'asset1:client1:10',
+        feedback_id: null,
+        asset: 'asset1',
+        client_address: 'client1',
+        feedback_index: '10',
+      }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedback({}, { id: 'asset1:client1:10' }, ctx)
+    ).rejects.toThrow('Missing feedback_id');
+  });
+
+  it('throws when Query.feedbackResponse loads a non-orphan row without response_id', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        id: 'asset1:client1:11:responder:sig',
+        response_id: null,
+        asset: 'asset1',
+        client_address: 'client1',
+        feedback_index: '11',
+        responder: 'responder',
+        tx_signature: 'sig',
+      }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbackResponse({}, { id: 'asset1:client1:11:responder:sig' }, ctx)
+    ).rejects.toThrow('Missing response_id');
+  });
+
+  it('throws when Query.revocation loads a non-orphan row without revocation_id', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        id: 'asset1:client1:12',
+        revocation_id: null,
+        asset: 'asset1',
+        client_address: 'client1',
+        feedback_index: '12',
+      }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.revocation({}, { id: 'asset1:client1:12' }, ctx)
+    ).rejects.toThrow('Missing revocation_id');
+  });
+});
+
+describe('Query Resolver Deterministic ID Ordering', () => {
+  it('supports feedbacks order/filter by sequential feedback_id', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.feedbacks(
+      {},
+      { first: 10, orderBy: 'feedbackId', orderDirection: 'asc', where: { feedbackId_gt: 5n } },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('feedback_id > $1');
+    expect(sql).toContain('ORDER BY feedback_id ASC, asset ASC, client_address ASC, feedback_index ASC, feedback_id ASC NULLS LAST, id ASC');
+    expect(params).toEqual([5n, 10, 0]);
+  });
+
+  it('supports feedbackResponses order/filter by sequential response_id', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.feedbackResponses(
+      {},
+      { first: 7, orderBy: 'responseId', orderDirection: 'desc', where: { responseId_gte: 2n } },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('response_id >= $1');
+    expect(sql).toContain('ORDER BY response_id DESC, response_id DESC NULLS LAST, id DESC');
+    expect(params).toEqual([2n, 7, 0]);
+  });
+
+  it('supports revocations order/filter by sequential revocation_id', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.revocations(
+      {},
+      { first: 3, orderBy: 'revocationId', orderDirection: 'asc', where: { revocationId_gt: 9n } },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM revocations');
+    expect(sql).toContain('revocation_id > $1');
+    expect(sql).toContain('ORDER BY revocation_id ASC, revocation_id ASC NULLS LAST, id ASC');
+    expect(params).toEqual([9n, 3, 0]);
   });
 });
 

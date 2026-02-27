@@ -41,18 +41,22 @@ describe('GraphQL ID encoding/decoding', () => {
 
   describe('Feedback IDs', () => {
     it('encodes feedback ID', () => {
-      expect(encodeFeedbackId('asset1', 'client1', 42n)).toBe('sol:asset1:client1:42');
-      expect(encodeFeedbackId('asset1', 'client1', '0')).toBe('sol:asset1:client1:0');
+      expect(encodeFeedbackId('asset1', 'client1', 42n)).toBe('asset1:client1:42');
+      expect(encodeFeedbackId('asset1', 'client1', '0')).toBe('asset1:client1:0');
     });
 
     it('decodes valid feedback ID', () => {
+      const decoded = decodeFeedbackId('asset1:client1:42');
+      expect(decoded).toEqual({ asset: 'asset1', client: 'client1', index: '42' });
+    });
+
+    it('decodes legacy sol-prefixed feedback ID', () => {
       const decoded = decodeFeedbackId('sol:asset1:client1:42');
       expect(decoded).toEqual({ asset: 'asset1', client: 'client1', index: '42' });
     });
 
     it('returns null for invalid feedback ID', () => {
       expect(decodeFeedbackId('sol:asset1:client1')).toBeNull();
-      expect(decodeFeedbackId('asset1:client1:42')).toBeNull();
       expect(decodeFeedbackId('')).toBeNull();
     });
   });
@@ -60,10 +64,21 @@ describe('GraphQL ID encoding/decoding', () => {
   describe('Response IDs', () => {
     it('encodes response ID with full signature', () => {
       const id = encodeResponseId('asset1', 'client1', 0, 'resp1', '5UXfAbcDeFgHiJkLm');
-      expect(id).toBe('sol:asset1:client1:0:resp1:5UXfAbcDeFgHiJkLm');
+      expect(id).toBe('asset1:client1:0:resp1:5UXfAbcDeFgHiJkLm');
     });
 
     it('decodes valid response ID', () => {
+      const decoded = decodeResponseId('asset1:client1:0:resp1:5UXfAbcDeFgHiJkLm');
+      expect(decoded).toEqual({
+        asset: 'asset1',
+        client: 'client1',
+        index: '0',
+        responder: 'resp1',
+        sig: '5UXfAbcDeFgHiJkLm',
+      });
+    });
+
+    it('decodes legacy sol-prefixed response ID', () => {
       const decoded = decodeResponseId('sol:asset1:client1:0:resp1:5UXfAbcDeFgHiJkLm');
       expect(decoded).toEqual({
         asset: 'asset1',
@@ -83,7 +98,7 @@ describe('GraphQL ID encoding/decoding', () => {
   describe('Validation IDs', () => {
     it('encodes and decodes validation ID', () => {
       const encoded = encodeValidationId('asset1', 'validator1', 5n);
-      expect(encoded).toBe('sol:asset1:validator1:5');
+      expect(encoded).toBe('asset1:validator1:5');
 
       const decoded = decodeValidationId(encoded);
       expect(decoded).toEqual({ asset: 'asset1', validator: 'validator1', nonce: '5' });
@@ -97,7 +112,7 @@ describe('GraphQL ID encoding/decoding', () => {
   describe('Metadata IDs', () => {
     it('encodes and decodes metadata ID', () => {
       const encoded = encodeMetadataId('asset1', 'capabilities');
-      expect(encoded).toBe('sol:asset1:capabilities');
+      expect(encoded).toBe('asset1:capabilities');
 
       const decoded = decodeMetadataId(encoded);
       expect(decoded).toEqual({ asset: 'asset1', key: 'capabilities' });

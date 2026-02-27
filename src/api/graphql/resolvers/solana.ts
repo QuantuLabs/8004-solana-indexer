@@ -1,4 +1,4 @@
-import type { AgentRow, FeedbackRow, ResponseRow } from '../dataloaders.js';
+import type { AgentRow, FeedbackRow, ResponseRow, RevocationRow } from '../dataloaders.js';
 
 export const solanaResolvers = {
   SolanaAgentExtension: {
@@ -32,5 +32,13 @@ export const solanaResolvers = {
     verificationStatus(parent: ResponseRow) { return parent.status; },
     txSignature(parent: ResponseRow) { return parent.tx_signature; },
     blockSlot(parent: ResponseRow) { return parent.block_slot; },
+  },
+
+  SolanaRevocationExtension: {
+    runningDigest(parent: RevocationRow) { return parent.running_digest; },
+    revokeCount(parent: RevocationRow) { return parent.revoke_count; },
+    verificationStatus(parent: RevocationRow) { return parent.status; },
+    txSignature(parent: RevocationRow) { return parent.tx_signature; },
+    blockSlot(parent: RevocationRow) { return parent.slot; },
   },
 };

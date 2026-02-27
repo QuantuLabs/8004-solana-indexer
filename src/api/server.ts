@@ -267,6 +267,7 @@ type AgentApiRow = Pick<
 function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
   return {
     asset: a.id,
+    agent_id: a.agentId !== null ? a.agentId.toString() : null,
     owner: a.owner,
     creator: a.creator,
     agent_uri: a.uri,
@@ -460,6 +461,8 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/agents', async (req: Request, res: Response) => {
     try {
       const id = parsePostgRESTValue(req.query.id) ?? parsePostgRESTValue(req.query.asset);
+      const agentIdRaw = parsePostgRESTValue(req.query.agent_id) ?? parsePostgRESTValue(req.query.agentId);
+      const agentId = safeBigInt(agentIdRaw);
       const owner = parsePostgRESTValue(req.query.owner);
       const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
@@ -479,6 +482,11 @@ export function createApiServer(options: ApiServerOptions): Express {
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
+      if (agentIdRaw !== undefined && agentId === undefined) {
+        res.status(400).json({ error: 'Invalid agent_id filter value' });
+        return;
+      }
+
       if ((updatedAtGtRaw && !updatedAtGt) || (updatedAtLtRaw && !updatedAtLt)) {
         res.status(400).json({ error: 'Invalid updated_at filter value' });
         return;
@@ -491,6 +499,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
       const where: Prisma.AgentWhereInput = { ...statusFilter };
       if (id) where.id = id;
+      if (agentId !== undefined) where.agentId = agentId;
       if (owner) where.owner = owner;
       if (creator) where.creator = creator;
       if (collection) where.collection = collection;
@@ -695,6 +704,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const feedback_id = parsePostgRESTValue(req.query.feedback_id);
       const feedback_index_in = parsePostgRESTIn(req.query.feedback_index);
       const is_revoked = parsePostgRESTValue(req.query.is_revoked);
       const tag1 = parsePostgRESTValue(req.query.tag1);
@@ -723,6 +733,14 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.FeedbackWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
+      if (feedback_id !== undefined) {
+        const parsedFeedbackId = safeBigInt(feedback_id);
+        if (parsedFeedbackId === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_id: must be a valid integer' });
+          return;
+        }
+        where.feedbackId = parsedFeedbackId;
+      }
       if (feedback_index_in) {
         const indices = safeBigIntArray(feedback_index_in.join(','));
         if (indices) where.feedbackIndex = { in: indices };
@@ -774,6 +792,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         needsCount ? prisma.feedback.count({ where }) : Promise.resolve(0),
       ]);
 
+      if (feedback_id !== undefined && !asset && feedbacks.length > 1) {
+        res.status(400).json({ error: 'feedback_id is scoped by agent. Provide asset filter when ambiguous.' });
+        return;
+      }
+
       // Set Content-Range header if count was requested
       if (needsCount) {
         setContentRange(res, offset, feedbacks.length, totalCount);
@@ -824,7 +847,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       // Map to SDK expected format
       // Note: feedback_index as String to preserve BigInt precision (> 2^53)
       const mapped = feedbacks.map(f => ({
-        id: f.id,
+        id: f.feedbackId != null ? f.feedbackId.toString() : null,
+        feedback_id: f.feedbackId != null ? f.feedbackId.toString() : null,
         asset: f.agentId,
         client_address: f.client,
         feedback_index: f.feedbackIndex.toString(),
@@ -860,6 +884,7 @@ export function createApiServer(options: ApiServerOptions): Express {
   const responsesHandler = async (req: Request, res: Response) => {
     try {
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
+      const response_id = parsePostgRESTValue(req.query.response_id);
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
@@ -873,6 +898,14 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
+      if (response_id !== undefined) {
+        const parsedResponseId = safeBigInt(response_id);
+        if (parsedResponseId === undefined) {
+          res.status(400).json({ error: 'Invalid response_id: must be a valid integer' });
+          return;
+        }
+        where.responseId = parsedResponseId;
+      }
 
       let parsedFeedbackIndex: bigint | undefined;
       if (feedback_index !== undefined) {
@@ -885,7 +918,19 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       if (feedback_id) {
-        where.feedbackId = feedback_id;
+        const feedbackSequentialId = safeBigInt(feedback_id);
+        if (feedbackSequentialId === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_id: must be a valid integer' });
+          return;
+        }
+        if (!asset) {
+          res.status(400).json({ error: 'feedback_id is scoped by agent. Provide asset filter when using sequential feedback_id.' });
+          return;
+        }
+        where.feedback = {
+          agentId: asset,
+          feedbackId: feedbackSequentialId,
+        };
       } else if (asset && client_address && parsedFeedbackIndex !== undefined) {
         // Find feedback first, then get responses
         const feedback = await prisma.feedback.findFirst({
@@ -906,8 +951,9 @@ export function createApiServer(options: ApiServerOptions): Express {
             skip: offset,
           });
           const mapped = orphans.map(o => ({
-            id: o.id,
+            id: null,
             feedback_id: null,
+            response_id: null,
             asset: o.agentId,
             client_address: o.client,
             feedback_index: o.feedbackIndex.toString(),
@@ -956,8 +1002,9 @@ export function createApiServer(options: ApiServerOptions): Express {
       // Map to SDK expected format (IndexedFeedbackResponse)
       // Note: feedback_index as String to preserve BigInt precision (> 2^53)
       const mapped = responses.map(r => ({
-        id: r.id,
-        feedback_id: r.feedbackId,
+        id: r.responseId != null ? r.responseId.toString() : null,
+        response_id: r.responseId != null ? r.responseId.toString() : null,
+        feedback_id: r.feedback.feedbackId != null ? r.feedback.feedbackId.toString() : null,
         asset: r.feedback.agentId,
         client_address: r.feedback.client,
         feedback_index: r.feedback.feedbackIndex.toString(),
@@ -988,6 +1035,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = parsePostgRESTValue(req.query.asset);
       const client = parsePostgRESTValue(req.query.client_address) ?? parsePostgRESTValue(req.query.client);
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const revoke_count = parsePostgRESTValue(req.query.revoke_count);
+      const revoke_count_in = parsePostgRESTIn(req.query.revoke_count);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1007,6 +1056,26 @@ export function createApiServer(options: ApiServerOptions): Express {
           return;
         }
         where.feedbackIndex = idx;
+      }
+      if (revoke_count_in) {
+        if (revoke_count_in.length === 0) {
+          res.status(400).json({ error: 'Invalid revoke_count IN filter: in.() must include at least one integer' });
+          return;
+        }
+
+        const counts = safeBigIntArray(revoke_count_in.join(','));
+        if (counts === undefined) {
+          res.status(400).json({ error: 'Invalid revoke_count IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        where.revokeCount = { in: counts };
+      } else if (revoke_count !== undefined) {
+        const count = safeBigInt(revoke_count);
+        if (count === undefined) {
+          res.status(400).json({ error: 'Invalid revoke_count: must be a valid integer' });
+          return;
+        }
+        where.revokeCount = count;
       }
 
       const orderBy: { revokeCount?: 'asc' | 'desc'; createdAt?: 'asc' | 'desc' } =
@@ -1032,7 +1101,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       const mapped = revocations.map(r => ({
-        id: r.id,
+        id: r.revocationId != null ? r.revocationId.toString() : null,
+        revocation_id: r.revocationId != null ? r.revocationId.toString() : null,
         asset: r.agentId,
         client_address: r.client,
         feedback_index: r.feedbackIndex.toString(),

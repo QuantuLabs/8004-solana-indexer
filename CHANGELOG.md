@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
+
 ## [1.7.2] - 2026-02-27
 
 ### Fixed

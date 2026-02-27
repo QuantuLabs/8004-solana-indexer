@@ -38,6 +38,7 @@ export interface AgentRow {
 
 export interface FeedbackRow {
   id: string;
+  feedback_id: string | null;
   asset: string;
   client_address: string;
   feedback_index: string;
@@ -61,6 +62,7 @@ export interface FeedbackRow {
 
 export interface ResponseRow {
   id: string;
+  response_id: string | null;
   asset: string;
   client_address: string;
   feedback_index: string;
@@ -73,6 +75,25 @@ export interface ResponseRow {
   verified_at: string | null;
   tx_signature: string | null;
   block_slot: string | null;
+  created_at: string;
+}
+
+export interface RevocationRow {
+  id: string;
+  revocation_id: string | null;
+  asset: string;
+  client_address: string;
+  feedback_index: string;
+  feedback_hash: string | null;
+  slot: string;
+  original_score: number | null;
+  atom_enabled: boolean;
+  had_impact: boolean;
+  running_digest: string | null;
+  revoke_count: string;
+  status: string;
+  verified_at: string | null;
+  tx_signature: string | null;
   created_at: string;
 }
 
@@ -136,7 +157,7 @@ export interface FeedbackPageKey {
   asset: string;
   first: number;
   skip: number;
-  orderBy: 'created_at' | 'value' | 'feedback_index';
+  orderBy: 'created_at' | 'feedback_id' | 'value' | 'feedback_index';
   orderDirection: 'ASC' | 'DESC';
 }
 
@@ -251,7 +272,7 @@ function createFeedbackByLookupLoader(pool: Pool) {
     }
 
     const { rows } = await pool.query<FeedbackRow>(
-      `SELECT id, asset, client_address, feedback_index, value, value_decimals,
+      `SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index, value, value_decimals,
               score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
               running_digest, is_revoked, status, verified_at,
               tx_signature, block_slot, created_at, revoked_at
@@ -296,6 +317,7 @@ function createFeedbackPageByAgentLoader(pool: Pool) {
            ), ranked AS (
              SELECT
                f.id,
+               f.feedback_id::text AS feedback_id,
                f.asset,
                f.client_address,
                f.feedback_index,
@@ -317,7 +339,7 @@ function createFeedbackPageByAgentLoader(pool: Pool) {
                f.revoked_at,
                ROW_NUMBER() OVER (
                  PARTITION BY f.asset
-                 ORDER BY ${sample.orderBy} ${sample.orderDirection}, f.client_address ASC, f.feedback_index ASC, f.id ASC
+                 ORDER BY ${sample.orderBy} ${sample.orderDirection}, f.client_address ASC, f.feedback_index ASC, f.feedback_id ASC NULLS LAST, f.id ASC
                ) AS rn
              FROM feedbacks f
              INNER JOIN requested r ON r.asset = f.asset
@@ -325,6 +347,7 @@ function createFeedbackPageByAgentLoader(pool: Pool) {
            )
            SELECT
              id,
+             feedback_id,
              asset,
              client_address,
              feedback_index,
@@ -397,6 +420,7 @@ function createResponsesPageByFeedbackLoader(pool: Pool) {
            ), ranked AS (
              SELECT
                fr.id,
+               fr.response_id::text AS response_id,
                fr.asset,
                fr.client_address,
                fr.feedback_index,
@@ -412,7 +436,7 @@ function createResponsesPageByFeedbackLoader(pool: Pool) {
                fr.created_at,
                ROW_NUMBER() OVER (
                  PARTITION BY fr.asset, fr.client_address, fr.feedback_index
-                 ORDER BY fr.created_at ASC, fr.id ASC
+                 ORDER BY fr.response_id ASC NULLS LAST, fr.created_at ASC, fr.id ASC
                ) AS rn
              FROM feedback_responses fr
              INNER JOIN requested r
@@ -423,6 +447,7 @@ function createResponsesPageByFeedbackLoader(pool: Pool) {
            )
            SELECT
              id,
+             response_id,
              asset,
              client_address,
              feedback_index,

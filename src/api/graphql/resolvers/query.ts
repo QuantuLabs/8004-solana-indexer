@@ -1,9 +1,9 @@
 import type { GraphQLContext } from '../context.js';
-import { decodeFeedbackId, decodeResponseId, decodeAgentId } from '../utils/ids.js';
+import { decodeAgentId, decodeFeedbackId, decodeResponseId } from '../utils/ids.js';
 import { clampFirst, clampSkip, MAX_FIRST } from '../utils/pagination.js';
 import { buildWhereClause } from '../utils/filters.js';
 import { createBadUserInputError } from '../utils/errors.js';
-import type { AgentRow, FeedbackRow, ResponseRow } from '../dataloaders.js';
+import type { AgentRow, FeedbackRow, ResponseRow, RevocationRow } from '../dataloaders.js';
 import { config } from '../../../config.js';
 
 const ORDER_MAP_AGENT: Record<string, string> = {
@@ -16,12 +16,20 @@ const ORDER_MAP_AGENT: Record<string, string> = {
 
 const ORDER_MAP_FEEDBACK: Record<string, string> = {
   createdAt: 'created_at',
+  feedbackId: 'feedback_id',
   value: 'value',
   feedbackIndex: 'feedback_index',
 };
 
 const ORDER_MAP_RESPONSE: Record<string, string> = {
   createdAt: 'created_at',
+  responseId: 'response_id',
+};
+
+const ORDER_MAP_REVOCATION: Record<string, string> = {
+  createdAt: 'created_at',
+  revocationId: 'revocation_id',
+  revokeCount: 'revoke_count',
 };
 
 const MAX_TREE_DEPTH = 8;
@@ -67,6 +75,7 @@ interface DecodedCursor {
   client_address?: string;
   feedback_index?: string;
   id?: string;
+  row_id?: string;
 }
 
 interface CollectionRow {
@@ -133,7 +142,8 @@ function decodeFlexibleCursor(cursor: string): DecodedCursor | null {
     const client_address = typeof obj.client_address === 'string' ? obj.client_address : undefined;
     const feedback_index = typeof obj.feedback_index === 'string' ? obj.feedback_index : undefined;
     const id = typeof obj.id === 'string' ? obj.id : undefined;
-    return { created_at: obj.created_at, asset, client_address, feedback_index, id };
+    const row_id = typeof obj.row_id === 'string' ? obj.row_id : undefined;
+    return { created_at: obj.created_at, asset, client_address, feedback_index, id, row_id };
   } catch {
     return null;
   }
@@ -153,6 +163,31 @@ function assertCursorOrderCompatibility(after: string | undefined, orderCol: str
 
 function resolveAssetId(input: string): string {
   return decodeAgentId(input) ?? input;
+}
+
+function isIntegerString(value: string): boolean {
+  return /^-?\d+$/.test(value);
+}
+
+function requireFeedbackRowId(row: FeedbackRow): FeedbackRow {
+  if (!row.feedback_id) {
+    throw new Error(`Missing feedback_id for feedback row ${row.id}`);
+  }
+  return row;
+}
+
+function requireResponseRowId(row: ResponseRow): ResponseRow {
+  if (!row.response_id) {
+    throw new Error(`Missing response_id for response row ${row.id}`);
+  }
+  return row;
+}
+
+function requireRevocationRowId(row: RevocationRow): RevocationRow {
+  if (!row.revocation_id) {
+    throw new Error(`Missing revocation_id for revocation row ${row.id}`);
+  }
+  return row;
 }
 
 function clampTreeDepth(depth: number | undefined): number {
@@ -322,20 +357,45 @@ export const queryResolvers = {
     },
 
     async feedback(_: unknown, args: { id: string }, ctx: GraphQLContext) {
-      const decoded = decodeFeedbackId(args.id);
-      if (!decoded) return null;
+      const canonicalId = decodeFeedbackId(args.id);
+      if (canonicalId && isIntegerString(canonicalId.index)) {
+        const { rows } = await ctx.pool.query<FeedbackRow>(
+          `SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index, value, value_decimals,
+                  score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+                  running_digest, is_revoked, status, verified_at,
+                  tx_signature, block_slot, created_at, revoked_at
+           FROM feedbacks
+           WHERE asset = $1
+           AND client_address = $2
+           AND feedback_index = $3::bigint
+           AND status != 'ORPHANED'
+           LIMIT 1`,
+          [canonicalId.asset, canonicalId.client, canonicalId.index]
+        );
+        return rows[0] ? requireFeedbackRowId(rows[0]) : null;
+      }
+
+      const sequentialId = isIntegerString(args.id) ? args.id : null;
+      if (!sequentialId) return null;
 
       const { rows } = await ctx.pool.query<FeedbackRow>(
-        `SELECT id, asset, client_address, feedback_index, value, value_decimals,
+        `SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index, value, value_decimals,
                 score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
                 running_digest, is_revoked, status, verified_at,
                 tx_signature, block_slot, created_at, revoked_at
          FROM feedbacks
-         WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
-         AND status != 'ORPHANED'`,
-        [decoded.asset, decoded.client, decoded.index]
+         WHERE feedback_id = $1::bigint
+         AND status != 'ORPHANED'
+         ORDER BY asset ASC, client_address ASC, feedback_index ASC
+         LIMIT 2`,
+        [sequentialId]
       );
-      return rows[0] ?? null;
+      if (rows.length > 1) {
+        throw createBadUserInputError(
+          'Ambiguous scoped feedback id. Use feedbacks(...) with explicit asset/client/feedback_index filters.'
+        );
+      }
+      return rows[0] ? requireFeedbackRowId(rows[0]) : null;
     },
 
     async feedbacks(
@@ -379,14 +439,19 @@ export const queryResolvers = {
         const assetParam = `$${paramIdx + 1}::text`;
         const clientParam = `$${paramIdx + 2}::text`;
         const feedbackIndexParam = `$${paramIdx + 3}::bigint`;
-        const idParam = `$${paramIdx + 4}::text`;
+        if (!/^-?\d+$/.test(cursor.id)) {
+          throw createBadUserInputError(
+            'Invalid feedbacks cursor. Expected base64 JSON with created_at, asset, client_address, feedback_index, and numeric id.'
+          );
+        }
+        const idParam = `$${paramIdx + 4}::bigint`;
 
         cursorSql = ` AND (
           created_at ${createdAtOp} ${createdAtParam}
           OR (created_at = ${createdAtParam} AND asset > ${assetParam})
           OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address > ${clientParam})
           OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address = ${clientParam} AND feedback_index > ${feedbackIndexParam})
-          OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address = ${clientParam} AND feedback_index = ${feedbackIndexParam} AND id > ${idParam})
+          OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address = ${clientParam} AND feedback_index = ${feedbackIndexParam} AND feedback_id > ${idParam})
         )`;
         params.push(
           cursor.created_at,
@@ -399,10 +464,10 @@ export const queryResolvers = {
       }
 
       const orderBySql = orderCol === 'created_at'
-        ? `created_at ${dir}, asset ASC, client_address ASC, feedback_index ASC, id ASC`
-        : `${orderCol} ${dir}, asset ASC, client_address ASC, feedback_index ASC, id ASC`;
+        ? `created_at ${dir}, asset ASC, client_address ASC, feedback_index ASC, feedback_id ASC NULLS LAST, id ASC`
+        : `${orderCol} ${dir}, asset ASC, client_address ASC, feedback_index ASC, feedback_id ASC NULLS LAST, id ASC`;
 
-      const sql = `SELECT id, asset, client_address, feedback_index, value, value_decimals,
+      const sql = `SELECT id, feedback_id::text AS feedback_id, asset, client_address, feedback_index, value, value_decimals,
                           score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
                           running_digest, is_revoked, status, verified_at,
                           tx_signature, block_slot, created_at, revoked_at
@@ -412,28 +477,68 @@ export const queryResolvers = {
       params.push(first, skip);
 
       const { rows } = await ctx.pool.query<FeedbackRow>(sql, params);
+      rows.forEach(requireFeedbackRowId);
       return rows;
     },
 
     async feedbackResponse(_: unknown, args: { id: string }, ctx: GraphQLContext) {
-      const decoded = decodeResponseId(args.id);
-      if (!decoded) return null;
+      const canonicalId = decodeResponseId(args.id);
+      if (canonicalId && isIntegerString(canonicalId.index)) {
+        const params: unknown[] = [
+          canonicalId.asset,
+          canonicalId.client,
+          canonicalId.index,
+          canonicalId.responder,
+        ];
+        const signatureOrCountSql = canonicalId.sig
+          ? ` AND (tx_signature = $5::text OR response_count::text = $5::text)`
+          : '';
+        if (canonicalId.sig) {
+          params.push(canonicalId.sig);
+        }
 
-      const useSig = decoded.sig.length > 0;
-      const sql = `SELECT id, asset, client_address, feedback_index, responder,
-                          response_uri, response_hash, running_digest, response_count,
-                          status, verified_at, tx_signature, block_slot, created_at
-                   FROM feedback_responses
-                   WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
-                     AND responder = $4 AND status != 'ORPHANED'
-                     ${useSig ? 'AND tx_signature = $5' : ''}
-                   LIMIT 1`;
-      const params = useSig
-        ? [decoded.asset, decoded.client, decoded.index, decoded.responder, decoded.sig]
-        : [decoded.asset, decoded.client, decoded.index, decoded.responder];
+        const { rows } = await ctx.pool.query<ResponseRow>(
+          `SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder,
+                  response_uri, response_hash, running_digest, response_count,
+                  status, verified_at, tx_signature, block_slot, created_at
+           FROM feedback_responses
+           WHERE asset = $1
+           AND client_address = $2
+           AND feedback_index = $3::bigint
+           AND responder = $4
+           ${signatureOrCountSql}
+           AND status != 'ORPHANED'
+           ORDER BY tx_signature ASC
+           LIMIT 2`,
+          params
+        );
+        if (rows.length > 1) {
+          throw createBadUserInputError(
+            'Ambiguous canonical response id. Include tx signature in the id to disambiguate.'
+          );
+        }
+        return rows[0] ? requireResponseRowId(rows[0]) : null;
+      }
 
-      const { rows } = await ctx.pool.query<ResponseRow>(sql, params);
-      return rows[0] ?? null;
+      const sequentialId = isIntegerString(args.id) ? args.id : null;
+      if (!sequentialId) return null;
+
+      const { rows } = await ctx.pool.query<ResponseRow>(
+        `SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder,
+                response_uri, response_hash, running_digest, response_count,
+                status, verified_at, tx_signature, block_slot, created_at
+         FROM feedback_responses
+         WHERE response_id = $1::bigint AND status != 'ORPHANED'
+         ORDER BY asset ASC, client_address ASC, feedback_index ASC, responder ASC
+         LIMIT 2`,
+        [sequentialId]
+      );
+      if (rows.length > 1) {
+        throw createBadUserInputError(
+          'Ambiguous scoped response id. Use feedbackResponses(...) with explicit filters.'
+        );
+      }
+      return rows[0] ? requireResponseRowId(rows[0]) : null;
     },
 
     async feedbackResponses(
@@ -463,22 +568,117 @@ export const queryResolvers = {
         if (!cursor) {
           throw createBadUserInputError('Invalid feedbackResponses cursor. Expected base64 JSON with created_at and optional id.');
         }
+        if (cursor.id && !/^-?\d+$/.test(cursor.id)) {
+          throw createBadUserInputError('Invalid feedbackResponses cursor id. Expected numeric scoped response id.');
+        }
         const op = dir === 'DESC' ? '<' : '>';
-        const cursorId = cursor.id ?? '';
-        cursorSql = ` AND (created_at, id) ${op} ($${paramIdx}::timestamptz, $${paramIdx + 1}::text)`;
-        params.push(cursor.created_at, cursorId);
-        paramIdx += 2;
+        const cursorId = cursor.id ?? '0';
+        const cursorRowId = cursor.row_id ?? '';
+        cursorSql = ` AND (created_at, response_id, id) ${op} ($${paramIdx}::timestamptz, $${paramIdx + 1}::bigint, $${paramIdx + 2}::text)`;
+        params.push(cursor.created_at, cursorId, cursorRowId);
+        paramIdx += 3;
       }
 
-      const sql = `SELECT id, asset, client_address, feedback_index, responder,
+      const sql = `SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder,
                           response_uri, response_hash, running_digest, response_count,
                           status, verified_at, tx_signature, block_slot, created_at
                    FROM feedback_responses ${where.sql}${cursorSql}
-                   ORDER BY ${orderCol} ${dir}, id ${dir}
+                   ORDER BY ${orderCol} ${dir}, response_id ${dir} NULLS LAST, id ${dir}
                    LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
       params.push(first, skip);
 
       const { rows } = await ctx.pool.query<ResponseRow>(sql, params);
+      rows.forEach(requireResponseRowId);
+      return rows;
+    },
+
+    async revocation(_: unknown, args: { id: string }, ctx: GraphQLContext) {
+      const canonicalId = decodeFeedbackId(args.id);
+      if (canonicalId && isIntegerString(canonicalId.index)) {
+        const { rows } = await ctx.pool.query<RevocationRow>(
+          `SELECT id, revocation_id::text AS revocation_id, asset, client_address, feedback_index,
+                  feedback_hash, slot::text AS slot, original_score, atom_enabled, had_impact,
+                  running_digest, revoke_count::text AS revoke_count, status, verified_at, tx_signature, created_at
+           FROM revocations
+           WHERE asset = $1
+           AND client_address = $2
+           AND feedback_index = $3::bigint
+           AND status != 'ORPHANED'
+           LIMIT 1`,
+          [canonicalId.asset, canonicalId.client, canonicalId.index]
+        );
+        return rows[0] ? requireRevocationRowId(rows[0]) : null;
+      }
+
+      const sequentialId = isIntegerString(args.id) ? args.id : null;
+      if (!sequentialId) return null;
+
+      const { rows } = await ctx.pool.query<RevocationRow>(
+        `SELECT id, revocation_id::text AS revocation_id, asset, client_address, feedback_index,
+                feedback_hash, slot::text AS slot, original_score, atom_enabled, had_impact,
+                running_digest, revoke_count::text AS revoke_count, status, verified_at, tx_signature, created_at
+         FROM revocations
+         WHERE revocation_id = $1::bigint AND status != 'ORPHANED'
+         ORDER BY asset ASC, client_address ASC, feedback_index ASC
+         LIMIT 2`,
+        [sequentialId]
+      );
+      if (rows.length > 1) {
+        throw createBadUserInputError(
+          'Ambiguous scoped revocation id. Use revocations(...) with explicit filters.'
+        );
+      }
+      return rows[0] ? requireRevocationRowId(rows[0]) : null;
+    },
+
+    async revocations(
+      _: unknown,
+      args: {
+        first?: number; skip?: number; after?: string;
+        where?: Record<string, unknown>;
+        orderBy?: string; orderDirection?: string;
+      },
+      ctx: GraphQLContext
+    ) {
+      const first = clampFirst(args.first);
+      const skip = clampSkip(args.skip);
+      const dir = resolveDirection(args.orderDirection);
+      const orderCol = ORDER_MAP_REVOCATION[args.orderBy ?? 'createdAt'] ?? 'created_at';
+
+      assertNoMixedCursorOffset(args.after, skip);
+      assertCursorOrderCompatibility(args.after, orderCol);
+
+      const where = buildWhereClause('revocation', args.where);
+      const params = [...where.params];
+      let paramIdx = where.paramIndex;
+
+      let cursorSql = '';
+      if (args.after) {
+        const cursor = decodeFlexibleCursor(args.after);
+        if (!cursor) {
+          throw createBadUserInputError('Invalid revocations cursor. Expected base64 JSON with created_at and optional id.');
+        }
+        if (cursor.id && !/^-?\d+$/.test(cursor.id)) {
+          throw createBadUserInputError('Invalid revocations cursor id. Expected numeric scoped revocation id.');
+        }
+        const op = dir === 'DESC' ? '<' : '>';
+        const cursorId = cursor.id ?? '0';
+        const cursorRowId = cursor.row_id ?? '';
+        cursorSql = ` AND (created_at, revocation_id, id) ${op} ($${paramIdx}::timestamptz, $${paramIdx + 1}::bigint, $${paramIdx + 2}::text)`;
+        params.push(cursor.created_at, cursorId, cursorRowId);
+        paramIdx += 3;
+      }
+
+      const sql = `SELECT id, revocation_id::text AS revocation_id, asset, client_address, feedback_index,
+                          feedback_hash, slot::text AS slot, original_score, atom_enabled, had_impact,
+                          running_digest, revoke_count::text AS revoke_count, status, verified_at, tx_signature, created_at
+                   FROM revocations ${where.sql}${cursorSql}
+                   ORDER BY ${orderCol} ${dir}, revocation_id ${dir} NULLS LAST, id ${dir}
+                   LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
+      params.push(first, skip);
+
+      const { rows } = await ctx.pool.query<RevocationRow>(sql, params);
+      rows.forEach(requireRevocationRowId);
       return rows;
     },
 

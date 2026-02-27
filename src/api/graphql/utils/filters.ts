@@ -31,6 +31,11 @@ const AGENT_FILTERS: FilterConfig[] = [
 
 const FEEDBACK_FILTERS: FilterConfig[] = [
   { graphqlField: 'agent', dbColumn: 'asset', operator: 'eq' },
+  { graphqlField: 'feedbackId', dbColumn: 'feedback_id', operator: 'eq' },
+  { graphqlField: 'feedbackId_gt', dbColumn: 'feedback_id', operator: 'gt' },
+  { graphqlField: 'feedbackId_gte', dbColumn: 'feedback_id', operator: 'gte' },
+  { graphqlField: 'feedbackId_lt', dbColumn: 'feedback_id', operator: 'lt' },
+  { graphqlField: 'feedbackId_lte', dbColumn: 'feedback_id', operator: 'lte' },
   { graphqlField: 'clientAddress', dbColumn: 'client_address', operator: 'eq' },
   { graphqlField: 'tag1', dbColumn: 'tag1', operator: 'eq' },
   { graphqlField: 'tag2', dbColumn: 'tag2', operator: 'eq' },
@@ -42,7 +47,25 @@ const FEEDBACK_FILTERS: FilterConfig[] = [
 
 const RESPONSE_FILTERS: FilterConfig[] = [
   { graphqlField: 'feedback', dbColumn: '', operator: 'feedbackRef' },
+  { graphqlField: 'responseId', dbColumn: 'response_id', operator: 'eq' },
+  { graphqlField: 'responseId_gt', dbColumn: 'response_id', operator: 'gt' },
+  { graphqlField: 'responseId_gte', dbColumn: 'response_id', operator: 'gte' },
+  { graphqlField: 'responseId_lt', dbColumn: 'response_id', operator: 'lt' },
+  { graphqlField: 'responseId_lte', dbColumn: 'response_id', operator: 'lte' },
   { graphqlField: 'responder', dbColumn: 'responder', operator: 'eq' },
+  { graphqlField: 'createdAt_gt', dbColumn: 'created_at', operator: 'gt' },
+  { graphqlField: 'createdAt_lt', dbColumn: 'created_at', operator: 'lt' },
+];
+
+const REVOCATION_FILTERS: FilterConfig[] = [
+  { graphqlField: 'agent', dbColumn: 'asset', operator: 'eq' },
+  { graphqlField: 'revocationId', dbColumn: 'revocation_id', operator: 'eq' },
+  { graphqlField: 'revocationId_gt', dbColumn: 'revocation_id', operator: 'gt' },
+  { graphqlField: 'revocationId_gte', dbColumn: 'revocation_id', operator: 'gte' },
+  { graphqlField: 'revocationId_lt', dbColumn: 'revocation_id', operator: 'lt' },
+  { graphqlField: 'revocationId_lte', dbColumn: 'revocation_id', operator: 'lte' },
+  { graphqlField: 'clientAddress', dbColumn: 'client_address', operator: 'eq' },
+  { graphqlField: 'feedbackIndex', dbColumn: 'feedback_index', operator: 'eq' },
   { graphqlField: 'createdAt_gt', dbColumn: 'created_at', operator: 'gt' },
   { graphqlField: 'createdAt_lt', dbColumn: 'created_at', operator: 'lt' },
 ];
@@ -62,6 +85,7 @@ const FILTER_MAP: Record<string, FilterConfig[]> = {
   agent: AGENT_FILTERS,
   feedback: FEEDBACK_FILTERS,
   response: RESPONSE_FILTERS,
+  revocation: REVOCATION_FILTERS,
   validation: VALIDATION_FILTERS,
   metadata: METADATA_FILTERS,
 };
@@ -103,7 +127,7 @@ function resolveIdArray(values: unknown): string[] | null {
 }
 
 export function buildWhereClause(
-  entityType: 'agent' | 'feedback' | 'response' | 'validation' | 'metadata',
+  entityType: 'agent' | 'feedback' | 'response' | 'revocation' | 'validation' | 'metadata',
   filter: Record<string, unknown> | undefined | null,
   startParamIndex?: number,
 ): WhereClause {
@@ -135,23 +159,27 @@ export function buildWhereClause(
 
       if (cfg.operator === 'feedbackRef') {
         if (typeof value !== 'string') continue;
-        const decoded = decodeFeedbackId(value) ?? (() => {
-          const parts = value.split(':');
-          if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
-            return { asset: parts[0], client: parts[1], index: parts[2] };
-          }
-          return null;
-        })();
-        if (!decoded) continue;
-        conditions.push(`asset = $${idx}`);
-        params.push(decoded.asset);
-        idx++;
-        conditions.push(`client_address = $${idx}`);
-        params.push(decoded.client);
-        idx++;
-        conditions.push(`feedback_index = $${idx}::bigint`);
-        params.push(decoded.index);
-        idx++;
+        const canonicalFeedbackRef = decodeFeedbackId(value);
+        if (canonicalFeedbackRef && /^-?\d+$/.test(canonicalFeedbackRef.index)) {
+          conditions.push(
+            `asset = $${idx} AND client_address = $${idx + 1} AND feedback_index = $${idx + 2}::bigint`
+          );
+          params.push(canonicalFeedbackRef.asset, canonicalFeedbackRef.client, canonicalFeedbackRef.index);
+          idx += 3;
+          continue;
+        }
+        if (/^-?\d+$/.test(value)) {
+          conditions.push(`EXISTS (
+            SELECT 1
+            FROM feedbacks f
+            WHERE f.asset = feedback_responses.asset
+              AND f.client_address = feedback_responses.client_address
+              AND f.feedback_index = feedback_responses.feedback_index
+              AND f.feedback_id = $${idx}::bigint
+          )`);
+          params.push(value);
+          idx++;
+        }
         continue;
       }
 

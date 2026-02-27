@@ -3,6 +3,7 @@ import { queryResolvers } from './query.js';
 import { agentResolvers } from './agent.js';
 import { feedbackResolvers } from './feedback.js';
 import { responseResolvers } from './response.js';
+import { revocationResolvers } from './revocation.js';
 import { validationResolvers } from './validation.js';
 import { metadataResolvers } from './metadata.js';
 import { statsResolvers } from './stats.js';
@@ -22,6 +23,7 @@ export const resolvers = {
   ...agentResolvers,
   ...feedbackResolvers,
   ...responseResolvers,
+  ...revocationResolvers,
   ...validationResolvers,
   ...metadataResolvers,
   ...statsResolvers,
