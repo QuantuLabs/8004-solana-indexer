@@ -326,6 +326,18 @@ describe('Scalar Resolvers', () => {
   });
 });
 
+describe('Agent Field Resolvers', () => {
+  it('maps Agent.agentId from DB agent_id', () => {
+    const parent = { asset: 'asset1', agent_id: '42' } as any;
+    expect(agentResolvers.Agent.agentId(parent)).toBe('42');
+  });
+
+  it('throws when DB agent_id is null', () => {
+    const parent = { asset: 'asset2', agent_id: null } as any;
+    expect(() => agentResolvers.Agent.agentId(parent)).toThrow('Missing agent_id');
+  });
+});
+
 describe('Feedback Field Resolvers', () => {
   it('normalizes feedback.value to decimal string and preserves string output', () => {
     const normalized = feedbackResolvers.Feedback.value({

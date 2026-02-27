@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-02-27
+
+### Fixed
+- Restored GraphQL `Agent.agentId` to map the sequential DB `agents.agent_id` registration id (deterministic ordering pipeline), instead of asset-derived bytes.
+- Tightened GraphQL contract by requiring non-null `agentId` and surfacing explicit errors when `agent_id` is unexpectedly missing.
+
+### Changed
+- Updated README GHCR integrity helper examples to use `v1.7.2`.
+
 ## [1.7.1] - 2026-02-27
 
 ### Changed

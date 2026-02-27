@@ -10,7 +10,6 @@ import {
   decodeValidationId,
   encodeMetadataId,
   decodeMetadataId,
-  numericAgentId,
 } from '../../../src/api/graphql/utils/ids.js';
 
 describe('GraphQL ID encoding/decoding', () => {
@@ -107,19 +106,6 @@ describe('GraphQL ID encoding/decoding', () => {
     it('returns null for invalid metadata ID', () => {
       expect(decodeMetadataId('sol:asset1')).toBeNull();
       expect(decodeMetadataId('')).toBeNull();
-    });
-  });
-
-  describe('numericAgentId', () => {
-    it('returns a bigint from valid base58', () => {
-      const result = numericAgentId('11111111111111111111111111111112');
-      expect(typeof result).toBe('bigint');
-      expect(result).toBeGreaterThanOrEqual(0n);
-    });
-
-    it('returns 0n for invalid base58', () => {
-      expect(numericAgentId('!!!invalid!!!')).toBe(0n);
-      expect(numericAgentId('')).toBe(0n);
     });
   });
 });

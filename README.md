@@ -45,11 +45,11 @@ Canonical identity is asset-based:
 
 - GraphQL `id`: raw agent asset pubkey (base58).
 - REST `asset`: same value as GraphQL `id`.
-- GraphQL `agentId`: deterministic bigint derived from the first 8 bytes of the asset pubkey (big-endian), serialized as a JSON string for precision safety.
+- GraphQL `agentId`: sequential DB registration ID from `agents.agent_id` (returned as GraphQL `BigInt` string for precision safety).
 
 Public API note:
 
-- `global_id` / `globalId` / `agentid` are not public API fields.
+- Public field name is `agentId`; internal DB names such as `agent_id` (and legacy `global_id`) are implementation details.
 
 ## Required Environment
 
@@ -132,8 +132,8 @@ Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.1 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.1
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.2 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.2
 ```
 
 ## GraphQL Example

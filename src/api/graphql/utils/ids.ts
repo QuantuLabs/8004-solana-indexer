@@ -1,5 +1,3 @@
-import bs58 from 'bs58';
-
 const SOL_PREFIX = 'sol';
 const SEP = ':';
 
@@ -89,15 +87,4 @@ export function decodeMetadataId(
   if (parts.length !== 3 || parts[0] !== SOL_PREFIX) return null;
   if (!parts[1] || !parts[2]) return null;
   return { asset: parts[1], key: parts[2] };
-}
-
-export function numericAgentId(asset: string): bigint {
-  try {
-    const bytes = bs58.decode(asset);
-    if (bytes.length < 8) return 0n;
-    const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
-    return view.getBigUint64(0, false);
-  } catch {
-    return 0n;
-  }
 }

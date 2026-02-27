@@ -1,6 +1,6 @@
 import type { GraphQLContext } from '../context.js';
 import type { AgentRow } from '../dataloaders.js';
-import { encodeAgentId, numericAgentId } from '../utils/ids.js';
+import { encodeAgentId } from '../utils/ids.js';
 import { clampFirst, clampSkip, encodeCursor } from '../utils/pagination.js';
 
 const FEEDBACK_ORDER_MAP: Record<string, 'created_at' | 'value' | 'feedback_index'> = {
@@ -39,7 +39,10 @@ export const agentResolvers = {
       return resolveChainId(ctx);
     },
     agentId(parent: AgentRow) {
-      return numericAgentId(parent.asset).toString();
+      if (!parent.agent_id) {
+        throw new Error(`Missing agent_id for agent ${parent.asset}`);
+      }
+      return parent.agent_id;
     },
     agentURI(parent: AgentRow) {
       return parent.agent_uri;

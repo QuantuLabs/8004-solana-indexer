@@ -103,6 +103,7 @@ type Agent {
   id: ID!
   cursor: String!
   chainId: Int!
+  # Sequential DB registration id from agents.agent_id (not asset-derived).
   agentId: BigInt!
   agentURI: String
   agentURIType: URIType
