@@ -44,7 +44,7 @@ model Agent {
   createdSlot        BigInt?
   txIndex            Int?     // Transaction index within block (deterministic ordering)
   eventOrdinal       Int?     // Event index within transaction (deterministic intra-tx ordering)
-  globalId           BigInt?  // Sequential registration ID (auto-assigned, permanent)
+  agentId           BigInt?  @map("agent_id") // Sequential registration ID (auto-assigned, permanent)
 
   // Verification status (reorg resilience)
   status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED

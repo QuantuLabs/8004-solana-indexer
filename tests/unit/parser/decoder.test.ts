@@ -174,6 +174,101 @@ describe("Parser Decoder", () => {
       expect(result).toEqual([]);
       spy.mockRestore();
     });
+
+    it("should derive collection lock=false from set_collection_pointer_with_options logs", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "CollectionPointerSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+              col: "c1:test",
+            },
+          } as any;
+        })();
+      });
+
+      const logs = [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        "Program log: Instruction: set_collection_pointer_with_options",
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ];
+      const result = parseTransactionLogs(logs);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe("CollectionPointerSet");
+      expect(result[0].data.lock).toBe(false);
+
+      spy.mockRestore();
+    });
+
+    it("should derive parent lock=true from set_parent_asset logs", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "ParentAssetSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              parent_asset: TEST_COLLECTION.toBase58(),
+              parent_creator: TEST_OWNER.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+            },
+          } as any;
+        })();
+      });
+
+      const logs = [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        "Program log: Instruction: set_parent_asset",
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ];
+      const result = parseTransactionLogs(logs);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe("ParentAssetSet");
+      expect(result[0].data.lock).toBe(true);
+
+      spy.mockRestore();
+    });
+
+    it("should derive lock hints from CamelCase instruction logs", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "CollectionPointerSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+              col: "c1:test",
+            },
+          } as any;
+          yield {
+            name: "ParentAssetSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              parent_asset: TEST_COLLECTION.toBase58(),
+              parent_creator: TEST_OWNER.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+            },
+          } as any;
+        })();
+      });
+
+      const logs = [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        "Program log: Instruction: SetCollectionPointer",
+        "Program log: Instruction: SetParentAssetWithOptions",
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ];
+      const result = parseTransactionLogs(logs);
+
+      expect(result).toHaveLength(2);
+      expect(result[0].data.lock).toBe(true);
+      expect(result[1].data.lock).toBe(false);
+
+      spy.mockRestore();
+    });
   });
 
   describe("parseTransaction", () => {
@@ -312,6 +407,43 @@ describe("Parser Decoder", () => {
       expect(result).not.toBeNull();
       expect(result!.type).toBe("UriUpdated");
       expect(result!.data.newUri).toBe("https://example.com/agent.json");
+    });
+
+    it("should convert CollectionPointerSet event with lock hint", () => {
+      const event = {
+        name: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          set_by: TEST_OWNER.toBase58(),
+          col: "c1:test",
+          lock: false,
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("CollectionPointerSet");
+      expect(result!.data.lock).toBe(false);
+    });
+
+    it("should convert ParentAssetSet event with lock hint", () => {
+      const event = {
+        name: "ParentAssetSet",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          parent_asset: TEST_COLLECTION.toBase58(),
+          parent_creator: TEST_OWNER.toBase58(),
+          set_by: TEST_OWNER.toBase58(),
+          lock: true,
+        },
+      };
+
+      const result = toTypedEvent(event);
+
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("ParentAssetSet");
+      expect(result!.data.lock).toBe(true);
     });
 
     it("should convert WalletUpdated event with null oldWallet", () => {

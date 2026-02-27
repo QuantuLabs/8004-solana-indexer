@@ -22,6 +22,8 @@ const CONCURRENCY = 10;        // Max parallel URI fetches
 const INTERVAL = 100;          // Min 100ms between operations (rate limiting)
 const TIMEOUT_MS = 30000;      // 30s timeout per operation
 const MAX_QUEUE_SIZE = 5000;   // Max pending tasks in queue (memory protection)
+const RECOVERY_BATCH_SIZE = 1000;
+const RECOVERY_INTERVAL_MS = 60_000;
 
 import { STANDARD_URI_FIELDS } from "../constants.js";
 
@@ -39,14 +41,21 @@ class MetadataQueue {
   private queue: PQueue;
   private pool: Pool | null = null;
   private pending = new Map<string, MetadataTask>(); // assetId -> latest task
+  private deferred = new Map<string, MetadataTask>(); // assetId -> latest deferred task
   private statsInterval: NodeJS.Timeout | null = null;
+  private recoveryInterval: NodeJS.Timeout | null = null;
+  private recoveryInFlight = false;
   private stats = {
     queued: 0,
     processed: 0,
     skippedStale: 0,
     skippedDuplicate: 0,
+    deferredQueued: 0,
+    deferredPromoted: 0,
+    deferredReplaced: 0,
     errors: 0,
   };
+  private queueFullSignals = 0;
 
   constructor() {
     this.queue = new PQueue({
@@ -64,6 +73,7 @@ class MetadataQueue {
    */
   setPool(pool: Pool): void {
     this.pool = pool;
+    this.startRecoveryLoop();
   }
 
   /**
@@ -75,17 +85,13 @@ class MetadataQueue {
       return;
     }
 
+    this.promoteDeferredIfCapacity();
+
     // Check for duplicate (same asset, same URI already pending)
     const existing = this.pending.get(assetId);
     if (existing && existing.uri === uri) {
       this.stats.skippedDuplicate++;
       logger.debug({ assetId }, "Skipped duplicate metadata task");
-      return;
-    }
-
-    // Reject if queue is at capacity
-    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
-      logger.warn({ assetId, queueSize: this.queue.size }, "Metadata queue full, rejecting task");
       return;
     }
 
@@ -96,13 +102,7 @@ class MetadataQueue {
       addedAt: Date.now(),
     };
     this.pending.set(assetId, task);
-    this.stats.queued++;
-
-    // Fire and forget - don't await
-    this.queue.add(() => this.processTask(task)).catch((err) => {
-      logger.error({ assetId, uri, error: err.message }, "Queue task failed");
-      this.stats.errors++;
-    });
+    this.enqueueOrDefer(task);
   }
 
   /**
@@ -152,10 +152,16 @@ class MetadataQueue {
       // Purge old URI metadata before writing new
       if (this.pool) {
         await this.pool.query(
-          `DELETE FROM metadata WHERE asset = $1 AND key LIKE '\\_uri:%' ESCAPE '\\'`,
+          `DELETE FROM metadata
+           WHERE asset = $1
+             AND key LIKE '\\_uri:%' ESCAPE '\\'
+             AND NOT immutable`,
           [assetId]
         );
       }
+
+      // Track the exact URI used for this extraction so recovery can detect mismatches after restarts.
+      await this.storeMetadata(assetId, "_uri:_source", uri);
 
       // Fetch and digest URI
       const result = await digestUri(uri);
@@ -213,6 +219,58 @@ class MetadataQueue {
     } catch (error: any) {
       this.stats.errors++;
       logger.error({ assetId, uri, error: error.message }, "Metadata extraction failed");
+    } finally {
+      this.promoteDeferredIfCapacity();
+    }
+  }
+
+  private enqueueOrDefer(task: MetadataTask): void {
+    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
+      this.deferTask(task);
+      return;
+    }
+
+    this.stats.queued++;
+    this.queue.add(() => this.processTask(task)).catch((err) => {
+      logger.error({ assetId: task.assetId, uri: task.uri, error: err.message }, "Queue task failed");
+      this.stats.errors++;
+    });
+  }
+
+  private deferTask(task: MetadataTask): void {
+    const existing = this.deferred.get(task.assetId);
+    if (existing) {
+      this.stats.deferredReplaced++;
+      this.deferred.delete(task.assetId);
+    }
+
+    this.deferred.set(task.assetId, task);
+    this.stats.deferredQueued++;
+    this.queueFullSignals++;
+
+    if (this.queueFullSignals % 10 === 1) {
+      logger.warn(
+        {
+          assetId: task.assetId,
+          queueSize: this.queue.size,
+          inFlight: this.queue.pending,
+          deferredCount: this.deferred.size,
+          deferredQueued: this.stats.deferredQueued,
+        },
+        "Metadata queue at capacity, deferred latest task"
+      );
+    }
+  }
+
+  private promoteDeferredIfCapacity(): void {
+    while (this.deferred.size > 0 && this.queue.size + this.queue.pending < MAX_QUEUE_SIZE) {
+      const next = this.deferred.entries().next().value as [string, MetadataTask] | undefined;
+      if (!next) return;
+
+      const [assetId, task] = next;
+      this.deferred.delete(assetId);
+      this.stats.deferredPromoted++;
+      this.enqueueOrDefer(task);
     }
   }
 
@@ -226,7 +284,7 @@ class MetadataQueue {
     const id = `${assetId}:${keyHash}`;
 
     // Only compress non-standard fields
-    const shouldCompress = !STANDARD_URI_FIELDS.has(key);
+    const shouldCompress = !STANDARD_URI_FIELDS.has(key) && key !== "_uri:_source";
     const storedValue = shouldCompress
       ? await compressForStorage(Buffer.from(value))
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
@@ -236,7 +294,8 @@ class MetadataQueue {
        VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', NOW())
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       WHERE NOT metadata.immutable`,
       [id, assetId, key, keyHash, storedValue]
     );
   }
@@ -249,6 +308,7 @@ class MetadataQueue {
       ...this.stats,
       queueSize: this.queue.size,
       pendingCount: this.pending.size,
+      deferredCount: this.deferred.size,
     };
   }
 
@@ -256,7 +316,10 @@ class MetadataQueue {
    * Wait for queue to drain (useful for graceful shutdown)
    */
   async drain(): Promise<void> {
-    await this.queue.onIdle();
+    do {
+      this.promoteDeferredIfCapacity();
+      await this.queue.onIdle();
+    } while (this.deferred.size > 0);
   }
 
   /**
@@ -267,11 +330,68 @@ class MetadataQueue {
       clearInterval(this.statsInterval);
       this.statsInterval = null;
     }
+    if (this.recoveryInterval) {
+      clearInterval(this.recoveryInterval);
+      this.recoveryInterval = null;
+    }
   }
 
   private logStats(): void {
-    if (this.stats.queued === 0) return;
+    if (this.stats.queued === 0 && this.deferred.size === 0) return;
     logger.info(this.getStats(), "Metadata queue stats (60s)");
+  }
+
+  private startRecoveryLoop(): void {
+    if (!this.pool || process.env.NODE_ENV === "test" || this.recoveryInterval) {
+      return;
+    }
+
+    const tick = async () => {
+      if (this.recoveryInFlight || !this.pool || config.metadataIndexMode === "off") {
+        return;
+      }
+      this.recoveryInFlight = true;
+      try {
+        const { rows } = await this.pool.query<{ asset: string; agent_uri: string }>(
+          `SELECT a.asset, a.agent_uri
+           FROM agents a
+           LEFT JOIN metadata m_source
+             ON m_source.asset = a.asset
+            AND m_source.key = '_uri:_source'
+           LEFT JOIN metadata m_status
+             ON m_status.asset = a.asset
+            AND m_status.key = '_uri:_status'
+           WHERE a.agent_uri IS NOT NULL
+             AND a.agent_uri != ''
+             AND (
+               m_source.id IS NULL
+               OR get_byte(m_source.value, 0) != 0
+               OR convert_from(substring(m_source.value from 2), 'UTF8') != a.agent_uri
+               OR m_status.id IS NULL
+               OR get_byte(m_status.value, 0) != 0
+               OR convert_from(substring(m_status.value from 2), 'UTF8') NOT LIKE '%"status":"ok"%'
+             )
+           LIMIT $1`,
+          [RECOVERY_BATCH_SIZE]
+        );
+
+        if (rows.length > 0) {
+          for (const row of rows) {
+            this.add(row.asset, row.agent_uri);
+          }
+          logger.info({ recoveredCount: rows.length }, "Recovered missing URI metadata tasks");
+        }
+      } catch (error: any) {
+        logger.warn({ error: error.message }, "Metadata recovery sweep failed");
+      } finally {
+        this.recoveryInFlight = false;
+      }
+    };
+
+    void tick();
+    this.recoveryInterval = setInterval(() => {
+      void tick();
+    }, RECOVERY_INTERVAL_MS);
   }
 }
 

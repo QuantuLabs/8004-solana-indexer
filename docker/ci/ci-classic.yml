@@ -13,4 +13,20 @@ services:
       RPC_URL: https://api.devnet.solana.com
       WS_URL: wss://api.devnet.solana.com
       LOG_LEVEL: warn
-    command: ["npx", "vitest", "run", "tests/unit/config.test.ts", "tests/unit/parser/types.test.ts", "tests/unit/parser/decoder.test.ts"]
+    command:
+      [
+        "npx",
+        "vitest",
+        "run",
+        "tests/unit/config.test.ts",
+        "tests/unit/parser/types.test.ts",
+        "tests/unit/parser/decoder.test.ts",
+        "tests/unit/db/handlers-coverage.test.ts",
+        "tests/unit/indexer/batch-processor.test.ts",
+        "tests/unit/indexer/poller-coverage.test.ts",
+        "tests/unit/indexer/websocket-coverage.test.ts",
+        "tests/unit/indexer/metadata-queue.test.ts",
+        "tests/unit/indexer/processor.test.ts",
+        "tests/unit/indexer/collection-metadata-queue.test.ts",
+        "tests/unit/api-parity-both.test.ts"
+      ]

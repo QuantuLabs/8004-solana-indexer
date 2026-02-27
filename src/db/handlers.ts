@@ -33,13 +33,231 @@ const logger = createChildLogger("db-handlers");
 // Global concurrency limiter for URI metadata fetching
 // Prevents OOM from unbounded fire-and-forget digest operations
 const MAX_URI_FETCH_CONCURRENT = 5;
-const MAX_URI_FETCH_QUEUE = 100;
 const uriDigestQueue = new PQueue({ concurrency: MAX_URI_FETCH_CONCURRENT });
-let uriDigestDroppedCount = 0;
 const MAX_COLLECTION_FETCH_CONCURRENT = 3;
-const MAX_COLLECTION_FETCH_QUEUE = 200;
 const collectionDigestQueue = new PQueue({ concurrency: MAX_COLLECTION_FETCH_CONCURRENT });
-let collectionDigestDroppedCount = 0;
+const pendingUriDigests = new Map<string, { prisma: PrismaClient; uri: string }>();
+const inFlightUriDigests = new Set<string>();
+const pendingCollectionDigests = new Map<string, { prisma: PrismaClient; pointer: string }>();
+const inFlightCollectionDigests = new Set<string>();
+const LOCAL_RECOVERY_INTERVAL_MS = 60_000;
+const LOCAL_RECOVERY_BATCH_SIZE = 500;
+let localRecoveryInterval: NodeJS.Timeout | null = null;
+let localRecoveryInFlight = false;
+let agentIdAssignmentTail: Promise<void> = Promise.resolve();
+
+async function withAgentIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  const previous = agentIdAssignmentTail;
+  let release: () => void = () => {};
+  agentIdAssignmentTail = new Promise<void>((resolve) => {
+    release = () => resolve();
+  });
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+function asBigInt(value: bigint | number | null | undefined): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value));
+  return 0n;
+}
+
+function enqueueUriDigestWorker(assetId: string): void {
+  if (inFlightUriDigests.has(assetId)) return;
+  const pending = pendingUriDigests.get(assetId);
+  if (!pending) return;
+
+  inFlightUriDigests.add(assetId);
+  uriDigestQueue
+    .add(async () => {
+      try {
+        while (true) {
+          const next = pendingUriDigests.get(assetId);
+          if (!next) break;
+          pendingUriDigests.delete(assetId);
+
+          try {
+            await digestAndStoreUriMetadataLocal(next.prisma, assetId, next.uri);
+          } catch (err: any) {
+            logger.warn({ assetId, uri: next.uri, error: err.message }, "Failed to digest URI metadata");
+          }
+        }
+      } finally {
+        inFlightUriDigests.delete(assetId);
+        if (pendingUriDigests.has(assetId)) {
+          enqueueUriDigestWorker(assetId);
+        }
+      }
+    })
+    .catch((err: any) => {
+      inFlightUriDigests.delete(assetId);
+      logger.error({ assetId, error: err.message }, "URI digest queue task failed");
+      if (pendingUriDigests.has(assetId)) {
+        enqueueUriDigestWorker(assetId);
+      }
+    });
+}
+
+function scheduleUriDigest(prisma: PrismaClient, assetId: string, uri: string): void {
+  if (!uri || config.metadataIndexMode === "off") return;
+  pendingUriDigests.set(assetId, { prisma, uri });
+  enqueueUriDigestWorker(assetId);
+}
+
+function enqueueCollectionDigestWorker(assetId: string): void {
+  if (inFlightCollectionDigests.has(assetId)) return;
+  const pending = pendingCollectionDigests.get(assetId);
+  if (!pending) return;
+
+  inFlightCollectionDigests.add(assetId);
+  collectionDigestQueue
+    .add(async () => {
+      try {
+        while (true) {
+          const next = pendingCollectionDigests.get(assetId);
+          if (!next) break;
+          pendingCollectionDigests.delete(assetId);
+
+          try {
+            await digestAndStoreCollectionMetadataLocal(next.prisma, assetId, next.pointer);
+          } catch (err: any) {
+            logger.warn({ assetId, col: next.pointer, error: err.message }, "Failed to digest collection metadata");
+          }
+        }
+      } finally {
+        inFlightCollectionDigests.delete(assetId);
+        if (pendingCollectionDigests.has(assetId)) {
+          enqueueCollectionDigestWorker(assetId);
+        }
+      }
+    })
+    .catch((err: any) => {
+      inFlightCollectionDigests.delete(assetId);
+      logger.error({ assetId, error: err.message }, "Collection digest queue task failed");
+      if (pendingCollectionDigests.has(assetId)) {
+        enqueueCollectionDigestWorker(assetId);
+      }
+    });
+}
+
+function scheduleCollectionDigest(prisma: PrismaClient, assetId: string, pointer: string): void {
+  if (!pointer || !config.collectionMetadataIndexEnabled) return;
+  pendingCollectionDigests.set(assetId, { prisma, pointer });
+  enqueueCollectionDigestWorker(assetId);
+}
+
+function decodeRawMetadataValue(value: Uint8Array | Buffer | null | undefined): string | null {
+  if (!value || value.length === 0) return null;
+  const buffer = Buffer.from(value);
+  if (buffer[0] !== 0x00) return null;
+  return buffer.slice(1).toString("utf8");
+}
+
+function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
+  if (process.env.NODE_ENV === "test" || localRecoveryInterval) {
+    return;
+  }
+
+  const tick = async () => {
+    if (localRecoveryInFlight) return;
+    localRecoveryInFlight = true;
+    try {
+      if (config.metadataIndexMode !== "off") {
+        const agents = await prisma.agent.findMany({
+          where: {
+            uri: { not: "" },
+          },
+          select: {
+            id: true,
+            uri: true,
+          },
+          orderBy: { updatedAt: "desc" },
+          take: LOCAL_RECOVERY_BATCH_SIZE,
+        });
+
+        if (agents.length > 0) {
+          const metadataRows = await prisma.agentMetadata.findMany({
+            where: {
+              agentId: { in: agents.map((a) => a.id) },
+              key: { in: ["_uri:_source", "_uri:_status"] },
+            },
+            select: {
+              agentId: true,
+              key: true,
+              value: true,
+            },
+          });
+
+          const sourceByAgent = new Map<string, string | null>();
+          const statusByAgent = new Map<string, string | null>();
+          for (const row of metadataRows) {
+            const decoded = decodeRawMetadataValue(row.value);
+            if (row.key === "_uri:_source") {
+              sourceByAgent.set(row.agentId, decoded);
+            } else if (row.key === "_uri:_status") {
+              statusByAgent.set(row.agentId, decoded);
+            }
+          }
+
+          for (const agent of agents) {
+            const source = sourceByAgent.get(agent.id);
+            const status = statusByAgent.get(agent.id);
+            const statusOk = !!status && status.includes('"status":"ok"');
+            if (source !== agent.uri || !statusOk) {
+              scheduleUriDigest(prisma, agent.id, agent.uri);
+            }
+          }
+        }
+      }
+
+      if (config.collectionMetadataIndexEnabled) {
+        const collections = await prisma.collection.findMany({
+          select: {
+            col: true,
+            creator: true,
+            metadataStatus: true,
+            metadataUpdatedAt: true,
+            lastSeenAt: true,
+          },
+          orderBy: { lastSeenAt: "desc" },
+          take: LOCAL_RECOVERY_BATCH_SIZE,
+        });
+
+        for (const collection of collections) {
+          const stale =
+            collection.metadataStatus !== "ok" ||
+            !collection.metadataUpdatedAt ||
+            collection.metadataUpdatedAt.getTime() < collection.lastSeenAt.getTime();
+          if (!stale) continue;
+
+          const agent = await prisma.agent.findFirst({
+            where: {
+              collectionPointer: collection.col,
+              creator: collection.creator,
+            },
+            select: { id: true },
+          });
+          if (agent) {
+            scheduleCollectionDigest(prisma, agent.id, collection.col);
+          }
+        }
+      }
+    } catch (error: any) {
+      logger.warn({ error: error.message }, "Local metadata recovery sweep failed");
+    } finally {
+      localRecoveryInFlight = false;
+    }
+  };
+
+  void tick();
+  localRecoveryInterval = setInterval(() => {
+    void tick();
+  }, LOCAL_RECOVERY_INTERVAL_MS);
+}
 
 // Default status for new records (will be verified later)
 const DEFAULT_STATUS: ChainStatus = "PENDING";
@@ -180,6 +398,8 @@ export async function handleEventAtomic(
     throw new Error("Prisma client required in local mode");
   }
 
+  startLocalDigestRecoveryLoop(prisma);
+
   await prisma.$transaction(async (tx) => {
     // 1. Handle event
     await handleEventInner(tx, event, ctx);
@@ -247,44 +467,13 @@ async function triggerDerivedDigestsIfNeeded(
   }
 
   if (uriAssetId && uri && config.metadataIndexMode !== "off") {
-    // Use bounded queue to prevent OOM from unbounded concurrent fetches
-    if (uriDigestQueue.size >= MAX_URI_FETCH_QUEUE) {
-      uriDigestDroppedCount++;
-      if (uriDigestDroppedCount % 10 === 1) {
-        logger.warn({ assetId: uriAssetId, queueSize: uriDigestQueue.size, dropped: uriDigestDroppedCount }, "URI digest queue full, dropping request");
-      }
-    } else {
-      uriDigestQueue.add(async () => {
-        try {
-          await digestAndStoreUriMetadataLocal(prisma, uriAssetId!, uri!);
-        } catch (err: any) {
-          logger.warn({ assetId: uriAssetId, uri, error: err.message }, "Failed to digest URI metadata");
-        }
-      });
-    }
+    scheduleUriDigest(prisma, uriAssetId, uri);
   }
 
   if (event.type === "CollectionPointerSet" && config.collectionMetadataIndexEnabled) {
     const assetId = event.data.asset.toBase58();
     const pointer = event.data.col;
-    if (collectionDigestQueue.size >= MAX_COLLECTION_FETCH_QUEUE) {
-      collectionDigestDroppedCount++;
-      if (collectionDigestDroppedCount % 10 === 1) {
-        logger.warn(
-          { assetId, queueSize: collectionDigestQueue.size, dropped: collectionDigestDroppedCount },
-          "Collection digest queue full, dropping request"
-        );
-      }
-      return;
-    }
-
-    collectionDigestQueue.add(async () => {
-      try {
-        await digestAndStoreCollectionMetadataLocal(prisma, assetId, pointer);
-      } catch (err: any) {
-        logger.warn({ assetId, col: pointer, error: err.message }, "Failed to digest collection metadata");
-      }
-    });
+    scheduleCollectionDigest(prisma, assetId, pointer);
   }
 }
 
@@ -370,6 +559,8 @@ export async function handleEvent(
     throw new Error("PrismaClient required for local mode");
   }
 
+  startLocalDigestRecoveryLoop(prisma);
+
   switch (event.type) {
     case "AgentRegistered":
       await handleAgentRegistered(prisma, event.data, ctx);
@@ -447,36 +638,56 @@ async function handleAgentRegisteredCore(
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
   const collectionId = data.collection.toBase58();
+  await withAgentIdAssignmentLock(async () => {
+    const existingAgent = await client.agent.findUnique({
+      where: { id: assetId },
+      select: { agentId: true },
+    });
 
-  await client.agent.upsert({
-    where: { id: assetId },
-    create: {
-      id: assetId,
-      owner: data.owner.toBase58(),
-      creator: data.owner.toBase58(),
-      uri: agentUri,
-      nftName: "",
-      collection: collectionId,
-      collectionPointer: "",
-      colLocked: false,
-      parentLocked: false,
-      registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
-      atomEnabled: data.atomEnabled,
-      createdTxSignature: ctx.signature,
-      createdSlot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: DEFAULT_STATUS,
-    },
-    update: {
-      collection: collectionId,
-      registry: collectionId, // v0.6.0: registry = collection
-      atomEnabled: data.atomEnabled,
-      uri: agentUri,
-      creator: data.owner.toBase58(),
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-    },
+    let assignedAgentId: bigint | undefined;
+    if (!existingAgent || existingAgent.agentId === null) {
+      const highestAssigned = await client.agent.findMany({
+        where: { agentId: { not: null } },
+        select: { agentId: true },
+        orderBy: { agentId: "desc" },
+        take: 1,
+      });
+      const maxAssigned = highestAssigned[0]?.agentId;
+      assignedAgentId = asBigInt(maxAssigned) + 1n;
+    }
+
+    await client.agent.upsert({
+      where: { id: assetId },
+      create: {
+        id: assetId,
+        owner: data.owner.toBase58(),
+        creator: data.owner.toBase58(),
+        uri: agentUri,
+        nftName: "",
+        collection: collectionId,
+        collectionPointer: "",
+        colLocked: false,
+        parentLocked: false,
+        registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
+        atomEnabled: data.atomEnabled,
+        createdTxSignature: ctx.signature,
+        createdSlot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        agentId: assignedAgentId ?? null,
+        status: DEFAULT_STATUS,
+      },
+      update: {
+        collection: collectionId,
+        registry: collectionId, // v0.6.0: registry = collection
+        atomEnabled: data.atomEnabled,
+        uri: agentUri,
+        creator: data.owner.toBase58(),
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
+      },
+    });
   });
 
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
@@ -493,22 +704,8 @@ async function handleAgentRegistered(
   const agentUri = data.agentUri || "";
 
   // Trigger URI metadata extraction if configured and URI is present
-  // Uses bounded queue to prevent OOM from unbounded concurrent fetches
   if (agentUri && config.metadataIndexMode !== "off") {
-    if (uriDigestQueue.size >= MAX_URI_FETCH_QUEUE) {
-      uriDigestDroppedCount++;
-      if (uriDigestDroppedCount % 10 === 1) {
-        logger.warn({ assetId, queueSize: uriDigestQueue.size, dropped: uriDigestDroppedCount }, "URI digest queue full, dropping request");
-      }
-    } else {
-      uriDigestQueue.add(async () => {
-        try {
-          await digestAndStoreUriMetadataLocal(prisma, assetId, agentUri);
-        } catch (err: any) {
-          logger.warn({ assetId, uri: agentUri, error: err.message }, "Failed to digest URI metadata");
-        }
-      });
-    }
+    scheduleUriDigest(prisma, assetId, agentUri);
   }
 }
 
@@ -644,22 +841,8 @@ async function handleUriUpdated(
   logger.info({ assetId, newUri }, "Agent URI updated");
 
   // Trigger URI metadata extraction if configured and URI is present
-  // Uses bounded queue to prevent OOM from unbounded concurrent fetches
   if (newUri && config.metadataIndexMode !== "off") {
-    if (uriDigestQueue.size >= MAX_URI_FETCH_QUEUE) {
-      uriDigestDroppedCount++;
-      if (uriDigestDroppedCount % 10 === 1) {
-        logger.warn({ assetId, queueSize: uriDigestQueue.size, dropped: uriDigestDroppedCount }, "URI digest queue full, dropping request");
-      }
-    } else {
-      uriDigestQueue.add(async () => {
-        try {
-          await digestAndStoreUriMetadataLocal(prisma, assetId, newUri);
-        } catch (err: any) {
-          logger.warn({ assetId, uri: newUri, error: err.message }, "Failed to digest URI metadata");
-        }
-      });
-    }
+    scheduleUriDigest(prisma, assetId, newUri);
   }
 }
 
@@ -806,6 +989,7 @@ async function handleCollectionPointerSetTx(
     data: {
       collectionPointer: pointer,
       creator,
+      ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
       updatedAt: ctx.blockTime,
     },
   });
@@ -881,6 +1065,7 @@ async function handleCollectionPointerSet(
     data: {
       collectionPointer: pointer,
       creator,
+      ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
       updatedAt: ctx.blockTime,
     },
   });
@@ -916,24 +1101,7 @@ async function handleCollectionPointerSet(
   logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
   if (config.collectionMetadataIndexEnabled) {
-    if (collectionDigestQueue.size >= MAX_COLLECTION_FETCH_QUEUE) {
-      collectionDigestDroppedCount++;
-      if (collectionDigestDroppedCount % 10 === 1) {
-        logger.warn(
-          { assetId, queueSize: collectionDigestQueue.size, dropped: collectionDigestDroppedCount },
-          "Collection digest queue full, dropping request"
-        );
-      }
-      return;
-    }
-
-    collectionDigestQueue.add(async () => {
-      try {
-        await digestAndStoreCollectionMetadataLocal(prisma, assetId, pointer);
-      } catch (err: any) {
-        logger.warn({ assetId, col: pointer, error: err.message }, "Failed to digest collection metadata");
-      }
-    });
+    scheduleCollectionDigest(prisma, assetId, pointer);
   }
 }
 
@@ -948,6 +1116,7 @@ async function handleParentAssetSetTx(
     data: {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
+      ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
       updatedAt: ctx.blockTime,
     },
   });
@@ -976,6 +1145,7 @@ async function handleParentAssetSet(
     data: {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
+      ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
       updatedAt: ctx.blockTime,
     },
   });
@@ -1966,12 +2136,16 @@ async function digestAndStoreUriMetadataLocal(
       where: {
         agentId: assetId,
         key: { startsWith: "_uri:" },
+        immutable: false,
       },
     });
     logger.debug({ assetId }, "Purged old URI metadata");
   } catch (error: any) {
     logger.warn({ assetId, error: error.message }, "Failed to purge old URI metadata");
   }
+
+  // Keep extraction source for restart recovery and URI mismatch detection.
+  await storeUriMetadataLocal(prisma, assetId, "_uri:_source", uri);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
@@ -2121,8 +2295,22 @@ async function storeUriMetadataLocal(
   value: string
 ): Promise<void> {
   try {
+    const existing = await prisma.agentMetadata.findUnique({
+      where: {
+        agentId_key: {
+          agentId: assetId,
+          key,
+        },
+      },
+      select: { immutable: true },
+    });
+    if (existing?.immutable) {
+      logger.debug({ assetId, key }, "Skipping URI metadata overwrite for immutable entry");
+      return;
+    }
+
     // Apply compression parity with Supabase mode
-    const shouldCompress = !STANDARD_URI_FIELDS.has(key);
+    const shouldCompress = !STANDARD_URI_FIELDS.has(key) && key !== "_uri:_source";
     const storedBuffer = shouldCompress
       ? await compressForStorage(Buffer.from(value))
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
@@ -2149,6 +2337,7 @@ async function storeUriMetadataLocal(
     });
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
+    throw error;
   }
 }
 

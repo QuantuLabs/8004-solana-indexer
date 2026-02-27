@@ -10,6 +10,8 @@ const CONCURRENCY = 5;
 const INTERVAL = 100;
 const TIMEOUT_MS = 30000;
 const MAX_QUEUE_SIZE = 5000;
+const RECOVERY_BATCH_SIZE = 1000;
+const RECOVERY_INTERVAL_MS = 60_000;
 
 export interface CollectionMetadataTask {
   assetId: string;
@@ -21,14 +23,21 @@ class CollectionMetadataQueue {
   private queue: PQueue;
   private pool: Pool | null = null;
   private pending = new Map<string, CollectionMetadataTask>();
+  private deferred = new Map<string, CollectionMetadataTask>();
   private statsInterval: NodeJS.Timeout | null = null;
+  private recoveryInterval: NodeJS.Timeout | null = null;
+  private recoveryInFlight = false;
   private stats = {
     queued: 0,
     processed: 0,
     skippedStale: 0,
     skippedDuplicate: 0,
+    deferredQueued: 0,
+    deferredPromoted: 0,
+    deferredReplaced: 0,
     errors: 0,
   };
+  private queueFullSignals = 0;
 
   constructor() {
     this.queue = new PQueue({
@@ -43,6 +52,7 @@ class CollectionMetadataQueue {
 
   setPool(pool: Pool): void {
     this.pool = pool;
+    this.startRecoveryLoop();
   }
 
   add(assetId: string, col: string): void {
@@ -50,14 +60,11 @@ class CollectionMetadataQueue {
       return;
     }
 
+    this.promoteDeferredIfCapacity();
+
     const existing = this.pending.get(assetId);
     if (existing && existing.col === col) {
       this.stats.skippedDuplicate++;
-      return;
-    }
-
-    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
-      logger.warn({ assetId, queueSize: this.queue.size }, "Collection metadata queue full, rejecting task");
       return;
     }
 
@@ -68,12 +75,7 @@ class CollectionMetadataQueue {
     };
 
     this.pending.set(assetId, task);
-    this.stats.queued++;
-
-    this.queue.add(() => this.processTask(task)).catch((err) => {
-      this.stats.errors++;
-      logger.error({ assetId, col, error: err.message }, "Collection metadata queue task failed");
-    });
+    this.enqueueOrDefer(task);
   }
 
   addBatch(tasks: Array<{ assetId: string; col: string }>): void {
@@ -170,6 +172,58 @@ class CollectionMetadataQueue {
     } catch (error: any) {
       this.stats.errors++;
       logger.error({ assetId, col, error: error.message }, "Collection metadata extraction failed");
+    } finally {
+      this.promoteDeferredIfCapacity();
+    }
+  }
+
+  private enqueueOrDefer(task: CollectionMetadataTask): void {
+    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
+      this.deferTask(task);
+      return;
+    }
+
+    this.stats.queued++;
+    this.queue.add(() => this.processTask(task)).catch((err) => {
+      this.stats.errors++;
+      logger.error({ assetId: task.assetId, col: task.col, error: err.message }, "Collection metadata queue task failed");
+    });
+  }
+
+  private deferTask(task: CollectionMetadataTask): void {
+    const existing = this.deferred.get(task.assetId);
+    if (existing) {
+      this.stats.deferredReplaced++;
+      this.deferred.delete(task.assetId);
+    }
+
+    this.deferred.set(task.assetId, task);
+    this.stats.deferredQueued++;
+    this.queueFullSignals++;
+
+    if (this.queueFullSignals % 10 === 1) {
+      logger.warn(
+        {
+          assetId: task.assetId,
+          queueSize: this.queue.size,
+          inFlight: this.queue.pending,
+          deferredCount: this.deferred.size,
+          deferredQueued: this.stats.deferredQueued,
+        },
+        "Collection metadata queue at capacity, deferred latest task"
+      );
+    }
+  }
+
+  private promoteDeferredIfCapacity(): void {
+    while (this.deferred.size > 0 && this.queue.size + this.queue.pending < MAX_QUEUE_SIZE) {
+      const next = this.deferred.entries().next().value as [string, CollectionMetadataTask] | undefined;
+      if (!next) return;
+
+      const [assetId, task] = next;
+      this.deferred.delete(assetId);
+      this.stats.deferredPromoted++;
+      this.enqueueOrDefer(task);
     }
   }
 
@@ -178,6 +232,7 @@ class CollectionMetadataQueue {
       ...this.stats,
       queueSize: this.queue.size,
       pendingCount: this.pending.size,
+      deferredCount: this.deferred.size,
     };
   }
 
@@ -186,11 +241,64 @@ class CollectionMetadataQueue {
       clearInterval(this.statsInterval);
       this.statsInterval = null;
     }
+    if (this.recoveryInterval) {
+      clearInterval(this.recoveryInterval);
+      this.recoveryInterval = null;
+    }
   }
 
   private logStats(): void {
-    if (this.stats.queued === 0) return;
+    if (this.stats.queued === 0 && this.deferred.size === 0) return;
     logger.info(this.getStats(), "Collection metadata queue stats (60s)");
+  }
+
+  private startRecoveryLoop(): void {
+    if (!this.pool || process.env.NODE_ENV === "test" || this.recoveryInterval) {
+      return;
+    }
+
+    const tick = async () => {
+      if (this.recoveryInFlight || !this.pool || !config.collectionMetadataIndexEnabled) {
+        return;
+      }
+      this.recoveryInFlight = true;
+      try {
+        const { rows } = await this.pool.query<{ asset: string; canonical_col: string }>(
+          `SELECT a.asset, a.canonical_col
+           FROM agents a
+           LEFT JOIN collection_pointers cp
+             ON cp.col = a.canonical_col
+            AND cp.creator = COALESCE(a.creator, a.owner)
+           WHERE a.canonical_col IS NOT NULL
+             AND a.canonical_col != ''
+             AND (
+               cp.col IS NULL
+               OR cp.metadata_status IS NULL
+               OR cp.metadata_status != 'ok'
+               OR cp.metadata_updated_at IS NULL
+               OR cp.metadata_updated_at < cp.last_seen_at
+             )
+           LIMIT $1`,
+          [RECOVERY_BATCH_SIZE]
+        );
+
+        if (rows.length > 0) {
+          for (const row of rows) {
+            this.add(row.asset, row.canonical_col);
+          }
+          logger.info({ recoveredCount: rows.length }, "Recovered missing collection metadata tasks");
+        }
+      } catch (error: any) {
+        logger.warn({ error: error.message }, "Collection metadata recovery sweep failed");
+      } finally {
+        this.recoveryInFlight = false;
+      }
+    };
+
+    void tick();
+    this.recoveryInterval = setInterval(() => {
+      void tick();
+    }, RECOVERY_INTERVAL_MS);
   }
 }
 

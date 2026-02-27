@@ -295,11 +295,10 @@ export class Poller {
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
-        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.sig.signature.localeCompare(b.sig.signature);
       });
 
       for (const { sig, txIndex } of sigsWithIndex) {
@@ -531,11 +530,10 @@ export class Poller {
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
-        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.sig.signature.localeCompare(b.sig.signature);
       });
 
       let batchFailed = false;

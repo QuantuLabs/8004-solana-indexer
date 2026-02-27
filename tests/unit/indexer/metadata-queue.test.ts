@@ -89,11 +89,16 @@ function createMockPool() {
 function resetQueueState() {
   const q = metadataQueue as any;
   q.pending.clear();
+  q.deferred.clear();
+  q.queueFullSignals = 0;
   q.stats = {
     queued: 0,
     processed: 0,
     skippedStale: 0,
     skippedDuplicate: 0,
+    deferredQueued: 0,
+    deferredPromoted: 0,
+    deferredReplaced: 0,
     errors: 0,
   };
   capturedTasks.length = 0;
@@ -174,12 +179,42 @@ describe("MetadataQueue", () => {
       expect(stats.queued).toBe(2);
     });
 
-    it("should reject tasks when queue is at capacity", () => {
+    it("should defer tasks when queue is at capacity", () => {
       mockPQueueInstance.size = 5000;
       mockPQueueInstance.pending = 0;
       metadataQueue.add("assetFull", "https://example.com/full.json");
       const stats = metadataQueue.getStats();
       expect(stats.queued).toBe(0);
+      expect(stats.deferredQueued).toBe(1);
+      expect(stats.deferredCount).toBe(1);
+    });
+
+    it("should promote deferred tasks when capacity returns", () => {
+      mockPQueueInstance.size = 5000;
+      metadataQueue.add("assetDeferred", "https://example.com/deferred.json");
+      expect(metadataQueue.getStats().deferredCount).toBe(1);
+
+      mockPQueueInstance.size = 0;
+      metadataQueue.add("assetNew", "https://example.com/new.json");
+
+      const stats = metadataQueue.getStats();
+      expect(stats.deferredCount).toBe(0);
+      expect(stats.deferredPromoted).toBeGreaterThanOrEqual(1);
+      expect(stats.queued).toBeGreaterThanOrEqual(2);
+      expect(capturedTasks.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("should keep only latest deferred task per asset", () => {
+      mockPQueueInstance.size = 5000;
+      metadataQueue.add("assetLatest", "https://example.com/v1.json");
+      metadataQueue.add("assetLatest", "https://example.com/v2.json");
+
+      const q = metadataQueue as any;
+      expect(q.deferred.get("assetLatest")?.uri).toBe("https://example.com/v2.json");
+
+      const stats = metadataQueue.getStats();
+      expect(stats.deferredReplaced).toBeGreaterThanOrEqual(1);
+      expect(stats.deferredCount).toBe(1);
     });
   });
 
@@ -428,6 +463,9 @@ describe("MetadataQueue", () => {
       expect(stats).toHaveProperty("errors");
       expect(stats).toHaveProperty("queueSize");
       expect(stats).toHaveProperty("pendingCount");
+      expect(stats).toHaveProperty("deferredCount");
+      expect(stats).toHaveProperty("deferredQueued");
+      expect(stats).toHaveProperty("deferredPromoted");
     });
   });
 

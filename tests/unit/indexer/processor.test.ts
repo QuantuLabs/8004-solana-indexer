@@ -226,8 +226,11 @@ describe("Processor", () => {
       const status = processor.getStatus();
       expect(status.running).toBe(true);
       expect(status.wsActive).toBe(true);
+      expect(status.pollerActive).toBe(true);
       expect(WebSocketIndexer).toHaveBeenCalled();
+      expect(Poller).toHaveBeenCalled();
       expect(mockWsIndexerInstance.start).toHaveBeenCalled();
+      expect(mockPollerInstance.start).toHaveBeenCalled();
     });
 
     it("should start in auto mode with WebSocket available", async () => {
@@ -302,6 +305,7 @@ describe("Processor", () => {
       const status = processor.getStatus();
       expect(status.running).toBe(false);
       expect(mockWsIndexerInstance.stop).toHaveBeenCalled();
+      expect(mockPollerInstance.stop).toHaveBeenCalled();
     });
 
     it("should stop auto mode", async () => {
@@ -319,6 +323,24 @@ describe("Processor", () => {
   });
 
   describe("monitorWebSocket", () => {
+    it("should handle WebSocket connection loss in websocket mode", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
+      await processor.start();
+
+      // Simulate WebSocket becoming inactive
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+
+      // Advance timer to trigger monitor check
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Poller should be restarted with faster interval
+      expect(mockPollerInstance.stop).toHaveBeenCalled();
+
+      vi.useRealTimers();
+    });
+
     it("should handle WebSocket connection loss in auto mode", async () => {
       vi.useFakeTimers();
 

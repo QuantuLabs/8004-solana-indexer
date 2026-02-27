@@ -4,6 +4,7 @@ export type IndexerMode = "auto" | "polling" | "websocket";
 export type DbMode = "local" | "supabase";
 export type ApiMode = "graphql" | "rest" | "both";
 export type MetadataIndexMode = "off" | "normal" | "full";
+export type SolanaNetwork = "devnet" | "mainnet-beta" | "testnet" | "localnet";
 export type ChainStatus = "PENDING" | "FINALIZED" | "ORPHANED";
 
 const DEFAULT_PROGRAM_ID = "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C";
@@ -13,6 +14,47 @@ const VALID_DB_MODES: DbMode[] = ["local", "supabase"];
 const VALID_API_MODES: ApiMode[] = ["graphql", "rest", "both"];
 const VALID_INDEXER_MODES: IndexerMode[] = ["auto", "polling", "websocket"];
 const VALID_METADATA_MODES: MetadataIndexMode[] = ["off", "normal", "full"];
+const VALID_SOLANA_NETWORKS: SolanaNetwork[] = ["devnet", "mainnet-beta", "testnet", "localnet"];
+
+function parseSolanaNetwork(value: string | undefined): SolanaNetwork {
+  const network = (value || "devnet").trim().toLowerCase();
+  if (!VALID_SOLANA_NETWORKS.includes(network as SolanaNetwork)) {
+    throw new Error(
+      `Invalid SOLANA_NETWORK '${network}'. Must be one of: ${VALID_SOLANA_NETWORKS.join(", ")}`
+    );
+  }
+  return network as SolanaNetwork;
+}
+
+function defaultRpcUrlForNetwork(network: SolanaNetwork): string {
+  switch (network) {
+    case "mainnet-beta":
+      return "https://api.mainnet-beta.solana.com";
+    case "testnet":
+      return "https://api.testnet.solana.com";
+    case "localnet":
+      return "http://127.0.0.1:8899";
+    case "devnet":
+    default:
+      return "https://api.devnet.solana.com";
+  }
+}
+
+function defaultWsUrlForNetwork(network: SolanaNetwork): string {
+  switch (network) {
+    case "mainnet-beta":
+      return "wss://api.mainnet-beta.solana.com";
+    case "testnet":
+      return "wss://api.testnet.solana.com";
+    case "localnet":
+      return "ws://127.0.0.1:8900";
+    case "devnet":
+    default:
+      return "wss://api.devnet.solana.com";
+  }
+}
+
+const resolvedSolanaNetwork = parseSolanaNetwork(process.env.SOLANA_NETWORK);
 
 function parseDbMode(value: string | undefined): DbMode {
   const mode = value || "local";
@@ -102,9 +144,12 @@ export const config = {
   supabaseDsn: process.env.SUPABASE_DSN, // PostgreSQL DSN for direct pg connection
   supabaseSslVerify: process.env.SUPABASE_SSL_VERIFY !== "false", // default: verify SSL certs
 
+  // Solana network for default RPC/WS endpoint resolution
+  solanaNetwork: resolvedSolanaNetwork,
+
   // Solana RPC (works with any provider)
-  rpcUrl: process.env.RPC_URL || "https://api.devnet.solana.com",
-  wsUrl: process.env.WS_URL || "wss://api.devnet.solana.com",
+  rpcUrl: process.env.RPC_URL || defaultRpcUrlForNetwork(resolvedSolanaNetwork),
+  wsUrl: process.env.WS_URL || defaultWsUrlForNetwork(resolvedSolanaNetwork),
 
   // Program ID from SDK (source of truth)
   programId: resolvedProgramId,
@@ -150,6 +195,8 @@ export const config = {
   // Verification config (reorg resilience)
   // Enable/disable background verification worker
   verificationEnabled: process.env.VERIFICATION_ENABLED !== "false",
+  // Expose Prometheus /metrics endpoint for integrity observability
+  metricsEndpointEnabled: parseBoolean(process.env.METRICS_ENDPOINT_ENABLED, false),
   // Interval between verification cycles (ms)
   verifyIntervalMs: parseInt(process.env.VERIFY_INTERVAL_MS || "60000", 10), // 60s
   // Max items to verify per cycle (prevents RPC rate limiting)
@@ -170,6 +217,12 @@ export function validateConfig(): void {
   // Warn about disabled SSL verification
   if (!config.supabaseSslVerify) {
     console.warn('[SECURITY WARNING] SUPABASE_SSL_VERIFY=false — TLS certificate verification is disabled for database connections. This is vulnerable to MITM attacks. Do NOT use in production.');
+  }
+
+  if (config.solanaNetwork === "mainnet-beta" && config.programId === DEFAULT_PROGRAM_ID) {
+    console.warn(
+      "[CONFIG WARNING] SOLANA_NETWORK=mainnet-beta but PROGRAM_ID is still the default devnet ID. Set PROGRAM_ID to your mainnet deployment before production use."
+    );
   }
 
   // Validate Supabase config when in supabase mode

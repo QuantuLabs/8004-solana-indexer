@@ -6,8 +6,10 @@ import { Poller } from "./poller.js";
 import { WebSocketIndexer, testWebSocketConnection } from "./websocket.js";
 import { DataVerifier } from "./verifier.js";
 import { createChildLogger } from "../logger.js";
+import { setVerifierActive } from "../observability/integrity-metrics.js";
 
 const logger = createChildLogger("processor");
+const WS_BACKUP_POLLING_INTERVAL_MS = 30_000;
 
 export interface ProcessorOptions {
   mode?: IndexerMode;
@@ -67,10 +69,12 @@ export class Processor {
 
   private async startVerifier(): Promise<void> {
     if (!config.verificationEnabled) {
+      setVerifierActive(false);
       logger.info("Verification disabled via config");
       return;
     }
 
+    setVerifierActive(false);
     this.verifier = new DataVerifier(
       this.connection,
       this.prisma,
@@ -79,6 +83,7 @@ export class Processor {
     );
 
     await this.verifier.start();
+    setVerifierActive(true);
     logger.info({ intervalMs: config.verifyIntervalMs }, "Background verifier started");
   }
 
@@ -96,6 +101,7 @@ export class Processor {
       await this.verifier.stop();
       this.verifier = null;
     }
+    setVerifierActive(false);
 
     if (this.poller) {
       await this.poller.stop();
@@ -109,6 +115,10 @@ export class Processor {
   }
 
   private async startWebSocket(): Promise<void> {
+    await this.startWebSocketWithBackupPoller();
+  }
+
+  private async startWebSocketWithBackupPoller(): Promise<void> {
     this.wsIndexer = new WebSocketIndexer({
       connection: this.connection,
       prisma: this.prisma,
@@ -116,6 +126,18 @@ export class Processor {
     });
 
     await this.wsIndexer.start();
+
+    // Keep a low-frequency poller running as a catch-up path so WS queue overflow
+    // or disconnects cannot permanently lose events.
+    this.poller = new Poller({
+      connection: this.connection,
+      prisma: this.prisma,
+      programId: this.programId,
+      pollingInterval: WS_BACKUP_POLLING_INTERVAL_MS,
+    });
+    await this.poller.start();
+
+    this.monitorWebSocket();
   }
 
   private async startPolling(): Promise<void> {
@@ -134,18 +156,7 @@ export class Processor {
 
     if (wsAvailable) {
       logger.info("WebSocket available, using WebSocket mode");
-      await this.startWebSocket();
-
-      // Backup poller for catching missed events (slower interval when WS is primary)
-      this.poller = new Poller({
-        connection: this.connection,
-        prisma: this.prisma,
-        programId: this.programId,
-        pollingInterval: 30000,
-      });
-      await this.poller.start();
-
-      this.monitorWebSocket();
+      await this.startWebSocketWithBackupPoller();
     } else {
       logger.info("WebSocket not available, falling back to polling mode");
       await this.startPolling();

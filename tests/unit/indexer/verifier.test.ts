@@ -49,6 +49,10 @@ vi.mock("../../../src/utils/pda.js", () => ({
 }));
 
 import { DataVerifier } from "../../../src/indexer/verifier.js";
+import {
+  getIntegrityMetricsSnapshot,
+  resetIntegrityMetrics,
+} from "../../../src/observability/integrity-metrics.js";
 
 function createMockConnection() {
   return {
@@ -93,6 +97,9 @@ function createMockPrisma() {
       findFirst: vi.fn().mockResolvedValue(null),
       count: vi.fn().mockResolvedValue(0),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    agentDigestCache: {
+      upsert: vi.fn().mockResolvedValue({}),
     },
   } as any;
 }
@@ -172,6 +179,7 @@ describe("DataVerifier", () => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrisma();
     mockPool = createMockPool();
+    resetIntegrityMetrics();
     // Patch sleep to resolve instantly under fake timers
     (DataVerifier.prototype as any).sleep = () => Promise.resolve();
   });
@@ -219,6 +227,18 @@ describe("DataVerifier", () => {
       await verifier.start();
       expect(mockConnection.getSlot).toHaveBeenCalledWith("finalized");
       await verifier.stop();
+    });
+
+    it("should update integrity metrics on verification cycle", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+      await verifier.stop();
+
+      const snapshot = getIntegrityMetricsSnapshot();
+      expect(snapshot.verifyCyclesTotal).toBeGreaterThanOrEqual(1);
+      expect(snapshot.lastVerifiedSlot).toBe(99968);
+      expect(snapshot.mismatchCount).toBe(0);
+      expect(snapshot.orphanCount).toBe(0);
     });
 
     it("should set up interval on start", async () => {
@@ -1512,6 +1532,115 @@ describe("DataVerifier", () => {
       const getAccountInfoCalls =
         mockConnection.getAccountInfo.mock.calls.length;
       expect(getAccountInfoCalls).toBeLessThanOrEqual(2);
+      await verifier.stop();
+    });
+
+    it("persists agent digest cache via prisma and falls back when signature field is unavailable", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      const digest = new Uint8Array(32).fill(0xaa);
+
+      mockPrisma.feedback.findMany
+        .mockResolvedValueOnce([{ id: "f1", agentId }])
+        .mockResolvedValue([]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+      mockConnection.getAccountInfo.mockResolvedValue({
+        data: buildAgentAccountData({
+          feedbackDigest: digest,
+          feedbackCount: 1n,
+        }),
+      });
+
+      mockPrisma.feedback.findFirst.mockResolvedValue({
+        runningDigest: Buffer.from(digest),
+        createdTxSignature: "sig-feedback",
+        createdSlot: 123n,
+      });
+      mockPrisma.feedback.count.mockResolvedValue(1);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValue(null);
+      mockPrisma.feedbackResponse.count.mockResolvedValue(0);
+      mockPrisma.revocation.findFirst.mockResolvedValue(null);
+      mockPrisma.revocation.count.mockResolvedValue(0);
+
+      mockPrisma.agentDigestCache.upsert
+        .mockRejectedValueOnce(new Error("Unknown arg `lastVerifiedSignature`"))
+        .mockResolvedValueOnce({});
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(mockPrisma.agentDigestCache.upsert).toHaveBeenCalledTimes(2);
+      expect(mockPrisma.agentDigestCache.upsert.mock.calls[0][0].create).toEqual(
+        expect.objectContaining({
+          agentId,
+          lastVerifiedSignature: "sig-feedback",
+        })
+      );
+      expect(mockPrisma.agentDigestCache.upsert.mock.calls[1][0].create).toEqual(
+        expect.not.objectContaining({
+          lastVerifiedSignature: expect.anything(),
+        })
+      );
+      await verifier.stop();
+    });
+
+    it("persists digest cache via pool and retries without last_verified_signature when column is unavailable", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      const digest = new Uint8Array(32).fill(0xbb);
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedbacks") && sql.includes("status = 'PENDING'")) {
+          return { rows: [{ id: "f1", agentId }] };
+        }
+        if (sql.includes("FROM feedbacks") && sql.includes("running_digest")) {
+          return { rows: [{ running_digest: Buffer.from(digest), tx_signature: "sig1", block_slot: "222" }] };
+        }
+        if (sql.includes("COUNT") && sql.includes("feedbacks")) {
+          return { rows: [{ cnt: "1" }] };
+        }
+        if (sql.includes("running_digest") && sql.includes("feedback_responses")) {
+          return { rows: [] };
+        }
+        if (sql.includes("COUNT") && sql.includes("feedback_responses")) {
+          return { rows: [{ cnt: "0" }] };
+        }
+        if (sql.includes("running_digest") && sql.includes("revocations")) {
+          return { rows: [] };
+        }
+        if (sql.includes("COUNT") && sql.includes("revocations")) {
+          return { rows: [{ cnt: "0" }] };
+        }
+        if (sql.includes("INSERT INTO agent_digest_cache") && sql.includes("last_verified_signature")) {
+          throw new Error('column "last_verified_signature" does not exist');
+        }
+        if (sql.includes("INSERT INTO agent_digest_cache")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+      mockConnection.getAccountInfo.mockResolvedValue({
+        data: buildAgentAccountData({
+          feedbackDigest: digest,
+          feedbackCount: 1n,
+        }),
+      });
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      const digestInsertCalls = mockPool.query.mock.calls
+        .map((call: unknown[]) => call[0] as string)
+        .filter((sql: string) => sql.includes("INSERT INTO agent_digest_cache"));
+
+      expect(digestInsertCalls.length).toBe(2);
+      expect(digestInsertCalls[0]).toContain("last_verified_signature");
+      expect(digestInsertCalls[1]).not.toContain("last_verified_signature");
       await verifier.stop();
     });
   });

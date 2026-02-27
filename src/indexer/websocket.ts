@@ -20,7 +20,7 @@ const HEALTH_CHECK_INTERVAL = 30_000;
 const STALE_THRESHOLD = 120_000;
 // Concurrency limits to prevent OOM during high traffic
 const MAX_CONCURRENT_HANDLERS = 10;
-const MAX_QUEUE_SIZE = 1000; // Drop logs if queue exceeds this (backpressure)
+const MAX_QUEUE_SIZE = 10_000;
 
 export interface WebSocketIndexerOptions {
   connection: Connection;
@@ -46,6 +46,7 @@ export class WebSocketIndexer {
   // Concurrency guards
   private isCheckingHealth = false;
   private isReconnecting = false;
+  private overflowStopInProgress = false;
   // Bounded concurrency queue to prevent OOM during high traffic
   private logQueue: PQueue;
   private droppedLogs = 0;
@@ -95,18 +96,10 @@ export class WebSocketIndexer {
       this.subscriptionId = null;
     }
 
-    // Drain remaining queue items before shutdown (max 5s wait)
+    // Drain remaining queue items before shutdown.
     if (this.logQueue.size > 0) {
       logger.info({ queueSize: this.logQueue.size }, "Draining log queue before shutdown");
-      this.logQueue.pause();
-      const drainTimeout = 5000;
-      const drainPromise = this.logQueue.onIdle();
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, drainTimeout));
-      await Promise.race([drainPromise, timeoutPromise]);
-      if (this.logQueue.size > 0) {
-        logger.warn({ remaining: this.logQueue.size }, "Queue drain timeout, clearing remaining items");
-        this.logQueue.clear();
-      }
+      await this.logQueue.onIdle();
     }
   }
 
@@ -221,18 +214,33 @@ export class WebSocketIndexer {
         this.programId,
         // Queue-based processing with backpressure to prevent OOM
         (logs: Logs, ctx: Context) => {
+          if (!this.isRunning) {
+            return;
+          }
+
           this.lastActivityTime = Date.now();
 
-          // Backpressure: drop logs if queue is full
           if (this.logQueue.size >= MAX_QUEUE_SIZE) {
+            this.errorCount++;
             this.droppedLogs++;
-            if (this.droppedLogs % 100 === 1) {
-              logger.warn({
-                queueSize: this.logQueue.size,
-                droppedLogs: this.droppedLogs,
-                signature: logs.signature
-              }, "Queue full, dropping logs (backpressure)");
+
+            if (this.overflowStopInProgress) {
+              return;
             }
+            this.overflowStopInProgress = true;
+
+            logger.error(
+              {
+                queueSize: this.logQueue.size,
+                signature: logs.signature,
+                errorCount: this.errorCount,
+                droppedLogs: this.droppedLogs,
+              },
+              "WebSocket processing queue is full, entering fail-safe stop so poller catch-up can recover missed events"
+            );
+            void this.stop().finally(() => {
+              this.overflowStopInProgress = false;
+            });
             return;
           }
 
@@ -326,6 +334,7 @@ export class WebSocketIndexer {
           blockTime,
           txIndex,
           eventOrdinal,
+          source: "websocket",
         };
 
         let eventProcessed = true;
@@ -393,16 +402,18 @@ export class WebSocketIndexer {
                 id: "main",
                 lastSignature: logs.signature,
                 lastSlot: newSlot,
+                source: "websocket",
               },
               update: {
                 lastSignature: logs.signature,
                 lastSlot: newSlot,
+                source: "websocket",
               },
             });
           }
         } else {
           // Supabase mode — saveIndexerState already has SQL-level monotonic guard
-          await saveIndexerState(logs.signature, newSlot);
+          await saveIndexerState(logs.signature, newSlot, "websocket");
         }
       } catch (stateError) {
         logger.error({

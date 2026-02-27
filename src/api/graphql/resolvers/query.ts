@@ -12,7 +12,7 @@ const ORDER_MAP_AGENT: Record<string, string> = {
   totalFeedback: 'feedback_count',
   qualityScore: 'quality_score',
   trustTier: 'trust_tier',
-  agentid: 'global_id',
+  agentid: 'agent_id',
 };
 
 const ORDER_MAP_FEEDBACK: Record<string, string> = {
@@ -30,7 +30,7 @@ const MAX_LINEAGE_DEPTH = 32;
 const MAX_AGENT_PAGE_SIZE = 1000;
 
 const AGENT_SELECT_WITH_DIGESTS = `a.asset,
-                          a.global_id::text AS global_id,
+                          a.agent_id::text AS agent_id,
                           a.owner,
                           a.creator,
                           a.agent_uri,
@@ -65,6 +65,8 @@ const AGENT_SELECT_WITH_DIGESTS = `a.asset,
 interface DecodedCursor {
   created_at: string;
   asset?: string;
+  client_address?: string;
+  feedback_index?: string;
   id?: string;
 }
 
@@ -129,8 +131,10 @@ function decodeFlexibleCursor(cursor: string): DecodedCursor | null {
     const obj = parsed as Record<string, unknown>;
     if (typeof obj.created_at !== 'string') return null;
     const asset = typeof obj.asset === 'string' ? obj.asset : undefined;
+    const client_address = typeof obj.client_address === 'string' ? obj.client_address : undefined;
+    const feedback_index = typeof obj.feedback_index === 'string' ? obj.feedback_index : undefined;
     const id = typeof obj.id === 'string' ? obj.id : undefined;
-    return { created_at: obj.created_at, asset, id };
+    return { created_at: obj.created_at, asset, client_address, feedback_index, id };
   } catch {
     return null;
   }
@@ -359,22 +363,52 @@ export const queryResolvers = {
       let cursorSql = '';
       if (args.after) {
         const cursor = decodeFlexibleCursor(args.after);
-        if (!cursor || !cursor.asset) {
-          throw createBadUserInputError('Invalid feedbacks cursor. Expected base64 JSON with created_at and asset.');
+        if (
+          !cursor ||
+          !cursor.asset ||
+          !cursor.client_address ||
+          !cursor.feedback_index ||
+          !cursor.id ||
+          !/^-?\d+$/.test(cursor.feedback_index)
+        ) {
+          throw createBadUserInputError(
+            'Invalid feedbacks cursor. Expected base64 JSON with created_at, asset, client_address, feedback_index, and id.'
+          );
         }
-        const op = dir === 'DESC' ? '<' : '>';
-        const cursorId = cursor.id ?? '';
-        cursorSql = ` AND (created_at, asset, id) ${op} ($${paramIdx}::timestamptz, $${paramIdx + 1}::text, $${paramIdx + 2}::text)`;
-        params.push(cursor.created_at, cursor.asset, cursorId);
-        paramIdx += 3;
+        const createdAtOp = dir === 'DESC' ? '<' : '>';
+        const createdAtParam = `$${paramIdx}::timestamptz`;
+        const assetParam = `$${paramIdx + 1}::text`;
+        const clientParam = `$${paramIdx + 2}::text`;
+        const feedbackIndexParam = `$${paramIdx + 3}::bigint`;
+        const idParam = `$${paramIdx + 4}::text`;
+
+        cursorSql = ` AND (
+          created_at ${createdAtOp} ${createdAtParam}
+          OR (created_at = ${createdAtParam} AND asset > ${assetParam})
+          OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address > ${clientParam})
+          OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address = ${clientParam} AND feedback_index > ${feedbackIndexParam})
+          OR (created_at = ${createdAtParam} AND asset = ${assetParam} AND client_address = ${clientParam} AND feedback_index = ${feedbackIndexParam} AND id > ${idParam})
+        )`;
+        params.push(
+          cursor.created_at,
+          cursor.asset,
+          cursor.client_address,
+          cursor.feedback_index,
+          cursor.id
+        );
+        paramIdx += 5;
       }
+
+      const orderBySql = orderCol === 'created_at'
+        ? `created_at ${dir}, asset ASC, client_address ASC, feedback_index ASC, id ASC`
+        : `${orderCol} ${dir}, asset ASC, client_address ASC, feedback_index ASC, id ASC`;
 
       const sql = `SELECT id, asset, client_address, feedback_index, value, value_decimals,
                           score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
                           running_digest, is_revoked, status, verified_at,
                           tx_signature, block_slot, created_at, revoked_at
                    FROM feedbacks ${where.sql}${cursorSql}
-                   ORDER BY ${orderCol} ${dir}, asset ${dir}, id ${dir}
+                   ORDER BY ${orderBySql}
                    LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
       params.push(first, skip);
 

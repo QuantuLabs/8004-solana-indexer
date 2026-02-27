@@ -65,6 +65,7 @@ export interface CollectionPointerSet {
   asset: PublicKey;
   setBy: PublicKey;
   col: string;
+  lock?: boolean;
 }
 
 export interface ParentAssetSet {
@@ -72,6 +73,7 @@ export interface ParentAssetSet {
   parentAsset: PublicKey;
   parentCreator: PublicKey;
   setBy: PublicKey;
+  lock?: boolean;
 }
 
 export interface NewFeedback {

@@ -25,7 +25,7 @@ export interface AgentRow {
   verified_at: string | null;
   created_at: string;
   updated_at: string;
-  global_id: string | null;
+  agent_id: string | null;
   created_tx_signature: string | null;
   created_slot: string | null;
   feedback_digest: string | null;
@@ -181,6 +181,7 @@ function createAgentByIdLoader(pool: Pool) {
     const { rows } = await pool.query<AgentRow>(
       `SELECT
               a.asset,
+              a.agent_id::text AS agent_id,
               a.owner,
               a.creator,
               a.agent_uri,
@@ -316,7 +317,7 @@ function createFeedbackPageByAgentLoader(pool: Pool) {
                f.revoked_at,
                ROW_NUMBER() OVER (
                  PARTITION BY f.asset
-                 ORDER BY ${sample.orderBy} ${sample.orderDirection}, f.id ${sample.orderDirection}
+                 ORDER BY ${sample.orderBy} ${sample.orderDirection}, f.client_address ASC, f.feedback_index ASC, f.id ASC
                ) AS rn
              FROM feedbacks f
              INNER JOIN requested r ON r.asset = f.asset

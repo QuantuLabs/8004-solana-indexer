@@ -119,7 +119,7 @@ describe("WebSocketIndexer Coverage", () => {
     return wsIndexer;
   }
 
-  describe("stop() - queue drain and timeout", () => {
+  describe("stop() - queue drain behavior", () => {
     it("should drain pending queue items on stop", async () => {
       createIndexer();
       await wsIndexer.start();
@@ -140,7 +140,7 @@ describe("WebSocketIndexer Coverage", () => {
       expect(queue.size).toBe(0);
     });
 
-    it("should timeout and clear queue if drain takes too long", async () => {
+    it("should wait for queued work to finish before stopping", async () => {
       createIndexer();
       await wsIndexer.start();
 
@@ -149,19 +149,14 @@ describe("WebSocketIndexer Coverage", () => {
       // Pause the queue so items pile up
       queue.pause();
 
-      // Add items that won't process (queue is paused)
-      for (let i = 0; i < 5; i++) {
-        queue.add(async () => {
-          await new Promise((r) => setTimeout(r, 60000)); // Very long task
-        });
-      }
+      queue.add(async () => {
+        await new Promise((r) => setTimeout(r, 25));
+      });
 
-      // stop() should timeout (5s max) and clear remaining items
-      // We can't wait 5s in tests, so directly test the timeout behavior
-      // by checking queue gets cleared
       const stopPromise = wsIndexer.stop();
 
-      // After 5s + margin, stop should resolve
+      // Allow queued work to run and complete
+      queue.start();
       await stopPromise;
 
       expect(queue.size).toBe(0);
@@ -451,7 +446,8 @@ describe("WebSocketIndexer Coverage", () => {
       // Should call supabase saveIndexerState instead of prisma upsert
       expect(saveIndexerState).toHaveBeenCalledWith(
         TEST_SIGNATURE,
-        BigInt(TEST_SLOT)
+        BigInt(TEST_SLOT),
+        "websocket",
       );
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
     });
@@ -697,14 +693,14 @@ describe("WebSocketIndexer Coverage", () => {
     });
   });
 
-  describe("handleLogs - queue full backpressure", () => {
-    it("should drop logs when queue is full", async () => {
+  describe("handleLogs - queue pressure", () => {
+    it("should fail-stop when queue size exceeds safety limit", async () => {
       createIndexer();
       await wsIndexer.start();
 
-      // Simulate full queue by setting size property
+      // Simulate queue overflow.
       const queue = (wsIndexer as any).logQueue;
-      Object.defineProperty(queue, "size", { value: 1001, writable: true });
+      Object.defineProperty(queue, "size", { value: 10001, writable: true });
 
       const logs = {
         signature: "dropped-sig",
@@ -717,8 +713,8 @@ describe("WebSocketIndexer Coverage", () => {
       const onLogsCallback = (mockConnection.onLogs as any).mock.calls[0][1];
       onLogsCallback(logs, { slot: 100 });
 
-      // droppedLogs should increment
       expect((wsIndexer as any).droppedLogs).toBe(1);
+      expect((wsIndexer as any).isRunning).toBe(false);
 
       // Restore
       Object.defineProperty(queue, "size", { value: 0, writable: true });
@@ -902,23 +898,9 @@ describe("WebSocketIndexer Coverage", () => {
       // (line 286) if it throws, or from the for loop processing.
       // parseTransactionLogs catches internally, so we need another path.
 
-      // Best approach: mock parseTransactionLogs to throw
-      const { parseTransactionLogs } = await import("../../../src/parser/decoder.js");
       const decoderModule = await import("../../../src/parser/decoder.js");
-      const origParseLogs = decoderModule.parseTransactionLogs;
-
-      // We can directly call handleLogs with bad data that causes an error
-      // after parseTransactionLogs. Let's make the events array iteration throw
-      // by returning a proxy from parseTransactionLogs.
-      vi.spyOn(decoderModule, "parseTransactionLogs").mockImplementation(() => {
-        // Return an object that looks like an array but throws on iteration
-        const trap: any = {
-          length: 1,
-          [Symbol.iterator]: () => {
-            throw new Error("Simulated outer error");
-          },
-        };
-        return trap;
+      vi.spyOn(decoderModule, "toTypedEvent").mockImplementation(() => {
+        throw new Error("Simulated outer error");
       });
 
       try {
@@ -946,14 +928,8 @@ describe("WebSocketIndexer Coverage", () => {
       await wsIndexer.start();
 
       const decoderModule = await import("../../../src/parser/decoder.js");
-      vi.spyOn(decoderModule, "parseTransactionLogs").mockImplementation(() => {
-        const trap: any = {
-          length: 1,
-          [Symbol.iterator]: () => {
-            throw new Error("Outer error");
-          },
-        };
-        return trap;
+      vi.spyOn(decoderModule, "toTypedEvent").mockImplementation(() => {
+        throw new Error("Outer error");
       });
 
       // Also make eventLog.create fail
@@ -984,14 +960,8 @@ describe("WebSocketIndexer Coverage", () => {
       await wsIndexer.start();
 
       const decoderModule = await import("../../../src/parser/decoder.js");
-      vi.spyOn(decoderModule, "parseTransactionLogs").mockImplementation(() => {
-        const trap: any = {
-          length: 1,
-          [Symbol.iterator]: () => {
-            throw new Error("Outer error no prisma");
-          },
-        };
-        return trap;
+      vi.spyOn(decoderModule, "toTypedEvent").mockImplementation(() => {
+        throw new Error("Outer error no prisma");
       });
 
       const logs = createEventLogs("AgentRegistered", {
@@ -1454,17 +1424,17 @@ describe("WebSocketIndexer Coverage", () => {
     });
   });
 
-  describe("multiple dropped logs warning", () => {
-    it("should only log warning every 100 dropped logs", async () => {
+  describe("queue pressure accounting", () => {
+    it("should increment droppedLogs under queue pressure", async () => {
       createIndexer();
       await wsIndexer.start();
 
       const queue = (wsIndexer as any).logQueue;
-      Object.defineProperty(queue, "size", { value: 1001, writable: true, configurable: true });
+      Object.defineProperty(queue, "size", { value: 10001, writable: true, configurable: true });
 
       const onLogsCallback = (mockConnection.onLogs as any).mock.calls[0][1];
 
-      // Drop 200 logs
+      // Emit many logs while queue appears busy
       for (let i = 0; i < 200; i++) {
         onLogsCallback(
           { signature: `dropped-${i}`, err: null, logs: [] },
@@ -1472,7 +1442,8 @@ describe("WebSocketIndexer Coverage", () => {
         );
       }
 
-      expect((wsIndexer as any).droppedLogs).toBe(200);
+      expect((wsIndexer as any).droppedLogs).toBe(1);
+      expect((wsIndexer as any).errorCount).toBeGreaterThan(0);
 
       Object.defineProperty(queue, "size", { value: 0, writable: true, configurable: true });
     });

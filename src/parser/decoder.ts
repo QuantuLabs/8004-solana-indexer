@@ -79,11 +79,88 @@ export interface TransactionEvents {
   events: ParsedEvent[];
 }
 
+interface IdentityLockHints {
+  collection: boolean[];
+  parent: boolean[];
+}
+
+function extractIdentityLockHintsFromLogs(logs: string[]): IdentityLockHints {
+  const hints: IdentityLockHints = {
+    collection: [],
+    parent: [],
+  };
+
+  for (const line of logs) {
+    const normalized = line.toLowerCase();
+    if (!normalized.includes("instruction:")) continue;
+
+    const isCollectionWithOptions =
+      normalized.includes("set_collection_pointer_with_options") ||
+      normalized.includes("setcollectionpointerwithoptions");
+    const isCollectionDefault =
+      normalized.includes("set_collection_pointer") ||
+      normalized.includes("setcollectionpointer");
+    const isParentWithOptions =
+      normalized.includes("set_parent_asset_with_options") ||
+      normalized.includes("setparentassetwithoptions");
+    const isParentDefault =
+      normalized.includes("set_parent_asset") ||
+      normalized.includes("setparentasset");
+
+    if (isCollectionWithOptions) {
+      // SDK path uses *_with_options for lock=false.
+      hints.collection.push(false);
+      continue;
+    }
+    if (isCollectionDefault) {
+      hints.collection.push(true);
+      continue;
+    }
+    if (isParentWithOptions) {
+      // SDK path uses *_with_options for lock=false.
+      hints.parent.push(false);
+      continue;
+    }
+    if (isParentDefault) {
+      hints.parent.push(true);
+    }
+  }
+
+  return hints;
+}
+
+function applyIdentityLockHints(
+  events: ParsedEvent[],
+  hints: IdentityLockHints
+): void {
+  let collectionIdx = 0;
+  let parentIdx = 0;
+
+  for (const event of events) {
+    if (event.name === "CollectionPointerSet") {
+      const lock = hints.collection[collectionIdx];
+      if (typeof lock === "boolean") {
+        event.data.lock = lock;
+      }
+      collectionIdx += 1;
+      continue;
+    }
+    if (event.name === "ParentAssetSet") {
+      const lock = hints.parent[parentIdx];
+      if (typeof lock === "boolean") {
+        event.data.lock = lock;
+      }
+      parentIdx += 1;
+    }
+  }
+}
+
 /**
  * Parse events from a transaction's logs
  */
 export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
   const events: ParsedEvent[] = [];
+  const lockHints = extractIdentityLockHintsFromLogs(logs);
 
   try {
     const generator = eventParser.parseLogs(logs);
@@ -96,6 +173,8 @@ export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
   } catch (error) {
     logger.debug({ error }, "Failed to parse some logs");
   }
+
+  applyIdentityLockHints(events, lockHints);
 
   return events;
 }
@@ -239,6 +318,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             asset: new PublicKey(data.asset as string),
             setBy: new PublicKey(data.set_by as string),
             col: data.col as string,
+            lock: typeof data.lock === "boolean" ? (data.lock as boolean) : undefined,
           },
         };
 
@@ -282,6 +362,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             parentAsset: new PublicKey(data.parent_asset as string),
             parentCreator: new PublicKey(data.parent_creator as string),
             setBy: new PublicKey(data.set_by as string),
+            lock: typeof data.lock === "boolean" ? (data.lock as boolean) : undefined,
           },
         };
 

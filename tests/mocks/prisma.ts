@@ -60,6 +60,14 @@ export function createMockPrismaClient(): PrismaClient {
       upsert: vi.fn(),
       count: vi.fn().mockResolvedValue(0),
     },
+    collection: {
+      findUnique: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      upsert: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      count: vi.fn().mockResolvedValue(0),
+    },
     indexerState: {
       findUnique: vi.fn(),
       upsert: vi.fn(),

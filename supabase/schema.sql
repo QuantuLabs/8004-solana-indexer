@@ -113,7 +113,7 @@ CREATE TABLE agents (
   ) STORED,
 
   -- Sequential registration ID (auto-assigned by trigger, permanent) --
-  global_id BIGINT,
+  agent_id BIGINT,
 
   -- Chain reference --
   block_slot BIGINT NOT NULL,
@@ -129,27 +129,27 @@ CREATE TABLE agents (
   verified_slot BIGINT
 );
 
--- Sequence + trigger for global_id auto-assignment
-CREATE SEQUENCE IF NOT EXISTS agent_global_id_seq START 1;
+-- Sequence + trigger for agent_id auto-assignment
+CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;
 
-CREATE OR REPLACE FUNCTION assign_agent_global_id()
+CREATE OR REPLACE FUNCTION assign_agent_id()
 RETURNS TRIGGER AS $$
 BEGIN
-  IF NEW.global_id IS NULL AND (NEW.status IS NULL OR NEW.status != 'ORPHANED') THEN
-    NEW.global_id := nextval('agent_global_id_seq');
+  IF NEW.agent_id IS NULL AND (NEW.status IS NULL OR NEW.status != 'ORPHANED') THEN
+    NEW.agent_id := nextval('agent_id_seq');
   END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_assign_agent_global_id
+CREATE TRIGGER trg_assign_agent_id
   BEFORE INSERT ON agents
   FOR EACH ROW
-  EXECUTE FUNCTION assign_agent_global_id();
+  EXECUTE FUNCTION assign_agent_id();
 
 -- Global ID indexes
-CREATE UNIQUE INDEX idx_agents_global_id ON agents(global_id) WHERE global_id IS NOT NULL;
-CREATE INDEX idx_agents_global_id_active ON agents(global_id ASC) WHERE status != 'ORPHANED' AND global_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_agents_agent_id ON agents(agent_id) WHERE agent_id IS NOT NULL;
+CREATE INDEX idx_agents_agent_id_active ON agents(agent_id ASC) WHERE status != 'ORPHANED' AND agent_id IS NOT NULL;
 
 -- Standard indexes
 CREATE INDEX idx_agents_owner ON agents(owner);

@@ -14,6 +14,7 @@ import { ReplayVerifier } from '../services/replay-verifier.js';
 import cors from 'cors';
 import type { Pool } from 'pg';
 import { config } from '../config.js';
+import { renderIntegrityMetrics } from '../observability/integrity-metrics.js';
 
 // GraphQL rate limiting constants
 const GRAPHQL_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -191,6 +192,49 @@ function parsePostgRESTBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
+function parseTimestampValue(value: string): Date | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  if (/^-?\d+$/.test(trimmed)) {
+    const raw = Number(trimmed);
+    if (!Number.isFinite(raw)) return undefined;
+    const ms = Math.abs(raw) >= 1_000_000_000_000 ? raw : raw * 1000;
+    const date = new Date(ms);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+
+  const date = new Date(trimmed);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function parsePostgRESTDateFilter(value: unknown): Prisma.DateTimeFilter | undefined {
+  const raw = safeQueryString(value);
+  if (!raw) return undefined;
+
+  const parseBound = (
+    prefix: string,
+    op: 'gt' | 'gte' | 'lt' | 'lte' | 'equals'
+  ): Prisma.DateTimeFilter | undefined => {
+    if (!raw.startsWith(prefix)) return undefined;
+    const date = parseTimestampValue(raw.slice(prefix.length));
+    if (!date) return undefined;
+    return { [op]: date } as Prisma.DateTimeFilter;
+  };
+
+  return (
+    parseBound('gt.', 'gt') ||
+    parseBound('gte.', 'gte') ||
+    parseBound('lt.', 'lt') ||
+    parseBound('lte.', 'lte') ||
+    parseBound('eq.', 'equals') ||
+    (() => {
+      const date = parseTimestampValue(raw);
+      return date ? ({ equals: date } as Prisma.DateTimeFilter) : undefined;
+    })()
+  );
+}
+
 type AgentApiRow = Pick<
   PrismaAgent,
   | 'id'
@@ -213,7 +257,7 @@ type AgentApiRow = Pick<
   | 'diversityRatio'
   | 'feedbackCount'
   | 'rawAvgScore'
-  | 'globalId'
+  | 'agentId'
   | 'status'
   | 'verifiedAt'
   | 'createdAt'
@@ -242,7 +286,7 @@ function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
     diversity_ratio: a.diversityRatio,
     feedback_count: a.feedbackCount,
     raw_avg_score: a.rawAvgScore,
-    agentid: a.globalId !== null ? a.globalId.toString() : null,
+    agentid: a.agentId !== null ? a.agentId.toString() : null,
     status: a.status,
     verified_at: a.verifiedAt?.toISOString() || null,
     created_at: a.createdAt.toISOString(),
@@ -381,6 +425,13 @@ export function createApiServer(options: ApiServerOptions): Express {
     res.json({ status: 'ok' });
   });
 
+  if (config.metricsEndpointEnabled) {
+    app.get('/metrics', (_req: Request, res: Response) => {
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.send(renderIntegrityMetrics());
+    });
+  }
+
   // Global rate limiting
   const limiter = rateLimit({
     windowMs: RATE_LIMIT_WINDOW_MS,
@@ -409,18 +460,30 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/agents - List agents with filters (PostgREST format)
   app.get('/rest/v1/agents', async (req: Request, res: Response) => {
     try {
-      const id = parsePostgRESTValue(req.query.id);
+      const id = parsePostgRESTValue(req.query.id) ?? parsePostgRESTValue(req.query.asset);
       const owner = parsePostgRESTValue(req.query.owner);
       const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
-      const collectionPointer = parsePostgRESTValue(req.query.canonical_col);
+      const collectionPointer =
+        parsePostgRESTValue(req.query.canonical_col) ??
+        parsePostgRESTValue(req.query.collection_pointer);
       const agent_wallet = parsePostgRESTValue(req.query.agent_wallet);
       const parentAsset = parsePostgRESTValue(req.query.parent_asset);
       const parentCreator = parsePostgRESTValue(req.query.parent_creator);
       const colLocked = parsePostgRESTBoolean(req.query.col_locked);
       const parentLocked = parsePostgRESTBoolean(req.query.parent_locked);
+      const updatedAtFilter = parsePostgRESTDateFilter(req.query.updated_at);
+      const updatedAtGtRaw = parsePostgRESTValue(req.query.updated_at_gt);
+      const updatedAtLtRaw = parsePostgRESTValue(req.query.updated_at_lt);
+      const updatedAtGt = updatedAtGtRaw ? parseTimestampValue(updatedAtGtRaw) : undefined;
+      const updatedAtLt = updatedAtLtRaw ? parseTimestampValue(updatedAtLtRaw) : undefined;
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+
+      if ((updatedAtGtRaw && !updatedAtGt) || (updatedAtLtRaw && !updatedAtLt)) {
+        res.status(400).json({ error: 'Invalid updated_at filter value' });
+        return;
+      }
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -438,10 +501,17 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (parentCreator) where.parentCreator = parentCreator;
       if (colLocked !== undefined) where.colLocked = colLocked;
       if (parentLocked !== undefined) where.parentLocked = parentLocked;
+      if (updatedAtFilter || updatedAtGt || updatedAtLt) {
+        where.updatedAt = {
+          ...(updatedAtFilter ?? {}),
+          ...(updatedAtGt ? { gt: updatedAtGt } : {}),
+          ...(updatedAtLt ? { lt: updatedAtLt } : {}),
+        };
+      }
 
       const agents = await prisma.agent.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         take: limit,
         skip: offset,
       });
@@ -631,10 +701,20 @@ export function createApiServer(options: ApiServerOptions): Express {
       const tag1 = parsePostgRESTValue(req.query.tag1);
       const tag2 = parsePostgRESTValue(req.query.tag2);
       const endpoint = parsePostgRESTValue(req.query.endpoint);
+      const createdAtFilter = parsePostgRESTDateFilter(req.query.created_at);
+      const createdAtGtRaw = parsePostgRESTValue(req.query.created_at_gt);
+      const createdAtLtRaw = parsePostgRESTValue(req.query.created_at_lt);
+      const createdAtGt = createdAtGtRaw ? parseTimestampValue(createdAtGtRaw) : undefined;
+      const createdAtLt = createdAtLtRaw ? parseTimestampValue(createdAtLtRaw) : undefined;
       const orFilterRaw = safeQueryString(req.query.or); // Handle OR filter for tag search
       const orFilter = orFilterRaw && orFilterRaw.length <= 200 ? orFilterRaw : undefined; // Limit filter length
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+
+      if ((createdAtGtRaw && !createdAtGt) || (createdAtLtRaw && !createdAtLt)) {
+        res.status(400).json({ error: 'Invalid created_at filter value' });
+        return;
+      }
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -655,6 +735,13 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (tag1) where.tag1 = tag1;
       if (tag2) where.tag2 = tag2;
       if (endpoint) where.endpoint = endpoint;
+      if (createdAtFilter || createdAtGt || createdAtLt) {
+        where.createdAt = {
+          ...(createdAtFilter ?? {}),
+          ...(createdAtGt ? { gt: createdAtGt } : {}),
+          ...(createdAtLt ? { lt: createdAtLt } : {}),
+        };
+      }
       // Handle OR filter: (tag1.eq.value,tag2.eq.value)
       if (orFilter) {
         const tag1Match = orFilter.match(/tag1\.eq\.([^,)]+)/);
@@ -675,7 +762,13 @@ export function createApiServer(options: ApiServerOptions): Express {
       const [feedbacks, totalCount] = await Promise.all([
         prisma.feedback.findMany({
           where,
-          orderBy: { createdAt: 'desc' },
+          orderBy: [
+            { createdAt: 'desc' },
+            { agentId: 'asc' },
+            { client: 'asc' },
+            { feedbackIndex: 'asc' },
+            { id: 'asc' },
+          ],
           take: limit,
           skip: offset,
         }),

@@ -33,11 +33,13 @@ describe("Config", () => {
       delete process.env.ENABLE_GRAPHQL;
       delete process.env.INDEX_METADATA;
       delete process.env.PROGRAM_ID;
+      delete process.env.SOLANA_NETWORK;
       delete process.env.GRAPHQL_STATS_CACHE_TTL_MS;
 
       const { config } = await import("../../src/config.js");
 
       expect(config.databaseUrl).toBe("file:./data/indexer.db");
+      expect(config.solanaNetwork).toBe("devnet");
       expect(config.rpcUrl).toBe("https://api.devnet.solana.com");
       expect(config.wsUrl).toBe("wss://api.devnet.solana.com");
       // programId comes from SDK (PROGRAM_ID.toBase58()), not env var
@@ -89,6 +91,44 @@ describe("Config", () => {
 
       expect(config.indexerMode).toBe("websocket");
     });
+
+    it("should derive RPC/WS defaults from SOLANA_NETWORK", async () => {
+      process.env.SOLANA_NETWORK = "mainnet-beta";
+      delete process.env.RPC_URL;
+      delete process.env.WS_URL;
+
+      let imported = await import("../../src/config.js");
+      expect(imported.config.solanaNetwork).toBe("mainnet-beta");
+      expect(imported.config.rpcUrl).toBe("https://api.mainnet-beta.solana.com");
+      expect(imported.config.wsUrl).toBe("wss://api.mainnet-beta.solana.com");
+
+      vi.resetModules();
+      process.env = { ...originalEnv, SOLANA_NETWORK: "testnet" };
+      delete process.env.RPC_URL;
+      delete process.env.WS_URL;
+      imported = await import("../../src/config.js");
+      expect(imported.config.rpcUrl).toBe("https://api.testnet.solana.com");
+      expect(imported.config.wsUrl).toBe("wss://api.testnet.solana.com");
+
+      vi.resetModules();
+      process.env = { ...originalEnv, SOLANA_NETWORK: "localnet" };
+      delete process.env.RPC_URL;
+      delete process.env.WS_URL;
+      imported = await import("../../src/config.js");
+      expect(imported.config.rpcUrl).toBe("http://127.0.0.1:8899");
+      expect(imported.config.wsUrl).toBe("ws://127.0.0.1:8900");
+    });
+
+    it("should prioritize explicit RPC_URL/WS_URL over SOLANA_NETWORK defaults", async () => {
+      process.env.SOLANA_NETWORK = "mainnet-beta";
+      process.env.RPC_URL = "https://custom.rpc.com";
+      process.env.WS_URL = "wss://custom.ws.com";
+
+      const { config } = await import("../../src/config.js");
+
+      expect(config.rpcUrl).toBe("https://custom.rpc.com");
+      expect(config.wsUrl).toBe("wss://custom.ws.com");
+    });
   });
 
   describe("parse-time validation", () => {
@@ -134,6 +174,14 @@ describe("Config", () => {
         /Invalid INDEX_METADATA 'bogus'/
       );
     });
+
+    it("should throw when SOLANA_NETWORK is invalid", async () => {
+      process.env.SOLANA_NETWORK = "mainnet";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid SOLANA_NETWORK 'mainnet'/
+      );
+    });
   });
 
   describe("validateConfig", () => {
@@ -157,6 +205,20 @@ describe("Config", () => {
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining("SUPABASE_SSL_VERIFY=false")
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("should warn when mainnet-beta uses default devnet PROGRAM_ID", async () => {
+      process.env.SOLANA_NETWORK = "mainnet-beta";
+      delete process.env.PROGRAM_ID;
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const { validateConfig } = await import("../../src/config.js");
+      validateConfig();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("SOLANA_NETWORK=mainnet-beta")
       );
       warnSpy.mockRestore();
     });

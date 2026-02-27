@@ -685,6 +685,28 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
+    it("should keep immutable guard in metadata upsert", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("MetadataSet", {
+          asset: "asset1",
+          key: "guarded",
+          value: new Uint8Array([1, 2, 3]),
+          immutable: false,
+        })
+      );
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const metadataInsertCall = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" &&
+          call[0].includes("INSERT INTO metadata") &&
+          call[0].includes("WHERE NOT metadata.immutable")
+      );
+      expect(metadataInsertCall).toBeDefined();
+    });
+
     it("should skip _uri: prefixed metadata keys", async () => {
       const client = mockPool._client;
       const queryCallsBefore = client.query.mock.calls.length;
@@ -975,13 +997,13 @@ describe("EventBuffer", () => {
     });
   });
 
-  describe("evictStaleDeadLetters", () => {
-    it("should evict dead letter entries older than 5 minutes and log", async () => {
+  describe("dead letter retention", () => {
+    it("should keep stale dead letter entries (diagnostic history is append-only)", async () => {
       vi.useRealTimers();
 
       const buffer = new EventBuffer(mockPool, null);
 
-      // Directly inject stale dead letter entries
+      // Directly inject stale dead letter entries.
       const dlq = (buffer as any).deadLetterQueue;
       const staleTime = Date.now() - 6 * 60 * 1000; // 6 minutes ago
       dlq.push(
@@ -991,13 +1013,12 @@ describe("EventBuffer", () => {
 
       expect(buffer.getDeadLetterQueue().length).toBe(2);
 
-      // Adding a new event triggers evictStaleDeadLetters since DLQ is non-empty
+      // Adding a new event should not evict stale diagnostic entries.
       const client = mockPool._client;
       client.query.mockResolvedValue({ rows: [], rowCount: 0 });
       await buffer.addEvent(makeEvent("AgentRegistered"));
 
-      // All stale entries should have been evicted
-      expect(buffer.getDeadLetterQueue().length).toBe(0);
+      expect(buffer.getDeadLetterQueue().length).toBe(2);
 
       // Flush remaining to clean up
       await buffer.flush();
@@ -1089,20 +1110,19 @@ describe("EventBuffer", () => {
       // Force retryCount to MAX_FLUSH_RETRIES - 1 so next failure hits DLQ path
       (buffer as any).retryCount = 2;
 
-      // Add 5 events directly to buffer (avoid addEvent which triggers evictStaleDeadLetters)
+      // Add 5 events directly to buffer.
       const eventsToAdd = 5;
       for (let i = 0; i < eventsToAdd; i++) {
         (buffer as any).buffer.push(makeEvent("AgentRegistered", { asset: `asset${i}` }));
       }
 
-      // Flush once - retryCount=3 >= MAX, enters DLQ path with partial space
-      await buffer.flush();
+      // Flush once - retryCount=3 >= MAX, enters fail-stop path with bounded DLQ copy.
+      await expect(buffer.flush()).rejects.toThrow("Persistent error");
 
-      // evictStaleDeadLetters reassigns the array, so re-read from buffer
       // DLQ should be at 10000 (9998 + 2 that fit)
       expect((buffer as any).deadLetterQueue.length).toBe(10000);
-      // Overflow events (3) should be re-buffered
-      expect(buffer.size).toBe(3);
+      // All source events remain buffered for retry.
+      expect(buffer.size).toBe(eventsToAdd);
       vi.useFakeTimers();
     });
   });

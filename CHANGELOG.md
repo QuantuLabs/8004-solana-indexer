@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - 2026-02-27
+## [Unreleased]
+
+## [1.7.0] - 2026-02-27
 
 ### Changed
 - Renamed internal deterministic registration key from `global_id` to `agent_id` across schema, migrations, Prisma, and API query/resolver mappings; API output field remains `agentid`.

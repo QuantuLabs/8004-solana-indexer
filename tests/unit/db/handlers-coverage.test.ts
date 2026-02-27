@@ -132,6 +132,63 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
+    it("should assign next agentId from max existing assigned id", async () => {
+      const event: ProgramEvent = {
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: true,
+          agentUri: "",
+        },
+      };
+
+      (prisma.agent.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.findMany as any).mockResolvedValue([{ agentId: 41n }]);
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.agent.findMany).toHaveBeenCalledWith({
+        where: { agentId: { not: null } },
+        select: { agentId: true },
+        orderBy: { agentId: "desc" },
+        take: 1,
+      });
+      expect(prisma.agent.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ agentId: 42n }),
+          update: expect.objectContaining({ agentId: 42n }),
+        })
+      );
+    });
+
+    it("should preserve existing agentId without reassigning", async () => {
+      const event: ProgramEvent = {
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: true,
+          agentUri: "",
+        },
+      };
+
+      (prisma.agent.findUnique as any).mockResolvedValue({ agentId: 9n });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.agent.findMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ where: { agentId: { not: null } } })
+      );
+      const upsertArgs = (prisma.agent.upsert as any).mock.calls[0]?.[0];
+      expect(upsertArgs?.create?.agentId).toBeNull();
+      expect(upsertArgs?.update?.agentId).toBeUndefined();
+    });
+
     it("should trigger URI digest for AgentRegistered with URI", async () => {
       const event: ProgramEvent = {
         type: "AgentRegistered",
@@ -994,7 +1051,7 @@ describe("DB Handlers Coverage", () => {
 
       // Should have purged old _uri: metadata
       expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-        where: { agentId: TEST_ASSET.toBase58(), key: { startsWith: "_uri:" } },
+        where: { agentId: TEST_ASSET.toBase58(), key: { startsWith: "_uri:" }, immutable: false },
       });
 
       // Should have stored each field + status
@@ -1181,6 +1238,43 @@ describe("DB Handlers Coverage", () => {
       // Should not throw - error is caught internally
       await handleEvent(prisma, event, ctx);
       await new Promise((r) => setTimeout(r, 300));
+    });
+
+    it("should not overwrite immutable URI-derived metadata entries", async () => {
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        uri: "https://example.com/immutable.json",
+        nftName: "",
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.agentMetadata.findUnique as any).mockImplementation((args: any) => {
+        if (args?.where?.agentId_key?.key === "_uri:name") {
+          return Promise.resolve({ immutable: true });
+        }
+        return Promise.resolve(null);
+      });
+      mockDigestUri.mockResolvedValue({
+        status: "ok",
+        bytes: 50,
+        hash: "immutablehash",
+        fields: { "_uri:name": "ShouldNotOverwrite" },
+        truncatedKeys: false,
+      });
+
+      const event: ProgramEvent = {
+        type: "UriUpdated",
+        data: { asset: TEST_ASSET, newUri: "https://example.com/immutable.json", updatedBy: TEST_OWNER },
+      };
+
+      await handleEvent(prisma, event, ctx);
+      await vi.waitFor(() => {
+        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+      }, { timeout: 500 });
+
+      const upsertCalls = (prisma.agentMetadata.upsert as any).mock.calls;
+      const immutableOverwriteCall = upsertCalls.find(
+        (c: any) => c[0]?.where?.agentId_key?.key === "_uri:name"
+      );
+      expect(immutableOverwriteCall).toBeUndefined();
     });
   });
 
@@ -1964,6 +2058,216 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
         where: { agentId: TEST_ASSET.toBase58(), key: "test-key" },
       });
+    });
+  });
+
+  // ==========================================================================
+  // 26. Identity event coverage (wallet/collection/parent)
+  // ==========================================================================
+  describe("Identity event handling coverage", () => {
+    it("WalletResetOnOwnerSync should update owner and reset wallet when DEFAULT_PUBKEY (atomic)", async () => {
+      const defaultPubkey = new PublicKey(DEFAULT_PUBKEY_STR);
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "WalletResetOnOwnerSync",
+        data: {
+          asset: TEST_ASSET,
+          oldWallet: TEST_WALLET,
+          newWallet: defaultPubkey,
+          ownerAfterSync: TEST_NEW_OWNER,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
+        where: { id: TEST_ASSET.toBase58() },
+        data: {
+          owner: TEST_NEW_OWNER.toBase58(),
+          wallet: null,
+          updatedAt: ctx.blockTime,
+        },
+      });
+    });
+
+    it("CollectionPointerSet should preserve existing creator and apply lock (atomic)", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      const setByDifferent = TEST_NEW_OWNER;
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: setByDifferent,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.collection.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { col_creator: { col: "c1:new-pointer", creator: immutableCreator } },
+        })
+      );
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: TEST_ASSET.toBase58() },
+          data: expect.objectContaining({
+            collectionPointer: "c1:new-pointer",
+            creator: immutableCreator,
+            colLocked: true,
+            updatedAt: ctx.blockTime,
+          }),
+        })
+      );
+    });
+
+    it("CollectionPointerSet should decrement previous collection and increment new collection count", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: false,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.collection.updateMany).toHaveBeenCalledWith({
+        where: {
+          col: "c1:old-pointer",
+          creator: immutableCreator,
+          assetCount: { gt: 0n },
+        },
+        data: {
+          assetCount: { decrement: 1n },
+        },
+      });
+
+      expect(prisma.collection.update).toHaveBeenCalledWith({
+        where: { col_creator: { col: "c1:new-pointer", creator: immutableCreator } },
+        data: {
+          assetCount: { increment: 1n },
+        },
+      });
+    });
+
+    it("CollectionPointerSet should not change collection counts when pointer stays identical", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:same-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:same-pointer",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.collection.updateMany).not.toHaveBeenCalled();
+      expect(prisma.collection.update).not.toHaveBeenCalled();
+    });
+
+    it("CollectionPointerSet should not mutate lock flag when lock is omitted (non-atomic)", async () => {
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:prev",
+        creator: TEST_OWNER.toBase58(),
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:next",
+        },
+      };
+
+      await handleEvent(prisma, event, ctx);
+
+      const updateCall = (prisma.agent.updateMany as any).mock.calls.at(-1)?.[0];
+      expect(updateCall?.data.collectionPointer).toBe("c1:next");
+      expect(updateCall?.data.creator).toBe(TEST_OWNER.toBase58());
+      expect("colLocked" in updateCall?.data).toBe(false);
+    });
+
+    it("ParentAssetSet should apply parent lock when provided (atomic)", async () => {
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "ParentAssetSet",
+        data: {
+          asset: TEST_ASSET,
+          parentAsset: TEST_COLLECTION,
+          parentCreator: TEST_OWNER,
+          setBy: TEST_NEW_OWNER,
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
+        where: { id: TEST_ASSET.toBase58() },
+        data: {
+          parentAsset: TEST_COLLECTION.toBase58(),
+          parentCreator: TEST_OWNER.toBase58(),
+          parentLocked: true,
+          updatedAt: ctx.blockTime,
+        },
+      });
+    });
+
+    it("ParentAssetSet should leave parentLocked unchanged when lock omitted (non-atomic)", async () => {
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+
+      const event: ProgramEvent = {
+        type: "ParentAssetSet",
+        data: {
+          asset: TEST_ASSET,
+          parentAsset: TEST_COLLECTION,
+          parentCreator: TEST_OWNER,
+          setBy: TEST_NEW_OWNER,
+        },
+      };
+
+      await handleEvent(prisma, event, ctx);
+
+      const updateCall = (prisma.agent.updateMany as any).mock.calls.at(-1)?.[0];
+      expect(updateCall?.data.parentAsset).toBe(TEST_COLLECTION.toBase58());
+      expect(updateCall?.data.parentCreator).toBe(TEST_OWNER.toBase58());
+      expect("parentLocked" in updateCall?.data).toBe(false);
     });
   });
 });

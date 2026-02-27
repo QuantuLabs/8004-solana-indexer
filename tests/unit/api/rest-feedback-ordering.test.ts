@@ -1,0 +1,72 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AddressInfo } from "net";
+import type { Server } from "http";
+import type { Express } from "express";
+
+const originalEnv = process.env;
+
+async function startServer(prisma: any): Promise<{ server: Server; baseUrl: string }> {
+  const { createApiServer } = await import("../../../src/api/server.js");
+  const app: Express = createApiServer({ prisma, pool: null });
+
+  const server = await new Promise<Server>((resolve, reject) => {
+    const started = app.listen(0, "127.0.0.1", () => resolve(started));
+    started.on("error", reject);
+  });
+
+  const addr = server.address() as AddressInfo;
+  return { server, baseUrl: `http://127.0.0.1:${addr.port}` };
+}
+
+async function stopServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+describe("REST feedback deterministic ordering", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: "rest",
+      ENABLE_GRAPHQL: "false",
+    };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.restoreAllMocks();
+  });
+
+  it("applies stable tie-breakers for created_at collisions", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?limit=5`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { createdAt: "desc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { id: "asc" },
+          ],
+          take: 5,
+          skip: 0,
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+});

@@ -15,6 +15,12 @@ import { Pool } from "pg";
 import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
 import {
+  incrementVerifyCycles,
+  setLastVerifiedSlot,
+  setMismatchCount,
+  setOrphanCount,
+} from "../observability/integrity-metrics.js";
+import {
   getAgentPda,
   getValidationRequestPda,
   getMetadataEntryPda,
@@ -39,10 +45,16 @@ interface OnChainDigests {
 interface DbDigestState {
   feedbackDigest: Buffer | null;
   feedbackCount: bigint;
+  feedbackSignature: string | null;
+  feedbackSlot: bigint;
   responseDigest: Buffer | null;
   responseCount: bigint;
+  responseSignature: string | null;
+  responseSlot: bigint;
   revokeDigest: Buffer | null;
   revokeCount: bigint;
+  revokeSignature: string | null;
+  revokeSlot: bigint;
 }
 
 type ChainType = 'feedback' | 'response' | 'revoke';
@@ -97,6 +109,9 @@ export class DataVerifier {
   private cycleCount = 0;
   // Per-cycle cache for on-chain digests (cleared each cycle)
   private digestCache = new Map<string, OnChainDigests | null>();
+  // Persist each agent digest cache at most once per cycle.
+  private persistedDigestAgents = new Set<string>();
+  private currentCutoffSlot = 0n;
 
   constructor(
     private connection: Connection,
@@ -150,6 +165,7 @@ export class DataVerifier {
     }
 
     this.verifyInProgress = true;
+    incrementVerifyCycles();
     const startTime = Date.now();
     logger.debug("Starting verification cycle");
 
@@ -163,8 +179,11 @@ export class DataVerifier {
       const cutoffSlot = BigInt(currentSlot) > BigInt(config.verifySafetyMarginSlots)
         ? BigInt(currentSlot) - BigInt(config.verifySafetyMarginSlots)
         : 0n;
+      this.currentCutoffSlot = cutoffSlot;
+      setLastVerifiedSlot(cutoffSlot);
 
       // Verify in parallel for better performance
+      this.persistedDigestAgents.clear();
       await Promise.all([
         this.verifyAgents(cutoffSlot),
         this.verifyValidations(cutoffSlot),
@@ -196,8 +215,23 @@ export class DataVerifier {
     } catch (error: any) {
       logger.error({ error: error.message }, "Verification cycle failed");
     } finally {
+      this.updateIntegrityMetrics();
       this.verifyInProgress = false;
     }
+  }
+
+  private updateIntegrityMetrics(): void {
+    const orphanCount =
+      this.stats.agentsOrphaned +
+      this.stats.feedbacksOrphaned +
+      this.stats.responsesOrphaned +
+      this.stats.revocationsOrphaned +
+      this.stats.validationsOrphaned +
+      this.stats.metadataOrphaned +
+      this.stats.registriesOrphaned;
+
+    setOrphanCount(orphanCount);
+    setMismatchCount(this.stats.hashChainMismatches);
   }
 
   // =========================================================================
@@ -1070,6 +1104,16 @@ export class DataVerifier {
       }
 
       const dbState = await this.getLastDbDigests(agentId);
+      if (!this.persistedDigestAgents.has(agentId)) {
+        const lastVerifiedSignature = this.resolveLastVerifiedSignature(dbState);
+        await this.persistAgentDigestCache(
+          agentId,
+          onChain,
+          this.currentCutoffSlot,
+          lastVerifiedSignature
+        );
+        this.persistedDigestAgents.add(agentId);
+      }
 
       let onChainDigest: Uint8Array;
       let onChainCount: bigint;
@@ -1144,14 +1188,165 @@ export class DataVerifier {
     }
   }
 
+  private resolveLastVerifiedSignature(dbState: DbDigestState): string | null {
+    const candidates = [
+      { signature: dbState.feedbackSignature, slot: dbState.feedbackSlot },
+      { signature: dbState.responseSignature, slot: dbState.responseSlot },
+      { signature: dbState.revokeSignature, slot: dbState.revokeSlot },
+    ].filter((entry) => !!entry.signature);
+
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => {
+      if (a.slot === b.slot) return 0;
+      return a.slot > b.slot ? -1 : 1;
+    });
+    return candidates[0]?.signature ?? null;
+  }
+
+  private async persistAgentDigestCache(
+    agentId: string,
+    onChain: OnChainDigests,
+    lastVerifiedSlot: bigint,
+    lastVerifiedSignature: string | null,
+  ): Promise<void> {
+    const verifiedAt = new Date();
+    const baseRecord = {
+      feedbackDigest: Buffer.from(onChain.feedbackDigest),
+      feedbackCount: onChain.feedbackCount,
+      responseDigest: Buffer.from(onChain.responseDigest),
+      responseCount: onChain.responseCount,
+      revokeDigest: Buffer.from(onChain.revokeDigest),
+      revokeCount: onChain.revokeCount,
+      lastVerifiedAt: verifiedAt,
+      lastVerifiedSlot,
+    };
+
+    if (this.prisma) {
+      const model = (this.prisma as any).agentDigestCache;
+      if (!model?.upsert) return;
+
+      const createData: Record<string, unknown> = { agentId, ...baseRecord };
+      const updateData: Record<string, unknown> = { ...baseRecord };
+      if (lastVerifiedSignature) {
+        createData.lastVerifiedSignature = lastVerifiedSignature;
+        updateData.lastVerifiedSignature = lastVerifiedSignature;
+      }
+
+      try {
+        await model.upsert({
+          where: { agentId },
+          create: createData,
+          update: updateData,
+        });
+        return;
+      } catch (error: any) {
+        // Fallback for clients/schemas that don't include lastVerifiedSignature yet.
+        if (!lastVerifiedSignature) return;
+        try {
+          await model.upsert({
+            where: { agentId },
+            create: { agentId, ...baseRecord },
+            update: { ...baseRecord },
+          });
+          return;
+        } catch (fallbackError: any) {
+          logger.debug(
+            { agentId, error: fallbackError?.message ?? error?.message },
+            "Skipping agent digest cache persistence (Prisma model unavailable)"
+          );
+          return;
+        }
+      }
+    }
+
+    if (!this.pool) return;
+
+    const baseParams: unknown[] = [
+      agentId,
+      Buffer.from(onChain.feedbackDigest),
+      onChain.feedbackCount.toString(),
+      Buffer.from(onChain.responseDigest),
+      onChain.responseCount.toString(),
+      Buffer.from(onChain.revokeDigest),
+      onChain.revokeCount.toString(),
+      verifiedAt.toISOString(),
+      lastVerifiedSlot.toString(),
+    ];
+
+    const baseSql = `INSERT INTO agent_digest_cache (
+        agent_id,
+        feedback_digest,
+        feedback_count,
+        response_digest,
+        response_count,
+        revoke_digest,
+        revoke_count,
+        last_verified_at,
+        last_verified_slot
+      ) VALUES ($1, $2, $3::bigint, $4, $5::bigint, $6, $7::bigint, $8::timestamptz, $9::bigint)
+      ON CONFLICT (agent_id) DO UPDATE SET
+        feedback_digest = EXCLUDED.feedback_digest,
+        feedback_count = EXCLUDED.feedback_count,
+        response_digest = EXCLUDED.response_digest,
+        response_count = EXCLUDED.response_count,
+        revoke_digest = EXCLUDED.revoke_digest,
+        revoke_count = EXCLUDED.revoke_count,
+        last_verified_at = EXCLUDED.last_verified_at,
+        last_verified_slot = EXCLUDED.last_verified_slot`;
+
+    if (lastVerifiedSignature) {
+      const withSigSql = `INSERT INTO agent_digest_cache (
+          agent_id,
+          feedback_digest,
+          feedback_count,
+          response_digest,
+          response_count,
+          revoke_digest,
+          revoke_count,
+          last_verified_at,
+          last_verified_slot,
+          last_verified_signature
+        ) VALUES ($1, $2, $3::bigint, $4, $5::bigint, $6, $7::bigint, $8::timestamptz, $9::bigint, $10::text)
+        ON CONFLICT (agent_id) DO UPDATE SET
+          feedback_digest = EXCLUDED.feedback_digest,
+          feedback_count = EXCLUDED.feedback_count,
+          response_digest = EXCLUDED.response_digest,
+          response_count = EXCLUDED.response_count,
+          revoke_digest = EXCLUDED.revoke_digest,
+          revoke_count = EXCLUDED.revoke_count,
+          last_verified_at = EXCLUDED.last_verified_at,
+          last_verified_slot = EXCLUDED.last_verified_slot,
+          last_verified_signature = EXCLUDED.last_verified_signature`;
+      try {
+        await this.pool.query(withSigSql, [...baseParams, lastVerifiedSignature]);
+        return;
+      } catch {
+        // Column may not exist yet on older schemas. Fall back to core fields only.
+      }
+    }
+
+    try {
+      await this.pool.query(baseSql, baseParams);
+    } catch (error: any) {
+      logger.debug(
+        { agentId, error: error.message },
+        "Skipping agent digest cache persistence (table unavailable)"
+      );
+    }
+  }
+
   /**
    * Get the last running_digest and event count from DB for each chain type.
    */
   private async getLastDbDigests(agentId: string): Promise<DbDigestState> {
     const zero: DbDigestState = {
       feedbackDigest: null, feedbackCount: 0n,
+      feedbackSignature: null, feedbackSlot: 0n,
       responseDigest: null, responseCount: 0n,
+      responseSignature: null, responseSlot: 0n,
       revokeDigest: null, revokeCount: 0n,
+      revokeSignature: null, revokeSlot: 0n,
     };
 
     if (this.prisma) {
@@ -1160,19 +1355,19 @@ export class DataVerifier {
         this.prisma.feedback.findFirst({
           where: { agentId, runningDigest: { not: null }, status: notOrphaned },
           orderBy: { feedbackIndex: 'desc' },
-          select: { runningDigest: true },
+          select: { runningDigest: true, createdTxSignature: true, createdSlot: true },
         }),
         this.prisma.feedback.count({ where: { agentId, status: notOrphaned } }),
         this.prisma.feedbackResponse.findFirst({
           where: { feedback: { agentId }, runningDigest: { not: null }, status: notOrphaned },
           orderBy: { slot: 'desc' },
-          select: { runningDigest: true },
+          select: { runningDigest: true, txSignature: true, slot: true },
         }),
         this.prisma.feedbackResponse.count({ where: { feedback: { agentId }, status: notOrphaned } }),
         this.prisma.revocation.findFirst({
           where: { agentId, runningDigest: { not: null }, status: notOrphaned },
           orderBy: { revokeCount: 'desc' },
-          select: { runningDigest: true },
+          select: { runningDigest: true, txSignature: true, slot: true },
         }),
         this.prisma.revocation.count({ where: { agentId, status: notOrphaned } }),
       ]);
@@ -1180,25 +1375,43 @@ export class DataVerifier {
       return {
         feedbackDigest: lastFb?.runningDigest ? Buffer.from(lastFb.runningDigest) : null,
         feedbackCount: BigInt(fbCount),
+        feedbackSignature: lastFb?.createdTxSignature ?? null,
+        feedbackSlot: BigInt(lastFb?.createdSlot ?? 0),
         responseDigest: lastResp?.runningDigest ? Buffer.from(lastResp.runningDigest) : null,
         responseCount: BigInt(respCount),
+        responseSignature: lastResp?.txSignature ?? null,
+        responseSlot: BigInt(lastResp?.slot ?? 0),
         revokeDigest: lastRev?.runningDigest ? Buffer.from(lastRev.runningDigest) : null,
         revokeCount: BigInt(revCount),
+        revokeSignature: lastRev?.txSignature ?? null,
+        revokeSlot: BigInt(lastRev?.slot ?? 0),
       };
     } else if (this.pool) {
       const [fbRes, fbCnt, respRes, respCnt, revRes, revCnt] = await Promise.all([
         this.pool.query(
-          `SELECT running_digest FROM feedbacks WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY feedback_index DESC LIMIT 1`,
+          `SELECT running_digest, tx_signature, block_slot
+           FROM feedbacks
+           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
+           ORDER BY feedback_index DESC
+           LIMIT 1`,
           [agentId]
         ),
         this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedbacks WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
         this.pool.query(
-          `SELECT running_digest FROM feedback_responses WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC LIMIT 1`,
+          `SELECT running_digest, tx_signature, block_slot
+           FROM feedback_responses
+           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
+           ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+           LIMIT 1`,
           [agentId]
         ),
         this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedback_responses WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
         this.pool.query(
-          `SELECT running_digest FROM revocations WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED' ORDER BY revoke_count DESC LIMIT 1`,
+          `SELECT running_digest, tx_signature, slot
+           FROM revocations
+           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
+           ORDER BY revoke_count DESC
+           LIMIT 1`,
           [agentId]
         ),
         this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM revocations WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
@@ -1215,13 +1428,26 @@ export class DataVerifier {
         return null;
       };
 
+      const toSlot = (val: unknown): bigint => {
+        if (typeof val === 'bigint') return val;
+        if (typeof val === 'number' && Number.isFinite(val)) return BigInt(Math.trunc(val));
+        if (typeof val === 'string' && /^-?\d+$/.test(val)) return BigInt(val);
+        return 0n;
+      };
+
       return {
         feedbackDigest: toBuffer(fbRes.rows[0]?.running_digest),
         feedbackCount: BigInt(fbCnt.rows[0]?.cnt ?? 0),
+        feedbackSignature: (fbRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
+        feedbackSlot: toSlot(fbRes.rows[0]?.block_slot),
         responseDigest: toBuffer(respRes.rows[0]?.running_digest),
         responseCount: BigInt(respCnt.rows[0]?.cnt ?? 0),
+        responseSignature: (respRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
+        responseSlot: toSlot(respRes.rows[0]?.block_slot),
         revokeDigest: toBuffer(revRes.rows[0]?.running_digest),
         revokeCount: BigInt(revCnt.rows[0]?.cnt ?? 0),
+        revokeSignature: (revRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
+        revokeSlot: toSlot(revRes.rows[0]?.slot),
       };
     }
 

@@ -50,8 +50,9 @@ The API intentionally exposes multiple identifiers:
 
 Precision note:
 
-- `agentid` is serialized as `string` in API responses to avoid JSON `number` precision loss beyond `2^53-1`.
+- `agentId` and `agentid` are serialized as `string` in API responses to avoid JSON `number` precision loss beyond `2^53-1`.
 - GraphQL filters/order for this field use `agentid`, `agentid_gt`, `agentid_lt`, `agentid_gte`, `agentid_lte`, and `orderBy: agentid`.
+- There is no `globalId` API field name; use `agentid` for the registry sequence value.
 
 ## Required Environment
 
@@ -60,8 +61,18 @@ DB_MODE=supabase
 SUPABASE_DSN=POSTGRES_DSN_REDACTED
 SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_KEY=<service_role_key>
+SOLANA_NETWORK=devnet
 RPC_URL=https://api.devnet.solana.com
 WS_URL=wss://api.devnet.solana.com
+PROGRAM_ID=8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C
+```
+
+```bash
+# Mainnet config example (set PROGRAM_ID to your deployed mainnet program)
+# SOLANA_NETWORK=mainnet-beta
+# RPC_URL=https://api.mainnet-beta.solana.com
+# WS_URL=wss://api.mainnet-beta.solana.com
+# PROGRAM_ID=<MAINNET_PROGRAM_ID>
 ```
 
 Notes:
@@ -69,6 +80,8 @@ Notes:
 - GraphQL requires `DB_MODE=supabase` (recommended `API_MODE=graphql`).
 - REST v1 requires `DB_MODE=local` (Prisma; recommended `API_MODE=rest`).
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
+- `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
+- If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples).
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
 
@@ -121,6 +134,7 @@ docker compose -f docker/stack/classic-stack.yml up -d
 Integrity helpers:
 
 ```bash
+# Official GHCR namespace: ghcr.io/quantulabs/*
 scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.6.0 docker/digests.yml
 scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.6.0
 ```

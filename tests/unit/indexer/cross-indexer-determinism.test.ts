@@ -4,7 +4,7 @@ import { describe, it, expect } from "vitest";
  * Cross-indexer determinism tests.
  *
  * Proves that canonical ordering (block_slot, tx_signature, tx_index)
- * produces identical global_id assignments regardless of which indexer runs:
+ * produces identical agent_id assignments regardless of which indexer runs:
  *   - RPC Poller (getBlock → enumerate → tx_index)
  *   - Substreams  (block.transactions.iter().enumerate() → tx_index)
  *   - WebSocket   (onLogs → no tx_index, NULL fallback)
@@ -44,7 +44,7 @@ function sqlEquivalentSort<T extends { block_slot: bigint; tx_index: number | nu
   });
 }
 
-/** Simulates global_id assignment: sort then assign sequential IDs */
+/** Simulates agent_id assignment: sort then assign sequential IDs */
 function assignGlobalIds(
   agents: Array<{ asset: string; block_slot: bigint; tx_index: number | null; tx_signature: string; status?: string }>,
 ): Map<string, number> {
@@ -175,7 +175,7 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     // Both should produce identical asset ordering
     expect(pollerSorted.map(a => a.asset)).toEqual(substreamsSorted.map(a => a.asset));
 
-    // Both should produce identical global_id assignments
+    // Both should produce identical agent_id assignments
     const pollerIds = assignGlobalIds(pollerResult);
     const substreamsIds = assignGlobalIds(substreamsResult);
     expect(pollerIds).toEqual(substreamsIds);
@@ -188,7 +188,7 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     const pollerIds = assignGlobalIds(pollerResult);
     const substreamsIds = assignGlobalIds(substreamsResult);
 
-    // Every agent should get the same global_id from either indexer
+    // Every agent should get the same agent_id from either indexer
     for (const [asset, id] of pollerIds) {
       expect(substreamsIds.get(asset)).toBe(id);
     }
@@ -361,7 +361,7 @@ describe("Cross-indexer determinism: getBlock fallback scenarios", () => {
 });
 
 describe("Cross-indexer determinism: reorg resilience", () => {
-  it("orphaned agents are excluded from global_id assignment", () => {
+  it("orphaned agents are excluded from agent_id assignment", () => {
     const agents: AgentRecord[] = [
       { asset: "A", block_slot: 100n, tx_index: 0, tx_signature: "sig_a" },
       { asset: "B", block_slot: 100n, tx_index: 1, tx_signature: "sig_b", status: "ORPHANED" },
@@ -371,11 +371,11 @@ describe("Cross-indexer determinism: reorg resilience", () => {
     const ids = assignGlobalIds(agents);
 
     expect(ids.get("A")).toBe(1);
-    expect(ids.has("B")).toBe(false); // ORPHANED, no global_id
+    expect(ids.has("B")).toBe(false); // ORPHANED, no agent_id
     expect(ids.get("C")).toBe(2);     // No gap shift expected in backfill
   });
 
-  it("recovered agent preserves global_id (trigger doesn't reassign on UPDATE)", () => {
+  it("recovered agent preserves agent_id (trigger doesn't reassign on UPDATE)", () => {
     const agents: AgentRecord[] = [
       { asset: "A", block_slot: 100n, tx_index: 0, tx_signature: "sig_a" },
       { asset: "B", block_slot: 100n, tx_index: 1, tx_signature: "sig_b" },
@@ -387,9 +387,9 @@ describe("Cross-indexer determinism: reorg resilience", () => {
 
     // B becomes orphaned then recovers - simulate trigger behavior:
     // The BEFORE INSERT trigger only fires on INSERT, not UPDATE
-    // So recovering an agent (UPDATE status='FINALIZED') keeps global_id
+    // So recovering an agent (UPDATE status='FINALIZED') keeps agent_id
     const bId = initialIds.get("B");
-    expect(bId).toBe(2); // B's global_id persists through status changes
+    expect(bId).toBe(2); // B's agent_id persists through status changes
   });
 
   it("new agent after gap gets next sequence value (no backfill)", () => {

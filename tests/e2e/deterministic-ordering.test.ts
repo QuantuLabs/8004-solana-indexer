@@ -5,9 +5,9 @@
  * Registers multiple agents (same block + cross-block), then validates:
  *   1. tx_index is resolved correctly via getBlock
  *   2. Agents are ordered by composite key (block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST)
- *   3. global_id is assigned deterministically based on insertion order
+ *   3. agent_id is assigned deterministically based on insertion order
  *   4. Re-ingesting produces the same ordering
- *   5. Orphaned agents do NOT receive a global_id
+ *   5. Orphaned agents do NOT receive a agent_id
  *
  * Prerequisites:
  *   1. Start localnet: npm run localnet:start
@@ -345,10 +345,10 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   });
 
   // =========================================================================
-  // 3. DB Ingestion & global_id Assignment
+  // 3. DB Ingestion & agent_id Assignment
   // =========================================================================
 
-  describe("3. DB Ingestion & global_id Assignment", () => {
+  describe("3. DB Ingestion & agent_id Assignment", () => {
     it("should ingest agents with correct tx_index into DB", async () => {
       // Sort agents in deterministic order for insertion
       const sorted = sortAgentsDeterministically(registeredAgents);
@@ -541,7 +541,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   });
 
   // =========================================================================
-  // 6. Orphaned Agents & global_id
+  // 6. Orphaned Agents & agent_id
   // =========================================================================
 
   describe("6. Orphaned Agents", () => {
@@ -566,7 +566,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       });
 
       const orphan = await prisma.agent.findUnique({ where: { id: fakeId } });
-      expect(orphan?.globalId).toBeNull();
+      expect(orphan?.agentId).toBeNull();
 
       // Query non-orphaned agents — orphaned should be excluded
       const activeAgents = await prisma.agent.findMany({

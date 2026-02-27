@@ -35,7 +35,13 @@ export const feedbackResolvers = {
     cursor(parent: FeedbackRow) {
       // Opaque cursor used by Query.feedbacks(after: ...)
       return Buffer.from(
-        JSON.stringify({ created_at: parent.created_at, asset: parent.asset, id: parent.id }),
+        JSON.stringify({
+          created_at: parent.created_at,
+          asset: parent.asset,
+          client_address: parent.client_address,
+          feedback_index: parent.feedback_index,
+          id: parent.id,
+        }),
         'utf-8'
       ).toString('base64');
     },

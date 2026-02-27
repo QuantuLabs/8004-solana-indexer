@@ -285,18 +285,21 @@ describe("E2E: Localnet Verification", () => {
           registry: registryConfigPda.toBase58(),
           atomEnabled: false,
           status: "PENDING",
-          createdSlot: 1n,
+          createdSlot: 0n,
         },
         update: {
           status: "PENDING",
-          createdSlot: 1n,
+          createdSlot: 0n,
           verifiedAt: null,
         },
       });
 
       // Get current slot
       const currentSlot = await connection.getSlot("finalized");
-      const cutoffSlot = BigInt(currentSlot) - 32n;
+      const safetyMargin = 32n;
+      const cutoffSlot = BigInt(currentSlot) > safetyMargin
+        ? BigInt(currentSlot) - safetyMargin
+        : BigInt(currentSlot);
 
       // Run verification
       await (verifier as any).verifyAgents(cutoffSlot);
@@ -335,18 +338,21 @@ describe("E2E: Localnet Verification", () => {
           registryType: "Base",
           authority: wallet.publicKey.toBase58(),
           status: "PENDING",
-          slot: 1n,
+          slot: 0n,
         },
         update: {
           status: "PENDING",
-          slot: 1n,
+          slot: 0n,
           verifiedAt: null,
         },
       });
 
       // Get current slot
       const currentSlot = await connection.getSlot("finalized");
-      const cutoffSlot = BigInt(currentSlot) - 32n;
+      const safetyMargin = 32n;
+      const cutoffSlot = BigInt(currentSlot) > safetyMargin
+        ? BigInt(currentSlot) - safetyMargin
+        : BigInt(currentSlot);
 
       // Run verification
       await (verifier as any).verifyRegistries(cutoffSlot);
@@ -421,11 +427,11 @@ describe("E2E: Localnet Verification", () => {
           registry: registryConfigPda.toBase58(),
           atomEnabled: false,
           status: "PENDING",
-          createdSlot: 1n,
+          createdSlot: 0n,
         },
         update: {
           status: "PENDING",
-          createdSlot: 1n,
+          createdSlot: 0n,
           verifiedAt: null,
         },
       });

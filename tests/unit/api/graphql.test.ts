@@ -269,9 +269,21 @@ describe('Pagination Utilities', () => {
   });
 
   it('exposes Feedback.cursor compatible with Query.feedbacks(after: ...)', () => {
-    const parent = { id: 'fb1', asset: 'agent1', created_at: '2025-01-01T00:00:00Z' } as any;
+    const parent = {
+      id: 'fb1',
+      asset: 'agent1',
+      client_address: 'client1',
+      feedback_index: '42',
+      created_at: '2025-01-01T00:00:00Z',
+    } as any;
     const cursor = feedbackResolvers.Feedback.cursor(parent);
-    expect(decodeBase64Json(cursor)).toEqual({ created_at: parent.created_at, asset: parent.asset, id: parent.id });
+    expect(decodeBase64Json(cursor)).toEqual({
+      created_at: parent.created_at,
+      asset: parent.asset,
+      client_address: parent.client_address,
+      feedback_index: parent.feedback_index,
+      id: parent.id,
+    });
   });
 
   it('exposes FeedbackResponse.cursor compatible with Query.feedbackResponses(after: ...)', () => {
@@ -385,6 +397,25 @@ describe('Query Resolver User Input Errors', () => {
       queryResolvers.Query.agents({}, { first: 10, after, orderBy: 'updatedAt' }, ctx)
     ).rejects.toMatchObject({
       message: 'The after cursor is only supported when orderBy is createdAt.',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  it('returns BAD_USER_INPUT for invalid feedbacks cursor format', async () => {
+    const poolQuery = vi.fn();
+    const ctx = {
+      pool: { query: poolQuery },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbacks({}, { first: 10, after: 'invalid-cursor' }, ctx)
+    ).rejects.toMatchObject({
+      message: 'Invalid feedbacks cursor. Expected base64 JSON with created_at, asset, client_address, feedback_index, and id.',
       extensions: { code: 'BAD_USER_INPUT' },
     });
 

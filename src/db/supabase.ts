@@ -542,6 +542,7 @@ async function handleCollectionPointerSetTx(
   const assetId = data.asset.toBase58();
   const pointer = data.col;
   const setBy = data.setBy.toBase58();
+  const lock = typeof data.lock === "boolean" ? data.lock : null;
   await client.query(
     `WITH previous AS (
        SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
@@ -553,21 +554,19 @@ async function handleCollectionPointerSetTx(
        SET canonical_col = $2,
            creator = COALESCE(creator, $3),
            block_slot = $4,
-           updated_at = $5
+           updated_at = $5,
+           col_locked = COALESCE($7, col_locked)
        WHERE asset = $1
        RETURNING 1
      ),
-     upserted AS (
+     inserted AS (
        INSERT INTO collection_pointers (
          col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
          last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
        )
-       VALUES ($2, $3, $1, $5, $4, $6, $5, $4, $6, 0)
-       ON CONFLICT (col, creator) DO UPDATE SET
-         last_seen_at = EXCLUDED.last_seen_at,
-         last_seen_slot = EXCLUDED.last_seen_slot,
-         last_seen_tx_signature = EXCLUDED.last_seen_tx_signature
-       RETURNING col
+       SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+       WHERE EXISTS (SELECT 1 FROM updated)
+       ON CONFLICT (col, creator) DO NOTHING
      ),
      dec_old AS (
        UPDATE collection_pointers cp
@@ -580,16 +579,18 @@ async function handleCollectionPointerSetTx(
        RETURNING 1
      )
      UPDATE collection_pointers cp
-     SET asset_count = cp.asset_count + 1
+     SET last_seen_at = $5,
+         last_seen_slot = $4,
+         last_seen_tx_signature = $6,
+         asset_count = cp.asset_count + CASE
+           WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
+             OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+           THEN 1 ELSE 0 END
      WHERE cp.col = $2
        AND cp.creator = $3
-       AND EXISTS (SELECT 1 FROM updated)
-       AND (
-         COALESCE((SELECT prev_col FROM previous), '') <> $2
-         OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
-       )`,
-    [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature]
-  );
+       AND EXISTS (SELECT 1 FROM updated)`,
+     [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
+   );
   logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
   if (config.collectionMetadataIndexEnabled) {
@@ -603,12 +604,14 @@ async function handleParentAssetSetTx(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
+  const lock = typeof data.lock === "boolean" ? data.lock : null;
   await client.query(
     `UPDATE agents
      SET parent_asset = $1,
          parent_creator = $2,
          block_slot = $3,
-         updated_at = $4
+         updated_at = $4,
+         parent_locked = COALESCE($6, parent_locked)
      WHERE asset = $5`,
     [
       data.parentAsset.toBase58(),
@@ -616,6 +619,7 @@ async function handleParentAssetSetTx(
       ctx.slot.toString(),
       ctx.blockTime.toISOString(),
       assetId,
+      lock,
     ]
   );
   logger.info({
@@ -648,7 +652,8 @@ async function handleMetadataSetTx(
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
-       updated_at = EXCLUDED.updated_at`,
+       updated_at = EXCLUDED.updated_at
+     WHERE NOT metadata.immutable`,
     [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, key: data.key }, "Metadata set");
@@ -1025,9 +1030,7 @@ async function handleAgentRegistered(
 
     // Trigger URI metadata extraction if configured and URI is present
     if (agentUri && config.metadataIndexMode !== "off") {
-      digestAndStoreUriMetadata(assetId, agentUri).catch((err) => {
-        logger.warn({ assetId, uri: agentUri, error: err.message }, "Failed to digest URI metadata");
-      });
+      metadataQueue.add(assetId, agentUri);
     }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to register agent");
@@ -1087,9 +1090,7 @@ async function handleUriUpdated(
 
     // Trigger URI metadata extraction if configured and URI is present
     if (newUri && config.metadataIndexMode !== "off") {
-      digestAndStoreUriMetadata(assetId, newUri).catch((err) => {
-        logger.warn({ assetId, uri: newUri, error: err.message }, "Failed to digest URI metadata");
-      });
+      metadataQueue.add(assetId, newUri);
     }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to update URI");
@@ -1145,6 +1146,7 @@ async function handleCollectionPointerSet(
   const assetId = data.asset.toBase58();
   const pointer = data.col;
   const setBy = data.setBy.toBase58();
+  const lock = typeof data.lock === "boolean" ? data.lock : null;
 
   try {
     await db.query(
@@ -1158,21 +1160,19 @@ async function handleCollectionPointerSet(
          SET canonical_col = $2,
              creator = COALESCE(creator, $3),
              block_slot = $4,
-             updated_at = $5
+             updated_at = $5,
+             col_locked = COALESCE($7, col_locked)
          WHERE asset = $1
          RETURNING 1
        ),
-       upserted AS (
+       inserted AS (
          INSERT INTO collection_pointers (
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
            last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
          )
-         VALUES ($2, $3, $1, $5, $4, $6, $5, $4, $6, 0)
-         ON CONFLICT (col, creator) DO UPDATE SET
-           last_seen_at = EXCLUDED.last_seen_at,
-           last_seen_slot = EXCLUDED.last_seen_slot,
-           last_seen_tx_signature = EXCLUDED.last_seen_tx_signature
-         RETURNING col
+         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+         WHERE EXISTS (SELECT 1 FROM updated)
+         ON CONFLICT (col, creator) DO NOTHING
        ),
        dec_old AS (
          UPDATE collection_pointers cp
@@ -1185,15 +1185,17 @@ async function handleCollectionPointerSet(
          RETURNING 1
        )
        UPDATE collection_pointers cp
-       SET asset_count = cp.asset_count + 1
+       SET last_seen_at = $5,
+           last_seen_slot = $4,
+           last_seen_tx_signature = $6,
+           asset_count = cp.asset_count + CASE
+             WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
+               OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+             THEN 1 ELSE 0 END
        WHERE cp.col = $2
          AND cp.creator = $3
-         AND EXISTS (SELECT 1 FROM updated)
-         AND (
-           COALESCE((SELECT prev_col FROM previous), '') <> $2
-           OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
-         )`,
-      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature]
+         AND EXISTS (SELECT 1 FROM updated)`,
+      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
     );
     logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
@@ -1211,6 +1213,7 @@ async function handleParentAssetSet(
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
+  const lock = typeof data.lock === "boolean" ? data.lock : null;
 
   try {
     await db.query(
@@ -1218,7 +1221,8 @@ async function handleParentAssetSet(
        SET parent_asset = $1,
            parent_creator = $2,
            block_slot = $3,
-           updated_at = $4
+           updated_at = $4,
+           parent_locked = COALESCE($6, parent_locked)
        WHERE asset = $5`,
       [
         data.parentAsset.toBase58(),
@@ -1226,6 +1230,7 @@ async function handleParentAssetSet(
         ctx.slot.toString(),
         ctx.blockTime.toISOString(),
         assetId,
+        lock,
       ]
     );
     logger.info({
@@ -1268,7 +1273,8 @@ async function handleMetadataSet(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
-         updated_at = EXCLUDED.updated_at`,
+         updated_at = EXCLUDED.updated_at
+       WHERE NOT metadata.immutable`,
       [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
@@ -1690,18 +1696,23 @@ export async function loadIndexerState(): Promise<IndexerState> {
 /**
  * Save indexer state (cursor) to Supabase
  */
-export async function saveIndexerState(signature: string, slot: bigint): Promise<void> {
+export async function saveIndexerState(
+  signature: string,
+  slot: bigint,
+  source: "poller" | "websocket" | "substreams" = "poller"
+): Promise<void> {
   const db = getPool();
   try {
     await db.query(
-      `INSERT INTO indexer_state (id, last_signature, last_slot, updated_at)
-       VALUES ('main', $1, $2, NOW())
+      `INSERT INTO indexer_state (id, last_signature, last_slot, source, updated_at)
+       VALUES ('main', $1, $2, $3, NOW())
        ON CONFLICT (id) DO UPDATE SET
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
+         source = EXCLUDED.source,
          updated_at = NOW()
        WHERE indexer_state.last_slot <= EXCLUDED.last_slot`,
-      [signature, slot.toString()]
+      [signature, slot.toString(), source]
     );
   } catch (error: any) {
     logger.error({ error: error.message }, "Failed to save indexer state");
@@ -1726,7 +1737,7 @@ import { collectionMetadataQueue } from "../indexer/collection-metadata-queue.js
  * two consecutive URI updates (block N and N+1) might complete out of order.
  * We check if the agent's current URI matches before writing to prevent stale overwrites.
  */
-async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<void> {
+export async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<void> {
   if (config.metadataIndexMode === "off") {
     return;
   }
@@ -1761,7 +1772,10 @@ async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<
   // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
   try {
     await db.query(
-      `DELETE FROM metadata WHERE asset = $1 AND key LIKE '\\_uri:%' ESCAPE '\\'`,
+      `DELETE FROM metadata
+       WHERE asset = $1
+         AND key LIKE '\\_uri:%' ESCAPE '\\'
+         AND NOT immutable`,
       [assetId]
     );
     logger.debug({ assetId }, "Purged old URI metadata");
@@ -1852,10 +1866,12 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
        VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', NOW())
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       WHERE NOT metadata.immutable`,
       [id, assetId, key, keyHash, storedValue]
     );
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");
+    throw error;
   }
 }

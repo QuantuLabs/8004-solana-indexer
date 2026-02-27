@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 /**
- * Tests for global_id formatting and resolver logic.
+ * Tests for agent_id formatting and resolver logic.
  * The actual sequence/trigger behavior is PostgreSQL-specific
  * and tested via the migration SQL.
  */
@@ -120,11 +120,11 @@ describe("Global ID reorg resilience", () => {
     // Gap at 2 is acceptable - no shifting
   });
 
-  it("should retain global_id when orphaned agent is recovered", () => {
-    // Agent marked ORPHANED keeps its global_id
-    // When recovered (status back to FINALIZED), global_id unchanged
-    const agent = { asset: "test", global_id: 42, status: "ORPHANED" };
+  it("should retain agent_id when orphaned agent is recovered", () => {
+    // Agent marked ORPHANED keeps its agent_id
+    // When recovered (status back to FINALIZED), agent_id unchanged
+    const agent = { asset: "test", agent_id: 42, status: "ORPHANED" };
     agent.status = "FINALIZED";
-    expect(agent.global_id).toBe(42); // Unchanged
+    expect(agent.agent_id).toBe(42); // Unchanged
   });
 });

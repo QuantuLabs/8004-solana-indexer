@@ -26,9 +26,8 @@ const BATCH_SIZE_RPC = 100;        // Max transactions per RPC call
 const BATCH_SIZE_DB = 500;         // Max events per DB transaction
 const FLUSH_INTERVAL_MS = 500;     // Flush every 500ms even if batch not full
 const MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
-const MAX_DEAD_LETTER = 10000;     // Max events in dead letter queue (memory protection)
-const DEAD_LETTER_BACKPRESSURE = 0.8; // Warn at 80% capacity
-const DEAD_LETTER_MAX_AGE_MS = 5 * 60 * 1000; // Evict entries older than 5 minutes
+const MAX_DEAD_LETTER = 10000;     // Max diagnostic events retained in dead letter queue
+const DEAD_LETTER_BACKPRESSURE = 0.8; // Warn at 80% diagnostic queue capacity
 
 // Helper to check for all-zero hash (empty hash should be NULL, not "00...00")
 function isAllZeroHash(hash: Uint8Array | undefined | null): boolean {
@@ -213,30 +212,11 @@ export class EventBuffer {
   }
 
   /**
-   * Evict dead letter entries older than DEAD_LETTER_MAX_AGE_MS
-   */
-  private evictStaleDeadLetters(): void {
-    const now = Date.now();
-    const before = this.deadLetterQueue.length;
-    this.deadLetterQueue = this.deadLetterQueue.filter(
-      entry => (now - entry.addedAt) < DEAD_LETTER_MAX_AGE_MS
-    );
-    const evicted = before - this.deadLetterQueue.length;
-    if (evicted > 0) {
-      logger.warn({ evicted, remaining: this.deadLetterQueue.length },
-        "Evicted stale dead letter entries (older than 5 minutes)");
-    }
-  }
-
-  /**
    * Add event to buffer
    * Auto-flushes when buffer is full
    */
   async addEvent(event: BatchEvent): Promise<void> {
-    // Backpressure: evict stale dead letter entries and warn if near capacity
-    if (this.deadLetterQueue.length > 0) {
-      this.evictStaleDeadLetters();
-    }
+    // Backpressure signal for repeated flush failures.
     const dlqUtilization = this.deadLetterQueue.length / MAX_DEAD_LETTER;
     if (dlqUtilization > DEAD_LETTER_BACKPRESSURE) {
       logger.warn({
@@ -304,34 +284,35 @@ export class EventBuffer {
       logger.error({ error, eventCount: eventsToFlush.length, retryCount: this.retryCount }, "Batch flush failed");
 
       if (this.retryCount >= MAX_FLUSH_RETRIES) {
-        // Move to dead letter queue after max retries (poison pill protection)
-        logger.warn({
+        // High integrity mode: never continue after unrecoverable flush failure.
+        // Keep events in memory for retry and optionally copy to DLQ for diagnostics.
+        logger.error({
           eventCount: eventsToFlush.length,
           retryCount: this.retryCount
-        }, "Max retries exceeded, moving events to dead letter queue");
+        }, "Max retries exceeded, failing stop-safe flush (events re-queued)");
 
-        // Evict stale entries before adding new ones
-        this.evictStaleDeadLetters();
-
-        // Memory protection: cap dead letter queue size
-        const now = Date.now();
-        const spaceAvailable = MAX_DEAD_LETTER - this.deadLetterQueue.length;
-        if (spaceAvailable <= 0) {
-          logger.error({ eventCount: eventsToFlush.length }, "Dead letter queue full, halting ingestion");
-          this.buffer = [...eventsToFlush, ...this.buffer];
-          this.retryCount = 0;
-          throw error;
-        } else if (eventsToFlush.length > spaceAvailable) {
-          const toKeep = eventsToFlush.slice(0, spaceAvailable);
-          const overflow = eventsToFlush.slice(spaceAvailable);
-          this.deadLetterQueue.push(...toKeep.map(e => ({ event: e, addedAt: now })));
-          this.buffer = [...overflow, ...this.buffer];
-          logger.error({ deadLettered: toKeep.length, requeued: overflow.length }, "Dead letter queue nearly full, requeuing overflow");
-        } else {
-          this.deadLetterQueue.push(...eventsToFlush.map(e => ({ event: e, addedAt: now })));
+        // Keep a bounded diagnostic snapshot without dropping source events.
+        const spaceAvailable = Math.max(0, MAX_DEAD_LETTER - this.deadLetterQueue.length);
+        const toCopy = Math.min(spaceAvailable, eventsToFlush.length);
+        if (toCopy > 0) {
+          const now = Date.now();
+          this.deadLetterQueue.push(...eventsToFlush
+            .slice(0, toCopy)
+            .map(event => ({ event, addedAt: now })));
+          this.stats.deadLettered += toCopy;
         }
-        this.stats.deadLettered += eventsToFlush.length;
+        if (toCopy < eventsToFlush.length) {
+          logger.warn({
+            copiedToDeadLetter: toCopy,
+            skippedDiagnosticCopies: eventsToFlush.length - toCopy,
+            deadLetterSize: this.deadLetterQueue.length,
+          }, "Dead letter queue at capacity; skipped excess diagnostic copies");
+        }
+
+        // Critical: requeue all source events and propagate error so caller halts/retries.
+        this.buffer = [...eventsToFlush, ...this.buffer];
         this.retryCount = 0;
+        throw error;
       } else {
         // Re-add events to buffer for retry (limited retries)
         this.buffer = [...eventsToFlush, ...this.buffer];
@@ -774,6 +755,7 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     const setBy = data.setBy?.toBase58?.() || data.setBy;
     const pointer = data.col || "";
+    const lock = typeof data.lock === "boolean" ? data.lock : null;
     await client.query(
       `WITH previous AS (
          SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
@@ -785,21 +767,19 @@ export class EventBuffer {
          SET canonical_col = $2,
              creator = COALESCE(creator, $3),
              block_slot = $4,
-             updated_at = $5
+             updated_at = $5,
+             col_locked = COALESCE($7, col_locked)
          WHERE asset = $1
          RETURNING 1
        ),
-       upserted AS (
+       inserted AS (
          INSERT INTO collection_pointers (
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
            last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
          )
-         VALUES ($2, $3, $1, $5, $4, $6, $5, $4, $6, 0)
-         ON CONFLICT (col, creator) DO UPDATE SET
-           last_seen_at = EXCLUDED.last_seen_at,
-           last_seen_slot = EXCLUDED.last_seen_slot,
-           last_seen_tx_signature = EXCLUDED.last_seen_tx_signature
-         RETURNING col
+         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+         WHERE EXISTS (SELECT 1 FROM updated)
+         ON CONFLICT (col, creator) DO NOTHING
        ),
        dec_old AS (
          UPDATE collection_pointers cp
@@ -812,15 +792,18 @@ export class EventBuffer {
          RETURNING 1
        )
        UPDATE collection_pointers cp
-       SET asset_count = cp.asset_count + 1
+       SET last_seen_at = $5,
+           last_seen_slot = $4,
+           last_seen_tx_signature = $6,
+           asset_count = cp.asset_count + CASE
+             WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
+               OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+             THEN 1 ELSE 0 END
        WHERE cp.col = $2
          AND cp.creator = $3
          AND EXISTS (SELECT 1 FROM updated)
-         AND (
-           COALESCE((SELECT prev_col FROM previous), '') <> $2
-           OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
-         )`,
-      [asset, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature]
+      `,
+      [asset, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
     );
   }
 
