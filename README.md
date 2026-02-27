@@ -45,7 +45,7 @@ The API intentionally exposes multiple identifiers:
 
 - `id` (GraphQL): canonical opaque id (`sol:<asset>`), used for entity references.
 - `agentId` (GraphQL): deterministic numeric id derived from the asset public key bytes (first 8 bytes, big-endian).
-- `agentid` (GraphQL + REST): registry global id backed by DB `global_id` (`uint64` semantic).
+- `agentid` (GraphQL + REST): registry sequence id backed by DB `agent_id` (`uint64` semantic).
 - `agentidFormatted` (GraphQL): display format of `agentid` (for example `#042`).
 
 Precision note:
