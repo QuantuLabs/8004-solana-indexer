@@ -121,6 +121,13 @@ export const ATOM_ENGINE_PROGRAM_ID = resolveProgramId(
 );
 export const MPL_CORE_PROGRAM_ID = SDK_MPL_CORE_PROGRAM_ID;
 
+const solanaNetwork = (process.env.SOLANA_NETWORK || "").trim().toLowerCase();
+if (solanaNetwork === "mainnet-beta" && ATOM_ENGINE_PROGRAM_ID.equals(DEFAULT_ATOM_ENGINE_PROGRAM_ID)) {
+  console.warn(
+    "[CONFIG WARNING] SOLANA_NETWORK=mainnet-beta but ATOM_ENGINE_PROGRAM_ID is still the default devnet ID. Set ATOM_ENGINE_PROGRAM_ID to the mainnet deployment before production use."
+  );
+}
+
 /**
  * Convert a number to little-endian buffer
  */
