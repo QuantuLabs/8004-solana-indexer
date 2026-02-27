@@ -421,10 +421,14 @@ export class EventBuffer {
         await this.insertResponseSupabase(client, data, ctx);
         break;
       case "ValidationRequested":
-        await this.insertValidationRequestSupabase(client, data, ctx);
+        if (config.validationIndexEnabled) {
+          await this.insertValidationRequestSupabase(client, data, ctx);
+        }
         break;
       case "ValidationResponded":
-        await this.updateValidationResponseSupabase(client, data, ctx);
+        if (config.validationIndexEnabled) {
+          await this.updateValidationResponseSupabase(client, data, ctx);
+        }
         break;
       case "RegistryInitialized":
         await this.insertCollectionSupabase(client, data, ctx);

@@ -201,6 +201,9 @@ export const config = {
   // Collection metadata indexing from canonical pointer (c1:<cid>)
   // true = fetch and parse collection JSON, false = keep on-chain only
   collectionMetadataIndexEnabled: parseBoolean(process.env.INDEX_COLLECTION_METADATA, true),
+  // Validation module is archived on-chain in v0.6.x.
+  // Keep ingestion off by default in runtime, on during tests for coverage.
+  validationIndexEnabled: parseBoolean(process.env.INDEX_VALIDATIONS, process.env.NODE_ENV === "test" || process.env.VITEST !== undefined),
   // Maximum bytes to fetch from URI (prevents memory exhaustion)
   metadataMaxBytes: parseInt(process.env.METADATA_MAX_BYTES || "262144", 10), // 256KB
   // Maximum bytes per field value (prevents single oversize field)

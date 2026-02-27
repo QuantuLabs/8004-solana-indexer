@@ -45,19 +45,58 @@ const LOCAL_RECOVERY_BATCH_SIZE = 500;
 let localRecoveryInterval: NodeJS.Timeout | null = null;
 let localRecoveryInFlight = false;
 let agentIdAssignmentTail: Promise<void> = Promise.resolve();
+let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
+let responseIdAssignmentTail: Promise<void> = Promise.resolve();
+let revocationIdAssignmentTail: Promise<void> = Promise.resolve();
 
-async function withAgentIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
-  const previous = agentIdAssignmentTail;
+async function withAssignmentLock<T>(
+  getTail: () => Promise<void>,
+  setTail: (tail: Promise<void>) => void,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = getTail();
   let release: () => void = () => {};
-  agentIdAssignmentTail = new Promise<void>((resolve) => {
+  setTail(new Promise<void>((resolve) => {
     release = () => resolve();
-  });
+  }));
   await previous;
   try {
     return await task();
   } finally {
     release();
   }
+}
+
+async function withAgentIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => agentIdAssignmentTail,
+    (tail) => { agentIdAssignmentTail = tail; },
+    task
+  );
+}
+
+async function withFeedbackIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => feedbackIdAssignmentTail,
+    (tail) => { feedbackIdAssignmentTail = tail; },
+    task
+  );
+}
+
+async function withResponseIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => responseIdAssignmentTail,
+    (tail) => { responseIdAssignmentTail = tail; },
+    task
+  );
+}
+
+async function withRevocationIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => revocationIdAssignmentTail,
+    (tail) => { revocationIdAssignmentTail = tail; },
+    task
+  );
 }
 
 function asBigInt(value: bigint | number | null | undefined): bigint {
@@ -529,10 +568,14 @@ async function handleEventInner(
       await handleResponseAppendedTx(tx, event.data, ctx);
       break;
     case "ValidationRequested":
-      await handleValidationRequestedTx(tx, event.data, ctx);
+      if (config.validationIndexEnabled) {
+        await handleValidationRequestedTx(tx, event.data, ctx);
+      }
       break;
     case "ValidationResponded":
-      await handleValidationRespondedTx(tx, event.data, ctx);
+      if (config.validationIndexEnabled) {
+        await handleValidationRespondedTx(tx, event.data, ctx);
+      }
       break;
     default:
       logger.warn({ event }, "Unhandled event type");
@@ -616,11 +659,15 @@ export async function handleEvent(
       break;
 
     case "ValidationRequested":
-      await handleValidationRequested(prisma, event.data, ctx);
+      if (config.validationIndexEnabled) {
+        await handleValidationRequested(prisma, event.data, ctx);
+      }
       break;
 
     case "ValidationResponded":
-      await handleValidationResponded(prisma, event.data, ctx);
+      if (config.validationIndexEnabled) {
+        await handleValidationResponded(prisma, event.data, ctx);
+      }
       break;
 
     default:
@@ -641,8 +688,17 @@ async function handleAgentRegisteredCore(
   await withAgentIdAssignmentLock(async () => {
     const existingAgent = await client.agent.findUnique({
       where: { id: assetId },
-      select: { agentId: true },
+      select: { agentId: true, creator: true },
     });
+    const ownerBase58 = data.owner.toBase58();
+    const canonicalCreator = existingAgent
+      ? (() => {
+          if (!existingAgent.creator) {
+            throw new Error(`Invariant violation: missing creator for existing agent ${assetId}`);
+          }
+          return existingAgent.creator;
+        })()
+      : ownerBase58;
 
     let assignedAgentId: bigint | undefined;
     if (!existingAgent || existingAgent.agentId === null) {
@@ -661,7 +717,7 @@ async function handleAgentRegisteredCore(
       create: {
         id: assetId,
         owner: data.owner.toBase58(),
-        creator: data.owner.toBase58(),
+        creator: canonicalCreator,
         uri: agentUri,
         nftName: "",
         collection: collectionId,
@@ -682,7 +738,7 @@ async function handleAgentRegisteredCore(
         registry: collectionId, // v0.6.0: registry = collection
         atomEnabled: data.atomEnabled,
         uri: agentUri,
-        creator: data.owner.toBase58(),
+        creator: canonicalCreator,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
         ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
@@ -1347,59 +1403,116 @@ async function handleNewFeedbackTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
-  const feedback = await tx.feedback.upsert({
-    where: {
-      agentId_client_feedbackIndex: {
+  const feedback = await withFeedbackIdAssignmentLock(async () => {
+    const existingFeedback = await tx.feedback.findUnique({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      select: { feedbackId: true },
+    });
+
+    let assignedFeedbackId: bigint | undefined;
+    if (!existingFeedback || existingFeedback.feedbackId === null) {
+      const highestAssigned = await tx.feedback.findMany({
+        where: { agentId: assetId, feedbackId: { not: null } },
+        select: { feedbackId: true },
+        orderBy: { feedbackId: "desc" },
+        take: 1,
+      });
+      assignedFeedbackId = asBigInt(highestAssigned[0]?.feedbackId) + 1n;
+    }
+
+    return tx.feedback.upsert({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      create: {
         agentId: assetId,
         client: clientAddress,
         feedbackIndex: data.feedbackIndex,
+        value: data.value.toString(),
+        valueDecimals: data.valueDecimals,
+        score: data.score,
+        tag1: data.tag1,
+        tag2: data.tag2,
+        endpoint: data.endpoint,
+        feedbackUri: data.feedbackUri,
+        feedbackHash: normalizeHash(data.sealHash),
+        runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
+        createdTxSignature: ctx.signature,
+        createdSlot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        feedbackId: assignedFeedbackId ?? null,
+        status: DEFAULT_STATUS,
       },
-    },
-    create: {
-      agentId: assetId,
-      client: clientAddress,
-      feedbackIndex: data.feedbackIndex,
-      value: data.value.toString(),
-      valueDecimals: data.valueDecimals,
-      score: data.score,
-      tag1: data.tag1,
-      tag2: data.tag2,
-      endpoint: data.endpoint,
-      feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.sealHash),
-      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
-      createdTxSignature: ctx.signature,
-      createdSlot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: DEFAULT_STATUS,
-    },
-    update: {},
+      update: {
+        ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
+      },
+    });
   });
   // Reconcile orphan responses
   const orphans = await tx.orphanResponse.findMany({
     where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
   });
   for (const orphan of orphans) {
-    await tx.feedbackResponse.upsert({
-      where: {
-        feedbackId_responder_txSignature: {
+    await withResponseIdAssignmentLock(async () => {
+      const orphanTxSignature = orphan.txSignature ?? "";
+      const existingResponse = await tx.feedbackResponse.findUnique({
+        where: {
+          feedbackId_responder_txSignature: {
+            feedbackId: feedback.id,
+            responder: orphan.responder,
+            txSignature: orphanTxSignature,
+          },
+        },
+        select: { responseId: true },
+      });
+
+      let assignedResponseId: bigint | undefined;
+      if (!existingResponse || existingResponse.responseId === null) {
+        const highestAssigned = await tx.feedbackResponse.findMany({
+          where: { feedbackId: feedback.id, responseId: { not: null } },
+          select: { responseId: true },
+          orderBy: { responseId: "desc" },
+          take: 1,
+        });
+        assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+      }
+
+      await tx.feedbackResponse.upsert({
+        where: {
+          feedbackId_responder_txSignature: {
+            feedbackId: feedback.id,
+            responder: orphan.responder,
+            txSignature: orphanTxSignature,
+          },
+        },
+        create: {
           feedbackId: feedback.id,
           responder: orphan.responder,
-          txSignature: orphan.txSignature ?? "",
+          responseUri: orphan.responseUri,
+          responseHash: orphan.responseHash,
+          runningDigest: orphan.runningDigest,
+          responseCount: orphan.responseCount,
+          txSignature: orphan.txSignature,
+          slot: orphan.slot,
+          responseId: assignedResponseId ?? null,
+          status: DEFAULT_STATUS,
         },
-      },
-      create: {
-        feedbackId: feedback.id,
-        responder: orphan.responder,
-        responseUri: orphan.responseUri,
-        responseHash: orphan.responseHash,
-        runningDigest: orphan.runningDigest,
-        txSignature: orphan.txSignature,
-        slot: orphan.slot,
-        status: DEFAULT_STATUS,
-      },
-      update: {},
+        update: {
+          responseCount: orphan.responseCount,
+          ...(assignedResponseId !== undefined ? { responseId: assignedResponseId } : {}),
+        },
+      });
     });
     await tx.orphanResponse.delete({ where: { id: orphan.id } });
   }
@@ -1433,34 +1546,61 @@ async function handleNewFeedback(
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
 
-  const feedback = await prisma.feedback.upsert({
-    where: {
-      agentId_client_feedbackIndex: {
+  const feedback = await withFeedbackIdAssignmentLock(async () => {
+    const existingFeedback = await prisma.feedback.findUnique({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      select: { feedbackId: true },
+    });
+
+    let assignedFeedbackId: bigint | undefined;
+    if (!existingFeedback || existingFeedback.feedbackId === null) {
+      const highestAssigned = await prisma.feedback.findMany({
+        where: { agentId: assetId, feedbackId: { not: null } },
+        select: { feedbackId: true },
+        orderBy: { feedbackId: "desc" },
+        take: 1,
+      });
+      assignedFeedbackId = asBigInt(highestAssigned[0]?.feedbackId) + 1n;
+    }
+
+    return prisma.feedback.upsert({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      create: {
         agentId: assetId,
         client: clientAddress,
         feedbackIndex: data.feedbackIndex,
+        value: data.value.toString(),
+        valueDecimals: data.valueDecimals,
+        score: data.score,
+        tag1: data.tag1,
+        tag2: data.tag2,
+        endpoint: data.endpoint,
+        feedbackUri: data.feedbackUri,
+        feedbackHash: normalizeHash(data.sealHash),
+        runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
+        createdTxSignature: ctx.signature,
+        createdSlot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        feedbackId: assignedFeedbackId ?? null,
+        status: DEFAULT_STATUS,
       },
-    },
-    create: {
-      agentId: assetId,
-      client: clientAddress,
-      feedbackIndex: data.feedbackIndex,
-      value: data.value.toString(),
-      valueDecimals: data.valueDecimals,
-      score: data.score,
-      tag1: data.tag1,
-      tag2: data.tag2,
-      endpoint: data.endpoint,
-      feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.sealHash),
-      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
-      createdTxSignature: ctx.signature,
-      createdSlot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: DEFAULT_STATUS,
-    },
-    update: {},
+      update: {
+        ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
+      },
+    });
   });
 
   // Reconcile orphan responses
@@ -1469,25 +1609,55 @@ async function handleNewFeedback(
   });
 
   for (const orphan of orphans) {
-    await prisma.feedbackResponse.upsert({
-      where: {
-        feedbackId_responder_txSignature: {
+    await withResponseIdAssignmentLock(async () => {
+      const orphanTxSignature = orphan.txSignature ?? "";
+      const existingResponse = await prisma.feedbackResponse.findUnique({
+        where: {
+          feedbackId_responder_txSignature: {
+            feedbackId: feedback.id,
+            responder: orphan.responder,
+            txSignature: orphanTxSignature,
+          },
+        },
+        select: { responseId: true },
+      });
+
+      let assignedResponseId: bigint | undefined;
+      if (!existingResponse || existingResponse.responseId === null) {
+        const highestAssigned = await prisma.feedbackResponse.findMany({
+          where: { feedbackId: feedback.id, responseId: { not: null } },
+          select: { responseId: true },
+          orderBy: { responseId: "desc" },
+          take: 1,
+        });
+        assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+      }
+
+      await prisma.feedbackResponse.upsert({
+        where: {
+          feedbackId_responder_txSignature: {
+            feedbackId: feedback.id,
+            responder: orphan.responder,
+            txSignature: orphanTxSignature,
+          },
+        },
+        create: {
           feedbackId: feedback.id,
           responder: orphan.responder,
-          txSignature: orphan.txSignature ?? "",
+          responseUri: orphan.responseUri,
+          responseHash: orphan.responseHash,
+          runningDigest: orphan.runningDigest,
+          responseCount: orphan.responseCount,
+          txSignature: orphan.txSignature,
+          slot: orphan.slot,
+          responseId: assignedResponseId ?? null,
+          status: DEFAULT_STATUS,
         },
-      },
-      create: {
-        feedbackId: feedback.id,
-        responder: orphan.responder,
-        responseUri: orphan.responseUri,
-        responseHash: orphan.responseHash,
-        runningDigest: orphan.runningDigest,
-        txSignature: orphan.txSignature,
-        slot: orphan.slot,
-        status: DEFAULT_STATUS,
-      },
-      update: {},
+        update: {
+          responseCount: orphan.responseCount,
+          ...(assignedResponseId !== undefined ? { responseId: assignedResponseId } : {}),
+        },
+      });
     });
     await prisma.orphanResponse.delete({ where: { id: orphan.id } });
   }
@@ -1561,37 +1731,67 @@ async function handleFeedbackRevokedTx(
   });
 
   const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
-  await tx.revocation.upsert({
-    where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
-    create: {
-      agentId: assetId,
-      client: clientAddress,
-      feedbackIndex: data.feedbackIndex,
-      feedbackHash: eventSealHash,
-      slot: data.slot,
-      originalScore: data.originalScore,
-      atomEnabled: data.atomEnabled,
-      hadImpact: data.hadImpact,
-      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
-      revokeCount: data.newRevokeCount,
-      txSignature: ctx.signature,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: revokeStatus,
-    },
-    update: {
-      feedbackHash: eventSealHash,
-      slot: data.slot,
-      originalScore: data.originalScore,
-      atomEnabled: data.atomEnabled,
-      hadImpact: data.hadImpact,
-      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
-      revokeCount: data.newRevokeCount,
-      txSignature: ctx.signature,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: revokeStatus,
-    },
+  await withRevocationIdAssignmentLock(async () => {
+    const existingRevocation = await tx.revocation.findUnique({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      select: { revocationId: true },
+    });
+
+    let assignedRevocationId: bigint | undefined;
+    if (revokeStatus !== "ORPHANED" && (!existingRevocation || existingRevocation.revocationId === null)) {
+      const highestAssigned = await tx.revocation.findMany({
+        where: { agentId: assetId, revocationId: { not: null } },
+        select: { revocationId: true },
+        orderBy: { revocationId: "desc" },
+        take: 1,
+      });
+      assignedRevocationId = asBigInt(highestAssigned[0]?.revocationId) + 1n;
+    }
+
+    await tx.revocation.upsert({
+      where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
+      create: {
+        agentId: assetId,
+        client: clientAddress,
+        feedbackIndex: data.feedbackIndex,
+        feedbackHash: eventSealHash,
+        slot: data.slot,
+        originalScore: data.originalScore,
+        atomEnabled: data.atomEnabled,
+        hadImpact: data.hadImpact,
+        runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+        revokeCount: data.newRevokeCount,
+        txSignature: ctx.signature,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        revocationId: revokeStatus === "ORPHANED" ? null : (assignedRevocationId ?? null),
+        status: revokeStatus,
+      },
+      update: {
+        feedbackHash: eventSealHash,
+        slot: data.slot,
+        originalScore: data.originalScore,
+        atomEnabled: data.atomEnabled,
+        hadImpact: data.hadImpact,
+        runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+        revokeCount: data.newRevokeCount,
+        txSignature: ctx.signature,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: revokeStatus,
+        ...(revokeStatus === "ORPHANED"
+          ? { revocationId: null }
+          : assignedRevocationId !== undefined
+            ? { revocationId: assignedRevocationId }
+            : {}),
+      },
+    });
   });
 
   await syncAgentFeedbackStatsTx(
@@ -1650,37 +1850,67 @@ async function handleFeedbackRevoked(
   });
 
   const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
-  await prisma.revocation.upsert({
-    where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
-    create: {
-      agentId: assetId,
-      client: clientAddress,
-      feedbackIndex: data.feedbackIndex,
-      feedbackHash: eventSealHash,
-      slot: data.slot,
-      originalScore: data.originalScore,
-      atomEnabled: data.atomEnabled,
-      hadImpact: data.hadImpact,
-      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
-      revokeCount: data.newRevokeCount,
-      txSignature: ctx.signature,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: revokeStatus,
-    },
-    update: {
-      feedbackHash: eventSealHash,
-      slot: data.slot,
-      originalScore: data.originalScore,
-      atomEnabled: data.atomEnabled,
-      hadImpact: data.hadImpact,
-      runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
-      revokeCount: data.newRevokeCount,
-      txSignature: ctx.signature,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: revokeStatus,
-    },
+  await withRevocationIdAssignmentLock(async () => {
+    const existingRevocation = await prisma.revocation.findUnique({
+      where: {
+        agentId_client_feedbackIndex: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+        },
+      },
+      select: { revocationId: true },
+    });
+
+    let assignedRevocationId: bigint | undefined;
+    if (revokeStatus !== "ORPHANED" && (!existingRevocation || existingRevocation.revocationId === null)) {
+      const highestAssigned = await prisma.revocation.findMany({
+        where: { agentId: assetId, revocationId: { not: null } },
+        select: { revocationId: true },
+        orderBy: { revocationId: "desc" },
+        take: 1,
+      });
+      assignedRevocationId = asBigInt(highestAssigned[0]?.revocationId) + 1n;
+    }
+
+    await prisma.revocation.upsert({
+      where: { agentId_client_feedbackIndex: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex } },
+      create: {
+        agentId: assetId,
+        client: clientAddress,
+        feedbackIndex: data.feedbackIndex,
+        feedbackHash: eventSealHash,
+        slot: data.slot,
+        originalScore: data.originalScore,
+        atomEnabled: data.atomEnabled,
+        hadImpact: data.hadImpact,
+        runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+        revokeCount: data.newRevokeCount,
+        txSignature: ctx.signature,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        revocationId: revokeStatus === "ORPHANED" ? null : (assignedRevocationId ?? null),
+        status: revokeStatus,
+      },
+      update: {
+        feedbackHash: eventSealHash,
+        slot: data.slot,
+        originalScore: data.originalScore,
+        atomEnabled: data.atomEnabled,
+        hadImpact: data.hadImpact,
+        runningDigest: Uint8Array.from(data.newRevokeDigest) as Uint8Array<ArrayBuffer>,
+        revokeCount: data.newRevokeCount,
+        txSignature: ctx.signature,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: revokeStatus,
+        ...(revokeStatus === "ORPHANED"
+          ? { revocationId: null }
+          : assignedRevocationId !== undefined
+            ? { revocationId: assignedRevocationId }
+            : {}),
+      },
+    });
   });
 
   await syncAgentFeedbackStats(
@@ -1739,10 +1969,13 @@ async function handleResponseAppendedTx(
         responseUri: data.responseUri,
         responseHash: normalizeHash(data.responseHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
+        responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
       },
-      update: {},
+      update: {
+        responseCount: data.newResponseCount,
+      },
     });
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Orphan response stored");
     return;
@@ -1759,28 +1992,59 @@ async function handleResponseAppendedTx(
 
   const responseStatus = sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
 
-  await tx.feedbackResponse.upsert({
-    where: {
-      feedbackId_responder_txSignature: {
+  await withResponseIdAssignmentLock(async () => {
+    const existingResponse = await tx.feedbackResponse.findUnique({
+      where: {
+        feedbackId_responder_txSignature: {
+          feedbackId: feedback.id,
+          responder,
+          txSignature: ctx.signature,
+        },
+      },
+      select: { responseId: true },
+    });
+
+    let assignedResponseId: bigint | undefined;
+    if (responseStatus !== "ORPHANED" && (!existingResponse || existingResponse.responseId === null)) {
+      const highestAssigned = await tx.feedbackResponse.findMany({
+        where: { feedbackId: feedback.id, responseId: { not: null } },
+        select: { responseId: true },
+        orderBy: { responseId: "desc" },
+        take: 1,
+      });
+      assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+    }
+
+    await tx.feedbackResponse.upsert({
+      where: {
+        feedbackId_responder_txSignature: {
+          feedbackId: feedback.id,
+          responder,
+          txSignature: ctx.signature,
+        },
+      },
+      create: {
         feedbackId: feedback.id,
         responder,
+        responseUri: data.responseUri,
+        responseHash: normalizeHash(data.responseHash),
+        runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+        responseCount: data.newResponseCount,
         txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        responseId: responseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
+        status: responseStatus,
       },
-    },
-    create: {
-      feedbackId: feedback.id,
-      responder,
-      responseUri: data.responseUri,
-      responseHash: normalizeHash(data.responseHash),
-      runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
-      responseCount: data.newResponseCount,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: responseStatus,
-    },
-    update: {},
+      update: {
+        ...(responseStatus === "ORPHANED"
+          ? { responseId: null, status: responseStatus }
+          : assignedResponseId !== undefined
+            ? { responseId: assignedResponseId, status: responseStatus }
+            : { status: responseStatus }),
+      },
+    });
   });
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");
 }
@@ -1828,10 +2092,13 @@ async function handleResponseAppended(
         responseUri: data.responseUri,
         responseHash: normalizeHash(data.responseHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
+        responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
       },
-      update: {},
+      update: {
+        responseCount: data.newResponseCount,
+      },
     });
 
     logger.info(
@@ -1852,28 +2119,59 @@ async function handleResponseAppended(
 
   const responseStatus = sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
 
-  await prisma.feedbackResponse.upsert({
-    where: {
-      feedbackId_responder_txSignature: {
+  await withResponseIdAssignmentLock(async () => {
+    const existingResponse = await prisma.feedbackResponse.findUnique({
+      where: {
+        feedbackId_responder_txSignature: {
+          feedbackId: feedback.id,
+          responder,
+          txSignature: ctx.signature,
+        },
+      },
+      select: { responseId: true },
+    });
+
+    let assignedResponseId: bigint | undefined;
+    if (responseStatus !== "ORPHANED" && (!existingResponse || existingResponse.responseId === null)) {
+      const highestAssigned = await prisma.feedbackResponse.findMany({
+        where: { feedbackId: feedback.id, responseId: { not: null } },
+        select: { responseId: true },
+        orderBy: { responseId: "desc" },
+        take: 1,
+      });
+      assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+    }
+
+    await prisma.feedbackResponse.upsert({
+      where: {
+        feedbackId_responder_txSignature: {
+          feedbackId: feedback.id,
+          responder,
+          txSignature: ctx.signature,
+        },
+      },
+      create: {
         feedbackId: feedback.id,
         responder,
+        responseUri: data.responseUri,
+        responseHash: normalizeHash(data.responseHash),
+        runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+        responseCount: data.newResponseCount,
         txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        responseId: responseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
+        status: responseStatus,
       },
-    },
-    create: {
-      feedbackId: feedback.id,
-      responder,
-      responseUri: data.responseUri,
-      responseHash: normalizeHash(data.responseHash),
-      runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
-      responseCount: data.newResponseCount,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: responseStatus,
-    },
-    update: {},
+      update: {
+        ...(responseStatus === "ORPHANED"
+          ? { responseId: null, status: responseStatus }
+          : assignedResponseId !== undefined
+            ? { responseId: assignedResponseId, status: responseStatus }
+            : { status: responseStatus }),
+      },
+    });
   });
 
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Response appended");

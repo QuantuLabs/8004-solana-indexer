@@ -102,6 +102,144 @@ function hashesMatchHex(stored: string | null, event: string | null): boolean {
   return stored === event;
 }
 
+type DbQueryable = {
+  query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount: number | null }>;
+};
+
+let feedbackIdAssignmentTail = Promise.resolve();
+let responseIdAssignmentTail = Promise.resolve();
+let revocationIdAssignmentTail = Promise.resolve();
+
+async function withAssignmentLock<T>(
+  getTail: () => Promise<void>,
+  setTail: (tail: Promise<void>) => void,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = getTail();
+  let release: () => void = () => { /* no-op until replaced */ };
+  const current = new Promise<void>((resolve) => {
+    release = () => resolve();
+  });
+  setTail(previous.then(() => current));
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+async function withFeedbackIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => feedbackIdAssignmentTail,
+    (tail) => { feedbackIdAssignmentTail = tail; },
+    task
+  );
+}
+
+async function withResponseIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => responseIdAssignmentTail,
+    (tail) => { responseIdAssignmentTail = tail; },
+    task
+  );
+}
+
+async function withRevocationIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => revocationIdAssignmentTail,
+    (tail) => { revocationIdAssignmentTail = tail; },
+    task
+  );
+}
+
+function toNullableBigInt(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value));
+  if (typeof value === "string" && value !== "") {
+    try {
+      return BigInt(value);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function toBigInt(value: unknown): bigint {
+  return toNullableBigInt(value) ?? 0n;
+}
+
+async function fetchExistingFeedbackId(db: DbQueryable, id: string): Promise<bigint | null> {
+  const { rows } = await db.query(
+    `SELECT feedback_id::text AS feedback_id FROM feedbacks WHERE id = $1 LIMIT 1`,
+    [id]
+  );
+  return toNullableBigInt(rows[0]?.feedback_id);
+}
+
+async function fetchNextFeedbackId(db: DbQueryable, assetId: string): Promise<bigint> {
+  const { rows } = await db.query(
+    `SELECT MAX(feedback_id)::text AS max_id
+     FROM feedbacks
+     WHERE asset = $1 AND feedback_id IS NOT NULL`,
+    [assetId]
+  );
+  return toBigInt(rows[0]?.max_id) + 1n;
+}
+
+async function fetchExistingResponseId(db: DbQueryable, id: string): Promise<bigint | null> {
+  const { rows } = await db.query(
+    `SELECT response_id::text AS response_id FROM feedback_responses WHERE id = $1 LIMIT 1`,
+    [id]
+  );
+  return toNullableBigInt(rows[0]?.response_id);
+}
+
+async function fetchNextResponseId(
+  db: DbQueryable,
+  assetId: string,
+  clientAddress: string,
+  feedbackIndex: bigint
+): Promise<bigint> {
+  const { rows } = await db.query(
+    `SELECT MAX(response_id)::text AS max_id
+     FROM feedback_responses
+     WHERE asset = $1
+       AND client_address = $2
+       AND feedback_index = $3
+       AND response_id IS NOT NULL`,
+    [assetId, clientAddress, feedbackIndex.toString()]
+  );
+  return toBigInt(rows[0]?.max_id) + 1n;
+}
+
+async function fetchExistingRevocationId(
+  db: DbQueryable,
+  assetId: string,
+  clientAddress: string,
+  feedbackIndex: bigint
+): Promise<bigint | null> {
+  const { rows } = await db.query(
+    `SELECT revocation_id::text AS revocation_id
+     FROM revocations
+     WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
+     LIMIT 1`,
+    [assetId, clientAddress, feedbackIndex.toString()]
+  );
+  return toNullableBigInt(rows[0]?.revocation_id);
+}
+
+async function fetchNextRevocationId(db: DbQueryable, assetId: string): Promise<bigint> {
+  const { rows } = await db.query(
+    `SELECT MAX(revocation_id)::text AS max_id
+     FROM revocations
+     WHERE asset = $1 AND revocation_id IS NOT NULL`,
+    [assetId]
+  );
+  return toBigInt(rows[0]?.max_id) + 1n;
+}
+
 function logStatsIfNeeded(): void {
   const now = Date.now();
   // Log stats every 60 seconds
@@ -214,13 +352,17 @@ export async function handleEvent(
         break;
 
       case "ValidationRequested":
-        await handleValidationRequested(event.data, ctx);
-        eventStats.validationRequested++;
+        if (config.validationIndexEnabled) {
+          await handleValidationRequested(event.data, ctx);
+          eventStats.validationRequested++;
+        }
         break;
 
       case "ValidationResponded":
-        await handleValidationResponded(event.data, ctx);
-        eventStats.validationResponded++;
+        if (config.validationIndexEnabled) {
+          await handleValidationResponded(event.data, ctx);
+          eventStats.validationResponded++;
+        }
         break;
 
       default:
@@ -357,12 +499,16 @@ async function handleEventInTx(
       await handleResponseAppendedTx(client, event.data, ctx);
       break;
     case "ValidationRequested":
-      await handleValidationRequestedTx(client, event.data, ctx);
-      eventStats.validationRequested++;
+      if (config.validationIndexEnabled) {
+        await handleValidationRequestedTx(client, event.data, ctx);
+        eventStats.validationRequested++;
+      }
       break;
     case "ValidationResponded":
-      await handleValidationRespondedTx(client, event.data, ctx);
-      eventStats.validationResponded++;
+      if (config.validationIndexEnabled) {
+        await handleValidationRespondedTx(client, event.data, ctx);
+        eventStats.validationResponded++;
+      }
       break;
     default:
       logger.warn({ event }, "Unhandled event type");
@@ -702,13 +848,27 @@ async function handleNewFeedbackTx(
   const runningDigest = data.newFeedbackDigest
     ? Buffer.from(data.newFeedbackDigest)
     : null;
+
+  const feedbackIdAssignment = await withFeedbackIdAssignmentLock(async () => {
+    const existingFeedbackId = await fetchExistingFeedbackId(client, id);
+    if (existingFeedbackId !== null) {
+      return { feedbackId: existingFeedbackId, alreadyExists: true };
+    }
+    const nextFeedbackId = await fetchNextFeedbackId(client, assetId);
+    return { feedbackId: nextFeedbackId, alreadyExists: false };
+  });
+  if (feedbackIdAssignment.alreadyExists) {
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
+    return;
+  }
+
   const insertResult = await client.query(
-    `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+    `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
        running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
      ON CONFLICT (id) DO NOTHING`,
     [
-      id, assetId, clientAddress, data.feedbackIndex.toString(),
+      id, feedbackIdAssignment.feedbackId.toString(), assetId, clientAddress, data.feedbackIndex.toString(),
       data.value.toString(), data.valueDecimals, data.score,
       data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
       feedbackHash, runningDigest,
@@ -716,6 +876,12 @@ async function handleNewFeedbackTx(
     ]
   );
   if (insertResult.rowCount === 0) {
+    await client.query(
+      `UPDATE feedbacks
+       SET feedback_id = COALESCE(feedback_id, $2::bigint)
+       WHERE id = $1`,
+      [id, feedbackIdAssignment.feedbackId.toString()]
+    );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
     return;
   }
@@ -810,11 +976,26 @@ async function handleFeedbackRevokedTx(
   const revokeSealHash = data.sealHash
     ? Buffer.from(data.sealHash).toString("hex")
     : null;
+  const assignedRevocationId = await withRevocationIdAssignmentLock(async () => {
+    if (isOrphan) return null;
+    const existingRevocationId = await fetchExistingRevocationId(
+      client,
+      assetId,
+      clientAddress,
+      data.feedbackIndex
+    );
+    if (existingRevocationId !== null) return existingRevocationId;
+    return fetchNextRevocationId(client, assetId);
+  });
   const revokeId = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
   await client.query(
-    `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    `INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+       revocation_id = CASE
+         WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
+         ELSE COALESCE(revocations.revocation_id, EXCLUDED.revocation_id)
+       END,
        feedback_hash = EXCLUDED.feedback_hash,
        slot = EXCLUDED.slot,
        original_score = EXCLUDED.original_score,
@@ -826,7 +1007,7 @@ async function handleFeedbackRevokedTx(
        event_ordinal = EXCLUDED.event_ordinal,
        tx_signature = EXCLUDED.tx_signature,
        status = EXCLUDED.status`,
-    [revokeId, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
+    [revokeId, assignedRevocationId?.toString() ?? null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
      data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
      revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
      isOrphan ? "ORPHANED" : DEFAULT_STATUS]
@@ -890,10 +1071,10 @@ async function handleResponseAppendedTx(
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
     await client.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (id) DO NOTHING`,
-      [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
+      [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash, responseRunningDigest, data.newResponseCount.toString(),
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
     );
@@ -914,12 +1095,31 @@ async function handleResponseAppendedTx(
     );
   }
   const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
+  const assignedResponseId = await withResponseIdAssignmentLock(async () => {
+    if (responseStatus === "ORPHANED") return null;
+    const existingResponseId = await fetchExistingResponseId(client, id);
+    if (existingResponseId !== null) return existingResponseId;
+    return fetchNextResponseId(client, assetId, clientAddress, data.feedbackIndex);
+  });
 
   await client.query(
-    `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (id) DO NOTHING`,
-    [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
+    `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (id) DO UPDATE SET
+       response_id = CASE
+         WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
+         ELSE COALESCE(feedback_responses.response_id, EXCLUDED.response_id)
+       END,
+       response_uri = EXCLUDED.response_uri,
+       response_hash = EXCLUDED.response_hash,
+       running_digest = EXCLUDED.running_digest,
+       response_count = EXCLUDED.response_count,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature,
+       status = EXCLUDED.status`,
+    [id, assignedResponseId?.toString() ?? null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
      responseHash, responseRunningDigest, data.newResponseCount.toString(),
      ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
   );
@@ -1338,13 +1538,27 @@ async function handleNewFeedback(
     const runningDigest = data.newFeedbackDigest
       ? Buffer.from(data.newFeedbackDigest)
       : null;
+
+    const feedbackIdAssignment = await withFeedbackIdAssignmentLock(async () => {
+      const existingFeedbackId = await fetchExistingFeedbackId(db, id);
+      if (existingFeedbackId !== null) {
+        return { feedbackId: existingFeedbackId, alreadyExists: true };
+      }
+      const nextFeedbackId = await fetchNextFeedbackId(db, assetId);
+      return { feedbackId: nextFeedbackId, alreadyExists: false };
+    });
+    if (feedbackIdAssignment.alreadyExists) {
+      logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
+      return;
+    }
+
     const insertResult = await db.query(
-      `INSERT INTO feedbacks (id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+      `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
        ON CONFLICT (id) DO NOTHING`,
       [
-        id, assetId, clientAddress, data.feedbackIndex.toString(),
+        id, feedbackIdAssignment.feedbackId.toString(), assetId, clientAddress, data.feedbackIndex.toString(),
         data.value.toString(), data.valueDecimals, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
         feedbackHash, runningDigest,
@@ -1353,6 +1567,12 @@ async function handleNewFeedback(
     );
 
     if (insertResult.rowCount === 0) {
+      await db.query(
+        `UPDATE feedbacks
+         SET feedback_id = COALESCE(feedback_id, $2::bigint)
+         WHERE id = $1`,
+        [id, feedbackIdAssignment.feedbackId.toString()]
+      );
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
       return;
     }
@@ -1454,10 +1674,25 @@ async function handleFeedbackRevoked(
     const revokeSealHash = data.sealHash
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
+    const assignedRevocationId = await withRevocationIdAssignmentLock(async () => {
+      if (isOrphan) return null;
+      const existingRevocationId = await fetchExistingRevocationId(
+        db,
+        assetId,
+        clientAddress,
+        data.feedbackIndex
+      );
+      if (existingRevocationId !== null) return existingRevocationId;
+      return fetchNextRevocationId(db, assetId);
+    });
     await db.query(
-      `INSERT INTO revocations (id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      `INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+         revocation_id = CASE
+           WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
+           ELSE COALESCE(revocations.revocation_id, EXCLUDED.revocation_id)
+         END,
          feedback_hash = EXCLUDED.feedback_hash,
          slot = EXCLUDED.slot,
          original_score = EXCLUDED.original_score,
@@ -1469,7 +1704,7 @@ async function handleFeedbackRevoked(
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
-      [id, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
+      [id, assignedRevocationId?.toString() ?? null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
        data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
        revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
        isOrphan ? "ORPHANED" : DEFAULT_STATUS]
@@ -1541,10 +1776,10 @@ async function handleResponseAppended(
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
       await db.query(
-        `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          ON CONFLICT (id) DO NOTHING`,
-        [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
+        [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
          responseHash, responseRunningDigest, data.newResponseCount.toString(),
          ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
       );
@@ -1565,12 +1800,31 @@ async function handleResponseAppended(
       );
     }
     const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
+    const assignedResponseId = await withResponseIdAssignmentLock(async () => {
+      if (responseStatus === "ORPHANED") return null;
+      const existingResponseId = await fetchExistingResponseId(db, id);
+      if (existingResponseId !== null) return existingResponseId;
+      return fetchNextResponseId(db, assetId, clientAddress, data.feedbackIndex);
+    });
 
     await db.query(
-      `INSERT INTO feedback_responses (id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-       ON CONFLICT (id) DO NOTHING`,
-      [id, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       ON CONFLICT (id) DO UPDATE SET
+         response_id = CASE
+           WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
+           ELSE COALESCE(feedback_responses.response_id, EXCLUDED.response_id)
+         END,
+         response_uri = EXCLUDED.response_uri,
+         response_hash = EXCLUDED.response_hash,
+         running_digest = EXCLUDED.running_digest,
+         response_count = EXCLUDED.response_count,
+         block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature,
+         status = EXCLUDED.status`,
+      [id, assignedResponseId?.toString() ?? null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
        responseHash, responseRunningDigest, data.newResponseCount.toString(),
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
