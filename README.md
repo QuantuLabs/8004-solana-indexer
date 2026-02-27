@@ -49,7 +49,7 @@ Canonical identity is asset-based:
 
 Public API note:
 
-- Public field name is `agentId`; internal DB names such as `agent_id` (and legacy `global_id`) are implementation details.
+- Public field name is `agentId`; internal DB column names are implementation details and not part of the API contract.
 
 ## Required Environment
 
@@ -83,6 +83,7 @@ Notes:
 - If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
+- Validation module is archived on-chain in v0.6.x; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
 
 ## Commands
 
