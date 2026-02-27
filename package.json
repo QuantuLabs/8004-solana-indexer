@@ -25,7 +25,7 @@
     "localnet:start": "bash scripts/localnet-start.sh",
     "localnet:init": "bash scripts/localnet-init.sh",
     "localnet:stop": "bash scripts/localnet-stop.sh",
-    "test:metadata:digestion": "bunx vitest run tests/unit/uriDigest.test.ts tests/unit/uriDigest-coverage.test.ts",
+    "test:metadata:digestion": "bunx vitest run tests/unit/uriDigest.test.ts tests/unit/uriDigest-coverage.test.ts tests/unit/indexer/collectionDigest.test.ts",
     "test:localnet:only": "RUN_LOCALNET_E2E=1 bunx vitest run --config vitest.e2e.config.ts -t 'Localnet' && bun run test:metadata:digestion",
     "test:localnet": "bash scripts/run-localnet-e2e.sh",
     "test:docker:ci": "docker compose -f docker/ci/ci-classic.yml up --build --abort-on-container-exit --exit-code-from tests",

@@ -174,7 +174,7 @@ query Dashboard {
 
 - start validator + deploy program
 - initialize on-chain localnet state
-- run `Localnet`-tagged E2E suite + metadata digestion checks (`uriDigest` unit suite)
+- run `Localnet`-tagged E2E suite + metadata digestion checks (`uriDigest` + `collectionDigest` unit suites)
 - stop validator (unless `KEEP_LOCALNET=1`)
 
 ## Project Structure
