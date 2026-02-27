@@ -25,10 +25,9 @@ LOCALNET_CLONE_ATOM_PROGRAM="${LOCALNET_CLONE_ATOM_PROGRAM:-1}" \
 echo "[localnet] initializing localnet state"
 "$SCRIPT_DIR/localnet-init.sh"
 
-echo "[localnet] running indexer Localnet E2E"
+echo "[localnet] running indexer Localnet E2E + metadata digestion checks"
 (
   cd "$INDEXER_ROOT"
-  RUN_LOCALNET_E2E=1 \
   VITEST_E2E_MAX_WORKERS="${VITEST_E2E_MAX_WORKERS:-1}" \
-  bunx vitest run --config vitest.e2e.config.ts -t "Localnet"
+  bun run test:localnet:only
 )

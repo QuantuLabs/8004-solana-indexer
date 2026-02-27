@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { handleEvent, EventContext } from "../../../src/db/handlers.js";
+import { config } from "../../../src/config.js";
 import { ProgramEvent } from "../../../src/parser/types.js";
 import { createMockPrismaClient, resetMockPrisma } from "../../mocks/prisma.js";
 import {
@@ -259,6 +260,69 @@ describe("DB Handlers", () => {
           })
         );
       });
+
+      it("should reconcile orphan response with responseCount and assign missing responseId", async () => {
+        const feedbackId = "feedback-uuid-reconcile";
+        (prisma.feedback.upsert as any).mockResolvedValue({ id: feedbackId });
+        (prisma.orphanResponse.findMany as any).mockResolvedValue([
+          {
+            id: "orphan-1",
+            responder: TEST_OWNER.toBase58(),
+            responseUri: "ipfs://QmOrphan",
+            responseHash: Uint8Array.from(TEST_HASH),
+            runningDigest: Uint8Array.from(TEST_HASH),
+            responseCount: 3n,
+            txSignature: "orphan-tx-sig",
+            slot: 123456n,
+          },
+        ]);
+        (prisma.feedbackResponse.findUnique as any).mockResolvedValue({ responseId: null });
+        (prisma.feedbackResponse.findMany as any).mockResolvedValue([{ responseId: 2n }]);
+
+        const event: ProgramEvent = {
+          type: "NewFeedback",
+          data: {
+            asset: TEST_ASSET,
+            clientAddress: TEST_CLIENT,
+            feedbackIndex: 0n,
+            value: 9500n,
+            valueDecimals: 2,
+            score: 85,
+            tag1: "quality",
+            tag2: "speed",
+            endpoint: "/api/chat",
+            feedbackUri: "ipfs://QmXXX",
+            feedbackFileHash: null,
+            sealHash: TEST_HASH,
+            slot: 123456n,
+            atomEnabled: true,
+            newFeedbackDigest: TEST_HASH,
+            newFeedbackCount: 1n,
+            newTrustTier: 0,
+            newQualityScore: 0,
+            newConfidence: 0,
+            newRiskScore: 0,
+            newDiversityRatio: 0,
+            isUniqueClient: true,
+          },
+        };
+
+        await handleEvent(prisma, event, ctx);
+
+        expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({
+              feedbackId,
+              responseCount: 3n,
+              responseId: 3n,
+            }),
+            update: expect.objectContaining({
+              responseCount: 3n,
+              responseId: 3n,
+            }),
+          })
+        );
+      });
     });
 
     describe("FeedbackRevoked", () => {
@@ -450,6 +514,7 @@ describe("DB Handlers", () => {
               feedbackIndex: 0n,
               responder: TEST_OWNER.toBase58(),
               responseUri: "ipfs://QmYYY",
+              responseCount: 1n,
             }),
           })
         );
@@ -556,6 +621,30 @@ describe("DB Handlers", () => {
           })
         );
       });
+
+      it("should no-op when validation indexing is disabled", async () => {
+        const previous = (config as any).validationIndexEnabled;
+        (config as any).validationIndexEnabled = false;
+
+        try {
+          const event: ProgramEvent = {
+            type: "ValidationRequested",
+            data: {
+              asset: TEST_ASSET,
+              validatorAddress: TEST_VALIDATOR,
+              nonce: 99,
+              requestUri: "ipfs://QmNoop",
+              requestHash: TEST_HASH,
+              requester: TEST_OWNER,
+            },
+          };
+
+          await handleEvent(prisma, event, ctx);
+          expect(prisma.validation.upsert).not.toHaveBeenCalled();
+        } finally {
+          (config as any).validationIndexEnabled = previous;
+        }
+      });
     });
 
     describe("ValidationResponded", () => {
@@ -597,6 +686,31 @@ describe("DB Handlers", () => {
             tag: "security",
           }),
         });
+      });
+
+      it("should no-op when validation indexing is disabled", async () => {
+        const previous = (config as any).validationIndexEnabled;
+        (config as any).validationIndexEnabled = false;
+
+        try {
+          const event: ProgramEvent = {
+            type: "ValidationResponded",
+            data: {
+              asset: TEST_ASSET,
+              validatorAddress: TEST_VALIDATOR,
+              nonce: 2n,
+              response: 10,
+              responseUri: "ipfs://QmNoopResp",
+              responseHash: TEST_HASH,
+              tag: "noop",
+            },
+          };
+
+          await handleEvent(prisma, event, ctx);
+          expect(prisma.validation.upsert).not.toHaveBeenCalled();
+        } finally {
+          (config as any).validationIndexEnabled = previous;
+        }
       });
     });
 

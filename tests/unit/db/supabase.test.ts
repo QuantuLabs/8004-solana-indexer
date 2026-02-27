@@ -949,6 +949,32 @@ describe("supabase.ts", () => {
         expect(insertCall).toBeDefined();
       });
 
+      it("should no-op when validation indexing is disabled", async () => {
+        const previous = (config as any).validationIndexEnabled;
+        (config as any).validationIndexEnabled = false;
+
+        try {
+          const event = {
+            type: "ValidationRequested" as const,
+            data: {
+              asset: TEST_ASSET,
+              validatorAddress: TEST_VALIDATOR,
+              nonce: 42n,
+              requestUri: "ipfs://QmReqNoop",
+              requestHash: TEST_HASH,
+              requester: TEST_OWNER,
+            },
+          };
+          await handleEvent(event, ctx);
+          const insertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+            typeof c[0] === "string" && c[0].includes("INSERT INTO validations")
+          );
+          expect(insertCall).toBeUndefined();
+        } finally {
+          (config as any).validationIndexEnabled = previous;
+        }
+      });
+
       it("should catch query error", async () => {
         mockPoolInstance.query.mockRejectedValueOnce(new Error("fail"));
         const event = {
@@ -987,6 +1013,33 @@ describe("supabase.ts", () => {
         expect(upsertCall).toBeDefined();
         // "RESPONDED" is a parameter value
         expect(upsertCall![1]).toContain("RESPONDED");
+      });
+
+      it("should no-op when validation indexing is disabled", async () => {
+        const previous = (config as any).validationIndexEnabled;
+        (config as any).validationIndexEnabled = false;
+
+        try {
+          const event = {
+            type: "ValidationResponded" as const,
+            data: {
+              asset: TEST_ASSET,
+              validatorAddress: TEST_VALIDATOR,
+              nonce: 43n,
+              response: 77,
+              responseUri: "ipfs://QmRespNoop",
+              responseHash: TEST_HASH,
+              tag: "noop",
+            },
+          };
+          await handleEvent(event, ctx);
+          const upsertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+            typeof c[0] === "string" && c[0].includes("INSERT INTO validations")
+          );
+          expect(upsertCall).toBeUndefined();
+        } finally {
+          (config as any).validationIndexEnabled = previous;
+        }
       });
 
       it("should handle null optional fields", async () => {

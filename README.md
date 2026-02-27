@@ -11,7 +11,8 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
 - Supabase/PostgreSQL data backend support
 - Strict events-only integrity policy:
   - revoke/response without parent feedback => `ORPHANED`
-  - revoke/response `seal_hash` mismatch => `ORPHANED`
+  - revocation `seal_hash` mismatch with parent feedback => logged/flagged (not `ORPHANED`)
+  - response `seal_hash` mismatch => `ORPHANED`
   - GraphQL filters exclude `ORPHANED` records by default
 
 ## Quick Start
@@ -83,7 +84,8 @@ Notes:
 - If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
-- Validation module is archived on-chain in v0.6.x; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
+- Validation module is archived on-chain in v0.5.0+; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
+- Validation API surface remains archived/deprecated: REST `/rest/v1/validations` returns `410`, and GraphQL `validation`/`validations` return `null`/`[]` for backward compatibility.
 
 ## Commands
 
@@ -96,6 +98,7 @@ npm run localnet:start
 npm run localnet:init
 npm run test:localnet:only
 npm run test:localnet
+npm run test:metadata:digestion
 npm run localnet:stop
 npm run test:docker:ci
 npm run check:graphql:coherence
@@ -169,7 +172,7 @@ query Dashboard {
 
 - start validator + deploy program
 - initialize on-chain localnet state
-- run `Localnet`-tagged E2E suite
+- run `Localnet`-tagged E2E suite + metadata digestion checks (`uriDigest` unit suite)
 - stop validator (unless `KEEP_LOCALNET=1`)
 
 ## Project Structure
