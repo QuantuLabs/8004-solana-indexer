@@ -7,6 +7,7 @@ vi.mock("../../../src/config.js", () => ({
     metadataMaxBytes: 1024,
     metadataTimeoutMs: 25,
     ipfsGatewayBase: "https://ipfs.io",
+    uriDigestTrustedHosts: [],
   },
 }));
 
@@ -60,6 +61,19 @@ describe("collectionDigest", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("returns error for canonical pointers with invalid cid path characters", async () => {
+    const fetchSpy = vi.fn();
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123?bad=1");
+
+    expect(result).toEqual({
+      status: "error",
+      error: "Invalid canonical collection pointer format (expected c1:<cid>)",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("returns ok with sanitized collection fields", async () => {
     const payload = {
       version: "<b>1.0.0</b>",
@@ -99,6 +113,19 @@ describe("collectionDigest", () => {
     );
   });
 
+  it("uses follow redirect mode for collection pointer fetches", async () => {
+    global.fetch = vi.fn().mockResolvedValue(mockStreamResponse(JSON.stringify({ name: "Collection" }))) as unknown as typeof fetch;
+
+    await digestCollectionPointerDoc("c1:bafy123");
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://ipfs.io/ipfs/bafy123",
+      expect.objectContaining({
+        redirect: "follow",
+      })
+    );
+  });
+
   it("uses configured IPFS gateway base for canonical pointers", async () => {
     vi.resetModules();
     vi.doMock("../../../src/config.js", () => ({
@@ -106,6 +133,7 @@ describe("collectionDigest", () => {
         metadataMaxBytes: 1024,
         metadataTimeoutMs: 25,
         ipfsGatewayBase: "http://127.0.0.1:8080",
+        uriDigestTrustedHosts: ["127.0.0.1"],
       },
     }));
     vi.doMock("../../../src/logger.js", () => ({
@@ -127,6 +155,21 @@ describe("collectionDigest", () => {
       "http://127.0.0.1:8080/ipfs/bafy123",
       expect.any(Object)
     );
+  });
+
+  it("returns explicit error for non-2xx responses", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      headers: new Headers(),
+    } as unknown as Response) as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123");
+
+    expect(result).toEqual({
+      status: "error",
+      error: "HTTP 503",
+    });
   });
 
   it("returns invalid_json when payload is not valid JSON", async () => {
@@ -157,6 +200,52 @@ describe("collectionDigest", () => {
       bytes: 1025,
     });
     expect(getReader).not.toHaveBeenCalled();
+  });
+
+  it("returns error when response has no body stream", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-length": "12" }),
+      body: null,
+    } as unknown as Response) as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123");
+
+    expect(result).toEqual({
+      status: "error",
+      error: "No response body",
+    });
+  });
+
+  it("returns oversize when streamed body exceeds configured maximum", async () => {
+    const firstChunk = new Uint8Array(700);
+    const secondChunk = new Uint8Array(500);
+    const cancel = vi.fn();
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce({ done: false, value: firstChunk })
+      .mockResolvedValueOnce({ done: false, value: secondChunk });
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: {
+        getReader: () => ({
+          read,
+          cancel,
+        }),
+      },
+    } as unknown as Response) as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123");
+
+    expect(result).toEqual({
+      status: "oversize",
+      bytes: 1200,
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it("returns timeout when fetch aborts", async () => {
