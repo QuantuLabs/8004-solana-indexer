@@ -14,6 +14,7 @@ DROP FUNCTION IF EXISTS get_leaderboard CASCADE;
 DROP TABLE IF EXISTS atom_config CASCADE;
 DROP TABLE IF EXISTS validations CASCADE;
 DROP TABLE IF EXISTS feedback_responses CASCADE;
+DROP TABLE IF EXISTS revocations CASCADE;
 DROP TABLE IF EXISTS feedbacks CASCADE;
 DROP TABLE IF EXISTS metadata CASCADE;
 DROP TABLE IF EXISTS agents CASCADE;
@@ -215,6 +216,7 @@ WHERE status != 'ORPHANED' AND key LIKE '\_uri:%' ESCAPE '\';
 -- =============================================
 CREATE TABLE feedbacks (
   id TEXT PRIMARY KEY,
+  feedback_id BIGINT,
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   client_address TEXT NOT NULL,
   feedback_index BIGINT NOT NULL,
@@ -237,6 +239,7 @@ CREATE TABLE feedbacks (
   -- Verification status (reorg resilience) --
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
+  CHECK (status = 'ORPHANED' OR feedback_id IS NOT NULL),
   UNIQUE(asset, client_address, feedback_index)
 );
 
@@ -248,12 +251,15 @@ CREATE INDEX idx_feedbacks_not_revoked ON feedbacks(asset, created_at DESC) WHER
 CREATE INDEX idx_feedbacks_status ON feedbacks(status) WHERE status = 'PENDING';
 CREATE INDEX idx_feedbacks_graphql_created_asset ON feedbacks(created_at DESC, asset DESC) WHERE status != 'ORPHANED';
 CREATE INDEX idx_feedbacks_graphql_value_asset ON feedbacks(value DESC, asset DESC) WHERE status != 'ORPHANED';
+CREATE UNIQUE INDEX idx_feedbacks_asset_feedback_id_unique ON feedbacks(asset, feedback_id);
+CREATE INDEX idx_feedbacks_asset_feedback_id ON feedbacks(asset, feedback_id);
 
 -- =============================================
 -- FEEDBACK_RESPONSES
 -- =============================================
 CREATE TABLE feedback_responses (
   id TEXT PRIMARY KEY,
+  response_id BIGINT,
   asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
   client_address TEXT NOT NULL,
   feedback_index BIGINT NOT NULL,
@@ -270,6 +276,7 @@ CREATE TABLE feedback_responses (
   -- Verification status (reorg resilience) --
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
+  CHECK (status = 'ORPHANED' OR response_id IS NOT NULL),
   -- Multiple responses per responder allowed (ERC-8004)
   -- id format: asset:client:index:responder:tx_signature
   UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
@@ -279,6 +286,45 @@ CREATE INDEX idx_responses_asset ON feedback_responses(asset);
 CREATE INDEX idx_responses_lookup ON feedback_responses(asset, client_address, feedback_index);
 CREATE INDEX idx_responses_status ON feedback_responses(status) WHERE status = 'PENDING';
 CREATE INDEX idx_responses_graphql_created_id ON feedback_responses(created_at DESC, id DESC) WHERE status != 'ORPHANED';
+CREATE UNIQUE INDEX idx_responses_scope_response_id_unique
+ON feedback_responses(asset, client_address, feedback_index, response_id);
+CREATE INDEX idx_responses_scope_response_id
+ON feedback_responses(asset, client_address, feedback_index, response_id);
+CREATE INDEX idx_responses_response_id ON feedback_responses(response_id);
+
+-- =============================================
+-- REVOCATIONS
+-- =============================================
+CREATE TABLE revocations (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL REFERENCES agents(asset) ON DELETE CASCADE,
+  client_address TEXT NOT NULL,
+  revocation_id BIGINT, -- Sequential revocation ID (auto-assigned, permanent)
+  feedback_index BIGINT NOT NULL,
+  feedback_hash TEXT,
+  slot BIGINT NOT NULL,
+  original_score SMALLINT,
+  atom_enabled BOOLEAN DEFAULT FALSE,
+  had_impact BOOLEAN DEFAULT FALSE,
+  running_digest BYTEA,
+  revoke_count BIGINT NOT NULL,
+  tx_signature TEXT,
+  tx_index INTEGER,
+  event_ordinal INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
+  verified_at TIMESTAMPTZ,
+  CHECK (status = 'ORPHANED' OR revocation_id IS NOT NULL),
+  UNIQUE(asset, client_address, feedback_index)
+);
+
+CREATE INDEX idx_revocations_asset ON revocations(asset);
+CREATE INDEX idx_revocations_status ON revocations(status) WHERE status = 'PENDING';
+CREATE UNIQUE INDEX idx_revocations_asset_revocation_id
+ON revocations(asset, revocation_id)
+WHERE revocation_id IS NOT NULL;
+CREATE INDEX idx_revocations_asset_revocation_id_lookup
+ON revocations(asset, revocation_id);
 
 -- =============================================
 -- VALIDATIONS
@@ -463,6 +509,13 @@ SELECT
 FROM feedback_responses
 UNION ALL
 SELECT
+  'revocations' AS model,
+  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+FROM revocations
+UNION ALL
+SELECT
   'validations' AS model,
   COUNT(*) FILTER (WHERE chain_status = 'PENDING') AS pending_count,
   COUNT(*) FILTER (WHERE chain_status = 'FINALIZED') AS finalized_count,
@@ -552,6 +605,7 @@ ALTER TABLE collections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE metadata ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feedbacks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feedback_responses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE revocations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE validations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE atom_config ENABLE ROW LEVEL SECURITY;
 ALTER TABLE indexer_state ENABLE ROW LEVEL SECURITY;
@@ -563,6 +617,7 @@ CREATE POLICY "Public read collections" ON collections FOR SELECT USING (true);
 CREATE POLICY "Public read metadata" ON metadata FOR SELECT USING (true);
 CREATE POLICY "Public read feedbacks" ON feedbacks FOR SELECT USING (true);
 CREATE POLICY "Public read feedback_responses" ON feedback_responses FOR SELECT USING (true);
+CREATE POLICY "Public read revocations" ON revocations FOR SELECT USING (true);
 CREATE POLICY "Public read validations" ON validations FOR SELECT USING (true);
 CREATE POLICY "Public read atom_config" ON atom_config FOR SELECT USING (true);
 CREATE POLICY "Public read agent_digest_cache" ON agent_digest_cache FOR SELECT USING (true);
@@ -592,6 +647,10 @@ ON feedbacks(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal
 CREATE INDEX idx_feedback_responses_canonical_order
 ON feedback_responses(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
 
+-- Revocation ordering: canonical replay/head resolution
+CREATE INDEX idx_revocations_canonical_order
+ON revocations(asset, slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+
 -- Grant read access to metadata views
 GRANT SELECT ON metadata_decoded TO anon;
 GRANT SELECT ON metadata_decoded TO authenticated;
@@ -612,3 +671,6 @@ GRANT SELECT ON verification_stats TO authenticated;
 -- - Added agent_digest_cache table for hash-chain verification
 -- - Added source column to indexer_state
 -- - Added partial indexes for PENDING status queries
+
+-- Modified 2026-02-27:
+-- - Added revocations bootstrap parity to schema.sql (table/indexes/verification_stats/RLS/policy/canonical ordering index)

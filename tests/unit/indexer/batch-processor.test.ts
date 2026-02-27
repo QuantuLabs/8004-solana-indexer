@@ -5,6 +5,7 @@ vi.mock("../../../src/config.js", () => ({
   config: {
     dbMode: "supabase",
     metadataIndexMode: "normal",
+    validationIndexEnabled: true,
   },
 }));
 
@@ -46,6 +47,7 @@ import {
   EventBuffer,
   BatchEvent,
 } from "../../../src/indexer/batch-processor.js";
+import { config } from "../../../src/config.js";
 import { metadataQueue } from "../../../src/indexer/metadata-queue.js";
 
 function createMockConnection() {
@@ -579,6 +581,40 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const validationInsert = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+      );
+      expect(validationInsert).toBeDefined();
+    });
+
+    it("should no-op ValidationRequested when validation indexing is disabled", async () => {
+      const previous = (config as any).validationIndexEnabled;
+      (config as any).validationIndexEnabled = false;
+
+      try {
+        const buffer = new EventBuffer(mockPool, null);
+        await buffer.addEvent(
+          makeEvent("ValidationRequested", {
+            asset: "asset1",
+            validatorAddress: "validator1",
+            requester: "requester1",
+            nonce: 2n,
+            requestUri: "https://example.com/noop",
+            requestHash: new Uint8Array(32).fill(0xab),
+          })
+        );
+        await buffer.flush();
+
+        const client = mockPool._client;
+        const validationInsert = client.query.mock.calls.find(
+          (call: any[]) =>
+            typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+        );
+        expect(validationInsert).toBeUndefined();
+      } finally {
+        (config as any).validationIndexEnabled = previous;
+      }
     });
 
     it("should handle ValidationResponded event", async () => {
@@ -598,6 +634,41 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const validationUpsert = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+      );
+      expect(validationUpsert).toBeDefined();
+    });
+
+    it("should no-op ValidationResponded when validation indexing is disabled", async () => {
+      const previous = (config as any).validationIndexEnabled;
+      (config as any).validationIndexEnabled = false;
+
+      try {
+        const buffer = new EventBuffer(mockPool, null);
+        await buffer.addEvent(
+          makeEvent("ValidationResponded", {
+            asset: "asset1",
+            validatorAddress: "validator1",
+            nonce: 3n,
+            response: 1,
+            responseUri: "https://example.com/noop-resp",
+            responseHash: new Uint8Array(32).fill(0xab),
+            tag: "noop",
+          })
+        );
+        await buffer.flush();
+
+        const client = mockPool._client;
+        const validationUpsert = client.query.mock.calls.find(
+          (call: any[]) =>
+            typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+        );
+        expect(validationUpsert).toBeUndefined();
+      } finally {
+        (config as any).validationIndexEnabled = previous;
+      }
     });
 
     it("should insert RegistryInitialized event", async () => {
@@ -815,6 +886,262 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("ROLLBACK");
       expect(client.release).toHaveBeenCalled();
       vi.useFakeTimers();
+    });
+  });
+
+  describe("deterministic sequential IDs (batch path)", () => {
+    it("assigns feedback_id sequentially per asset and backfills on conflict", async () => {
+      const client = mockPool._client;
+      const maxByAsset = new Map<string, bigint>();
+
+      client.query.mockImplementation((sql: string, params?: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT feedback_id::text AS feedback_id FROM feedbacks WHERE id = $1 LIMIT 1")) {
+          const id = params?.[0] as string;
+          if (id === "asset1:client1:2") {
+            return { rows: [{ feedback_id: null }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT MAX(feedback_id)::text AS max_id")) {
+          const asset = params?.[0] as string;
+          const currentMax = maxByAsset.get(asset) ?? 0n;
+          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedbacks (id, feedback_id")) {
+          const asset = params?.[2] as string;
+          const assignedId = BigInt(params?.[1] as string);
+          const prev = maxByAsset.get(asset) ?? 0n;
+          maxByAsset.set(asset, assignedId > prev ? assignedId : prev);
+          if ((params?.[0] as string) === "asset1:client1:2") {
+            return { rows: [], rowCount: 0 };
+          }
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("NewFeedback", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+        })
+      );
+      await buffer.addEvent(
+        makeEvent("NewFeedback", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 1n,
+        })
+      );
+      await buffer.addEvent(
+        makeEvent("NewFeedback", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 2n,
+        })
+      );
+      await buffer.flush();
+
+      const feedbackInsertCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedbacks (id, feedback_id")
+      );
+      expect(feedbackInsertCalls).toHaveLength(3);
+      expect(feedbackInsertCalls[0][1][1]).toBe("1");
+      expect(feedbackInsertCalls[1][1][1]).toBe("2");
+      expect(feedbackInsertCalls[2][1][1]).toBe("3");
+
+      const feedbackBackfillCall = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" &&
+          call[0].includes("SET feedback_id = COALESCE(feedback_id, $2::bigint)")
+      );
+      expect(feedbackBackfillCall).toBeDefined();
+      expect(feedbackBackfillCall?.[1]).toEqual(["asset1:client1:2", "3"]);
+    });
+
+    it("assigns revocation_id for non-orphans and keeps orphan revocations null", async () => {
+      const client = mockPool._client;
+      const maxByAsset = new Map<string, bigint>();
+
+      client.query.mockImplementation((sql: string, params?: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1")) {
+          const id = params?.[0] as string;
+          if (id === "asset1:client1:0") {
+            return { rows: [{ id, feedback_hash: "ab".repeat(32) }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT revocation_id::text AS revocation_id")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT MAX(revocation_id)::text AS max_id")) {
+          const asset = params?.[0] as string;
+          const currentMax = maxByAsset.get(asset) ?? 0n;
+          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO revocations (id, revocation_id")) {
+          const asset = params?.[2] as string;
+          const assignedId = params?.[1];
+          if (assignedId !== null) {
+            const next = BigInt(assignedId as string);
+            const prev = maxByAsset.get(asset) ?? 0n;
+            maxByAsset.set(asset, next > prev ? next : prev);
+          }
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          newRevokeCount: 1,
+        })
+      );
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 1n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          newRevokeCount: 2,
+        })
+      );
+      await buffer.flush();
+
+      const revocationInsertCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO revocations (id, revocation_id")
+      );
+      expect(revocationInsertCalls).toHaveLength(2);
+      expect(revocationInsertCalls[0][1][1]).toBe("1");
+      expect(revocationInsertCalls[0][1][16]).toBe("PENDING");
+      expect(revocationInsertCalls[1][1][1]).toBeNull();
+      expect(revocationInsertCalls[1][1][16]).toBe("ORPHANED");
+      expect(revocationInsertCalls[0][0]).toContain("revocation_id = CASE");
+    });
+
+    it("assigns response_id per feedback scope and keeps orphan/seal-mismatch IDs null", async () => {
+      const client = mockPool._client;
+      const maxByScope = new Map<string, bigint>();
+
+      client.query.mockImplementation((sql: string, params?: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1")) {
+          const feedbackIndex = params?.[2] as string;
+          if (feedbackIndex === "9") {
+            return { rows: [], rowCount: 0 };
+          }
+          if (feedbackIndex === "10") {
+            return { rows: [{ id: "fb:10", feedback_hash: "ff".repeat(32) }], rowCount: 1 };
+          }
+          return { rows: [{ id: "fb:ok", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT response_id::text AS response_id FROM feedback_responses WHERE id = $1 LIMIT 1")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT MAX(response_id)::text AS max_id")) {
+          const scope = `${params?.[0]}:${params?.[1]}:${params?.[2]}`;
+          const currentMax = maxByScope.get(scope) ?? 0n;
+          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedback_responses (id, response_id")) {
+          const status = params?.[15];
+          const scope = `${params?.[2]}:${params?.[3]}:${params?.[4]}`;
+          const assignedId = params?.[1];
+          if (assignedId !== null && status !== "ORPHANED") {
+            const next = BigInt(assignedId as string);
+            const prev = maxByScope.get(scope) ?? 0n;
+            maxByScope.set(scope, next > prev ? next : prev);
+          }
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          responseHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-1" })
+      );
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder2",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          responseHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-2" })
+      );
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder3",
+          feedbackIndex: 1n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          responseHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-3" })
+      );
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder4",
+          feedbackIndex: 9n,
+          sealHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-4" })
+      );
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder5",
+          feedbackIndex: 10n,
+          sealHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-5" })
+      );
+      await buffer.flush();
+
+      const responseInsertCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      );
+      expect(responseInsertCalls).toHaveLength(5);
+
+      expect(responseInsertCalls[0][1][1]).toBe("1");
+      expect(responseInsertCalls[0][1][15]).toBe("PENDING");
+      expect(responseInsertCalls[1][1][1]).toBe("2");
+      expect(responseInsertCalls[1][1][15]).toBe("PENDING");
+      expect(responseInsertCalls[2][1][1]).toBe("1");
+      expect(responseInsertCalls[2][1][15]).toBe("PENDING");
+
+      expect(responseInsertCalls[3][1][1]).toBeNull();
+      expect(responseInsertCalls[3][1][15]).toBe("ORPHANED");
+      expect(responseInsertCalls[3][0]).toContain("ON CONFLICT (id) DO NOTHING");
+
+      expect(responseInsertCalls[4][1][1]).toBeNull();
+      expect(responseInsertCalls[4][1][15]).toBe("ORPHANED");
+      expect(responseInsertCalls[4][0]).toContain("response_id = CASE");
     });
   });
 

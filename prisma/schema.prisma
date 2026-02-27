@@ -130,6 +130,7 @@ model AgentMetadata {
 
 model Feedback {
   id                 String   @id @default(uuid())
+  feedbackId         BigInt?  @map("feedback_id") // Sequential feedback ID (auto-assigned, permanent)
   agentId            String
   client             String
   feedbackIndex      BigInt
@@ -157,7 +158,9 @@ model Feedback {
   responses FeedbackResponse[]
 
   @@unique([agentId, client, feedbackIndex])
+  @@unique([agentId, feedbackId])
   @@index([agentId])
+  @@index([agentId, feedbackId])
   @@index([client])
   @@index([score])
   @@index([tag1])
@@ -167,6 +170,7 @@ model Feedback {
 
 model FeedbackResponse {
   id            String   @id @default(uuid())
+  responseId    BigInt?  @map("response_id") // Sequential response ID (auto-assigned, permanent)
   feedbackId    String
   responder     String
   responseUri   String
@@ -184,7 +188,9 @@ model FeedbackResponse {
   feedback Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
 
   @@unique([feedbackId, responder, txSignature])
+  @@unique([feedbackId, responseId])
   @@index([feedbackId])
+  @@index([feedbackId, responseId])
   @@index([feedbackId, responder])
   @@index([feedbackId, responseCount])
   @@index([status])
@@ -192,6 +198,7 @@ model FeedbackResponse {
 
 model Revocation {
   id            String   @id @default(uuid())
+  revocationId  BigInt?  @map("revocation_id") // Sequential revocation ID (auto-assigned, permanent)
   agentId       String
   client        String
   feedbackIndex BigInt
@@ -210,7 +217,9 @@ model Revocation {
   verifiedAt    DateTime?
 
   @@unique([agentId, client, feedbackIndex])
+  @@unique([agentId, revocationId])
   @@index([agentId])
+  @@index([agentId, revocationId])
   @@index([status])
 }
 
@@ -223,6 +232,7 @@ model OrphanResponse {
   responseUri    String
   responseHash   Bytes?
   runningDigest  Bytes?
+  responseCount  BigInt?
   createdAt      DateTime @default(now())
   txSignature    String?
   slot           BigInt?
