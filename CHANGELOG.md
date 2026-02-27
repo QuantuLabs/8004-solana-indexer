@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-02-27
+
+### Changed
+- Renamed internal deterministic registration key from `global_id` to `agent_id` across schema, migrations, Prisma, and API query/resolver mappings; API output field remains `agentid`.
+- Collection pointer naming and accounting were aligned around `collection_pointers`, with idempotent count updates and REST `/rest/v1/agents` aliases for `asset` (id) and `collection_pointer` (canonical_col).
+- Added `SOLANA_NETWORK`-driven RPC/WS defaults (`devnet`, `mainnet-beta`, `testnet`, `localnet`) plus startup warning when mainnet uses the default devnet `PROGRAM_ID`.
+
+### Added
+- REST agent timestamp filtering for `updated_at`, `updated_at_gt`, and `updated_at_lt` (ISO or unix timestamps), with explicit `400` validation errors for invalid values.
+
+### Fixed
+- Integrity hardening: WebSocket queue overflow now fail-stops ingestion instead of silently dropping logs, with backup poller catch-up.
+- URI/collection metadata queues now defer and replay tasks at capacity and run periodic recovery sweeps after restarts.
+- Immutable metadata rows are no longer purged or overwritten by URI-derived writes.
+- Identity lock hints are parsed and propagated into `col_locked` / `parent_locked`.
+- Deterministic ordering was tightened for poller tx sorting and REST feedback tie-breakers.
+
+### DevOps & Tests
+- Expanded Docker CI unit test set to include API parity and indexer queue/processor coverage suites.
+- Localnet E2E script now supports `LOCALNET_CLONE_ATOM_PROGRAM` and `VITEST_E2E_MAX_WORKERS`.
+- Added coverage for `agent_id` assignment consistency, collection pointer/lock handling, queue recovery behavior, and decoder lock hints.
+
 ## [1.3.0] - 2026-02-09
 
 ### Breaking
