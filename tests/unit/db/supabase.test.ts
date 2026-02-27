@@ -138,6 +138,7 @@ const {
   getPool,
   handleEvent,
   handleEventAtomic,
+  digestAndStoreUriMetadata,
   loadIndexerState,
   saveIndexerState,
 } = await import("../../../src/db/supabase.js");
@@ -175,6 +176,14 @@ function resetPoolMocks() {
   mockClientInstance.release.mockClear();
 }
 
+function mockQueueToRunDigestWorker() {
+  mockMetadataQueue.add.mockImplementation((assetId: string, uri: string) => {
+    void digestAndStoreUriMetadata(assetId, uri).catch(() => {
+      // Queue worker failures are intentionally swallowed.
+    });
+  });
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 describe("supabase.ts", () => {
@@ -184,7 +193,8 @@ describe("supabase.ts", () => {
     ctx = defaultCtx();
     resetPoolMocks();
     mockMetadataQueue.setPool.mockClear();
-    mockMetadataQueue.add.mockClear();
+    mockMetadataQueue.add.mockReset();
+    mockMetadataQueue.add.mockImplementation(() => {});
     mockDigestUri.mockClear();
     mockSerializeValue.mockClear();
     mockCompressForStorage.mockClear();
@@ -2220,6 +2230,7 @@ describe("supabase.ts", () => {
 
   describe("digestAndStoreUriMetadata", () => {
     beforeEach(() => {
+      mockQueueToRunDigestWorker();
       mockDigestUri.mockClear();
       mockSerializeValue.mockClear();
       mockCompressForStorage.mockClear();
@@ -2640,6 +2651,10 @@ describe("supabase.ts", () => {
   // =========================================================================
 
   describe("storeUriMetadata (tested via digestAndStoreUriMetadata)", () => {
+    beforeEach(() => {
+      mockQueueToRunDigestWorker();
+    });
+
     it("should store standard field raw (no compression)", async () => {
       (config as any).metadataIndexMode = "normal";
       try {
@@ -2804,6 +2819,10 @@ describe("supabase.ts", () => {
   // =========================================================================
 
   describe("UriUpdated metadata extraction (non-tx path)", () => {
+    beforeEach(() => {
+      mockQueueToRunDigestWorker();
+    });
+
     it("should trigger metadata extraction on URI update when mode is on", async () => {
       (config as any).metadataIndexMode = "normal";
       try {
