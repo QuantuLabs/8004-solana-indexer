@@ -67,7 +67,7 @@
     "@supabase/supabase-js": "^2.49.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "8004-solana": "github:QuantuLabs/8004-solana-ts#v0.6.0",
+    "8004-solana": "github:QuantuLabs/8004-solana-ts#v0.7.3",
     "bs58": "^6.0.0",
     "cors": "^2.8.6",
     "dataloader": "^2.2.3",
@@ -91,9 +91,9 @@
     "@vitest/coverage-v8": "4.0.18",
     "eslint": "^9.39.2",
     "prisma": "^6.19.2",
-    "typescript-eslint": "^8.54.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.54.0",
     "vitest": "4.0.18"
   },
   "engines": {
