@@ -8,7 +8,7 @@ RPC_URL="${LOCALNET_RPC_URL:-http://127.0.0.1:8899}"
 LOG_FILE="/tmp/8004-solana-test-validator.log"
 PID_FILE="/tmp/8004-solana-test-validator.pid"
 CLONE_ATOM_PROGRAM="${LOCALNET_CLONE_ATOM_PROGRAM:-0}"
-PROGRAM_KEYPAIR="${LOCALNET_PROGRAM_KEYPAIR:-$SOLANA_ROOT/keys/mainnet-program/8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ.json}"
+PROGRAM_KEYPAIR="${LOCALNET_PROGRAM_KEYPAIR:-$SOLANA_ROOT/keys/devnet-program/8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C.json}"
 
 validator_args=(
   --reset

@@ -10,6 +10,7 @@ services:
     environment:
       NODE_ENV: production
       DB_MODE: ${DB_MODE:-supabase}
+      DATABASE_URL: ${DATABASE_URL:-file:./data/indexer.db}
       API_MODE: ${API_MODE:-graphql}
       API_PORT: 3001
       SOLANA_NETWORK: ${SOLANA_NETWORK:-devnet}
