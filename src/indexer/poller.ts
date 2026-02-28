@@ -426,6 +426,36 @@ export class Poller {
     };
   }
 
+  private async tryApplyConfiguredStartCursor(source: "local" | "supabase"): Promise<boolean> {
+    if (!config.indexerStartSignature) {
+      return false;
+    }
+
+    this.lastSignature = config.indexerStartSignature;
+    logger.info(
+      {
+        source,
+        lastSignature: this.lastSignature,
+        lastSlot: config.indexerStartSlot?.toString() ?? null,
+      },
+      "No saved state found, bootstrapping cursor from env"
+    );
+
+    if (config.indexerStartSlot !== null) {
+      await this.saveState(config.indexerStartSignature, config.indexerStartSlot);
+      logger.info(
+        {
+          source,
+          lastSignature: config.indexerStartSignature,
+          lastSlot: config.indexerStartSlot.toString(),
+        },
+        "Persisted bootstrap cursor from env"
+      );
+    }
+
+    return true;
+  }
+
   private async loadState(): Promise<void> {
     // Supabase mode - load from Supabase
     if (!this.prisma) {
@@ -433,8 +463,20 @@ export class Poller {
       if (state.lastSignature) {
         this.lastSignature = state.lastSignature;
         logger.info({ lastSignature: this.lastSignature, lastSlot: state.lastSlot?.toString() }, "Supabase mode: resuming from signature");
+        if (config.indexerStartSignature && config.indexerStartSignature !== state.lastSignature) {
+          logger.info(
+            {
+              savedSignature: state.lastSignature,
+              configuredStartSignature: config.indexerStartSignature,
+            },
+            "Supabase mode: ignoring INDEXER_START_SIGNATURE because saved state exists"
+          );
+        }
       } else {
-        logger.info("Supabase mode: starting from latest transactions (no saved state)");
+        const bootstrapped = await this.tryApplyConfiguredStartCursor("supabase");
+        if (!bootstrapped) {
+          logger.info("Supabase mode: starting from latest transactions (no saved state)");
+        }
       }
       return;
     }
@@ -447,8 +489,20 @@ export class Poller {
     if (state?.lastSignature) {
       this.lastSignature = state.lastSignature;
       logger.info({ lastSignature: this.lastSignature }, "Resuming from signature");
+      if (config.indexerStartSignature && config.indexerStartSignature !== state.lastSignature) {
+        logger.info(
+          {
+            savedSignature: state.lastSignature,
+            configuredStartSignature: config.indexerStartSignature,
+          },
+          "Local mode: ignoring INDEXER_START_SIGNATURE because saved state exists"
+        );
+      }
     } else {
-      logger.info("Starting from latest transactions");
+      const bootstrapped = await this.tryApplyConfiguredStartCursor("local");
+      if (!bootstrapped) {
+        logger.info("Starting from latest transactions");
+      }
     }
   }
 

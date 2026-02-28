@@ -27,6 +27,7 @@ const {
   mockConfig: {
     dbMode: "local" as string,
     metadataIndexMode: "normal" as string,
+    validationIndexEnabled: true,
     metadataMaxValueBytes: 10000,
     metadataMaxBytes: 262144,
     metadataTimeoutMs: 5000,
@@ -88,6 +89,7 @@ describe("DB Handlers Coverage", () => {
     // Reset config to defaults
     mockConfig.dbMode = "local";
     mockConfig.metadataIndexMode = "normal";
+    mockConfig.validationIndexEnabled = true;
     mockConfig.metadataMaxValueBytes = 10000;
 
     // Re-set mock implementations (vi.restoreAllMocks in setup.ts resets them)
@@ -176,7 +178,10 @@ describe("DB Handlers Coverage", () => {
         },
       };
 
-      (prisma.agent.findUnique as any).mockResolvedValue({ agentId: 9n });
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        agentId: 9n,
+        creator: TEST_OWNER.toBase58(),
+      });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       await handleEventAtomic(prisma, event, ctx);
@@ -202,6 +207,8 @@ describe("DB Handlers Coverage", () => {
       };
 
       (prisma.agent.findUnique as any).mockResolvedValue({
+        agentId: 9n,
+        creator: TEST_OWNER.toBase58(),
         uri: "ipfs://QmTestUri",
         nftName: "",
       });
@@ -443,6 +450,8 @@ describe("DB Handlers Coverage", () => {
       };
 
       (prisma.agent.findUnique as any).mockResolvedValue({
+        agentId: 9n,
+        creator: TEST_OWNER.toBase58(),
         uri: "ipfs://QmNonAtomic",
         nftName: "",
       });

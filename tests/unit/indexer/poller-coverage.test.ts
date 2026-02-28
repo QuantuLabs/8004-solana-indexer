@@ -53,6 +53,7 @@ vi.mock("../../../src/db/handlers.js", () => ({
 import { Poller } from "../../../src/indexer/poller.js";
 import { loadIndexerState, saveIndexerState } from "../../../src/db/supabase.js";
 import { handleEventAtomic } from "../../../src/db/handlers.js";
+import { config } from "../../../src/config.js";
 
 /**
  * Safely stop a poller by setting isRunning=false and nullifying batch components.
@@ -76,6 +77,10 @@ describe("Poller Coverage", () => {
   beforeEach(() => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrismaClient();
+    vi.mocked(loadIndexerState).mockClear();
+    vi.mocked(saveIndexerState).mockClear();
+    (config as any).indexerStartSignature = null;
+    (config as any).indexerStartSlot = null;
   });
 
   afterEach(async () => {
@@ -216,6 +221,58 @@ describe("Poller Coverage", () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect(loadIndexerState).toHaveBeenCalled();
+    });
+
+    it("should bootstrap cursor from env when no saved state exists", async () => {
+      vi.mocked(loadIndexerState).mockResolvedValue({
+        lastSignature: null,
+        lastSlot: null,
+      } as any);
+      (config as any).indexerStartSignature = "env-start-sig";
+      (config as any).indexerStartSlot = 123n;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      const backfillSpy = vi.spyOn(poller as any, "backfill");
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await poller.start();
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect((poller as any).lastSignature).toBe("env-start-sig");
+      expect(saveIndexerState).toHaveBeenCalledWith("env-start-sig", 123n);
+      expect(backfillSpy).not.toHaveBeenCalled();
+    });
+
+    it("should prefer saved state over env bootstrap cursor", async () => {
+      vi.mocked(loadIndexerState).mockResolvedValue({
+        lastSignature: "persisted-sig",
+        lastSlot: 999n,
+      } as any);
+      (config as any).indexerStartSignature = "env-start-sig";
+      (config as any).indexerStartSlot = 123n;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await poller.start();
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect((poller as any).lastSignature).toBe("persisted-sig");
+      expect(saveIndexerState).not.toHaveBeenCalledWith("env-start-sig", 123n);
     });
 
     it("should not call logFailedTransaction when prisma is null", async () => {

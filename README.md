@@ -19,10 +19,16 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.devnet.example .env
 npm run db:generate
 npm run db:push
 npm run dev
+```
+
+Mainnet bootstrap:
+
+```bash
+cp .env.mainnet.example .env
 ```
 
 GraphQL v2 endpoint:
@@ -63,6 +69,7 @@ SOLANA_NETWORK=devnet
 RPC_URL=https://api.devnet.solana.com
 WS_URL=wss://api.devnet.solana.com
 PROGRAM_ID=8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C
+ATOM_ENGINE_PROGRAM_ID=AToMufS4QD6hEXvcvBDg9m1AHeCLpmZQsyfYa5h9MwAF
 ```
 
 ```bash
@@ -71,6 +78,7 @@ PROGRAM_ID=8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C
 # RPC_URL=https://api.mainnet-beta.solana.com
 # WS_URL=wss://api.mainnet-beta.solana.com
 # PROGRAM_ID=<MAINNET_PROGRAM_ID>
+# ATOM_ENGINE_PROGRAM_ID=<MAINNET_ATOM_ENGINE_PROGRAM_ID>
 ```
 
 Notes:
@@ -78,10 +86,15 @@ Notes:
 - GraphQL requires `DB_MODE=supabase` (recommended `API_MODE=graphql`).
 - REST v1 requires `DB_MODE=local` (Prisma; recommended `API_MODE=rest`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
+- `.env.devnet.example` includes current devnet bootstrap cursor (`INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`).
+- `.env.mainnet.example` is a template: set mainnet `PROGRAM_ID` plus mainnet deployment signature/slot.
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
 - `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
+- Optional startup cursor bootstrap: `INDEXER_START_SIGNATURE` (and optional `INDEXER_START_SLOT`) is applied only when no persisted `indexer_state` exists.
+- `INDEXER_START_SLOT` requires `INDEXER_START_SIGNATURE`.
 - If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
+- If `SOLANA_NETWORK=mainnet-beta`, also set `ATOM_ENGINE_PROGRAM_ID` to your mainnet ATOM deployment (`<MAINNET_ATOM_ENGINE_PROGRAM_ID>` placeholder in examples).
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
 - `IPFS_GATEWAY_BASE` sets the gateway base used for `ipfs://` URI digest fetches and canonical collection pointer (`c1:<cid>`) fetches (default `https://ipfs.io`).

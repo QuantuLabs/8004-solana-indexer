@@ -37,6 +37,8 @@ describe("Config", () => {
       delete process.env.GRAPHQL_STATS_CACHE_TTL_MS;
       delete process.env.IPFS_GATEWAY_BASE;
       delete process.env.URI_DIGEST_TRUSTED_HOSTS;
+      delete process.env.INDEXER_START_SIGNATURE;
+      delete process.env.INDEXER_START_SLOT;
 
       const { config } = await import("../../src/config.js");
 
@@ -56,6 +58,8 @@ describe("Config", () => {
       expect(config.graphqlStatsCacheTtlMs).toBe(60000);
       expect(config.ipfsGatewayBase).toBe("https://ipfs.io");
       expect(config.uriDigestTrustedHosts).toEqual([]);
+      expect(config.indexerStartSignature).toBeNull();
+      expect(config.indexerStartSlot).toBeNull();
     });
 
     it("should use custom env values when set", async () => {
@@ -72,6 +76,8 @@ describe("Config", () => {
       process.env.GRAPHQL_STATS_CACHE_TTL_MS = "45000";
       process.env.IPFS_GATEWAY_BASE = "https://gateway.example.com/";
       process.env.URI_DIGEST_TRUSTED_HOSTS = " localhost,127.0.0.1 ";
+      process.env.INDEXER_START_SIGNATURE = "env-start-signature";
+      process.env.INDEXER_START_SLOT = "123456789";
 
       const { config } = await import("../../src/config.js");
 
@@ -90,6 +96,8 @@ describe("Config", () => {
       expect(config.graphqlStatsCacheTtlMs).toBe(45000);
       expect(config.ipfsGatewayBase).toBe("https://gateway.example.com");
       expect(config.uriDigestTrustedHosts).toEqual(["localhost", "127.0.0.1"]);
+      expect(config.indexerStartSignature).toBe("env-start-signature");
+      expect(config.indexerStartSlot).toBe(123456789n);
     });
 
     it("should support websocket mode", async () => {
@@ -204,6 +212,14 @@ describe("Config", () => {
 
       await expect(import("../../src/config.js")).rejects.toThrow(
         /Invalid URI_DIGEST_TRUSTED_HOSTS entry/
+      );
+    });
+
+    it("should throw when INDEXER_START_SLOT is invalid", async () => {
+      process.env.INDEXER_START_SLOT = "not-a-slot";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid INDEXER_START_SLOT/
       );
     });
   });
@@ -374,6 +390,17 @@ describe("Config", () => {
 
       expect(() => validateConfig()).toThrow(
         "GRAPHQL_STATS_CACHE_TTL_MS must be between 1000 and 3600000"
+      );
+    });
+
+    it("should throw when INDEXER_START_SLOT is set without INDEXER_START_SIGNATURE", async () => {
+      process.env.INDEXER_START_SLOT = "123";
+      delete process.env.INDEXER_START_SIGNATURE;
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "INDEXER_START_SLOT requires INDEXER_START_SIGNATURE"
       );
     });
   });

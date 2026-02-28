@@ -1965,7 +1965,7 @@ export async function saveIndexerState(
          last_slot = EXCLUDED.last_slot,
          source = EXCLUDED.source,
          updated_at = NOW()
-       WHERE indexer_state.last_slot <= EXCLUDED.last_slot`,
+       WHERE indexer_state.last_slot IS NULL OR indexer_state.last_slot <= EXCLUDED.last_slot`,
       [signature, slot.toString(), source]
     );
   } catch (error: any) {

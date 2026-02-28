@@ -135,6 +135,31 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
   return parsed;
 }
 
+function parseOptionalString(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function parseOptionalStartSlot(value: string | undefined): bigint | null {
+  if (!value || value.trim() === "") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid INDEXER_START_SLOT '${trimmed}'. Must be an unsigned integer.`);
+  }
+
+  try {
+    return BigInt(trimmed);
+  } catch {
+    throw new Error(`Invalid INDEXER_START_SLOT '${trimmed}'. Must be an unsigned integer.`);
+  }
+}
+
 function parseIpfsGatewayBase(value: string | undefined): string {
   const raw = (value || DEFAULT_IPFS_GATEWAY_BASE).trim();
   if (!raw) {
@@ -236,6 +261,9 @@ export const config = {
   // Polling config
   pollingInterval: parseInt(process.env.POLLING_INTERVAL || "5000", 10),
   batchSize: parseInt(process.env.BATCH_SIZE || "100", 10),
+  // Optional bootstrap cursor used only when no persisted indexer state exists.
+  indexerStartSignature: parseOptionalString(process.env.INDEXER_START_SIGNATURE),
+  indexerStartSlot: parseOptionalStartSlot(process.env.INDEXER_START_SLOT),
 
   // WebSocket config
   wsReconnectInterval: parseInt(
@@ -334,5 +362,9 @@ export function validateConfig(): void {
 
   if (config.maxSupportedTransactionVersion < 0) {
     throw new Error("MAX_SUPPORTED_TRANSACTION_VERSION must be >= 0");
+  }
+
+  if (config.indexerStartSlot !== null && !config.indexerStartSignature) {
+    throw new Error("INDEXER_START_SLOT requires INDEXER_START_SIGNATURE");
   }
 }

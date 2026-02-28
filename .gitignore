@@ -8,6 +8,8 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.devnet.example
+!.env.mainnet.example
 
 # Internal docs
 docs/SECURITY_AUDIT.md
