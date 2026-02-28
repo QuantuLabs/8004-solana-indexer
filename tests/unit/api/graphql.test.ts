@@ -587,6 +587,90 @@ describe('Query Resolver User Input Errors', () => {
 
     expect(poolQuery).not.toHaveBeenCalled();
   });
+
+  it('returns BAD_USER_INPUT when responseId filters lack feedback scope', async () => {
+    const poolQuery = vi.fn();
+    const ctx = {
+      pool: { query: poolQuery },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbackResponses(
+        {},
+        { first: 10, where: { responseId_gt: 2n } },
+        ctx
+      )
+    ).rejects.toMatchObject({
+      message: 'Scoped responseId filters require feedback scope. Include where.feedback or where.feedbackId.',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  it('returns BAD_USER_INPUT when feedbackResponses where.feedback uses sequential feedback_id', async () => {
+    const poolQuery = vi.fn();
+    const ctx = {
+      pool: { query: poolQuery },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbackResponses({}, { first: 10, where: { feedback: '9' } }, ctx)
+    ).rejects.toMatchObject({
+      message: 'feedbackResponses where.feedback/where.feedbackId must use canonical feedback id format "<asset>:<client_address>:<feedback_index>" (sequential feedback_id is not supported).',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  it('returns BAD_USER_INPUT when feedbackResponses where.feedbackId uses sequential feedback_id', async () => {
+    const poolQuery = vi.fn();
+    const ctx = {
+      pool: { query: poolQuery },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbackResponses({}, { first: 10, where: { feedbackId: 9n } }, ctx)
+    ).rejects.toMatchObject({
+      message: 'feedbackResponses where.feedback/where.feedbackId must use canonical feedback id format "<asset>:<client_address>:<feedback_index>" (sequential feedback_id is not supported).',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  it('returns BAD_USER_INPUT when revocationId filters lack agent scope', async () => {
+    const poolQuery = vi.fn();
+    const ctx = {
+      pool: { query: poolQuery },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.revocations(
+        {},
+        { first: 10, where: { revocationId_gt: 2n } },
+        ctx
+      )
+    ).rejects.toMatchObject({
+      message: 'Scoped revocationId filters require agent scope. Include where.agent.',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
 });
 
 describe('Query Resolver Canonical ID Lookup', () => {
@@ -652,6 +736,25 @@ describe('Query Resolver Canonical ID Lookup', () => {
     expect(sql).toContain('responder = $4');
     expect(sql).toContain('tx_signature = $5::text OR response_count::text = $5::text');
     expect(params).toEqual(['asset1', 'client1', '9', 'responder1', 'sig-abc']);
+  });
+
+  it('returns BAD_USER_INPUT for numeric Query.feedbackResponse id', async () => {
+    const query = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.feedbackResponse({}, { id: '7' }, ctx)
+    ).rejects.toMatchObject({
+      message: 'feedbackResponse(id) requires canonical response id format: <asset>:<client_address>:<feedback_index>:<responder>:<signature_or_count>.',
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+
+    expect(query).not.toHaveBeenCalled();
   });
 
   it('resolves Query.revocation by canonical ID', async () => {
@@ -785,15 +888,21 @@ describe('Query Resolver Deterministic ID Ordering', () => {
 
     await queryResolvers.Query.feedbackResponses(
       {},
-      { first: 7, orderBy: 'responseId', orderDirection: 'desc', where: { responseId_gte: 2n } },
+      {
+        first: 7,
+        orderBy: 'responseId',
+        orderDirection: 'desc',
+        where: { feedback: 'asset1:client1:9', responseId_gte: 2n },
+      },
       ctx
     );
 
     expect(query).toHaveBeenCalledTimes(1);
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
-    expect(sql).toContain('response_id >= $1');
+    expect(sql).toContain('asset = $1 AND client_address = $2 AND feedback_index = $3::bigint');
+    expect(sql).toContain('response_id >= $4');
     expect(sql).toContain('ORDER BY response_id DESC, response_id DESC NULLS LAST, id DESC');
-    expect(params).toEqual([2n, 7, 0]);
+    expect(params).toEqual(['asset1', 'client1', '9', 2n, 7, 0]);
   });
 
   it('supports revocations order/filter by sequential revocation_id', async () => {
@@ -807,16 +916,16 @@ describe('Query Resolver Deterministic ID Ordering', () => {
 
     await queryResolvers.Query.revocations(
       {},
-      { first: 3, orderBy: 'revocationId', orderDirection: 'asc', where: { revocationId_gt: 9n } },
+      { first: 3, orderBy: 'revocationId', orderDirection: 'asc', where: { agent: 'asset1', revocationId_gt: 9n } },
       ctx
     );
 
     expect(query).toHaveBeenCalledTimes(1);
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain('FROM revocations');
-    expect(sql).toContain('revocation_id > $1');
+    expect(sql).toContain('revocation_id > $2');
     expect(sql).toContain('ORDER BY revocation_id ASC, revocation_id ASC NULLS LAST, id ASC');
-    expect(params).toEqual([9n, 3, 0]);
+    expect(params).toEqual(['asset1', 9n, 3, 0]);
   });
 });
 

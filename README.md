@@ -46,7 +46,7 @@ Canonical identity is asset-based:
 
 - GraphQL `id`: raw agent asset pubkey (base58).
 - REST `asset`: same value as GraphQL `id`.
-- GraphQL `agentId`: sequential DB registration ID from `agents.agent_id` (returned as GraphQL `BigInt` string for precision safety).
+- GraphQL `agentId`: sequential registration ID from DB `agent_id` (auto-assigned), serialized as GraphQL `BigInt` string for precision safety.
 
 Public API note:
 
@@ -155,10 +155,14 @@ query Dashboard {
   }
   agents(first: 10, orderBy: createdAt, orderDirection: desc) {
     id
-    asset
+    agentId
     owner
-    feedbackCount
-    trustScore
+    totalFeedback
+    solana {
+      assetPubkey
+      qualityScore
+      trustTier
+    }
   }
 }
 ```

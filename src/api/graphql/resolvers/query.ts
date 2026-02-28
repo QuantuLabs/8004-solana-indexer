@@ -169,6 +169,21 @@ function isIntegerString(value: string): boolean {
   return /^-?\d+$/.test(value);
 }
 
+function isNumericIdValue(value: unknown): boolean {
+  if (typeof value === 'bigint') return true;
+  if (typeof value === 'number') return Number.isInteger(value);
+  if (typeof value === 'string') return isIntegerString(value);
+  return false;
+}
+
+function hasProvidedFilter(
+  filter: Record<string, unknown> | undefined,
+  keys: string[]
+): boolean {
+  if (!filter) return false;
+  return keys.some((key) => filter[key] !== undefined && filter[key] !== null);
+}
+
 function requireFeedbackRowId(row: FeedbackRow): FeedbackRow {
   if (!row.feedback_id) {
     throw new Error(`Missing feedback_id for feedback row ${row.id}`);
@@ -520,25 +535,12 @@ export const queryResolvers = {
         return rows[0] ? requireResponseRowId(rows[0]) : null;
       }
 
-      const sequentialId = isIntegerString(args.id) ? args.id : null;
-      if (!sequentialId) return null;
-
-      const { rows } = await ctx.pool.query<ResponseRow>(
-        `SELECT id, response_id::text AS response_id, asset, client_address, feedback_index, responder,
-                response_uri, response_hash, running_digest, response_count,
-                status, verified_at, tx_signature, block_slot, created_at
-         FROM feedback_responses
-         WHERE response_id = $1::bigint AND status != 'ORPHANED'
-         ORDER BY asset ASC, client_address ASC, feedback_index ASC, responder ASC
-         LIMIT 2`,
-        [sequentialId]
-      );
-      if (rows.length > 1) {
+      if (isIntegerString(args.id)) {
         throw createBadUserInputError(
-          'Ambiguous scoped response id. Use feedbackResponses(...) with explicit filters.'
+          'feedbackResponse(id) requires canonical response id format: <asset>:<client_address>:<feedback_index>:<responder>:<signature_or_count>.'
         );
       }
-      return rows[0] ? requireResponseRowId(rows[0]) : null;
+      return null;
     },
 
     async feedbackResponses(
@@ -558,7 +560,46 @@ export const queryResolvers = {
       assertNoMixedCursorOffset(args.after, skip);
       assertCursorOrderCompatibility(args.after, orderCol);
 
-      const where = buildWhereClause('response', args.where);
+      const normalizedWhere = {
+        ...(args.where ?? {}),
+      } as Record<string, unknown>;
+      const feedbackScope = normalizedWhere.feedback;
+      const feedbackIdScope = normalizedWhere.feedbackId;
+      const feedbackScopeValues: unknown[] = [];
+      if (feedbackScope !== undefined && feedbackScope !== null) feedbackScopeValues.push(feedbackScope);
+      if (feedbackIdScope !== undefined && feedbackIdScope !== null) feedbackScopeValues.push(feedbackIdScope);
+      for (const scopeValue of feedbackScopeValues) {
+        if (isNumericIdValue(scopeValue)) {
+          throw createBadUserInputError(
+            'feedbackResponses where.feedback/where.feedbackId must use canonical feedback id format "<asset>:<client_address>:<feedback_index>" (sequential feedback_id is not supported).'
+          );
+        }
+        if (typeof scopeValue !== 'string') {
+          throw createBadUserInputError(
+            'feedbackResponses where.feedback/where.feedbackId must use canonical feedback id format "<asset>:<client_address>:<feedback_index>".'
+          );
+        }
+        const canonicalScope = decodeFeedbackId(scopeValue);
+        if (!canonicalScope || !isIntegerString(canonicalScope.index)) {
+          throw createBadUserInputError(
+            'feedbackResponses where.feedback/where.feedbackId must use canonical feedback id format "<asset>:<client_address>:<feedback_index>".'
+          );
+        }
+      }
+      if (normalizedWhere.feedback === undefined && typeof normalizedWhere.feedbackId === 'string') {
+        normalizedWhere.feedback = normalizedWhere.feedbackId;
+      }
+
+      if (
+        hasProvidedFilter(normalizedWhere, ['responseId', 'responseId_gt', 'responseId_gte', 'responseId_lt', 'responseId_lte'])
+        && !hasProvidedFilter(normalizedWhere, ['feedback', 'feedbackId'])
+      ) {
+        throw createBadUserInputError(
+          'Scoped responseId filters require feedback scope. Include where.feedback or where.feedbackId.'
+        );
+      }
+
+      const where = buildWhereClause('response', normalizedWhere);
       const params = [...where.params];
       let paramIdx = where.paramIndex;
 
@@ -647,6 +688,15 @@ export const queryResolvers = {
 
       assertNoMixedCursorOffset(args.after, skip);
       assertCursorOrderCompatibility(args.after, orderCol);
+
+      if (
+        hasProvidedFilter(args.where, ['revocationId', 'revocationId_gt', 'revocationId_gte', 'revocationId_lt', 'revocationId_lte'])
+        && !hasProvidedFilter(args.where, ['agent'])
+      ) {
+        throw createBadUserInputError(
+          'Scoped revocationId filters require agent scope. Include where.agent.'
+        );
+      }
 
       const where = buildWhereClause('revocation', args.where);
       const params = [...where.params];

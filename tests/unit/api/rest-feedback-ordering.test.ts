@@ -210,4 +210,156 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it("returns 400 when response_id is provided without canonical feedback scope", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/responses?response_id=eq.9&limit=1`);
+      expect(res.status).toBe(400);
+
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("response_id requires canonical feedback scope");
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+      expect(prisma.feedbackResponse.count).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("allows response_id when canonical feedback scope is provided", async () => {
+    const createdAt = new Date("2026-01-03T00:00:00.000Z");
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            responseId: 9n,
+            responder: "responder-a",
+            responseUri: "ipfs://response-a",
+            responseHash: null,
+            runningDigest: null,
+            responseCount: 1n,
+            status: "FINALIZED",
+            verifiedAt: null,
+            slot: 11n,
+            txSignature: "sig-a",
+            createdAt,
+            feedback: {
+              feedbackId: 10n,
+              agentId: "asset-1",
+              client: "client-1",
+              feedbackIndex: 1n,
+              createdSlot: 11n,
+              createdTxSignature: "sig-a",
+            },
+          },
+        ]),
+        count: vi.fn().mockResolvedValue(1),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_id=eq.10&response_id=eq.9`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            responseId: 9n,
+            feedback: { agentId: "asset-1", feedbackId: 10n },
+          }),
+        })
+      );
+      expect(prisma.feedbackResponse.count).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies revocation_id PostgREST filters to Prisma where.revocationId", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const cases: Array<{ filter: string; expected: unknown }> = [
+      { filter: "eq.9", expected: 9n },
+      { filter: "gt.9", expected: { gt: 9n } },
+      { filter: "gte.9", expected: { gte: 9n } },
+      { filter: "lt.9", expected: { lt: 9n } },
+      { filter: "lte.9", expected: { lte: 9n } },
+    ];
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      for (const testCase of cases) {
+        const res = await fetch(
+          `${baseUrl}/rest/v1/revocations?asset=asset-1&revocation_id=${encodeURIComponent(testCase.filter)}`
+        );
+        expect(res.status).toBe(200);
+      }
+
+      cases.forEach((testCase, index) => {
+        expect(prisma.revocation.findMany).toHaveBeenNthCalledWith(
+          index + 1,
+          expect.objectContaining({
+            where: expect.objectContaining({
+              agentId: "asset-1",
+              revocationId: testCase.expected,
+            }),
+          })
+        );
+      });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("requires asset when using revocation_id filters", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?revocation_id=eq.7`);
+      expect(res.status).toBe(400);
+
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("revocation_id is scoped by agent");
+      expect(prisma.revocation.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects invalid revocation_id filters", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&revocation_id=gt.not-a-number`);
+      expect(res.status).toBe(400);
+
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid revocation_id filter");
+      expect(prisma.revocation.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
 });

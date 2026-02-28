@@ -235,6 +235,37 @@ function parsePostgRESTDateFilter(value: unknown): Prisma.DateTimeFilter | undef
   );
 }
 
+function parsePostgRESTBigIntFilter(value: unknown): bigint | Prisma.BigIntFilter | undefined | null {
+  const raw = safeQueryString(value);
+  if (!raw) return undefined;
+
+  const parseOperand = (operand: string): bigint | undefined => safeBigInt(operand);
+
+  if (raw.startsWith('eq.')) {
+    return parseOperand(raw.slice(3)) ?? null;
+  }
+
+  const parseBound = (
+    prefix: string,
+    op: 'gt' | 'gte' | 'lt' | 'lte'
+  ): Prisma.BigIntFilter | undefined => {
+    if (!raw.startsWith(prefix)) return undefined;
+    const value = parseOperand(raw.slice(prefix.length));
+    if (value === undefined) return undefined;
+    return { [op]: value } as Prisma.BigIntFilter;
+  };
+
+  const bounded =
+    parseBound('gt.', 'gt') ||
+    parseBound('gte.', 'gte') ||
+    parseBound('lt.', 'lt') ||
+    parseBound('lte.', 'lte');
+  if (bounded) return bounded;
+
+  const equals = parseOperand(raw);
+  return equals ?? null;
+}
+
 type AgentApiRow = Pick<
   PrismaAgent,
   | 'id'
@@ -917,9 +948,10 @@ export function createApiServer(options: ApiServerOptions): Express {
         parsedFeedbackIndex = idx;
       }
 
-      if (feedback_id) {
-        const feedbackSequentialId = safeBigInt(feedback_id);
-        if (feedbackSequentialId === undefined) {
+      let parsedFeedbackSequentialId: bigint | undefined;
+      if (feedback_id !== undefined) {
+        parsedFeedbackSequentialId = safeBigInt(feedback_id);
+        if (parsedFeedbackSequentialId === undefined) {
           res.status(400).json({ error: 'Invalid feedback_id: must be a valid integer' });
           return;
         }
@@ -927,9 +959,24 @@ export function createApiServer(options: ApiServerOptions): Express {
           res.status(400).json({ error: 'feedback_id is scoped by agent. Provide asset filter when using sequential feedback_id.' });
           return;
         }
+      }
+
+      const hasCanonicalFeedbackScope = (
+        (feedback_id !== undefined && !!asset) ||
+        (!!asset && !!client_address && parsedFeedbackIndex !== undefined)
+      );
+
+      if (response_id !== undefined && !hasCanonicalFeedbackScope) {
+        res.status(400).json({
+          error: 'response_id requires canonical feedback scope (asset + client_address + feedback_index, or asset + feedback_id).',
+        });
+        return;
+      }
+
+      if (feedback_id !== undefined) {
         where.feedback = {
-          agentId: asset,
-          feedbackId: feedbackSequentialId,
+          agentId: asset!,
+          feedbackId: parsedFeedbackSequentialId!,
         };
       } else if (asset && client_address && parsedFeedbackIndex !== undefined) {
         // Find feedback first, then get responses
@@ -1035,6 +1082,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = parsePostgRESTValue(req.query.asset);
       const client = parsePostgRESTValue(req.query.client_address) ?? parsePostgRESTValue(req.query.client);
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const revocationIdRaw = safeQueryString(req.query.revocation_id);
+      const revocationIdFilter = parsePostgRESTBigIntFilter(req.query.revocation_id);
       const revoke_count = parsePostgRESTValue(req.query.revoke_count);
       const revoke_count_in = parsePostgRESTIn(req.query.revoke_count);
       const limit = safePaginationLimit(req.query.limit);
@@ -1049,6 +1098,17 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.RevocationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
+      if (revocationIdRaw !== undefined && !asset) {
+        res.status(400).json({ error: 'revocation_id is scoped by agent. Provide asset filter when using revocation_id.' });
+        return;
+      }
+      if (revocationIdFilter === null) {
+        res.status(400).json({ error: 'Invalid revocation_id filter: use eq/gt/gte/lt/lte with a valid integer' });
+        return;
+      }
+      if (revocationIdFilter !== undefined) {
+        where.revocationId = revocationIdFilter;
+      }
       if (feedback_index !== undefined) {
         const idx = safeBigInt(feedback_index);
         if (idx === undefined) {
