@@ -890,31 +890,14 @@ describe("EventBuffer", () => {
   });
 
   describe("deterministic sequential IDs (batch path)", () => {
-    it("assigns feedback_id sequentially per asset and backfills on conflict", async () => {
+    it("delegates feedback_id assignment to DB triggers and keeps app-side IDs null", async () => {
       const client = mockPool._client;
-      const maxByAsset = new Map<string, bigint>();
 
       client.query.mockImplementation((sql: string, params?: any[]) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
           return { rows: [], rowCount: 0 };
         }
-        if (typeof sql === "string" && sql.includes("SELECT feedback_id::text AS feedback_id FROM feedbacks WHERE id = $1 LIMIT 1")) {
-          const id = params?.[0] as string;
-          if (id === "asset1:client1:2") {
-            return { rows: [{ feedback_id: null }], rowCount: 1 };
-          }
-          return { rows: [], rowCount: 0 };
-        }
-        if (typeof sql === "string" && sql.includes("SELECT MAX(feedback_id)::text AS max_id")) {
-          const asset = params?.[0] as string;
-          const currentMax = maxByAsset.get(asset) ?? 0n;
-          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
-        }
         if (typeof sql === "string" && sql.includes("INSERT INTO feedbacks (id, feedback_id")) {
-          const asset = params?.[2] as string;
-          const assignedId = BigInt(params?.[1] as string);
-          const prev = maxByAsset.get(asset) ?? 0n;
-          maxByAsset.set(asset, assignedId > prev ? assignedId : prev);
           if ((params?.[0] as string) === "asset1:client1:2") {
             return { rows: [], rowCount: 0 };
           }
@@ -951,22 +934,18 @@ describe("EventBuffer", () => {
         (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedbacks (id, feedback_id")
       );
       expect(feedbackInsertCalls).toHaveLength(3);
-      expect(feedbackInsertCalls[0][1][1]).toBe("1");
-      expect(feedbackInsertCalls[1][1][1]).toBe("2");
-      expect(feedbackInsertCalls[2][1][1]).toBe("3");
+      expect(feedbackInsertCalls[0][1][1]).toBeNull();
+      expect(feedbackInsertCalls[1][1][1]).toBeNull();
+      expect(feedbackInsertCalls[2][1][1]).toBeNull();
 
       const feedbackBackfillCall = client.query.mock.calls.find(
-        (call: any[]) =>
-          typeof call[0] === "string" &&
-          call[0].includes("SET feedback_id = COALESCE(feedback_id, $2::bigint)")
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("SET feedback_id = COALESCE(feedback_id")
       );
-      expect(feedbackBackfillCall).toBeDefined();
-      expect(feedbackBackfillCall?.[1]).toEqual(["asset1:client1:2", "3"]);
+      expect(feedbackBackfillCall).toBeUndefined();
     });
 
-    it("assigns revocation_id for non-orphans and keeps orphan revocations null", async () => {
+    it("delegates revocation_id assignment to DB triggers and keeps app-side IDs null", async () => {
       const client = mockPool._client;
-      const maxByAsset = new Map<string, bigint>();
 
       client.query.mockImplementation((sql: string, params?: any[]) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
@@ -979,22 +958,7 @@ describe("EventBuffer", () => {
           }
           return { rows: [], rowCount: 0 };
         }
-        if (typeof sql === "string" && sql.includes("SELECT revocation_id::text AS revocation_id")) {
-          return { rows: [], rowCount: 0 };
-        }
-        if (typeof sql === "string" && sql.includes("SELECT MAX(revocation_id)::text AS max_id")) {
-          const asset = params?.[0] as string;
-          const currentMax = maxByAsset.get(asset) ?? 0n;
-          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
-        }
         if (typeof sql === "string" && sql.includes("INSERT INTO revocations (id, revocation_id")) {
-          const asset = params?.[2] as string;
-          const assignedId = params?.[1];
-          if (assignedId !== null) {
-            const next = BigInt(assignedId as string);
-            const prev = maxByAsset.get(asset) ?? 0n;
-            maxByAsset.set(asset, next > prev ? next : prev);
-          }
           return { rows: [], rowCount: 1 };
         }
         return { rows: [], rowCount: 1 };
@@ -1025,16 +989,15 @@ describe("EventBuffer", () => {
         (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO revocations (id, revocation_id")
       );
       expect(revocationInsertCalls).toHaveLength(2);
-      expect(revocationInsertCalls[0][1][1]).toBe("1");
+      expect(revocationInsertCalls[0][1][1]).toBeNull();
       expect(revocationInsertCalls[0][1][16]).toBe("PENDING");
       expect(revocationInsertCalls[1][1][1]).toBeNull();
       expect(revocationInsertCalls[1][1][16]).toBe("ORPHANED");
-      expect(revocationInsertCalls[0][0]).toContain("revocation_id = CASE");
+      expect(revocationInsertCalls[0][0]).not.toContain("revocation_id = CASE");
     });
 
-    it("assigns response_id per feedback scope and keeps orphan/seal-mismatch IDs null", async () => {
+    it("delegates response_id assignment to DB triggers and keeps app-side IDs null", async () => {
       const client = mockPool._client;
-      const maxByScope = new Map<string, bigint>();
 
       client.query.mockImplementation((sql: string, params?: any[]) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
@@ -1050,23 +1013,7 @@ describe("EventBuffer", () => {
           }
           return { rows: [{ id: "fb:ok", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
         }
-        if (typeof sql === "string" && sql.includes("SELECT response_id::text AS response_id FROM feedback_responses WHERE id = $1 LIMIT 1")) {
-          return { rows: [], rowCount: 0 };
-        }
-        if (typeof sql === "string" && sql.includes("SELECT MAX(response_id)::text AS max_id")) {
-          const scope = `${params?.[0]}:${params?.[1]}:${params?.[2]}`;
-          const currentMax = maxByScope.get(scope) ?? 0n;
-          return { rows: [{ max_id: currentMax === 0n ? null : currentMax.toString() }], rowCount: 1 };
-        }
         if (typeof sql === "string" && sql.includes("INSERT INTO feedback_responses (id, response_id")) {
-          const status = params?.[15];
-          const scope = `${params?.[2]}:${params?.[3]}:${params?.[4]}`;
-          const assignedId = params?.[1];
-          if (assignedId !== null && status !== "ORPHANED") {
-            const next = BigInt(assignedId as string);
-            const prev = maxByScope.get(scope) ?? 0n;
-            maxByScope.set(scope, next > prev ? next : prev);
-          }
           return { rows: [], rowCount: 1 };
         }
         return { rows: [], rowCount: 1 };
@@ -1128,11 +1075,11 @@ describe("EventBuffer", () => {
       );
       expect(responseInsertCalls).toHaveLength(5);
 
-      expect(responseInsertCalls[0][1][1]).toBe("1");
+      expect(responseInsertCalls[0][1][1]).toBeNull();
       expect(responseInsertCalls[0][1][15]).toBe("PENDING");
-      expect(responseInsertCalls[1][1][1]).toBe("2");
+      expect(responseInsertCalls[1][1][1]).toBeNull();
       expect(responseInsertCalls[1][1][15]).toBe("PENDING");
-      expect(responseInsertCalls[2][1][1]).toBe("1");
+      expect(responseInsertCalls[2][1][1]).toBeNull();
       expect(responseInsertCalls[2][1][15]).toBe("PENDING");
 
       expect(responseInsertCalls[3][1][1]).toBeNull();
@@ -1141,7 +1088,7 @@ describe("EventBuffer", () => {
 
       expect(responseInsertCalls[4][1][1]).toBeNull();
       expect(responseInsertCalls[4][1][15]).toBe("ORPHANED");
-      expect(responseInsertCalls[4][0]).toContain("response_id = CASE");
+      expect(responseInsertCalls[4][0]).not.toContain("response_id = CASE");
     });
   });
 

@@ -1502,10 +1502,10 @@ export class DataVerifier {
       );
     }
 
-    if (table === 'revocations' && status !== 'ORPHANED') {
+    if (this.prisma && table === 'revocations' && status !== 'ORPHANED') {
       await this.backfillRevocationIds(ids);
     }
-    if (table === 'feedback_responses' && status !== 'ORPHANED') {
+    if (this.prisma && table === 'feedback_responses' && status !== 'ORPHANED') {
       await this.backfillResponseIds(ids);
     }
   }

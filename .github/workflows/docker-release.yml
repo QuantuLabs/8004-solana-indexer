@@ -1,4 +1,4 @@
-name: docker-release-classic
+name: docker-release-indexer
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/8004-indexer-classic
+  IMAGE_NAME: ${{ github.repository_owner }}/8004-indexer
 
 jobs:
   build-and-push:

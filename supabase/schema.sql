@@ -127,7 +127,8 @@ CREATE TABLE agents (
   -- Verification status (reorg resilience) --
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
-  verified_slot BIGINT
+  verified_slot BIGINT,
+  CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)
 );
 
 -- Sequence + trigger for agent_id auto-assignment
@@ -135,16 +136,58 @@ CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;
 
 CREATE OR REPLACE FUNCTION assign_agent_id()
 RETURNS TRIGGER AS $$
+DECLARE
+  existing_agent_id BIGINT;
+  existing_status TEXT;
 BEGIN
-  IF NEW.agent_id IS NULL AND (NEW.status IS NULL OR NEW.status != 'ORPHANED') THEN
-    NEW.agent_id := nextval('agent_id_seq');
+  IF TG_OP = 'UPDATE' AND OLD.agent_id IS NOT NULL THEN
+    NEW.agent_id := OLD.agent_id;
+    RETURN NEW;
   END IF;
+
+  -- Ignore caller-provided IDs and assign under DB lock instead.
+  IF NEW.agent_id IS NOT NULL THEN
+    NEW.agent_id := NULL;
+  END IF;
+
+  IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Serialize per-asset ID assignment so duplicate upserts/replays do not burn sequence values.
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.asset, 0));
+
+  SELECT agent_id, status
+  INTO existing_agent_id, existing_status
+  FROM agents
+  WHERE asset = NEW.asset
+  LIMIT 1;
+
+  IF FOUND THEN
+    IF existing_agent_id IS NOT NULL THEN
+      NEW.agent_id := existing_agent_id;
+      RETURN NEW;
+    END IF;
+
+    IF existing_status IS NULL OR existing_status != 'ORPHANED' THEN
+      UPDATE agents
+      SET agent_id = nextval('agent_id_seq')
+      WHERE asset = NEW.asset
+        AND agent_id IS NULL
+        AND (status IS NULL OR status != 'ORPHANED')
+      RETURNING agent_id INTO NEW.agent_id;
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  NEW.agent_id := nextval('agent_id_seq');
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trg_assign_agent_id
-  BEFORE INSERT ON agents
+  BEFORE INSERT OR UPDATE ON agents
   FOR EACH ROW
   EXECUTE FUNCTION assign_agent_id();
 
@@ -327,6 +370,160 @@ CREATE INDEX idx_revocations_asset_revocation_id_lookup
 ON revocations(asset, revocation_id);
 
 -- =============================================
+-- Scoped sequential ID hardening (DB-level, multi-writer safe)
+-- =============================================
+CREATE OR REPLACE FUNCTION assign_feedback_id()
+RETURNS TRIGGER AS $$
+DECLARE
+  existing_feedback_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.feedback_id IS NOT NULL THEN
+    NEW.feedback_id := OLD.feedback_id;
+    RETURN NEW;
+  END IF;
+
+  -- Ignore caller-provided IDs and assign under DB lock instead.
+  IF NEW.feedback_id IS NOT NULL THEN
+    NEW.feedback_id := NULL;
+  END IF;
+
+  IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Serialize per-asset assignment across processes.
+  PERFORM pg_advisory_xact_lock(hashtextextended('feedback:' || NEW.asset, 0));
+
+  SELECT feedback_id
+  INTO existing_feedback_id
+  FROM feedbacks
+  WHERE id = NEW.id
+  LIMIT 1;
+
+  IF FOUND AND existing_feedback_id IS NOT NULL THEN
+    NEW.feedback_id := existing_feedback_id;
+    RETURN NEW;
+  END IF;
+
+  SELECT COALESCE(MAX(feedback_id), 0) + 1
+  INTO NEW.feedback_id
+  FROM feedbacks
+  WHERE asset = NEW.asset
+    AND feedback_id IS NOT NULL;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION assign_response_id()
+RETURNS TRIGGER AS $$
+DECLARE
+  existing_response_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.response_id IS NOT NULL THEN
+    NEW.response_id := OLD.response_id;
+    RETURN NEW;
+  END IF;
+
+  -- Ignore caller-provided IDs and assign under DB lock instead.
+  IF NEW.response_id IS NOT NULL THEN
+    NEW.response_id := NULL;
+  END IF;
+
+  IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Serialize per-feedback-scope assignment across processes.
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
+      0
+    )
+  );
+
+  SELECT response_id
+  INTO existing_response_id
+  FROM feedback_responses
+  WHERE id = NEW.id
+  LIMIT 1;
+
+  IF FOUND AND existing_response_id IS NOT NULL THEN
+    NEW.response_id := existing_response_id;
+    RETURN NEW;
+  END IF;
+
+  SELECT COALESCE(MAX(response_id), 0) + 1
+  INTO NEW.response_id
+  FROM feedback_responses
+  WHERE asset = NEW.asset
+    AND client_address = NEW.client_address
+    AND feedback_index = NEW.feedback_index
+    AND response_id IS NOT NULL;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION assign_revocation_id()
+RETURNS TRIGGER AS $$
+DECLARE
+  existing_revocation_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.revocation_id IS NOT NULL THEN
+    NEW.revocation_id := OLD.revocation_id;
+    RETURN NEW;
+  END IF;
+
+  -- Ignore caller-provided IDs and assign under DB lock instead.
+  IF NEW.revocation_id IS NOT NULL THEN
+    NEW.revocation_id := NULL;
+  END IF;
+
+  IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Serialize per-asset assignment across processes.
+  PERFORM pg_advisory_xact_lock(hashtextextended('revocation:' || NEW.asset, 0));
+
+  SELECT revocation_id
+  INTO existing_revocation_id
+  FROM revocations
+  WHERE id = NEW.id
+  LIMIT 1;
+
+  IF FOUND AND existing_revocation_id IS NOT NULL THEN
+    NEW.revocation_id := existing_revocation_id;
+    RETURN NEW;
+  END IF;
+
+  SELECT COALESCE(MAX(revocation_id), 0) + 1
+  INTO NEW.revocation_id
+  FROM revocations
+  WHERE asset = NEW.asset
+    AND revocation_id IS NOT NULL;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_assign_feedback_id
+  BEFORE INSERT OR UPDATE ON feedbacks
+  FOR EACH ROW
+  EXECUTE FUNCTION assign_feedback_id();
+
+CREATE TRIGGER trg_assign_response_id
+  BEFORE INSERT OR UPDATE ON feedback_responses
+  FOR EACH ROW
+  EXECUTE FUNCTION assign_response_id();
+
+CREATE TRIGGER trg_assign_revocation_id
+  BEFORE INSERT OR UPDATE ON revocations
+  FOR EACH ROW
+  EXECUTE FUNCTION assign_revocation_id();
+
+-- =============================================
 -- VALIDATIONS
 -- =============================================
 CREATE TABLE validations (
@@ -470,9 +667,8 @@ CREATE OR REPLACE VIEW global_stats
 WITH (security_invoker = true) AS
 SELECT
   (SELECT COUNT(*) FROM agents) AS total_agents,
-  (SELECT COUNT(*) FROM collections) AS total_collections,
+  (SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections,
   (SELECT COUNT(*) FROM feedbacks WHERE NOT is_revoked) AS total_feedbacks,
-  (SELECT COUNT(*) FROM validations) AS total_validations,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,
   (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE feedback_count > 0) AS avg_quality;
@@ -514,13 +710,6 @@ SELECT
   COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
   COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
 FROM revocations
-UNION ALL
-SELECT
-  'validations' AS model,
-  COUNT(*) FILTER (WHERE chain_status = 'PENDING') AS pending_count,
-  COUNT(*) FILTER (WHERE chain_status = 'FINALIZED') AS finalized_count,
-  COUNT(*) FILTER (WHERE chain_status = 'ORPHANED') AS orphaned_count
-FROM validations
 UNION ALL
 SELECT
   'metadata' AS model,
@@ -658,6 +847,8 @@ GRANT SELECT ON metadata_decoded_raw TO anon;
 GRANT SELECT ON metadata_decoded_raw TO authenticated;
 
 -- Grant read access to verification stats view
+GRANT SELECT ON global_stats TO anon;
+GRANT SELECT ON global_stats TO authenticated;
 GRANT SELECT ON verification_stats TO anon;
 GRANT SELECT ON verification_stats TO authenticated;
 

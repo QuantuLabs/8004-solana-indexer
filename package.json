@@ -1,6 +1,6 @@
 {
   "name": "8004-solana-indexer",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "description": "Custom Solana indexer for 8004 Agent Registry v0.4.0",
   "type": "module",
   "main": "dist/index.js",
@@ -28,7 +28,7 @@
     "test:metadata:digestion": "bunx vitest run tests/unit/uriDigest.test.ts tests/unit/uriDigest-coverage.test.ts tests/unit/indexer/collectionDigest.test.ts",
     "test:localnet:only": "RUN_LOCALNET_E2E=1 bunx vitest run --config vitest.e2e.config.ts -t 'Localnet' && bun run test:metadata:digestion",
     "test:localnet": "bash scripts/run-localnet-e2e.sh",
-    "test:docker:ci": "docker compose -f docker/ci/ci-classic.yml up --build --abort-on-container-exit --exit-code-from tests",
+    "test:docker:ci": "docker compose -f docker/ci/ci-indexer.yml up --build --abort-on-container-exit --exit-code-from tests",
     "test:mainnet:readiness:unit": "bunx vitest run tests/unit/indexer/batch-processor.test.ts tests/unit/indexer/poller-coverage.test.ts tests/unit/services/replay-verifier.test.ts tests/unit/db/handlers-coverage.test.ts tests/unit/api/server.test.ts",
     "test:mainnet:readiness:e2e": "bun run test:e2e:major",
     "test:mainnet:readiness:e2e:strict": "REQUIRE_ONCHAIN_VERIFICATION=true DEVNET_RPC_URL=https://api.devnet.solana.com RPC_URL=https://api.devnet.solana.com WS_URL=wss://api.devnet.solana.com bunx vitest run --config vitest.e2e.config.ts tests/e2e/devnet-verification.test.ts",

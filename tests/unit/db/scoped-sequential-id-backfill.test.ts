@@ -16,6 +16,26 @@ const prismaMigrationSql = readFileSync(
   "utf8"
 );
 
+const scopedHardeningMigrationSql = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260228235500_harden_scoped_sequential_id_assignment.sql"),
+  "utf8"
+);
+
+const scopedImmutabilityMigrationSql = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260301001000_harden_scoped_id_immutability_and_proxy_grants.sql"),
+  "utf8"
+);
+
+const archivedStatsMigrationSql = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260228233500_archive_validation_rest_stats.sql"),
+  "utf8"
+);
+
+const globalStatsAlignmentMigrationSql = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260301004000_align_global_stats_total_collections.sql"),
+  "utf8"
+);
+
 describe("scoped sequential ID backfill migrations", () => {
   it("defines deterministic supabase backfill for feedbacks, responses, and revocations", () => {
     expect(supabaseMigrationSql).toContain("feedback_pending AS");
@@ -56,5 +76,38 @@ describe("scoped sequential ID backfill migrations", () => {
     expect(prismaMigrationSql).toContain('"revocation_ranked"');
     expect(prismaMigrationSql).toContain('PARTITION BY r."agentId"');
     expect(prismaMigrationSql).toContain('COALESCE(r."revokeCount"');
+  });
+
+  it("hardens scoped IDs with DB trigger assignment and advisory locks", () => {
+    expect(scopedHardeningMigrationSql).toContain("CREATE OR REPLACE FUNCTION assign_feedback_id()");
+    expect(scopedHardeningMigrationSql).toContain("CREATE OR REPLACE FUNCTION assign_response_id()");
+    expect(scopedHardeningMigrationSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
+    expect(scopedHardeningMigrationSql).toContain("pg_advisory_xact_lock(hashtextextended('feedback:' || NEW.asset, 0));");
+    expect(scopedHardeningMigrationSql).toContain("'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(scopedHardeningMigrationSql).toContain("pg_advisory_xact_lock(hashtextextended('revocation:' || NEW.asset, 0));");
+    expect(scopedHardeningMigrationSql).toContain("CREATE TRIGGER trg_assign_feedback_id");
+    expect(scopedHardeningMigrationSql).toContain("CREATE TRIGGER trg_assign_response_id");
+    expect(scopedHardeningMigrationSql).toContain("CREATE TRIGGER trg_assign_revocation_id");
+  });
+
+  it("keeps scoped IDs immutable across ORPHANED transitions and ignores caller-provided IDs", () => {
+    expect(scopedImmutabilityMigrationSql).toContain("IF TG_OP = 'UPDATE' AND OLD.feedback_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF TG_OP = 'UPDATE' AND OLD.response_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF TG_OP = 'UPDATE' AND OLD.revocation_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF NEW.feedback_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF NEW.response_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF NEW.revocation_id IS NOT NULL THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN");
+    expect(scopedImmutabilityMigrationSql).toContain("GRANT SELECT ON global_stats TO anon;");
+    expect(scopedImmutabilityMigrationSql).toContain("GRANT SELECT ON verification_stats TO anon;");
+  });
+
+  it("keeps global_stats total_collections aligned with ORPHANED exclusion", () => {
+    expect(archivedStatsMigrationSql).toContain(
+      "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+    );
+    expect(globalStatsAlignmentMigrationSql).toContain(
+      "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+    );
   });
 });

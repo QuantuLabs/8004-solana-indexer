@@ -8,6 +8,7 @@ RPC_URL="${LOCALNET_RPC_URL:-http://127.0.0.1:8899}"
 LOG_FILE="/tmp/8004-solana-test-validator.log"
 PID_FILE="/tmp/8004-solana-test-validator.pid"
 CLONE_ATOM_PROGRAM="${LOCALNET_CLONE_ATOM_PROGRAM:-0}"
+PROGRAM_KEYPAIR="${LOCALNET_PROGRAM_KEYPAIR:-$SOLANA_ROOT/keys/mainnet-program/8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ.json}"
 
 validator_args=(
   --reset
@@ -64,7 +65,10 @@ echo "[localnet] validator ready at $RPC_URL"
 echo "[localnet] deploying 8004 program"
 if ! (
   cd "$SOLANA_ROOT"
-  anchor deploy --provider.cluster http://127.0.0.1:8899
+  anchor deploy \
+    --provider.cluster http://127.0.0.1:8899 \
+    --program-name agent_registry_8004 \
+    --program-keypair "$PROGRAM_KEYPAIR"
 ); then
   echo "[localnet] deploy failed. validator logs:" >&2
   tail -n 120 "$LOG_FILE" >&2 || true

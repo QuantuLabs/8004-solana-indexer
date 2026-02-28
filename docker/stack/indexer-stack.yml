@@ -1,9 +1,9 @@
-name: 8004-classic-stack
+name: 8004-indexer-stack
 
 services:
   indexer:
-    image: ${INDEXER_IMAGE:-ghcr.io/quantulabs/8004-indexer-classic:latest}
-    container_name: 8004-indexer-classic
+    image: ${INDEXER_IMAGE:-ghcr.io/quantulabs/8004-indexer:latest}
+    container_name: 8004-indexer
     restart: unless-stopped
     ports:
       - "${API_PORT:-3001}:3001"
@@ -12,12 +12,21 @@ services:
       DB_MODE: ${DB_MODE:-supabase}
       API_MODE: ${API_MODE:-graphql}
       API_PORT: 3001
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-devnet}
       RPC_URL: ${RPC_URL:?set RPC_URL}
       WS_URL: ${WS_URL:?set WS_URL}
+      PROGRAM_ID: ${PROGRAM_ID:-}
+      ATOM_ENGINE_PROGRAM_ID: ${ATOM_ENGINE_PROGRAM_ID:-}
       SUPABASE_DSN: ${SUPABASE_DSN:?set SUPABASE_DSN}
+      SUPABASE_SSL_VERIFY: ${SUPABASE_SSL_VERIFY:-true}
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_KEY: ${SUPABASE_KEY:-}
+      POSTGREST_URL: ${POSTGREST_URL:-}
+      POSTGREST_TOKEN: ${POSTGREST_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       INDEXER_MODE: ${INDEXER_MODE:-auto}
+      INDEXER_START_SIGNATURE: ${INDEXER_START_SIGNATURE:-}
+      INDEXER_START_SLOT: ${INDEXER_START_SLOT:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       VERIFICATION_ENABLED: ${VERIFICATION_ENABLED:-true}
       INDEX_METADATA: ${INDEX_METADATA:-normal}

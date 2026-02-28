@@ -30,7 +30,6 @@ const FIELD_COSTS: Record<string, number> = {
   agents: 2,
   feedbacks: 2,
   feedbackResponses: 2,
-  validations: 2,
   agentMetadatas: 2,
   feedback: 3,
   responses: 2,
@@ -46,7 +45,7 @@ const FIELD_COSTS: Record<string, number> = {
 };
 
 const LIST_FIELDS = new Set([
-  'agents', 'feedbacks', 'feedbackResponses', 'validations',
+  'agents', 'feedbacks', 'feedbackResponses',
   'agentMetadatas', 'protocols', 'agentSearch', 'agentRegistrationFiles',
   'feedback', 'responses', 'metadata',
   'hashChainReplayData',

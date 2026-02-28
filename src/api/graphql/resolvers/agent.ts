@@ -112,19 +112,6 @@ export const agentResolvers = {
         orderDirection,
       });
     },
-    async validations(
-      parent: AgentRow,
-      args: { first?: number; skip?: number },
-      ctx: GraphQLContext
-    ) {
-      const first = clampFirst(args.first);
-      const skip = clampSkip(args.skip);
-      return ctx.loaders.validationsPageByAgent.load({
-        asset: parent.asset,
-        first,
-        skip,
-      });
-    },
     async metadata(parent: AgentRow, _args: unknown, ctx: GraphQLContext) {
       return ctx.loaders.metadataByAgent.load(parent.asset);
     },

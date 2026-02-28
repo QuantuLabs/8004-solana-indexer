@@ -144,13 +144,19 @@ describe('Filter Builder', () => {
   it('maps agentId filter to sequential DB agent_id column', () => {
     const result = buildWhereClause('agent', { agentId: 42n });
     expect(result.sql).toContain('agent_id = $1');
-    expect(result.params).toEqual([42n]);
+    expect(result.params).toEqual(['42']);
   });
 
   it('maps legacy agentid filter alias to sequential DB agent_id column', () => {
     const result = buildWhereClause('agent', { agentid: 7n });
     expect(result.sql).toContain('agent_id = $1');
-    expect(result.params).toEqual([7n]);
+    expect(result.params).toEqual(['7']);
+  });
+
+  it('normalizes bigint values inside _in array params for SQL bindings', () => {
+    const result = buildWhereClause('agent', { owner_in: [1n, 2n] });
+    expect(result.sql).toContain('owner = ANY($1::text[])');
+    expect(result.params).toEqual([['1', '2']]);
   });
 
   it('accepts raw agent ID in feedback filter', () => {
@@ -219,7 +225,7 @@ describe('Filter Builder', () => {
     const result = buildWhereClause('feedback', { feedbackId_gt: 10n, feedbackId_lte: 20n });
     expect(result.sql).toContain('feedback_id > $1');
     expect(result.sql).toContain('feedback_id <= $2');
-    expect(result.params).toEqual([10n, 20n]);
+    expect(result.params).toEqual(['10', '20']);
   });
 
   it('builds response feedback filter from sequential feedback ID', () => {
@@ -239,7 +245,7 @@ describe('Filter Builder', () => {
     const result = buildWhereClause('response', { responseId_gte: 3n, responseId_lt: 9n });
     expect(result.sql).toContain('response_id >= $1');
     expect(result.sql).toContain('response_id < $2');
-    expect(result.params).toEqual([3n, 9n]);
+    expect(result.params).toEqual(['3', '9']);
   });
 
   it('maps revocation filters to revocation_id and client_address', () => {
@@ -251,7 +257,7 @@ describe('Filter Builder', () => {
     expect(result.sql).toContain('asset = $1');
     expect(result.sql).toContain('revocation_id > $2');
     expect(result.sql).toContain('client_address = $3');
-    expect(result.params).toEqual(['asset1', 5n, 'client1']);
+    expect(result.params).toEqual(['asset1', '5', 'client1']);
   });
 
   it('maps validation status filter to response nullability', () => {
@@ -855,6 +861,29 @@ describe('Query Resolver Canonical ID Lookup', () => {
 });
 
 describe('Query Resolver Deterministic ID Ordering', () => {
+  it('serializes where.agentId bigint filter before querying agents', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {
+        agentById: { prime: vi.fn() },
+      },
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.agents(
+      {},
+      { first: 6, where: { agentId: 42n } },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('agent_id = $1');
+    expect(params).toEqual(['42', 6, 0]);
+  });
+
   it('supports feedbacks order/filter by sequential feedback_id', async () => {
     const query = vi.fn().mockResolvedValue({ rows: [] });
     const ctx = {
@@ -874,7 +903,7 @@ describe('Query Resolver Deterministic ID Ordering', () => {
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain('feedback_id > $1');
     expect(sql).toContain('ORDER BY feedback_id ASC, asset ASC, client_address ASC, feedback_index ASC, feedback_id ASC NULLS LAST, id ASC');
-    expect(params).toEqual([5n, 10, 0]);
+    expect(params).toEqual(['5', 10, 0]);
   });
 
   it('supports feedbackResponses order/filter by sequential response_id', async () => {
@@ -902,7 +931,7 @@ describe('Query Resolver Deterministic ID Ordering', () => {
     expect(sql).toContain('asset = $1 AND client_address = $2 AND feedback_index = $3::bigint');
     expect(sql).toContain('response_id >= $4');
     expect(sql).toContain('ORDER BY response_id DESC, response_id DESC NULLS LAST, id DESC');
-    expect(params).toEqual(['asset1', 'client1', '9', 2n, 7, 0]);
+    expect(params).toEqual(['asset1', 'client1', '9', '2', 7, 0]);
   });
 
   it('supports revocations order/filter by sequential revocation_id', async () => {
@@ -925,7 +954,7 @@ describe('Query Resolver Deterministic ID Ordering', () => {
     expect(sql).toContain('FROM revocations');
     expect(sql).toContain('revocation_id > $2');
     expect(sql).toContain('ORDER BY revocation_id ASC, revocation_id ASC NULLS LAST, id ASC');
-    expect(params).toEqual(['asset1', 9n, 3, 0]);
+    expect(params).toEqual(['asset1', '9', 3, 0]);
   });
 });
 
@@ -939,7 +968,7 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '10',
         total_feedback: '20',
-        total_validations: '30',
+        total_collections: '4',
         tags: ['ai'],
       }],
     });
@@ -951,13 +980,90 @@ describe('Query Aggregated Stats Cache', () => {
       networkMode: 'devnet',
     } as any;
 
-    const first = await queryResolvers.Query.globalStats({}, { id: 'stats' }, ctx);
-    const second = await queryResolvers.Query.globalStats({}, { id: 'stats' }, ctx);
+    const first = await queryResolvers.Query.globalStats({}, {}, ctx);
+    const second = await queryResolvers.Query.globalStats({}, {}, ctx);
 
     expect(query).toHaveBeenCalledTimes(1);
+    expect(first.id).toBe('global-devnet');
     expect(first.totalAgents).toBe('10');
+    expect(first.totalCollections).toBe('4');
     expect(second.totalAgents).toBe('10');
+    expect(second.totalCollections).toBe('4');
     expect(second.tags).toEqual(['ai']);
+  });
+
+  it('refreshes globalStats synchronously after cache TTL expiry', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    let now = 1_700_000_000_000;
+    nowSpy.mockImplementation(() => now);
+
+    const query = vi.fn()
+      .mockResolvedValueOnce({
+        rows: [{
+          total_agents: '328',
+          total_feedback: '301',
+          total_collections: '0',
+          tags: [],
+        }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          total_agents: '329',
+          total_feedback: '301',
+          total_collections: '0',
+          tags: [],
+        }],
+      });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    try {
+      const first = await queryResolvers.Query.globalStats({}, {}, ctx);
+      expect(first.totalAgents).toBe('328');
+      expect(query).toHaveBeenCalledTimes(1);
+
+      // Default TTL is 60s; move past it to force a synchronous refresh.
+      now += 61_000;
+      const second = await queryResolvers.Query.globalStats({}, {}, ctx);
+      expect(second.totalAgents).toBe('329');
+      expect(query).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('uses COUNT-based totalAgents semantics when agent_id has gaps', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        // Example: active rows have agent_id values [1, 3], so count=2 while max(agent_id)=3.
+        total_agents: '2',
+        total_feedback: '9',
+        total_collections: '1',
+        tags: [],
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.globalStats({}, {}, ctx);
+
+    expect(result.totalAgents).toBe('2');
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("(SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents");
+    expect(sql).toMatch(/FROM collections[\s\S]*status != 'ORPHANED'[\s\S]*registry_type != 'BASE'/);
+    expect(sql).not.toContain('MAX(agent_id)');
+    expect(sql).not.toContain('FROM validations');
   });
 
   it('deduplicates concurrent globalStats refreshes', async () => {
@@ -965,7 +1071,7 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '1',
         total_feedback: '2',
-        total_validations: '3',
+        total_collections: '7',
         tags: ['x'],
       }],
     });
@@ -978,7 +1084,7 @@ describe('Query Aggregated Stats Cache', () => {
     } as any;
 
     await Promise.all([
-      queryResolvers.Query.globalStats({}, { id: 'a' }, ctx),
+      queryResolvers.Query.globalStats({}, {}, ctx),
       queryResolvers.Query.protocol({}, { id: 'b' }, ctx),
     ]);
 

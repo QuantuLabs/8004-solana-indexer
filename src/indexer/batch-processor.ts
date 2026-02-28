@@ -45,140 +45,6 @@ function hashesMatchHex(stored: string | null, event: string | null): boolean {
   return stored === event;
 }
 
-let feedbackIdAssignmentTail = Promise.resolve();
-let responseIdAssignmentTail = Promise.resolve();
-let revocationIdAssignmentTail = Promise.resolve();
-
-async function withAssignmentLock<T>(
-  getTail: () => Promise<void>,
-  setTail: (tail: Promise<void>) => void,
-  task: () => Promise<T>
-): Promise<T> {
-  const previous = getTail();
-  let release: () => void = () => { /* no-op until replaced */ };
-  const current = new Promise<void>((resolve) => {
-    release = () => resolve();
-  });
-  setTail(previous.then(() => current));
-  await previous;
-  try {
-    return await task();
-  } finally {
-    release();
-  }
-}
-
-async function withFeedbackIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
-  return withAssignmentLock(
-    () => feedbackIdAssignmentTail,
-    (tail) => { feedbackIdAssignmentTail = tail; },
-    task
-  );
-}
-
-async function withResponseIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
-  return withAssignmentLock(
-    () => responseIdAssignmentTail,
-    (tail) => { responseIdAssignmentTail = tail; },
-    task
-  );
-}
-
-async function withRevocationIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
-  return withAssignmentLock(
-    () => revocationIdAssignmentTail,
-    (tail) => { revocationIdAssignmentTail = tail; },
-    task
-  );
-}
-
-function toNullableBigInt(value: unknown): bigint | null {
-  if (typeof value === "bigint") return value;
-  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value));
-  if (typeof value === "string" && value !== "") {
-    try {
-      return BigInt(value);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function toBigInt(value: unknown): bigint {
-  return toNullableBigInt(value) ?? 0n;
-}
-
-async function fetchExistingFeedbackId(client: PoolClient, id: string): Promise<bigint | null> {
-  const { rows } = await client.query(
-    `SELECT feedback_id::text AS feedback_id FROM feedbacks WHERE id = $1 LIMIT 1`,
-    [id]
-  );
-  return toNullableBigInt(rows[0]?.feedback_id);
-}
-
-async function fetchNextFeedbackId(client: PoolClient, assetId: string): Promise<bigint> {
-  const { rows } = await client.query(
-    `SELECT MAX(feedback_id)::text AS max_id
-     FROM feedbacks
-     WHERE asset = $1 AND feedback_id IS NOT NULL`,
-    [assetId]
-  );
-  return toBigInt(rows[0]?.max_id) + 1n;
-}
-
-async function fetchExistingResponseId(client: PoolClient, id: string): Promise<bigint | null> {
-  const { rows } = await client.query(
-    `SELECT response_id::text AS response_id FROM feedback_responses WHERE id = $1 LIMIT 1`,
-    [id]
-  );
-  return toNullableBigInt(rows[0]?.response_id);
-}
-
-async function fetchNextResponseId(
-  client: PoolClient,
-  assetId: string,
-  clientAddress: string,
-  feedbackIndex: bigint
-): Promise<bigint> {
-  const { rows } = await client.query(
-    `SELECT MAX(response_id)::text AS max_id
-     FROM feedback_responses
-     WHERE asset = $1
-       AND client_address = $2
-       AND feedback_index = $3
-       AND response_id IS NOT NULL`,
-    [assetId, clientAddress, feedbackIndex.toString()]
-  );
-  return toBigInt(rows[0]?.max_id) + 1n;
-}
-
-async function fetchExistingRevocationId(
-  client: PoolClient,
-  assetId: string,
-  clientAddress: string,
-  feedbackIndex: bigint
-): Promise<bigint | null> {
-  const { rows } = await client.query(
-    `SELECT revocation_id::text AS revocation_id
-     FROM revocations
-     WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
-     LIMIT 1`,
-    [assetId, clientAddress, feedbackIndex.toString()]
-  );
-  return toNullableBigInt(rows[0]?.revocation_id);
-}
-
-async function fetchNextRevocationId(client: PoolClient, assetId: string): Promise<bigint> {
-  const { rows } = await client.query(
-    `SELECT MAX(revocation_id)::text AS max_id
-     FROM revocations
-     WHERE asset = $1 AND revocation_id IS NOT NULL`,
-    [assetId]
-  );
-  return toBigInt(rows[0]?.max_id) + 1n;
-}
-
 // EventData type for batch event data - uses Record for type safety while allowing runtime values
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type EventData = Record<string, any>;
@@ -651,35 +517,17 @@ export class EventBuffer {
       ? Buffer.from(data.newFeedbackDigest)
       : null;
 
-    const feedbackIdAssignment = await withFeedbackIdAssignmentLock(async () => {
-      const existingFeedbackId = await fetchExistingFeedbackId(client, id);
-      if (existingFeedbackId !== null) {
-        return { feedbackId: existingFeedbackId, alreadyExists: true };
-      }
-      const nextFeedbackId = await fetchNextFeedbackId(client, asset);
-      return { feedbackId: nextFeedbackId, alreadyExists: false };
-    });
-    if (feedbackIdAssignment.alreadyExists) {
-      return;
-    }
-
     const insertResult = await client.query(`
       INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'PENDING')
       ON CONFLICT (id) DO NOTHING
-    `, [id, feedbackIdAssignment.feedbackId.toString(), asset, client_addr, feedbackIndex.toString(),
+    `, [id, null, asset, client_addr, feedbackIndex.toString(),
         data.value?.toString() || "0", data.valueDecimals || 0, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null,
         data.feedbackUri || null, feedbackHash, runningDigest,
         false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
 
     if (insertResult.rowCount === 0) {
-      await client.query(
-        `UPDATE feedbacks
-         SET feedback_id = COALESCE(feedback_id, $2::bigint)
-         WHERE id = $1`,
-        [id, feedbackIdAssignment.feedbackId.toString()]
-      );
       return;
     }
 
@@ -746,26 +594,10 @@ export class EventBuffer {
     const revokeSealHash = !isAllZeroHash(data.sealHash)
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
-    const assignedRevocationId = await withRevocationIdAssignmentLock(async () => {
-      if (isOrphan) return null;
-      const existingRevocationId = await fetchExistingRevocationId(
-        client,
-        asset,
-        client_addr,
-        feedbackIndex
-      );
-      if (existingRevocationId !== null) return existingRevocationId;
-      return fetchNextRevocationId(client, asset);
-    });
-
     await client.query(`
       INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
-        revocation_id = CASE
-          WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
-          ELSE COALESCE(revocations.revocation_id, EXCLUDED.revocation_id)
-        END,
         feedback_hash = EXCLUDED.feedback_hash,
         slot = EXCLUDED.slot,
         original_score = EXCLUDED.original_score,
@@ -777,7 +609,7 @@ export class EventBuffer {
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
         status = EXCLUDED.status
-    `, [id, assignedRevocationId?.toString() ?? null, asset, client_addr, feedbackIndex.toString(), revokeSealHash,
+    `, [id, null, asset, client_addr, feedbackIndex.toString(), revokeSealHash,
         (data.slot || ctx.slot).toString(), data.originalScore ?? null,
         data.atomEnabled || false, data.hadImpact || false,
         revokeDigest, (data.newRevokeCount || 0).toString(),
@@ -853,21 +685,10 @@ export class EventBuffer {
         "seal_hash mismatch: response sealHash does not match stored feedbackHash");
     }
     const responseStatus = sealMismatch ? "ORPHANED" : "PENDING";
-    const assignedResponseId = await withResponseIdAssignmentLock(async () => {
-      if (responseStatus === "ORPHANED") return null;
-      const existingResponseId = await fetchExistingResponseId(client, id);
-      if (existingResponseId !== null) return existingResponseId;
-      return fetchNextResponseId(client, asset, client_addr, feedbackIndex);
-    });
-
     await client.query(
       `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (id) DO UPDATE SET
-         response_id = CASE
-           WHEN EXCLUDED.status = 'ORPHANED' THEN NULL
-           ELSE COALESCE(feedback_responses.response_id, EXCLUDED.response_id)
-         END,
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
          running_digest = EXCLUDED.running_digest,
@@ -877,7 +698,7 @@ export class EventBuffer {
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
-      [id, assignedResponseId?.toString() ?? null, asset, client_addr, feedbackIndex.toString(), responder,
+      [id, null, asset, client_addr, feedbackIndex.toString(), responder,
         data.responseUri || "", responseHash, responseRunningDigest, responseCount.toString(),
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );

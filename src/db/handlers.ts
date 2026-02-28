@@ -1786,7 +1786,7 @@ async function handleFeedbackRevokedTx(
         eventOrdinal: ctx.eventOrdinal ?? null,
         status: revokeStatus,
         ...(revokeStatus === "ORPHANED"
-          ? { revocationId: null }
+          ? {}
           : assignedRevocationId !== undefined
             ? { revocationId: assignedRevocationId }
             : {}),
@@ -1905,7 +1905,7 @@ async function handleFeedbackRevoked(
         eventOrdinal: ctx.eventOrdinal ?? null,
         status: revokeStatus,
         ...(revokeStatus === "ORPHANED"
-          ? { revocationId: null }
+          ? {}
           : assignedRevocationId !== undefined
             ? { revocationId: assignedRevocationId }
             : {}),
@@ -2039,7 +2039,7 @@ async function handleResponseAppendedTx(
       },
       update: {
         ...(responseStatus === "ORPHANED"
-          ? { responseId: null, status: responseStatus }
+          ? { status: responseStatus }
           : assignedResponseId !== undefined
             ? { responseId: assignedResponseId, status: responseStatus }
             : { status: responseStatus }),
@@ -2166,7 +2166,7 @@ async function handleResponseAppended(
       },
       update: {
         ...(responseStatus === "ORPHANED"
-          ? { responseId: null, status: responseStatus }
+          ? { status: responseStatus }
           : assignedResponseId !== undefined
             ? { responseId: assignedResponseId, status: responseStatus }
             : { status: responseStatus }),

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
   echo "Usage: $0 <image-repo> <tag> [cosign-key]"
-  echo "Example: $0 ghcr.io/quantulabs/8004-indexer-classic v1.6.0"
+  echo "Example: $0 ghcr.io/quantulabs/8004-indexer v1.6.0"
   exit 1
 fi
 

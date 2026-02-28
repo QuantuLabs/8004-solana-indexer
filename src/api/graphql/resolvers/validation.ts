@@ -19,7 +19,7 @@ export const validationResolvers = {
       return encodeValidationId(parent.asset, parent.validator, parent.nonce);
     },
     cursor(parent: ValidationRow) {
-      // Opaque cursor used by Query.validations(after: ...)
+      // Opaque pagination cursor.
       return Buffer.from(
         JSON.stringify({ created_at: parent.created_at, id: parent.id }),
         'utf-8'

@@ -83,13 +83,22 @@ async function main() {
 
   const wantsRest = config.apiMode !== "graphql";
   const wantsGraphql = config.apiMode !== "rest" && config.enableGraphql;
-  const canServeRest = wantsRest && !!prisma;
+  const hasSupabaseRestUrl = typeof config.supabaseUrl === "string" && config.supabaseUrl.trim().length > 0;
+  const hasSupabaseKey = typeof config.supabaseKey === "string" && config.supabaseKey.trim().length > 0;
+  const restProxyMissingKey = wantsRest && !prisma && !!pool && hasSupabaseRestUrl && !hasSupabaseKey;
+  const restProxyEnabled = wantsRest && !prisma && !!pool && hasSupabaseRestUrl && hasSupabaseKey;
+  const canServeRest = wantsRest && (!!prisma || restProxyEnabled);
   const canServeGraphql = wantsGraphql && !!pool;
 
-  if (config.apiMode === "rest" && !prisma) {
+  if (config.apiMode === "rest" && !canServeRest) {
     logger.fatal(
-      { apiMode: config.apiMode, dbMode: config.dbMode },
-      "REST mode requires DB_MODE=local (Prisma)"
+      {
+        apiMode: config.apiMode,
+        dbMode: config.dbMode,
+        hasSupabaseUrl: hasSupabaseRestUrl,
+        hasSupabaseKey,
+      },
+      "REST mode requires Prisma (DB_MODE=local) or Supabase PostgREST proxy auth (SUPABASE_URL + SUPABASE_KEY, or POSTGREST_URL + POSTGREST_TOKEN)"
     );
     process.exit(1);
   }
@@ -102,10 +111,19 @@ async function main() {
     process.exit(1);
   }
 
-  if (config.apiMode === "both" && wantsRest && !prisma) {
+  if (config.apiMode === "both" && wantsRest && !canServeRest) {
     logger.warn(
-      { apiMode: config.apiMode, dbMode: config.dbMode },
-      "REST disabled in API_MODE=both because Prisma is unavailable"
+      {
+        apiMode: config.apiMode,
+        dbMode: config.dbMode,
+        hasPool: !!pool,
+        hasSupabaseUrl: hasSupabaseRestUrl,
+        hasSupabaseKey,
+        restProxyMissingKey,
+      },
+      restProxyMissingKey
+        ? "REST disabled in API_MODE=both because SUPABASE_KEY (or POSTGREST_TOKEN) is missing for Supabase REST proxy"
+        : "REST disabled in API_MODE=both because no REST backend is available"
     );
   }
 
@@ -126,6 +144,7 @@ async function main() {
         apiPort,
         apiMode: config.apiMode,
         restEnabled: canServeRest,
+        restProxyEnabled,
         graphqlEnabled: canServeGraphql,
       },
       "API available"

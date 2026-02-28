@@ -30,8 +30,8 @@ FROM base AS runner
 ARG INDEXER_VERSION=dev
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
-LABEL org.opencontainers.image.title="8004 Solana Indexer (Classic)" \
-      org.opencontainers.image.description="Solana 8004 classic indexer with GraphQL/REST API" \
+LABEL org.opencontainers.image.title="8004 Solana Indexer" \
+      org.opencontainers.image.description="Solana 8004 indexer with GraphQL/REST API" \
       org.opencontainers.image.version="${INDEXER_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"

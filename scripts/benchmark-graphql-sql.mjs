@@ -194,6 +194,7 @@ const tests = [
             (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
             (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
             (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations,
+            (SELECT COUNT(*)::text FROM collections WHERE status != 'ORPHANED') AS total_collections,
             COALESCE((
               SELECT ARRAY(
                 SELECT tag FROM (

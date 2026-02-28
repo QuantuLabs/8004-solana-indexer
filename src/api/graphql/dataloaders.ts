@@ -137,9 +137,6 @@ export interface AgentStatsRow {
   asset: string;
   feedback_count: string;
   avg_value: string | null;
-  validation_count: string;
-  completed_validations: string;
-  avg_validation_score: string | null;
   last_activity: string | null;
 }
 
@@ -643,24 +640,13 @@ function createAgentStatsByAgentLoader(pool: Pool) {
          a.asset,
          COALESCE(f.cnt, 0)::text as feedback_count,
          f.avg_val::text as avg_value,
-         COALESCE(v.cnt, 0)::text as validation_count,
-         COALESCE(v.completed, 0)::text as completed_validations,
-         v.avg_score::text as avg_validation_score,
-         GREATEST(f.last_fb, v.last_val)::text as last_activity
+         f.last_fb::text as last_activity
        FROM (SELECT unnest($1::text[]) as asset) a
        LEFT JOIN (
          SELECT asset, COUNT(*) as cnt, AVG(value::numeric / POWER(10, COALESCE(value_decimals, 0))) as avg_val, MAX(created_at) as last_fb
          FROM feedbacks WHERE asset = ANY($1::text[]) AND NOT is_revoked AND status != 'ORPHANED'
          GROUP BY asset
-       ) f ON f.asset = a.asset
-       LEFT JOIN (
-         SELECT asset, COUNT(*) as cnt,
-                COUNT(*) FILTER (WHERE response IS NOT NULL) as completed,
-                AVG(response) FILTER (WHERE response IS NOT NULL) as avg_score,
-                MAX(created_at) as last_val
-         FROM validations WHERE asset = ANY($1::text[]) AND chain_status != 'ORPHANED'
-         GROUP BY asset
-       ) v ON v.asset = a.asset`,
+       ) f ON f.asset = a.asset`,
       [keys as string[]]
     );
     const map = new Map(rows.map(r => [r.asset, r]));

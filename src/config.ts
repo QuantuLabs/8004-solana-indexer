@@ -18,6 +18,20 @@ const VALID_SOLANA_NETWORKS: SolanaNetwork[] = ["devnet", "mainnet-beta", "testn
 const DEFAULT_IPFS_GATEWAY_BASE = "https://ipfs.io";
 const TRUSTED_LOCAL_URI_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
+function resolvePreferredEnv(primaryKey: string, aliasKey: string): string | undefined {
+  const primaryValue = process.env[primaryKey];
+  if (typeof primaryValue === "string" && primaryValue.trim().length > 0) {
+    return primaryValue;
+  }
+
+  const aliasValue = process.env[aliasKey];
+  if (typeof aliasValue === "string" && aliasValue.trim().length > 0) {
+    return aliasValue;
+  }
+
+  return undefined;
+}
+
 function parseSolanaNetwork(value: string | undefined): SolanaNetwork {
   const network = (value || "devnet").trim().toLowerCase();
   if (!VALID_SOLANA_NETWORKS.includes(network as SolanaNetwork)) {
@@ -59,6 +73,8 @@ function defaultWsUrlForNetwork(network: SolanaNetwork): string {
 const resolvedSolanaNetwork = parseSolanaNetwork(process.env.SOLANA_NETWORK);
 const resolvedIpfsGatewayBase = parseIpfsGatewayBase(process.env.IPFS_GATEWAY_BASE);
 const resolvedUriDigestTrustedHosts = parseUriDigestTrustedHosts(process.env.URI_DIGEST_TRUSTED_HOSTS);
+const resolvedSupabaseUrl = resolvePreferredEnv("SUPABASE_URL", "POSTGREST_URL");
+const resolvedSupabaseKey = resolvePreferredEnv("SUPABASE_KEY", "POSTGREST_TOKEN");
 
 function parseDbMode(value: string | undefined): DbMode {
   const mode = value || "local";
@@ -227,8 +243,8 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL || "file:./data/indexer.db",
 
   // Supabase (production)
-  supabaseUrl: process.env.SUPABASE_URL,
-  supabaseKey: process.env.SUPABASE_KEY, // service_role key for writes
+  supabaseUrl: resolvedSupabaseUrl, // SUPABASE_URL preferred, POSTGREST_URL supported as alias
+  supabaseKey: resolvedSupabaseKey, // SUPABASE_KEY preferred, POSTGREST_TOKEN supported as alias
   supabaseDsn: process.env.SUPABASE_DSN, // PostgreSQL DSN for direct pg connection
   supabaseSslVerify: process.env.SUPABASE_SSL_VERIFY !== "false", // default: verify SSL certs
 

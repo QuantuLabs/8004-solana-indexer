@@ -33,16 +33,40 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("ON revocations(asset, slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);");
   });
 
+  it("hardens scoped sequential IDs at DB layer with trigger assignment", () => {
+    expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_feedback_id()");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_response_id()");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
+    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('feedback:' || NEW.asset, 0));");
+    expect(schemaSql).toContain("'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('revocation:' || NEW.asset, 0));");
+    expect(schemaSql).toContain("CREATE TRIGGER trg_assign_agent_id");
+    expect(schemaSql).toContain("BEFORE INSERT OR UPDATE ON agents");
+    expect(schemaSql).toContain("CREATE TRIGGER trg_assign_feedback_id");
+    expect(schemaSql).toContain("CREATE TRIGGER trg_assign_response_id");
+    expect(schemaSql).toContain("CREATE TRIGGER trg_assign_revocation_id");
+  });
+
   it("includes revocations in verification stats and RLS policy", () => {
     expect(schemaSql).toContain("'revocations' AS model");
     expect(schemaSql).toContain("FROM revocations");
     expect(schemaSql).toContain("ALTER TABLE revocations ENABLE ROW LEVEL SECURITY;");
     expect(schemaSql).toContain('CREATE POLICY "Public read revocations" ON revocations FOR SELECT USING (true);');
+    expect(schemaSql).toContain("GRANT SELECT ON global_stats TO anon;");
+    expect(schemaSql).toContain("GRANT SELECT ON global_stats TO authenticated;");
   });
 
   it("enforces non-orphan scoped IDs as non-null invariants", () => {
     expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR feedback_id IS NOT NULL)");
     expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR response_id IS NOT NULL)");
     expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR revocation_id IS NOT NULL)");
+  });
+
+  it("excludes BASE registry rows from global_stats total_collections", () => {
+    expect(schemaSql).toContain("CREATE OR REPLACE VIEW global_stats");
+    expect(schemaSql).toContain(
+      "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+    );
   });
 });

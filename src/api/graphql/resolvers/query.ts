@@ -114,7 +114,7 @@ interface AgentTreeNodeRow {
 interface AggregatedStats {
   totalAgents: string;
   totalFeedback: string;
-  totalValidations: string;
+  totalCollections: string;
   tags: string[];
 }
 
@@ -228,13 +228,16 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
   const { rows } = await ctx.pool.query<{
     total_agents: string;
     total_feedback: string;
-    total_validations: string;
+    total_collections: string;
     tags: string[] | null;
   }>(
     `SELECT
        (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
        (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
-       (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations,
+       (SELECT COUNT(*)::text
+        FROM collections
+        WHERE status != 'ORPHANED'
+          AND registry_type != 'BASE') AS total_collections,
        COALESCE((
          SELECT ARRAY(
            SELECT tag FROM (
@@ -251,7 +254,7 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
   return {
     totalAgents: rows[0]?.total_agents ?? '0',
     totalFeedback: rows[0]?.total_feedback ?? '0',
-    totalValidations: rows[0]?.total_validations ?? '0',
+    totalCollections: rows[0]?.total_collections ?? '0',
     tags: rows[0]?.tags ?? [],
   };
 }
@@ -288,12 +291,7 @@ async function loadAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStats
     return cached.value;
   }
 
-  if (cached) {
-    // Serve stale result immediately and refresh asynchronously.
-    void refreshAggregatedStats(cacheKey, ctx).catch(() => undefined);
-    return cached.value;
-  }
-
+  // Cache miss or expired cache: refresh synchronously to avoid stale stats reads.
   return refreshAggregatedStats(cacheKey, ctx);
 }
 
@@ -732,25 +730,6 @@ export const queryResolvers = {
       return rows;
     },
 
-    async validation(_: unknown, _args: { id: string }, _ctx: GraphQLContext) {
-      // Validation module is archived in agent-registry-8004 (v0.5.0+).
-      // Keep schema field for backward compatibility, but return no rows.
-      return null;
-    },
-
-    async validations(
-      _: unknown,
-      _args: {
-        first?: number; skip?: number; after?: string;
-        where?: Record<string, unknown>;
-      },
-      _ctx: GraphQLContext
-    ) {
-      // Validation module is archived in agent-registry-8004 (v0.5.0+).
-      // Keep schema field for backward compatibility, but return no rows.
-      return [];
-    },
-
     async agentMetadatas(
       _: unknown,
       args: {
@@ -788,7 +767,6 @@ export const queryResolvers = {
         id: args.id,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
-        totalValidations: stats.totalValidations,
         tags: stats.tags,
       };
     },
@@ -802,14 +780,13 @@ export const queryResolvers = {
       return proto ? [proto] : [];
     },
 
-    async globalStats(_: unknown, args: { id: string }, ctx: GraphQLContext) {
+    async globalStats(_: unknown, _args: Record<string, never>, ctx: GraphQLContext) {
       const stats = await loadAggregatedStats(ctx);
       return {
-        id: args.id,
+        id: `global-${ctx.networkMode}`,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
-        totalValidations: stats.totalValidations,
-        totalProtocols: '1',
+        totalCollections: stats.totalCollections,
         tags: stats.tags,
       };
     },

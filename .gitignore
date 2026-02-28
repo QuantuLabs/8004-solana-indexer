@@ -16,7 +16,7 @@ docs/SECURITY_AUDIT.md
 REORG_RESILIENCE_PLAN.md
 deploy/PRODUCTION_PLAN.md
 docs/INTEGRITY-SUIVI.md
-docs/e2e-classic-indexer-runlog.md
+docs/e2e-indexer-runlog.md
 
 # IDE
 .vscode/

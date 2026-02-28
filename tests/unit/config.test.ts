@@ -39,6 +39,8 @@ describe("Config", () => {
       delete process.env.URI_DIGEST_TRUSTED_HOSTS;
       delete process.env.INDEXER_START_SIGNATURE;
       delete process.env.INDEXER_START_SLOT;
+      delete process.env.POSTGREST_URL;
+      delete process.env.POSTGREST_TOKEN;
 
       const { config } = await import("../../src/config.js");
 
@@ -98,6 +100,30 @@ describe("Config", () => {
       expect(config.uriDigestTrustedHosts).toEqual(["localhost", "127.0.0.1"]);
       expect(config.indexerStartSignature).toBe("env-start-signature");
       expect(config.indexerStartSlot).toBe(123456789n);
+    });
+
+    it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {
+      delete process.env.SUPABASE_URL;
+      delete process.env.SUPABASE_KEY;
+      process.env.POSTGREST_URL = "https://proxy-alias.supabase.co";
+      process.env.POSTGREST_TOKEN = "alias-service-role-key";
+
+      const { config } = await import("../../src/config.js");
+
+      expect(config.supabaseUrl).toBe("https://proxy-alias.supabase.co");
+      expect(config.supabaseKey).toBe("alias-service-role-key");
+    });
+
+    it("should prioritize SUPABASE_* over POSTGREST_* aliases when both are set", async () => {
+      process.env.SUPABASE_URL = "https://primary.supabase.co";
+      process.env.SUPABASE_KEY = "primary-key";
+      process.env.POSTGREST_URL = "https://alias.supabase.co";
+      process.env.POSTGREST_TOKEN = "alias-key";
+
+      const { config } = await import("../../src/config.js");
+
+      expect(config.supabaseUrl).toBe("https://primary.supabase.co");
+      expect(config.supabaseKey).toBe("primary-key");
     });
 
     it("should support websocket mode", async () => {

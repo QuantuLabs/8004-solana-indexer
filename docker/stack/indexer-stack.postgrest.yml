@@ -1,0 +1,25 @@
+services:
+  indexer:
+    environment:
+      API_MODE: ${API_MODE:-both}
+      POSTGREST_URL: ${POSTGREST_URL:-http://postgrest:3000}
+      POSTGREST_TOKEN: ${POSTGREST_TOKEN:?set POSTGREST_TOKEN}
+    depends_on:
+      - postgrest
+
+  postgrest:
+    profiles:
+      - postgrest
+    image: ${POSTGREST_IMAGE:-postgrest/postgrest:v12.2.8}
+    container_name: 8004-postgrest
+    restart: unless-stopped
+    ports:
+      - "${POSTGREST_PORT:-3002}:3000"
+    environment:
+      PGRST_DB_URI: ${PGRST_DB_URI:?set PGRST_DB_URI}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public}
+      PGRST_DB_ANON_ROLE: ${PGRST_DB_ANON_ROLE:?set PGRST_DB_ANON_ROLE}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public}
+      PGRST_JWT_SECRET: ${PGRST_JWT_SECRET:?set PGRST_JWT_SECRET}
+      PGRST_SERVER_PORT: 3000
+      PGRST_LOG_LEVEL: ${PGRST_LOG_LEVEL:-info}

@@ -1,4 +1,4 @@
-name: 8004-classic-ci
+name: 8004-indexer-ci
 
 services:
   tests:

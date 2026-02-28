@@ -58,7 +58,7 @@ const ACTIVE_RESPONSE = {
 const ACTIVE_STATS = {
   totalAgents: 1,
   totalFeedback: 1,
-  totalValidations: 2,
+  totalCollections: 1,
 };
 
 function toUnixSeconds(value: string | Date): string {
@@ -158,9 +158,6 @@ function makePrismaStub() {
     registry: {
       count: vi.fn().mockResolvedValue(1),
     },
-    validation: {
-      count: vi.fn().mockResolvedValue(ACTIVE_STATS.totalValidations),
-    },
   };
 }
 
@@ -244,13 +241,17 @@ function makePoolStub() {
           ],
         };
       }
-      if (sql.includes("total_agents") && sql.includes("total_feedback") && sql.includes("total_validations")) {
+      if (
+        sql.includes("total_agents")
+        && sql.includes("total_feedback")
+        && sql.includes("total_collections")
+      ) {
         return {
           rows: [
             {
               total_agents: String(ACTIVE_STATS.totalAgents),
               total_feedback: String(ACTIVE_STATS.totalFeedback),
-              total_validations: String(ACTIVE_STATS.totalValidations),
+              total_collections: String(ACTIVE_STATS.totalCollections),
               tags: [ACTIVE_FEEDBACK.tag1, ACTIVE_FEEDBACK.tag2],
             },
           ],
@@ -442,10 +443,10 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
                   responseCount
                 }
               }
-              globalStats(id: "stats") {
+              globalStats {
                 totalAgents
                 totalFeedback
-                totalValidations
+                totalCollections
               }
             }
           `,
@@ -548,13 +549,13 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       const restStatsCanonical = {
         totalAgents: String(restStatsBody?.[0]?.total_agents ?? 0),
         totalFeedback: String(restStatsBody?.[0]?.total_feedbacks ?? 0),
-        totalValidations: String(restStatsBody?.[0]?.total_validations ?? 0),
+        totalCollections: String(restStatsBody?.[0]?.total_collections ?? 0),
       };
 
       const gqlStatsCanonical = {
         totalAgents: String(gqlBody?.data?.globalStats?.totalAgents ?? 0),
         totalFeedback: String(gqlBody?.data?.globalStats?.totalFeedback ?? 0),
-        totalValidations: String(gqlBody?.data?.globalStats?.totalValidations ?? 0),
+        totalCollections: String(gqlBody?.data?.globalStats?.totalCollections ?? 0),
       };
 
       expect(gqlAgentsCanonical).toEqual(restAgentsCanonical);
@@ -590,6 +591,12 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
           }),
         })
       );
+      expect(prisma.registry.count).toHaveBeenCalledWith({
+        where: {
+          status: { not: "ORPHANED" },
+          registryType: { not: "Base" },
+        },
+      });
 
       const gqlAgentsCall = (pool.query as any).mock.calls.find(
         (call: unknown[]) => typeof call[0] === "string" && (call[0] as string).includes("FROM agents a")
@@ -617,6 +624,15 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       );
       expect(gqlResponsesCall).toBeDefined();
       expect(gqlResponsesCall[0]).toContain("status != 'ORPHANED'");
+
+      const gqlStatsCall = (pool.query as any).mock.calls.find(
+        (call: unknown[]) =>
+          typeof call[0] === "string" &&
+          (call[0] as string).includes("total_collections") &&
+          (call[0] as string).includes("FROM collections")
+      );
+      expect(gqlStatsCall).toBeDefined();
+      expect(gqlStatsCall[0]).toContain("registry_type != 'BASE'");
     } finally {
       await stopServer(server);
     }

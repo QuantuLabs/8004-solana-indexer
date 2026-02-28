@@ -84,7 +84,9 @@ ATOM_ENGINE_PROGRAM_ID=AToMufS4QD6hEXvcvBDg9m1AHeCLpmZQsyfYa5h9MwAF
 Notes:
 
 - GraphQL requires `DB_MODE=supabase` (recommended `API_MODE=graphql`).
-- REST v1 requires `DB_MODE=local` (Prisma; recommended `API_MODE=rest`).
+- REST v1 works with:
+  - `DB_MODE=local` (Prisma), or
+  - `DB_MODE=supabase` with PostgREST proxy auth (`SUPABASE_URL` + `SUPABASE_KEY`, or `POSTGREST_URL` + `POSTGREST_TOKEN`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
 - `.env.devnet.example` includes current devnet bootstrap cursor (`INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`).
 - `.env.mainnet.example` is a template: set mainnet `PROGRAM_ID` plus mainnet deployment signature/slot.
@@ -100,7 +102,7 @@ Notes:
 - `IPFS_GATEWAY_BASE` sets the gateway base used for `ipfs://` URI digest fetches and canonical collection pointer (`c1:<cid>`) fetches (default `https://ipfs.io`).
 - `URI_DIGEST_TRUSTED_HOSTS` is optional and only accepts `localhost`/`127.0.0.1` to allow local IPFS gateway tests without disabling SSRF protections globally.
 - Validation module is archived on-chain in v0.5.0+; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
-- Validation API surface remains archived/deprecated: REST `/rest/v1/validations` returns `410`, and GraphQL `validation`/`validations` return `null`/`[]` for backward compatibility.
+- Validation entity endpoints are removed from the public API surface: REST exposes no `/rest/v1/validations` route and GraphQL exposes no `validation`/`validations` query fields.
 
 ## Commands
 
@@ -128,13 +130,13 @@ Build local image:
 ```bash
 docker build \
   --build-arg INDEXER_VERSION=$(node -p "require('./package.json').version") \
-  -t 8004-indexer-classic:local .
+  -t 8004-indexer:local .
 ```
 
 Run local smoke container:
 
 ```bash
-docker run --rm -p 3001:3001 --env-file .env 8004-indexer-classic:local
+docker run --rm -p 3001:3001 --env-file .env 8004-indexer:local
 ```
 
 CI test target in Docker:
@@ -146,15 +148,53 @@ npm run test:docker:ci
 Runtime stack (digest-pin friendly):
 
 ```bash
-docker compose -f docker/stack/classic-stack.yml up -d
+docker compose -f docker/stack/indexer-stack.yml up -d
+```
+
+Optional PostgREST sidecar (local PostgreSQL REST, default stack unchanged):
+
+```bash
+cp docker/stack/postgrest.env.example .env.postgrest
+# edit .env.postgrest with your local PostgreSQL DSN/role/secret
+
+# generate a local POSTGREST_TOKEN (HS256 JWT with role=web_anon by default)
+node -e 'const c=require("crypto");const enc=(o)=>Buffer.from(JSON.stringify(o)).toString("base64url");const secret=process.env.SECRET||"replace-with-random-secret";const payload={role:"web_anon",iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+315360000};const token=enc({alg:"HS256",typ:"JWT"})+"."+enc(payload);const sig=c.createHmac("sha256",secret).update(token).digest("base64url");console.log(token+"."+sig)'
+
+docker compose \
+  --env-file .env \
+  --env-file .env.postgrest \
+  -f docker/stack/indexer-stack.yml \
+  -f docker/stack/indexer-stack.postgrest.yml \
+  --profile postgrest up -d
+```
+
+PostgREST endpoint:
+
+```text
+http://localhost:3002
+```
+
+Indexer endpoint remains unchanged:
+
+```text
+http://localhost:3001/rest/v1/*
+```
+
+Minimum PostgreSQL grants for `PGRST_DB_ANON_ROLE` (example role `web_anon`):
+
+```sql
+create role web_anon nologin;
+grant usage on schema public to web_anon;
+grant select on all tables in schema public to web_anon;
+alter default privileges in schema public grant select on tables to web_anon;
 ```
 
 Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.3 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer-classic v1.7.3
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.7.3 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.7.3
 ```
 
 ## GraphQL Example

@@ -18,15 +18,6 @@ export const statsResolvers = {
     averageFeedbackValue(parent: AgentStatsRow) {
       return parent.avg_value;
     },
-    totalValidations(parent: AgentStatsRow) {
-      return parent.validation_count;
-    },
-    completedValidations(parent: AgentStatsRow) {
-      return parent.completed_validations;
-    },
-    averageValidationScore(parent: AgentStatsRow) {
-      return parent.avg_validation_score;
-    },
     lastActivity(parent: AgentStatsRow) {
       return toUnixTimestamp(parent.last_activity);
     },
@@ -36,7 +27,6 @@ export const statsResolvers = {
     id(parent: { id: string }) { return parent.id; },
     totalAgents(parent: { totalAgents: string }) { return parent.totalAgents; },
     totalFeedback(parent: { totalFeedback: string }) { return parent.totalFeedback; },
-    totalValidations(parent: { totalValidations: string }) { return parent.totalValidations; },
     tags(parent: { tags: string[] }) { return parent.tags; },
   },
 
@@ -44,8 +34,7 @@ export const statsResolvers = {
     id(parent: { id: string }) { return parent.id; },
     totalAgents(parent: { totalAgents: string }) { return parent.totalAgents; },
     totalFeedback(parent: { totalFeedback: string }) { return parent.totalFeedback; },
-    totalValidations(parent: { totalValidations: string }) { return parent.totalValidations; },
-    totalProtocols(parent: { totalProtocols: string }) { return parent.totalProtocols; },
+    totalCollections(parent: { totalCollections: string }) { return parent.totalCollections; },
     tags(parent: { tags: string[] }) { return parent.tags; },
   },
 };

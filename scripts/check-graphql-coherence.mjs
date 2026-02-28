@@ -89,10 +89,11 @@ async function main() {
     const countData = await gql(
       url,
       `query {
-        globalStats(id: "global") {
+        globalStats {
           totalAgents
           totalFeedback
           totalValidations
+          totalCollections
         }
       }`
     );
@@ -101,12 +102,19 @@ async function main() {
       `SELECT
          (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
          (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
-         (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations`
+         (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations,
+         (SELECT COUNT(*)::text FROM collections WHERE status != 'ORPHANED') AS total_collections`
     );
 
     const g = countData.globalStats;
     const s = sqlCounts.rows[0];
-    if (!g || g.totalAgents !== s.total_agents || g.totalFeedback !== s.total_feedback || g.totalValidations !== s.total_validations) {
+    if (
+      !g
+      || g.totalAgents !== s.total_agents
+      || g.totalFeedback !== s.total_feedback
+      || g.totalValidations !== s.total_validations
+      || g.totalCollections !== s.total_collections
+    ) {
       throw new Error(`Count mismatch GraphQL vs SQL: gql=${JSON.stringify(g)} sql=${JSON.stringify(s)}`);
     }
 
@@ -161,7 +169,7 @@ async function main() {
     const perfResults = {
       globalStats: await runPerf(
         url,
-        `query { globalStats(id: "global") { totalAgents totalFeedback totalValidations tags } }`,
+        `query { globalStats { totalAgents totalFeedback totalValidations totalCollections tags } }`,
         {}
       ),
       agentsPage: await runPerf(

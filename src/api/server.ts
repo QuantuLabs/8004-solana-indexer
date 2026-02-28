@@ -1,9 +1,10 @@
 /**
- * REST API Server for local mode
- * Exposes endpoints compatible with Supabase PostgREST API format
+ * API server:
+ * - Local mode: native REST handlers backed by Prisma
+ * - Supabase mode: optional REST proxy passthrough + GraphQL endpoint
  */
 
-import express, { Express, Request, Response } from 'express';
+import express, { Express, NextFunction, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { LRUCache } from 'lru-cache';
 import { Server } from 'http';
@@ -395,14 +396,134 @@ function isInvalidStatus(filter: ReturnType<typeof buildStatusFilter>): filter i
   return filter !== undefined && '_invalid' in filter;
 }
 
+const PROXY_RESPONSE_HEADER_ALLOWLIST = [
+  'content-type',
+  'content-range',
+  'content-location',
+  'location',
+  'etag',
+  'cache-control',
+  'preference-applied',
+] as const;
+
+const PROXY_REQUEST_HEADER_BLOCKLIST = new Set([
+  'host',
+  'content-length',
+  'connection',
+  'transfer-encoding',
+  'upgrade',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+]);
+
+function resolveSupabaseRestBaseUrl(): string | null {
+  const supabaseRaw = typeof process.env.SUPABASE_URL === 'string' ? process.env.SUPABASE_URL.trim() : '';
+  if (supabaseRaw) {
+    const normalized = supabaseRaw.replace(/\/+$/, '');
+    return normalized.endsWith('/rest/v1') ? normalized : `${normalized}/rest/v1`;
+  }
+
+  // PostgREST alias points directly to a PostgREST base URL (no forced /rest/v1 suffix).
+  const postgrestRaw = typeof process.env.POSTGREST_URL === 'string' ? process.env.POSTGREST_URL.trim() : '';
+  if (postgrestRaw) {
+    return postgrestRaw.replace(/\/+$/, '');
+  }
+
+  if (!config.supabaseUrl) return null;
+  const trimmed = config.supabaseUrl.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/\/+$/, '');
+  return normalized.endsWith('/rest/v1') ? normalized : `${normalized}/rest/v1`;
+}
+
+const ARCHIVED_VALIDATIONS_ERROR =
+  'Validation endpoints are archived and no longer exposed. /rest/v1/validations has been retired.';
+
+const REST_PROXY_PATH_ALLOWLIST = [
+  '/agents',
+  '/feedbacks',
+  '/responses',
+  '/feedback_responses',
+  '/revocations',
+  '/collections',
+  '/collection_stats',
+  '/stats',
+  '/global_stats',
+  '/metadata',
+  '/leaderboard',
+] as const;
+
+const REST_PROXY_LOCAL_COMPAT_PATHS = [
+  '/collection_asset_count',
+  '/collection_assets',
+] as const;
+
+function isAllowedRestProxyPath(pathname: string): boolean {
+  return REST_PROXY_PATH_ALLOWLIST.some((allowed) => pathname === allowed || pathname.startsWith(`${allowed}/`));
+}
+
+function isLocalRestCompatPath(pathname: string): boolean {
+  return REST_PROXY_LOCAL_COMPAT_PATHS.some((allowed) => pathname === allowed || pathname.startsWith(`${allowed}/`));
+}
+
+function hasUnsafeRestProxyPath(pathname: string): boolean {
+  const lowered = pathname.toLowerCase();
+  return (
+    pathname.includes("..") ||
+    lowered.includes("%2e") ||
+    lowered.includes("%2f") ||
+    lowered.includes("%5c")
+  );
+}
+
+function buildSupabaseProxyHeaders(req: Request): Headers {
+  const upstreamHeaders = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    const lowerName = name.toLowerCase();
+    if (!value || PROXY_REQUEST_HEADER_BLOCKLIST.has(lowerName)) continue;
+    if (Array.isArray(value)) {
+      upstreamHeaders.set(name, value.join(','));
+    } else {
+      upstreamHeaders.set(name, value);
+    }
+  }
+
+  if (!upstreamHeaders.has('apikey') && config.supabaseKey) {
+    upstreamHeaders.set('apikey', config.supabaseKey);
+  }
+  if (!upstreamHeaders.has('authorization') && config.supabaseKey) {
+    upstreamHeaders.set('authorization', `Bearer ${config.supabaseKey}`);
+  }
+
+  return upstreamHeaders;
+}
+
+function parseContentRangeTotal(contentRange: string | null): number | null {
+  if (!contentRange) return null;
+  const match = contentRange.match(/\/(\d+)$/);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 export function createApiServer(options: ApiServerOptions): Express {
   const wantsRest = config.apiMode !== 'graphql';
   const wantsGraphql = config.apiMode !== 'rest' && config.enableGraphql;
-  const restEnabled = wantsRest && !!options.prisma;
+  const supabaseRestBaseUrl = resolveSupabaseRestBaseUrl();
+  const hasSupabaseKey = typeof config.supabaseKey === 'string' && config.supabaseKey.trim().length > 0;
+  const restProxyMissingKey = wantsRest && !options.prisma && !!options.pool && !!supabaseRestBaseUrl && !hasSupabaseKey;
+  const restProxyEnabled = wantsRest && !options.prisma && !!options.pool && !!supabaseRestBaseUrl && hasSupabaseKey;
+  const restEnabled = wantsRest && (!!options.prisma || restProxyEnabled);
   const graphqlEnabled = wantsGraphql && !!options.pool;
 
-  if (config.apiMode === 'rest' && !options.prisma) {
-    throw new Error('REST mode requires local Prisma client');
+  if (config.apiMode === 'rest' && !restEnabled) {
+    throw new Error(
+      'REST mode requires local Prisma client or Supabase PostgREST proxy auth (SUPABASE_URL + SUPABASE_KEY, or POSTGREST_URL + POSTGREST_TOKEN)'
+    );
   }
   if (config.apiMode === 'graphql' && !options.pool) {
     throw new Error('GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)');
@@ -482,7 +603,98 @@ export function createApiServer(options: ApiServerOptions): Express {
     legacyHeaders: false,
   });
 
-  if (!restEnabled) {
+  // Validation indexing API was archived. Keep this hard-block before any proxy/REST handlers.
+  app.all(/^\/rest\/v1\/validations(?:\/.*)?$/, (_req: Request, res: Response) => {
+    res.status(410).json({ error: ARCHIVED_VALIDATIONS_ERROR });
+  });
+
+  if (restProxyEnabled && supabaseRestBaseUrl) {
+    app.use('/rest/v1', async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const upstreamRawPath = req.url.startsWith('/') ? req.url : `/${req.url}`;
+        const [upstreamRawPathname, upstreamRawQuery = ''] = upstreamRawPath.split('?', 2);
+
+        const upstreamPathname = upstreamRawPathname === '/stats' ? '/global_stats' : upstreamRawPathname;
+        let upstreamQuery = upstreamRawQuery;
+        if (upstreamPathname === '/agents') {
+          const params = new URLSearchParams(upstreamRawQuery);
+          if (!params.has('status') && params.get('includeOrphaned') !== 'true') {
+            params.append('status', 'neq.ORPHANED');
+            upstreamQuery = params.toString();
+          }
+        }
+
+        const upstreamPath = upstreamQuery ? `${upstreamPathname}?${upstreamQuery}` : upstreamPathname;
+        if (isLocalRestCompatPath(upstreamPathname)) {
+          next();
+          return;
+        }
+
+        const method = req.method.toUpperCase();
+        if (method === 'OPTIONS') {
+          res.status(204).end();
+          return;
+        }
+        if (method !== 'GET' && method !== 'HEAD') {
+          res.status(405).json({ error: 'REST proxy is read-only. Mutating methods are disabled.' });
+          return;
+        }
+
+        const upstreamHeaders = buildSupabaseProxyHeaders(req);
+
+        let body: string | Buffer | Uint8Array | undefined;
+        if (method !== 'GET' && method !== 'HEAD') {
+          if (typeof req.body === 'string' || Buffer.isBuffer(req.body) || req.body instanceof Uint8Array) {
+            body = req.body;
+          } else if (req.body && typeof req.body === 'object') {
+            body = JSON.stringify(req.body);
+          } else if (req.readable) {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            if (chunks.length > 0) {
+              body = Buffer.concat(chunks);
+            }
+          }
+        }
+
+        if (hasUnsafeRestProxyPath(upstreamPathname)) {
+          res.status(403).json({ error: 'REST proxy path not allowed' });
+          return;
+        }
+        if (!isAllowedRestProxyPath(upstreamPathname)) {
+          res.status(403).json({ error: 'REST proxy path not allowed' });
+          return;
+        }
+        const upstreamUrl = `${supabaseRestBaseUrl}${upstreamPath}`;
+        const upstreamRes = await fetch(upstreamUrl, {
+          method,
+          headers: upstreamHeaders,
+          body: body as BodyInit | undefined,
+        });
+
+        for (const header of PROXY_RESPONSE_HEADER_ALLOWLIST) {
+          const value = upstreamRes.headers.get(header);
+          if (value) {
+            res.setHeader(header, value);
+          }
+        }
+
+        const payload = Buffer.from(await upstreamRes.arrayBuffer());
+        res.status(upstreamRes.status).send(payload);
+      } catch (error) {
+        logger.error({ error }, 'Supabase REST proxy request failed');
+        res.status(502).json({ error: 'Supabase REST backend unavailable' });
+      }
+    });
+  } else if (restProxyMissingKey) {
+    app.use('/rest/v1', (_req: Request, res: Response) => {
+      res.status(503).json({
+        error: 'REST proxy unavailable: SUPABASE_KEY (or POSTGREST_TOKEN) is not configured. Use /v2/graphql or set SUPABASE_KEY/POSTGREST_TOKEN.',
+      });
+    });
+  } else if (!restEnabled) {
     app.use('/rest/v1', (_req: Request, res: Response) => {
       res.status(410).json({ error: 'REST API disabled. Use GraphQL endpoint at /v2/graphql.' });
     });
@@ -1186,13 +1398,6 @@ export function createApiServer(options: ApiServerOptions): Express {
     }
   });
 
-  // GET /rest/v1/validations - disabled (validation module archived on-chain in v0.5.0+)
-  app.get('/rest/v1/validations', async (_req: Request, res: Response) => {
-    res.status(410).json({
-      error: 'Validation module is archived in agent-registry-8004 (v0.5.0+). Endpoint disabled.',
-    });
-  });
-
   // GET /rest/v1/collections - Canonical collections (creator + collection pointer key)
   app.get('/rest/v1/collections', async (req: Request, res: Response) => {
     try {
@@ -1249,6 +1454,62 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
 
+      if (!prisma) {
+        if (!restProxyEnabled || !supabaseRestBaseUrl) {
+          res.status(503).json({ error: 'Collection asset count unavailable without REST backend' });
+          return;
+        }
+
+        const params = new URLSearchParams();
+        params.set('select', 'asset');
+        params.set('limit', '1');
+        params.set('collection_pointer', `eq.${col}`);
+        if (creator) params.set('creator', `eq.${creator}`);
+
+        const status = parsePostgRESTValue(req.query.status);
+        const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+        if (status) params.set('status', `eq.${status}`);
+        else if (!includeOrphaned) params.set('status', 'neq.ORPHANED');
+
+        const upstreamHeaders = buildSupabaseProxyHeaders(req);
+        upstreamHeaders.set('prefer', 'count=exact');
+
+        const upstreamRes = await fetch(`${supabaseRestBaseUrl}/agents?${params.toString()}`, {
+          method: 'GET',
+          headers: upstreamHeaders,
+        });
+
+        for (const header of PROXY_RESPONSE_HEADER_ALLOWLIST) {
+          const value = upstreamRes.headers.get(header);
+          if (value) {
+            res.setHeader(header, value);
+          }
+        }
+
+        const payload = Buffer.from(await upstreamRes.arrayBuffer());
+        if (!upstreamRes.ok) {
+          res.status(upstreamRes.status).send(payload);
+          return;
+        }
+
+        let count = parseContentRangeTotal(upstreamRes.headers.get('content-range'));
+        if (count === null) {
+          try {
+            const parsed = JSON.parse(payload.toString('utf8'));
+            count = Array.isArray(parsed) ? parsed.length : 0;
+          } catch {
+            count = 0;
+          }
+        }
+
+        res.json({
+          collection: col,
+          creator: creator || null,
+          asset_count: count,
+        });
+        return;
+      }
+
       const where: Prisma.AgentWhereInput = { ...statusFilter, collectionPointer: col };
       if (creator) where.creator = creator;
 
@@ -1279,6 +1540,41 @@ export function createApiServer(options: ApiServerOptions): Express {
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+
+      if (!prisma) {
+        if (!restProxyEnabled || !supabaseRestBaseUrl) {
+          res.status(503).json({ error: 'Collection assets unavailable without REST backend' });
+          return;
+        }
+
+        const params = new URLSearchParams();
+        params.set('collection_pointer', `eq.${col}`);
+        if (creator) params.set('creator', `eq.${creator}`);
+        params.set('limit', String(limit));
+        params.set('offset', String(offset));
+        params.set('order', safeQueryString(req.query.order) || 'created_at.desc,id.desc');
+
+        const status = parsePostgRESTValue(req.query.status);
+        const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+        if (status) params.set('status', `eq.${status}`);
+        else if (!includeOrphaned) params.set('status', 'neq.ORPHANED');
+
+        const upstreamRes = await fetch(`${supabaseRestBaseUrl}/agents?${params.toString()}`, {
+          method: 'GET',
+          headers: buildSupabaseProxyHeaders(req),
+        });
+
+        for (const header of PROXY_RESPONSE_HEADER_ALLOWLIST) {
+          const value = upstreamRes.headers.get(header);
+          if (value) {
+            res.setHeader(header, value);
+          }
+        }
+
+        const payload = Buffer.from(await upstreamRes.arrayBuffer());
+        res.status(upstreamRes.status).send(payload);
         return;
       }
 
@@ -1471,24 +1767,21 @@ export function createApiServer(options: ApiServerOptions): Express {
       const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
       const agentWhere: Prisma.AgentWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
       const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
-      const registryWhere: Prisma.RegistryWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
-      const validationWhere: Prisma.ValidationWhereInput = includeOrphaned
-        ? {}
-        : { chainStatus: { not: 'ORPHANED' } };
+      const registryWhere: Prisma.RegistryWhereInput = includeOrphaned
+        ? { registryType: { not: 'Base' } }
+        : { status: { not: 'ORPHANED' }, registryType: { not: 'Base' } };
 
-      const [totalAgents, totalFeedbacks, totalRegistries, totalValidations] = await Promise.all([
+      const [totalAgents, totalFeedbacks, totalCollections] = await Promise.all([
         prisma.agent.count({ where: agentWhere }),
         prisma.feedback.count({ where: feedbackWhere }),
         prisma.registry.count({ where: registryWhere }),
-        prisma.validation.count({ where: validationWhere }),
       ]);
 
       // Return as array for SDK compatibility (PostgREST format)
       res.json([{
         total_agents: totalAgents,
         total_feedbacks: totalFeedbacks,
-        total_collections: totalRegistries,
-        total_validations: totalValidations,
+        total_collections: totalCollections,
       }]);
     } catch (error) {
       logger.error({ error }, 'Error fetching stats');
@@ -1501,10 +1794,9 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/stats/verification - Verification status stats
   app.get('/rest/v1/stats/verification', async (_req: Request, res: Response) => {
     try {
-      const [agents, feedbacks, validations, registries, metadata, responses] = await Promise.all([
+      const [agents, feedbacks, registries, metadata, responses] = await Promise.all([
         prisma.agent.groupBy({ by: ['status'], _count: true }),
         prisma.feedback.groupBy({ by: ['status'], _count: true }),
-        prisma.validation.groupBy({ by: ['chainStatus'], _count: true }),
         prisma.registry.groupBy({ by: ['status'], _count: true }),
         prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
         prisma.feedbackResponse.groupBy({ by: ['status'], _count: true }),
@@ -1522,7 +1814,6 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json({
         agents: toStatusMap(agents),
         feedbacks: toStatusMap(feedbacks),
-        validations: toStatusMap(validations),
         registries: toStatusMap(registries),
         metadata: toStatusMap(metadata),
         feedback_responses: toStatusMap(responses),

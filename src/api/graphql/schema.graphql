@@ -33,12 +33,6 @@ enum OrderDirection {
   desc
 }
 
-enum ValidationStatus {
-  PENDING
-  COMPLETED
-  EXPIRED
-}
-
 enum URIType {
   IPFS
   HTTP
@@ -119,12 +113,6 @@ input RevocationFilter {
   createdAt_lt: BigInt
 }
 
-input ValidationFilter {
-  agent: ID
-  validatorAddress: String
-  status: ValidationStatus
-}
-
 input AgentMetadataFilter {
   agent: ID
   key: String
@@ -162,7 +150,6 @@ type Agent {
     orderBy: FeedbackOrderBy
     orderDirection: OrderDirection
   ): [Feedback!]!
-  validations(first: Int = 100, skip: Int = 0): [Validation!]!
   metadata: [AgentMetadata!]!
   stats: AgentStats
   solana: SolanaAgentExtension
@@ -213,22 +200,6 @@ type Revocation {
   solana: SolanaRevocationExtension
 }
 
-type Validation {
-  id: ID!
-  cursor: String!
-  agent: Agent!
-  validatorAddress: String!
-  requestUri: String
-  requestHash: Bytes
-  response: Int
-  responseUri: String
-  responseHash: Bytes
-  tag: String
-  status: ValidationStatus!
-  createdAt: BigInt!
-  updatedAt: BigInt
-}
-
 type AgentMetadata {
   id: ID!
   agent: Agent!
@@ -241,9 +212,6 @@ type AgentStats {
   id: ID!
   totalFeedback: BigInt!
   averageFeedbackValue: BigDecimal
-  totalValidations: BigInt!
-  completedValidations: BigInt!
-  averageValidationScore: BigDecimal
   lastActivity: BigInt
 }
 
@@ -251,7 +219,6 @@ type Protocol {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
-  totalValidations: BigInt!
   tags: [String!]!
 }
 
@@ -259,8 +226,7 @@ type GlobalStats {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
-  totalValidations: BigInt!
-  totalProtocols: BigInt!
+  totalCollections: BigInt!
   tags: [String!]!
 }
 
@@ -433,13 +399,6 @@ type Query {
     orderBy: RevocationOrderBy
     orderDirection: OrderDirection
   ): [Revocation!]!
-  validation(id: ID!): Validation @deprecated(reason: "Validation module is archived in agent-registry-8004 (v0.5.0+).")
-  validations(
-    first: Int = 100
-    skip: Int = 0
-    after: String
-    where: ValidationFilter
-  ): [Validation!]! @deprecated(reason: "Validation module is archived in agent-registry-8004 (v0.5.0+).")
   agentMetadatas(
     first: Int = 100
     skip: Int = 0
@@ -448,7 +407,7 @@ type Query {
   agentStats(id: ID!): AgentStats
   protocol(id: ID!): Protocol
   protocols(first: Int = 10, skip: Int = 0): [Protocol!]!
-  globalStats(id: ID!): GlobalStats
+  globalStats: GlobalStats
   agentSearch(query: String!, first: Int = 20): [Agent!]!
   agentRegistrationFiles(
     first: Int = 100

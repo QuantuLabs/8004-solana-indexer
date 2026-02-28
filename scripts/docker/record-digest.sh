@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 <image-repo> <tag> <digest-file>"
-  echo "Example: $0 ghcr.io/quantulabs/8004-indexer-classic v1.6.0 docker/digests.yml"
+  echo "Example: $0 ghcr.io/quantulabs/8004-indexer v1.6.0 docker/digests.yml"
   exit 1
 fi
 

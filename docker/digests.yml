@@ -1,5 +1,5 @@
 images:
-  repository: ghcr.io/quantulabs/8004-indexer-classic
+  repository: ghcr.io/quantulabs/8004-indexer
   latest:
     version: ""
     digest: ""

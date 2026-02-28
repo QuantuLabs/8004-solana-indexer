@@ -126,6 +126,16 @@ function resolveIdArray(values: unknown): string[] | null {
   return resolved;
 }
 
+function normalizeSqlParam(value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeSqlParam(item));
+  }
+  return value;
+}
+
 export function buildWhereClause(
   entityType: 'agent' | 'feedback' | 'response' | 'revocation' | 'validation' | 'metadata',
   filter: Record<string, unknown> | undefined | null,
@@ -133,6 +143,9 @@ export function buildWhereClause(
 ): WhereClause {
   const conditions: string[] = [];
   const params: unknown[] = [];
+  const pushParam = (value: unknown): void => {
+    params.push(normalizeSqlParam(value));
+  };
   let idx = startParamIndex ?? 1;
 
   const allowedFilters = FILTER_MAP[entityType];
@@ -164,7 +177,9 @@ export function buildWhereClause(
           conditions.push(
             `asset = $${idx} AND client_address = $${idx + 1} AND feedback_index = $${idx + 2}::bigint`
           );
-          params.push(canonicalFeedbackRef.asset, canonicalFeedbackRef.client, canonicalFeedbackRef.index);
+          pushParam(canonicalFeedbackRef.asset);
+          pushParam(canonicalFeedbackRef.client);
+          pushParam(canonicalFeedbackRef.index);
           idx += 3;
           continue;
         }
@@ -177,7 +192,7 @@ export function buildWhereClause(
               AND f.feedback_index = feedback_responses.feedback_index
               AND f.feedback_id = $${idx}::bigint
           )`);
-          params.push(value);
+          pushParam(value);
           idx++;
         }
         continue;
@@ -203,19 +218,19 @@ export function buildWhereClause(
         if (resolved.length > MAX_IN_FILTER_VALUES) {
           const trimmed = resolved.slice(0, MAX_IN_FILTER_VALUES);
           conditions.push(`${cfg.dbColumn} = ANY($${idx}::text[])`);
-          params.push(trimmed);
+          pushParam(trimmed);
           idx++;
           continue;
         }
         conditions.push(`${cfg.dbColumn} = ANY($${idx}::text[])`);
-        params.push(resolved);
+        pushParam(resolved);
         idx++;
         continue;
       }
 
       if (cfg.operator === 'bool') {
         conditions.push(`${cfg.dbColumn} = $${idx}`);
-        params.push(Boolean(value));
+        pushParam(Boolean(value));
         idx++;
         continue;
       }
@@ -227,7 +242,7 @@ export function buildWhereClause(
           if (resolved === null) continue;
         }
         conditions.push(`${cfg.dbColumn} = $${idx}`);
-        params.push(resolved);
+        pushParam(resolved);
         idx++;
         continue;
       }
@@ -237,11 +252,11 @@ export function buildWhereClause(
 
       if (TIMESTAMP_OPERATORS.has(cfg.operator) && cfg.dbColumn.endsWith('_at')) {
         conditions.push(`${cfg.dbColumn} ${sqlOp} to_timestamp($${idx})`);
-        params.push(Number(value));
+        pushParam(Number(value));
         idx++;
       } else {
         conditions.push(`${cfg.dbColumn} ${sqlOp} $${idx}`);
-        params.push(value);
+        pushParam(value);
         idx++;
       }
     }
