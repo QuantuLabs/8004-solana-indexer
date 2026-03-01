@@ -62,6 +62,49 @@ jobs:
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
 
+      - name: Enforce canonical GHCR package visibility
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "GHCR_ADMIN_TOKEN secret is required to enforce public package visibility." >&2
+            exit 1
+          fi
+
+          owner="${{ github.repository_owner }}"
+          if gh api "orgs/${owner}" >/dev/null 2>&1; then
+            base="orgs/${owner}"
+          else
+            base="users/${owner}"
+          fi
+
+          gh api -X PATCH -H "Accept: application/vnd.github+json" \
+            "${base}/packages/container/8004-indexer/visibility" \
+            -f visibility=public >/dev/null
+          echo "Ensured package visibility: ghcr.io/${owner}/8004-indexer -> public"
+
+      - name: Delete legacy GHCR package alias
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          owner="${{ github.repository_owner }}"
+          if gh api "orgs/${owner}" >/dev/null 2>&1; then
+            base="orgs/${owner}"
+          else
+            base="users/${owner}"
+          fi
+
+          if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+            "${base}/packages/container/8004-indexer-classic" >/dev/null 2>&1; then
+            echo "Deleted legacy package ghcr.io/${owner}/8004-indexer-classic"
+          else
+            echo "Legacy package ghcr.io/${owner}/8004-indexer-classic not found or not deletable; skipping."
+          fi
+
       - name: Save digest
         run: |
           mkdir -p artifacts

@@ -7,6 +7,21 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 
+## [1.7.4] - 2026-03-01
+
+### Changed
+- Renamed aggregate metric naming from `totalProtocols` to `totalCollections` for collection count surfaces.
+- Added PostgreSQL deployment notes for running REST via a PostgREST sidecar when Supabase is not used.
+- GHCR release workflow now enforces canonical `8004-indexer` package visibility as `public`.
+
+### Removed
+- Retired the validation API surface and no longer expose public validation endpoints.
+- Retired legacy GHCR package alias `8004-indexer-classic` from release automation.
+
+### Fixed
+- Hardened sequential-id handling for agents, feedback, responses, and revocations to keep deterministic ordering stable during replay/reindex flows.
+- Fixed runtime/default network behavior so devnet defaults apply consistently.
+
 ## [1.7.2] - 2026-02-27
 
 ### Fixed
