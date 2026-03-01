@@ -173,6 +173,19 @@ function parsePostgRESTValue(value: unknown): string | undefined {
   return str;
 }
 
+type PostgRESTComparison = {
+  op: 'eq' | 'neq';
+  value: string;
+};
+
+function parsePostgRESTComparison(value: unknown): PostgRESTComparison | undefined {
+  const str = safeQueryString(value);
+  if (!str) return undefined;
+  if (str.startsWith('eq.')) return { op: 'eq', value: str.slice(3) };
+  if (str.startsWith('neq.')) return { op: 'neq', value: str.slice(4) };
+  return { op: 'eq', value: str };
+}
+
 /**
  * Parse PostgREST IN query: "in.(val1,val2,val3)" -> ["val1", "val2", "val3"]
  * Returns undefined if not in.() format
@@ -369,19 +382,22 @@ function buildStatusFilter(
   queryKeys: string | string[] = 'status'
 ): Record<string, unknown> | undefined | { _invalid: true } {
   const keys = Array.isArray(queryKeys) ? queryKeys : [queryKeys];
-  let status: string | undefined;
+  let statusComparison: PostgRESTComparison | undefined;
   const queryRecord = req.query as Record<string, unknown>;
   for (const key of keys) {
-    status = parsePostgRESTValue(queryRecord[key]);
-    if (status) break;
+    statusComparison = parsePostgRESTComparison(queryRecord[key]);
+    if (statusComparison) break;
   }
   const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
 
-  if (status) {
-    if (!VALID_STATUSES.has(status)) {
+  if (statusComparison?.value) {
+    if (!VALID_STATUSES.has(statusComparison.value)) {
       return { _invalid: true };
     }
-    return { [fieldName]: status };
+    if (statusComparison.op === 'neq') {
+      return { [fieldName]: { not: statusComparison.value } };
+    }
+    return { [fieldName]: statusComparison.value };
   }
 
   if (includeOrphaned) {
@@ -460,6 +476,12 @@ const REST_PROXY_LOCAL_COMPAT_PATHS = [
   '/collection_asset_count',
   '/collection_assets',
 ] as const;
+
+const REST_PROXY_STATUS_DEFAULT_PATHS = new Set([
+  '/feedbacks',
+  '/feedback_responses',
+  '/revocations',
+]);
 
 function isAllowedRestProxyPath(pathname: string): boolean {
   return REST_PROXY_PATH_ALLOWLIST.some((allowed) => pathname === allowed || pathname.startsWith(`${allowed}/`));
@@ -622,6 +644,14 @@ export function createApiServer(options: ApiServerOptions): Express {
             params.append('status', 'neq.ORPHANED');
             upstreamQuery = params.toString();
           }
+        } else if (REST_PROXY_STATUS_DEFAULT_PATHS.has(upstreamPathname)) {
+          const params = new URLSearchParams(upstreamRawQuery);
+          if (params.get('includeOrphaned') === 'true') {
+            params.delete('includeOrphaned');
+          } else if (!params.has('status')) {
+            params.append('status', 'neq.ORPHANED');
+          }
+          upstreamQuery = params.toString();
         }
 
         const upstreamPath = upstreamQuery ? `${upstreamPathname}?${upstreamQuery}` : upstreamPathname;
@@ -1832,6 +1862,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       // Use stricter limit for metadata (each value can be up to 100KB compressed)
       const requestedLimit = safePaginationLimit(req.query.limit);
       const limit = Math.min(requestedLimit, MAX_METADATA_LIMIT);
+      const offset = safePaginationOffset(req.query.offset);
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -1842,10 +1873,23 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (asset) where.agentId = asset;
       if (key) where.key = key;
 
-      const metadata = await prisma.agentMetadata.findMany({
-        where,
-        take: limit,
-      });
+      const needsCount = wantsCount(req);
+      const [metadata, totalCount] = await Promise.all([
+        prisma.agentMetadata.findMany({
+          where,
+          orderBy: [
+            { slot: 'desc' },
+            { txIndex: 'desc' },
+            { eventOrdinal: 'desc' },
+            { agentId: 'asc' },
+            { key: 'asc' },
+            { id: 'asc' },
+          ],
+          take: limit,
+          skip: offset,
+        }),
+        needsCount ? prisma.agentMetadata.count({ where }) : Promise.resolve(0),
+      ]);
 
       // Decompress sequentially with aggregate size limit (prevent OOM)
       const results: Array<{
@@ -1883,6 +1927,10 @@ export function createApiServer(options: ApiServerOptions): Express {
           status: m.status,
           verified_at: m.verifiedAt?.toISOString() || null,
         });
+      }
+
+      if (needsCount) {
+        setContentRange(res, offset, results.length, totalCount);
       }
 
       res.json(results);

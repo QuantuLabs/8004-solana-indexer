@@ -1251,6 +1251,63 @@ describe("Poller Coverage", () => {
 
       expect((poller as any).lastSignature).toBe(null);
     });
+
+    it("should fast-forward local saved state when configured start slot is newer", async () => {
+      (config as any).indexerStartSignature = "configured-start-sig";
+      (config as any).indexerStartSlot = 2000n;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "loaded-sig",
+        lastSlot: 999n,
+      });
+
+      await (poller as any).loadState();
+
+      expect((poller as any).lastSignature).toBe("configured-start-sig");
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: "main" },
+        create: {
+          id: "main",
+          lastSignature: "configured-start-sig",
+          lastSlot: 2000n,
+        },
+        update: {
+          lastSignature: "configured-start-sig",
+          lastSlot: 2000n,
+        },
+      });
+    });
+
+    it("should fast-forward supabase saved state when configured start slot is newer", async () => {
+      (config as any).indexerStartSignature = "configured-supabase-sig";
+      (config as any).indexerStartSlot = 3000n;
+      vi.mocked(loadIndexerState).mockResolvedValue({
+        lastSignature: "supabase-loaded",
+        lastSlot: 888n,
+      } as any);
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      await (poller as any).loadState();
+
+      expect((poller as any).lastSignature).toBe("configured-supabase-sig");
+      expect(saveIndexerState).toHaveBeenCalledWith("configured-supabase-sig", 3000n);
+    });
   });
 
   describe("backfill - Phase 2 and Phase 3 processing", () => {

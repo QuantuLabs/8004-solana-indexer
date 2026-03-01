@@ -307,6 +307,55 @@ describe("API_MODE=both behavior", () => {
       expect(includeOrphanedUrl.searchParams.get("includeOrphaned")).toBe("true");
       expect(includeOrphanedUrl.searchParams.get("status")).toBeNull();
 
+      const statusDefaultProxyPaths = ["/feedbacks", "/feedback_responses", "/revocations"];
+      for (const path of statusDefaultProxyPaths) {
+        const defaultCallStart = fetchSpy.mock.calls.length;
+        const defaultRes = await fetch(`${baseUrl}/rest/v1${path}?limit=1`);
+        expect(defaultRes.status).toBe(200);
+        const defaultUpstreamCall = fetchSpy.mock.calls.slice(defaultCallStart).find(([input]) => {
+          const url = typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input?.url;
+          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${path}?`);
+        });
+        expect(defaultUpstreamCall).toBeTruthy();
+        const defaultUrlRaw = typeof defaultUpstreamCall?.[0] === "string"
+          ? defaultUpstreamCall[0]
+          : defaultUpstreamCall?.[0] instanceof URL
+            ? defaultUpstreamCall[0].toString()
+            : defaultUpstreamCall?.[0]?.url;
+        expect(typeof defaultUrlRaw).toBe("string");
+        const defaultUrl = new URL(defaultUrlRaw as string);
+        expect(defaultUrl.searchParams.get("limit")).toBe("1");
+        expect(defaultUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+        expect(defaultUrl.searchParams.get("includeOrphaned")).toBeNull();
+
+        const includeCallStart = fetchSpy.mock.calls.length;
+        const includeRes = await fetch(`${baseUrl}/rest/v1${path}?limit=1&includeOrphaned=true`);
+        expect(includeRes.status).toBe(200);
+        const includeUpstreamCall = fetchSpy.mock.calls.slice(includeCallStart).find(([input]) => {
+          const url = typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input?.url;
+          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${path}?`);
+        });
+        expect(includeUpstreamCall).toBeTruthy();
+        const includeUrlRaw = typeof includeUpstreamCall?.[0] === "string"
+          ? includeUpstreamCall[0]
+          : includeUpstreamCall?.[0] instanceof URL
+            ? includeUpstreamCall[0].toString()
+            : includeUpstreamCall?.[0]?.url;
+        expect(typeof includeUrlRaw).toBe("string");
+        const includeUrl = new URL(includeUrlRaw as string);
+        expect(includeUrl.searchParams.get("limit")).toBe("1");
+        expect(includeUrl.searchParams.get("includeOrphaned")).toBeNull();
+        expect(includeUrl.searchParams.get("status")).toBeNull();
+      }
+
       const statsCallStart = fetchSpy.mock.calls.length;
       const statsRes = await fetch(`${baseUrl}/rest/v1/stats?limit=1`);
       expect(statsRes.status).toBe(200);

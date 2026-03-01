@@ -291,14 +291,17 @@ export class Poller {
         txIndexMap = new Map(sigs.map((s) => [s.signature, null]));
       }
 
+      // Canonical within-slot order must match SQL deterministic key:
+      // (tx_signature, tx_index NULLS LAST). event_ordinal is handled per event in parser.
       const sigsWithIndex = sigs.map(sig => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
+        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        if (txA !== txB) return txA - txB;
-        return a.sig.signature.localeCompare(b.sig.signature);
+        return txA - txB;
       });
 
       for (const { sig, txIndex } of sigsWithIndex) {
@@ -456,6 +459,38 @@ export class Poller {
     return true;
   }
 
+  private async tryPreferConfiguredStartCursor(
+    source: "local" | "supabase",
+    savedSignature: string,
+    savedSlot: bigint | null
+  ): Promise<boolean> {
+    if (!config.indexerStartSignature || config.indexerStartSlot === null || savedSlot === null) {
+      return false;
+    }
+
+    if (config.indexerStartSignature === savedSignature) {
+      return false;
+    }
+
+    if (savedSlot >= config.indexerStartSlot) {
+      return false;
+    }
+
+    this.lastSignature = config.indexerStartSignature;
+    await this.saveState(config.indexerStartSignature, config.indexerStartSlot);
+    logger.warn(
+      {
+        source,
+        savedSignature,
+        savedSlot: savedSlot.toString(),
+        configuredStartSignature: config.indexerStartSignature,
+        configuredStartSlot: config.indexerStartSlot.toString(),
+      },
+      "Configured start cursor is ahead of saved state, fast-forwarding persisted cursor"
+    );
+    return true;
+  }
+
   private async loadState(): Promise<void> {
     // Supabase mode - load from Supabase
     if (!this.prisma) {
@@ -463,11 +498,21 @@ export class Poller {
       if (state.lastSignature) {
         this.lastSignature = state.lastSignature;
         logger.info({ lastSignature: this.lastSignature, lastSlot: state.lastSlot?.toString() }, "Supabase mode: resuming from signature");
+        const fastForwarded = await this.tryPreferConfiguredStartCursor(
+          "supabase",
+          state.lastSignature,
+          state.lastSlot
+        );
+        if (fastForwarded) {
+          return;
+        }
         if (config.indexerStartSignature && config.indexerStartSignature !== state.lastSignature) {
           logger.info(
             {
               savedSignature: state.lastSignature,
+              savedSlot: state.lastSlot?.toString() ?? null,
               configuredStartSignature: config.indexerStartSignature,
+              configuredStartSlot: config.indexerStartSlot?.toString() ?? null,
             },
             "Supabase mode: ignoring INDEXER_START_SIGNATURE because saved state exists"
           );
@@ -489,11 +534,21 @@ export class Poller {
     if (state?.lastSignature) {
       this.lastSignature = state.lastSignature;
       logger.info({ lastSignature: this.lastSignature }, "Resuming from signature");
+      const fastForwarded = await this.tryPreferConfiguredStartCursor(
+        "local",
+        state.lastSignature,
+        state.lastSlot
+      );
+      if (fastForwarded) {
+        return;
+      }
       if (config.indexerStartSignature && config.indexerStartSignature !== state.lastSignature) {
         logger.info(
           {
             savedSignature: state.lastSignature,
+            savedSlot: state.lastSlot?.toString() ?? null,
             configuredStartSignature: config.indexerStartSignature,
+            configuredStartSlot: config.indexerStartSlot?.toString() ?? null,
           },
           "Local mode: ignoring INDEXER_START_SIGNATURE because saved state exists"
         );
@@ -579,15 +634,17 @@ export class Poller {
       const sigs = bySlot.get(slot)!;
       const txIndexMap = await this.getTxIndexMap(slot, sigs);
 
-      // Canonical within-slot ordering is by signature; tx_index is only a tie-break metadata field.
+      // Canonical within-slot order must match SQL deterministic key:
+      // (tx_signature, tx_index NULLS LAST). event_ordinal is handled per event in parser.
       const sigsWithIndex = sigs.map(sig => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
+        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        if (txA !== txB) return txA - txB;
-        return a.sig.signature.localeCompare(b.sig.signature);
+        return txA - txB;
       });
 
       let batchFailed = false;

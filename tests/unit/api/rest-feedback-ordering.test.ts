@@ -362,4 +362,52 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it("applies status=neq.ORPHANED as NOT filter on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?status=neq.ORPHANED`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies status=neq.ORPHANED as NOT filter on feedback_responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedback_responses?status=neq.ORPHANED`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
 });
