@@ -572,7 +572,7 @@ async function handleCollectionPointerSetTx(
          col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
          last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
        )
-       SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+       SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 1
        WHERE EXISTS (SELECT 1 FROM updated)
        ON CONFLICT (col, creator) DO NOTHING
      ),
@@ -1187,7 +1187,7 @@ async function handleCollectionPointerSet(
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
            last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
          )
-         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 1
          WHERE EXISTS (SELECT 1 FROM updated)
          ON CONFLICT (col, creator) DO NOTHING
        ),

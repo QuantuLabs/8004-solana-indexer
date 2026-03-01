@@ -819,7 +819,7 @@ export class EventBuffer {
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
            last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
          )
-         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 0
+         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 1
          WHERE EXISTS (SELECT 1 FROM updated)
          ON CONFLICT (col, creator) DO NOTHING
        ),
@@ -853,14 +853,16 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     const parentAsset = data.parentAsset?.toBase58?.() || data.parentAsset;
     const parentCreator = data.parentCreator?.toBase58?.() || data.parentCreator;
+    const lock = typeof data.lock === "boolean" ? data.lock : null;
     await client.query(
       `UPDATE agents
        SET parent_asset = $1,
            parent_creator = $2,
            block_slot = $3,
-           updated_at = $4
+           updated_at = $4,
+           parent_locked = COALESCE($6, parent_locked)
        WHERE asset = $5`,
-      [parentAsset, parentCreator, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+      [parentAsset, parentCreator, ctx.slot.toString(), ctx.blockTime.toISOString(), asset, lock]
     );
   }
 

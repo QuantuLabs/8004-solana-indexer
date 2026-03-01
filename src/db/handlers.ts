@@ -312,7 +312,11 @@ type PrismaClientOrTx = PrismaClient | PrismaTransactionClient;
  */
 function normalizeHash(hash: Uint8Array | number[]): Uint8Array<ArrayBuffer> | null {
   if (!hash) return null;
-  return Uint8Array.from(hash) as Uint8Array<ArrayBuffer>;
+  const normalized = Uint8Array.from(hash) as Uint8Array<ArrayBuffer>;
+  for (let i = 0; i < normalized.length; i++) {
+    if (normalized[i] !== 0) return normalized;
+  }
+  return null;
 }
 
 /**
@@ -1053,27 +1057,29 @@ async function handleCollectionPointerSetTx(
   if (result.count > 0) {
     const previousPointer = existing?.collectionPointer ?? "";
     const previousCreator = existing?.creator ?? creator;
-    if (previousPointer !== pointer) {
-      if (previousPointer !== "") {
-        await tx.collection.updateMany({
-          where: {
-            col: previousPointer,
-            creator: previousCreator,
-            assetCount: { gt: 0n },
-          },
-          data: {
-            assetCount: { decrement: 1n },
-          },
-        });
-      }
-
-      await tx.collection.update({
-        where: { col_creator: { col: pointer, creator } },
-        data: {
-          assetCount: { increment: 1n },
+    if (previousPointer !== pointer && previousPointer !== "") {
+      const previousCount = await tx.agent.count({
+        where: {
+          collectionPointer: previousPointer,
+          creator: previousCreator,
         },
       });
+      await tx.collection.updateMany({
+        where: { col: previousPointer, creator: previousCreator },
+        data: { assetCount: BigInt(previousCount) },
+      });
     }
+
+    const currentCount = await tx.agent.count({
+      where: {
+        collectionPointer: pointer,
+        creator,
+      },
+    });
+    await tx.collection.update({
+      where: { col_creator: { col: pointer, creator } },
+      data: { assetCount: BigInt(currentCount) },
+    });
   } else {
     logger.warn({ assetId }, "Agent not found for collection pointer set, event may be out of order");
   }
@@ -1129,27 +1135,29 @@ async function handleCollectionPointerSet(
   if (result.count > 0) {
     const previousPointer = existing?.collectionPointer ?? "";
     const previousCreator = existing?.creator ?? creator;
-    if (previousPointer !== pointer) {
-      if (previousPointer !== "") {
-        await prisma.collection.updateMany({
-          where: {
-            col: previousPointer,
-            creator: previousCreator,
-            assetCount: { gt: 0n },
-          },
-          data: {
-            assetCount: { decrement: 1n },
-          },
-        });
-      }
-
-      await prisma.collection.update({
-        where: { col_creator: { col: pointer, creator } },
-        data: {
-          assetCount: { increment: 1n },
+    if (previousPointer !== pointer && previousPointer !== "") {
+      const previousCount = await prisma.agent.count({
+        where: {
+          collectionPointer: previousPointer,
+          creator: previousCreator,
         },
       });
+      await prisma.collection.updateMany({
+        where: { col: previousPointer, creator: previousCreator },
+        data: { assetCount: BigInt(previousCount) },
+      });
     }
+
+    const currentCount = await prisma.agent.count({
+      where: {
+        collectionPointer: pointer,
+        creator,
+      },
+    });
+    await prisma.collection.update({
+      where: { col_creator: { col: pointer, creator } },
+      data: { assetCount: BigInt(currentCount) },
+    });
   } else {
     logger.warn({ assetId }, "Agent not found for collection pointer set, event may be out of order");
   }
@@ -1520,6 +1528,53 @@ async function handleNewFeedbackTx(
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), count: orphans.length }, "Reconciled orphan responses");
   }
 
+  // Reconcile orphan revocation for the same feedback scope if it can now be proven.
+  const orphanRevocation = await tx.revocation.findUnique({
+    where: {
+      agentId_client_feedbackIndex: {
+        agentId: assetId,
+        client: clientAddress,
+        feedbackIndex: data.feedbackIndex,
+      },
+    },
+    select: { revocationId: true, feedbackHash: true, status: true },
+  });
+  if (
+    orphanRevocation &&
+    orphanRevocation.status === "ORPHANED" &&
+    hashesMatch(orphanRevocation.feedbackHash, feedback.feedbackHash)
+  ) {
+    await withRevocationIdAssignmentLock(async () => {
+      let assignedRevocationId: bigint | undefined;
+      if (orphanRevocation.revocationId === null) {
+        const highestAssigned = await tx.revocation.findMany({
+          where: { agentId: assetId, revocationId: { not: null } },
+          select: { revocationId: true },
+          orderBy: { revocationId: "desc" },
+          take: 1,
+        });
+        assignedRevocationId = asBigInt(highestAssigned[0]?.revocationId) + 1n;
+      }
+
+      await tx.revocation.updateMany({
+        where: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+          status: "ORPHANED",
+        },
+        data: {
+          status: DEFAULT_STATUS,
+          ...(assignedRevocationId !== undefined ? { revocationId: assignedRevocationId } : {}),
+        },
+      });
+    });
+    logger.info(
+      { assetId, feedbackIndex: data.feedbackIndex.toString() },
+      "Reconciled orphan revocation"
+    );
+  }
+
   await syncAgentFeedbackStatsTx(
     tx,
     assetId,
@@ -1666,6 +1721,53 @@ async function handleNewFeedback(
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), count: orphans.length }, "Reconciled orphan responses");
   }
 
+  // Reconcile orphan revocation for the same feedback scope if it can now be proven.
+  const orphanRevocation = await prisma.revocation.findUnique({
+    where: {
+      agentId_client_feedbackIndex: {
+        agentId: assetId,
+        client: clientAddress,
+        feedbackIndex: data.feedbackIndex,
+      },
+    },
+    select: { revocationId: true, feedbackHash: true, status: true },
+  });
+  if (
+    orphanRevocation &&
+    orphanRevocation.status === "ORPHANED" &&
+    hashesMatch(orphanRevocation.feedbackHash, feedback.feedbackHash)
+  ) {
+    await withRevocationIdAssignmentLock(async () => {
+      let assignedRevocationId: bigint | undefined;
+      if (orphanRevocation.revocationId === null) {
+        const highestAssigned = await prisma.revocation.findMany({
+          where: { agentId: assetId, revocationId: { not: null } },
+          select: { revocationId: true },
+          orderBy: { revocationId: "desc" },
+          take: 1,
+        });
+        assignedRevocationId = asBigInt(highestAssigned[0]?.revocationId) + 1n;
+      }
+
+      await prisma.revocation.updateMany({
+        where: {
+          agentId: assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex,
+          status: "ORPHANED",
+        },
+        data: {
+          status: DEFAULT_STATUS,
+          ...(assignedRevocationId !== undefined ? { revocationId: assignedRevocationId } : {}),
+        },
+      });
+    });
+    logger.info(
+      { assetId, feedbackIndex: data.feedbackIndex.toString() },
+      "Reconciled orphan revocation"
+    );
+  }
+
   await syncAgentFeedbackStats(
     prisma,
     assetId,
@@ -1730,7 +1832,10 @@ async function handleFeedbackRevokedTx(
     data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
 
-  const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
+  // Parity with Supabase batch path:
+  // - missing feedback => ORPHANED
+  // - seal mismatch with existing feedback => warn, keep PENDING
+  const revokeStatus = !feedback ? "ORPHANED" as const : DEFAULT_STATUS;
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await tx.revocation.findUnique({
       where: {
@@ -1849,7 +1954,10 @@ async function handleFeedbackRevoked(
     data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
   });
 
-  const revokeStatus = !feedback || sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
+  // Parity with Supabase batch path:
+  // - missing feedback => ORPHANED
+  // - seal mismatch with existing feedback => warn, keep PENDING
+  const revokeStatus = !feedback ? "ORPHANED" as const : DEFAULT_STATUS;
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await prisma.revocation.findUnique({
       where: {

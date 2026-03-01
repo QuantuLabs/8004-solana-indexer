@@ -838,7 +838,7 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
-    it("should mark as ORPHANED when seal_hash mismatches", async () => {
+    it("should keep PENDING when seal_hash mismatches but feedback exists", async () => {
       const differentHash = new Uint8Array(32).fill(0xcd);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         feedbackHash: Uint8Array.from(differentHash),
@@ -851,7 +851,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.revocation.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ status: "ORPHANED" }),
+          create: expect.objectContaining({ status: "PENDING" }),
         })
       );
     });
@@ -1906,7 +1906,7 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
-    it("should handle seal_hash mismatch (non-atomic)", async () => {
+    it("should keep PENDING on seal_hash mismatch when feedback exists (non-atomic)", async () => {
       const differentHash = new Uint8Array(32).fill(0xdd);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         feedbackHash: Uint8Array.from(differentHash),
@@ -1917,7 +1917,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.revocation.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ status: "ORPHANED" }),
+          create: expect.objectContaining({ status: "PENDING" }),
         })
       );
     });
@@ -2148,6 +2148,7 @@ describe("DB Handlers Coverage", () => {
         creator: immutableCreator,
       });
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.agent.count as any).mockResolvedValueOnce(4).mockResolvedValueOnce(9);
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       const event: ProgramEvent = {
@@ -2166,28 +2167,28 @@ describe("DB Handlers Coverage", () => {
         where: {
           col: "c1:old-pointer",
           creator: immutableCreator,
-          assetCount: { gt: 0n },
         },
         data: {
-          assetCount: { decrement: 1n },
+          assetCount: 4n,
         },
       });
 
       expect(prisma.collection.update).toHaveBeenCalledWith({
         where: { col_creator: { col: "c1:new-pointer", creator: immutableCreator } },
         data: {
-          assetCount: { increment: 1n },
+          assetCount: 9n,
         },
       });
     });
 
-    it("CollectionPointerSet should not change collection counts when pointer stays identical", async () => {
+    it("CollectionPointerSet should still refresh current collection count when pointer stays identical", async () => {
       const immutableCreator = TEST_OWNER.toBase58();
       (prisma.agent.findUnique as any).mockResolvedValue({
         collectionPointer: "c1:same-pointer",
         creator: immutableCreator,
       });
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.agent.count as any).mockResolvedValueOnce(7);
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       const event: ProgramEvent = {
@@ -2203,7 +2204,10 @@ describe("DB Handlers Coverage", () => {
       await handleEventAtomic(prisma, event, ctx);
 
       expect(prisma.collection.updateMany).not.toHaveBeenCalled();
-      expect(prisma.collection.update).not.toHaveBeenCalled();
+      expect(prisma.collection.update).toHaveBeenCalledWith({
+        where: { col_creator: { col: "c1:same-pointer", creator: immutableCreator } },
+        data: { assetCount: 7n },
+      });
     });
 
     it("CollectionPointerSet should not mutate lock flag when lock is omitted (non-atomic)", async () => {
