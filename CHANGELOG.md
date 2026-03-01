@@ -16,7 +16,6 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 - Retired the validation API surface and no longer expose public validation endpoints.
-- Retired legacy GHCR package alias `8004-indexer-classic` from release automation.
 
 ### Fixed
 - Hardened sequential-id handling for agents, feedback, responses, and revocations to keep deterministic ordering stable during replay/reindex flows.

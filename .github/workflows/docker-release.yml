@@ -86,27 +86,6 @@ jobs:
             -f visibility=public >/dev/null
           echo "Ensured package visibility: ghcr.io/${owner}/8004-indexer -> public"
 
-      - name: Delete legacy GHCR package alias
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        env:
-          GH_TOKEN: ${{ secrets.GHCR_ADMIN_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          owner="${{ github.repository_owner }}"
-          if gh api "orgs/${owner}" >/dev/null 2>&1; then
-            base="orgs/${owner}"
-          else
-            base="users/${owner}"
-          fi
-
-          if gh api -X DELETE -H "Accept: application/vnd.github+json" \
-            "${base}/packages/container/8004-indexer-classic" >/dev/null 2>&1; then
-            echo "Deleted legacy package ghcr.io/${owner}/8004-indexer-classic"
-          else
-            echo "Legacy package ghcr.io/${owner}/8004-indexer-classic not found or not deletable; skipping."
-          fi
-
       - name: Save digest
         run: |
           mkdir -p artifacts
