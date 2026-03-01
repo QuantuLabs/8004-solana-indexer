@@ -131,8 +131,28 @@ CREATE TABLE agents (
   CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)
 );
 
--- Sequence + trigger for agent_id auto-assignment
-CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;
+-- Transactional gapless counters (rollback-safe)
+CREATE TABLE IF NOT EXISTS id_counters (
+  scope TEXT PRIMARY KEY,
+  next_value BIGINT NOT NULL CHECK (next_value >= 1),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)
+RETURNS BIGINT AS $$
+DECLARE
+  allocated BIGINT;
+BEGIN
+  INSERT INTO id_counters (scope, next_value, updated_at)
+  VALUES (p_scope, 2, NOW())
+  ON CONFLICT (scope) DO UPDATE
+    SET next_value = id_counters.next_value + 1,
+        updated_at = NOW()
+  RETURNING next_value - 1 INTO allocated;
+
+  RETURN allocated;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION assign_agent_id()
 RETURNS TRIGGER AS $$
@@ -154,8 +174,8 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Serialize per-asset ID assignment so duplicate upserts/replays do not burn sequence values.
-  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.asset, 0));
+  -- Serialize per-agent identity for idempotent replay handling.
+  PERFORM pg_advisory_xact_lock(hashtextextended('agent:id:' || NEW.asset, 0));
 
   SELECT agent_id, status
   INTO existing_agent_id, existing_status
@@ -170,18 +190,18 @@ BEGIN
     END IF;
 
     IF existing_status IS NULL OR existing_status != 'ORPHANED' THEN
+      NEW.agent_id := alloc_gapless_id('agent:global');
       UPDATE agents
-      SET agent_id = nextval('agent_id_seq')
+      SET agent_id = NEW.agent_id
       WHERE asset = NEW.asset
         AND agent_id IS NULL
-        AND (status IS NULL OR status != 'ORPHANED')
-      RETURNING agent_id INTO NEW.agent_id;
+        AND (status IS NULL OR status != 'ORPHANED');
     END IF;
 
     RETURN NEW;
   END IF;
 
-  NEW.agent_id := nextval('agent_id_seq');
+  NEW.agent_id := alloc_gapless_id('agent:global');
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -391,13 +411,20 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Serialize per-asset assignment across processes.
-  PERFORM pg_advisory_xact_lock(hashtextextended('feedback:' || NEW.asset, 0));
+  -- Serialize by canonical feedback identity to make duplicate upserts idempotent.
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'feedback:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
+      0
+    )
+  );
 
   SELECT feedback_id
   INTO existing_feedback_id
   FROM feedbacks
-  WHERE id = NEW.id
+  WHERE asset = NEW.asset
+    AND client_address = NEW.client_address
+    AND feedback_index = NEW.feedback_index
   LIMIT 1;
 
   IF FOUND AND existing_feedback_id IS NOT NULL THEN
@@ -405,11 +432,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(MAX(feedback_id), 0) + 1
-  INTO NEW.feedback_id
-  FROM feedbacks
-  WHERE asset = NEW.asset
-    AND feedback_id IS NOT NULL;
+  NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset);
 
   RETURN NEW;
 END;
@@ -434,10 +457,10 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Serialize per-feedback-scope assignment across processes.
+  -- Serialize by canonical response identity to make duplicate upserts idempotent.
   PERFORM pg_advisory_xact_lock(
     hashtextextended(
-      'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
+      'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, ''),
       0
     )
   );
@@ -445,7 +468,11 @@ BEGIN
   SELECT response_id
   INTO existing_response_id
   FROM feedback_responses
-  WHERE id = NEW.id
+  WHERE asset = NEW.asset
+    AND client_address = NEW.client_address
+    AND feedback_index = NEW.feedback_index
+    AND responder = NEW.responder
+    AND tx_signature = NEW.tx_signature
   LIMIT 1;
 
   IF FOUND AND existing_response_id IS NOT NULL THEN
@@ -453,13 +480,9 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(MAX(response_id), 0) + 1
-  INTO NEW.response_id
-  FROM feedback_responses
-  WHERE asset = NEW.asset
-    AND client_address = NEW.client_address
-    AND feedback_index = NEW.feedback_index
-    AND response_id IS NOT NULL;
+  NEW.response_id := alloc_gapless_id(
+    'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text
+  );
 
   RETURN NEW;
 END;
@@ -484,13 +507,20 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Serialize per-asset assignment across processes.
-  PERFORM pg_advisory_xact_lock(hashtextextended('revocation:' || NEW.asset, 0));
+  -- Serialize by canonical revocation identity to make duplicate upserts idempotent.
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'revocation:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
+      0
+    )
+  );
 
   SELECT revocation_id
   INTO existing_revocation_id
   FROM revocations
-  WHERE id = NEW.id
+  WHERE asset = NEW.asset
+    AND client_address = NEW.client_address
+    AND feedback_index = NEW.feedback_index
   LIMIT 1;
 
   IF FOUND AND existing_revocation_id IS NOT NULL THEN
@@ -498,11 +528,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(MAX(revocation_id), 0) + 1
-  INTO NEW.revocation_id
-  FROM revocations
-  WHERE asset = NEW.asset
-    AND revocation_id IS NOT NULL;
+  NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset);
 
   RETURN NEW;
 END;

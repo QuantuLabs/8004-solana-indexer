@@ -10,7 +10,7 @@ const schemaSql = readFileSync(resolve(__dirname, "../../../supabase/schema.sql"
 const migrationSql = readFileSync(
   resolve(
     __dirname,
-    "../../../supabase/migrations/20260228183000_fix_agent_id_sequence_conflicts.sql"
+    "../../../supabase/migrations/20260301123000_gapless_ids_for_all_scopes.sql"
   ),
   "utf8"
 );
@@ -85,26 +85,29 @@ function assertAgentInsertContract(source: string): void {
 
 describe("agent_id conflict-safe trigger semantics for ON CONFLICT", () => {
   it("defines lock-guarded BEFORE INSERT assignment in bootstrap schema", () => {
-    expect(schemaSql).toContain("CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;");
+    expect(schemaSql).toContain("CREATE TABLE IF NOT EXISTS id_counters (");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_agent_id()");
-    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended(NEW.asset, 0));");
+    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('agent:id:' || NEW.asset, 0));");
     expect(schemaSql).toContain("SELECT agent_id, status");
     expect(schemaSql).toContain("IF FOUND THEN");
-    expect(schemaSql).toContain("SET agent_id = nextval('agent_id_seq')");
+    expect(schemaSql).toContain("NEW.agent_id := alloc_gapless_id('agent:global');");
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_agent_id");
-    expect(schemaSql).toContain("BEFORE INSERT ON agents");
+    expect(schemaSql).toContain("BEFORE INSERT OR UPDATE ON agents");
+    expect(schemaSql).not.toContain("CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;");
+    expect(schemaSql).not.toContain("nextval('agent_id_seq')");
   });
 
   it("applies the same trigger contract in live migration SQL", () => {
+    expect(migrationSql).toContain("CREATE TABLE IF NOT EXISTS id_counters (");
+    expect(migrationSql).toContain("CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)");
     expect(migrationSql).toContain("DROP TRIGGER IF EXISTS trg_assign_agent_id ON agents;");
-    expect(migrationSql).toContain("CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;");
     expect(migrationSql).toContain("CREATE OR REPLACE FUNCTION assign_agent_id()");
-    expect(migrationSql).toContain("pg_advisory_xact_lock(hashtextextended(NEW.asset, 0));");
-    expect(migrationSql).toContain("repair_pending AS");
+    expect(migrationSql).toContain("pg_advisory_xact_lock(hashtextextended('agent:id:' || NEW.asset, 0));");
+    expect(migrationSql).toContain("NEW.agent_id := alloc_gapless_id('agent:global');");
     expect(migrationSql).toContain("ROW_NUMBER() OVER");
-    expect(migrationSql).toContain(
-      "SELECT setval('agent_id_seq', COALESCE((SELECT MAX(agent_id) FROM agents), 0));"
-    );
+    expect(migrationSql).toContain("DELETE FROM id_counters");
+    expect(migrationSql).toContain("DROP SEQUENCE IF EXISTS agent_id_seq;");
   });
 
   it("upserts agents via ON CONFLICT(asset) without mutating agent_id in runtime SQL", () => {

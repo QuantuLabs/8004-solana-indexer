@@ -46,10 +46,10 @@ FROM "Agent" a
 WHERE a."collectionPointer" != ''
 ON CONFLICT("col", "creator") DO NOTHING;
 
-UPDATE "CollectionPointer" cp
+UPDATE "CollectionPointer"
 SET "assetCount" = (
   SELECT COUNT(*)
   FROM "Agent" a
-  WHERE a."collectionPointer" = cp."col"
-    AND COALESCE(a."creator", a."owner") = cp."creator"
+  WHERE a."collectionPointer" = "CollectionPointer"."col"
+    AND COALESCE(a."creator", a."owner") = "CollectionPointer"."creator"
 );

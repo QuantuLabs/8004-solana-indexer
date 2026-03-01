@@ -1,11 +1,11 @@
 ALTER TABLE "Feedback"
-ADD COLUMN IF NOT EXISTS "feedback_id" BIGINT;
+ADD COLUMN "feedback_id" BIGINT;
 
 ALTER TABLE "FeedbackResponse"
-ADD COLUMN IF NOT EXISTS "response_id" BIGINT;
+ADD COLUMN "response_id" BIGINT;
 
 ALTER TABLE "Revocation"
-ADD COLUMN IF NOT EXISTS "revocation_id" BIGINT;
+ADD COLUMN "revocation_id" BIGINT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS "Feedback_agentId_feedback_id_key"
 ON "Feedback"("agentId", "feedback_id");

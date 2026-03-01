@@ -35,12 +35,19 @@ describe("supabase schema revocations bootstrap parity", () => {
 
   it("hardens scoped sequential IDs at DB layer with trigger assignment", () => {
     expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)");
+    expect(schemaSql).toContain("CREATE TABLE IF NOT EXISTS id_counters (");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_feedback_id()");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_response_id()");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
-    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('feedback:' || NEW.asset, 0));");
+    expect(schemaSql).toContain("'feedback:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(schemaSql).toContain(
+      "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '')"
+    );
+    expect(schemaSql).toContain("'revocation:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(schemaSql).toContain("NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset);");
     expect(schemaSql).toContain("'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
-    expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('revocation:' || NEW.asset, 0));");
+    expect(schemaSql).toContain("NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset);");
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_agent_id");
     expect(schemaSql).toContain("BEFORE INSERT OR UPDATE ON agents");
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_feedback_id");
