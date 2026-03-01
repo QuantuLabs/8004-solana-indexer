@@ -7,6 +7,16 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 
+## [1.7.5] - 2026-03-01
+
+### Fixed
+- Propagated `ParentAssetSet.lock` to PostgreSQL batch writes in `updateParentAssetSupabase`, so `parent_locked` is now updated consistently in batch mode.
+- Corrected initial `collection_pointers.asset_count` on first insert from `0` to `1` across all PostgreSQL `CollectionPointerSet` code paths (batch, transactional, non-transactional).
+
+### Impact
+- First-time collection pointer assignments no longer undercount by one.
+- Parent lock state remains consistent between batch and non-batch ingestion paths.
+
 ## [1.7.4] - 2026-03-01
 
 ### Changed
