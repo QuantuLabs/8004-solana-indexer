@@ -38,6 +38,7 @@ const PROGRAM_ID = new PublicKey("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C")
 const MPL_CORE_PROGRAM_ID = new PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
 
 function loadIdl(): any {
+  // Localnet tests keep using the devnet/default IDL; a mainnet copy also exists in ../../idl.
   const idlPath = path.join(__dirname, "../../idl/agent_registry_8004.json");
   return JSON.parse(fs.readFileSync(idlPath, "utf-8"));
 }

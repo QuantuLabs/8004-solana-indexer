@@ -28,7 +28,7 @@ const LOCALNET_RPC = "http://localhost:8899";
 const PROGRAM_ID = new PublicKey("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
 const MPL_CORE_PROGRAM_ID = new PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
 
-// Load IDL
+// Load devnet/default IDL for localnet tests; mainnet companion IDL is stored alongside it.
 function loadIdl(): any {
   const idlPath = path.join(__dirname, "../../idl/agent_registry_8004.json");
   return JSON.parse(fs.readFileSync(idlPath, "utf-8"));

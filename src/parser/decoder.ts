@@ -56,6 +56,7 @@ function parseOptionU8(value: unknown): number | null {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Keep both IDLs in /idl side-by-side; runtime intentionally uses the existing devnet/default file.
 const idlPath = join(__dirname, "../../idl/agent_registry_8004.json");
 const idl: Idl = JSON.parse(readFileSync(idlPath, "utf-8"));
 const coder = new BorshCoder(idl);
