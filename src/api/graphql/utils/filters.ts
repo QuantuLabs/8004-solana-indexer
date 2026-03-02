@@ -23,6 +23,8 @@ const AGENT_FILTERS: FilterConfig[] = [
   { graphqlField: 'colLocked', dbColumn: 'col_locked', operator: 'bool' },
   { graphqlField: 'parentLocked', dbColumn: 'parent_locked', operator: 'bool' },
   { graphqlField: 'trustTier_gte', dbColumn: 'trust_tier', operator: 'gte' },
+  { graphqlField: 'totalFeedback_gt', dbColumn: 'COALESCE(adc.digest_feedback_count, a.feedback_count, 0)', operator: 'gt' },
+  { graphqlField: 'totalFeedback_gte', dbColumn: 'COALESCE(adc.digest_feedback_count, a.feedback_count, 0)', operator: 'gte' },
   { graphqlField: 'createdAt_gt', dbColumn: 'created_at', operator: 'gt' },
   { graphqlField: 'createdAt_lt', dbColumn: 'created_at', operator: 'lt' },
   { graphqlField: 'updatedAt_gt', dbColumn: 'updated_at', operator: 'gt' },

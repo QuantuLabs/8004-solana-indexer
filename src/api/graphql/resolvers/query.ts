@@ -773,9 +773,13 @@ export const queryResolvers = {
 
     async protocols(
       _: unknown,
-      _args: { first?: number; skip?: number },
+      args: { first?: number; skip?: number },
       ctx: GraphQLContext
     ) {
+      const first = Math.max(args.first ?? 10, 0);
+      const skip = Math.max(args.skip ?? 0, 0);
+      if (first === 0 || skip > 0) return [];
+
       const proto = await queryResolvers.Query.protocol(_, { id: `solana-${ctx.networkMode}` }, ctx);
       return proto ? [proto] : [];
     },

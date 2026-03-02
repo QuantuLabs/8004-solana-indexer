@@ -405,8 +405,8 @@ type Query {
     where: AgentMetadataFilter
   ): [AgentMetadata!]!
   agentStats(id: ID!): AgentStats
-  protocol(id: ID!): Protocol
-  protocols(first: Int = 10, skip: Int = 0): [Protocol!]!
+  protocol(id: ID!): Protocol @deprecated(reason: "Use globalStats instead.")
+  protocols(first: Int = 10, skip: Int = 0): [Protocol!]! @deprecated(reason: "Use globalStats instead.")
   globalStats: GlobalStats
   agentSearch(query: String!, first: Int = 20): [Agent!]!
   agentRegistrationFiles(

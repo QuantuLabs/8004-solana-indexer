@@ -479,6 +479,7 @@ const REST_PROXY_LOCAL_COMPAT_PATHS = [
 
 const REST_PROXY_STATUS_DEFAULT_PATHS = new Set([
   '/feedbacks',
+  '/responses',
   '/feedback_responses',
   '/revocations',
 ]);
@@ -1170,9 +1171,19 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
         return;
       }
+      const parsedStatusComparison = parsePostgRESTComparison(req.query.status);
+      const statusComparison = parsedStatusComparison?.value ? parsedStatusComparison : null;
+      const orphanStatusAllowed = !statusComparison
+        ? true
+        : (
+          statusComparison.op === 'neq'
+            ? 'PENDING' !== statusComparison.value
+            : 'PENDING' === statusComparison.value
+        );
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
+      let parsedResponseId: bigint | undefined;
       if (response_id !== undefined) {
-        const parsedResponseId = safeBigInt(response_id);
+        parsedResponseId = safeBigInt(response_id);
         if (parsedResponseId === undefined) {
           res.status(400).json({ error: 'Invalid response_id: must be a valid integer' });
           return;
@@ -1233,9 +1244,21 @@ export function createApiServer(options: ApiServerOptions): Express {
           where.feedbackId = feedback.id;
         } else {
           // Check orphan responses (feedback not yet indexed)
+          if (parsedResponseId !== undefined || !orphanStatusAllowed) {
+            res.json([]);
+            return;
+          }
+
+          const orphanOrderBy =
+            order === 'response_count.asc'
+              ? { responseCount: 'asc' as const }
+              : order === 'response_count.desc'
+                ? { responseCount: 'desc' as const }
+                : { createdAt: 'desc' as const };
+
           const orphans = await prisma.orphanResponse.findMany({
             where: { agentId: asset, client: client_address, feedbackIndex: parsedFeedbackIndex },
-            orderBy: { createdAt: 'desc' },
+            orderBy: orphanOrderBy,
             take: limit,
             skip: offset,
           });
@@ -1249,7 +1272,10 @@ export function createApiServer(options: ApiServerOptions): Express {
             responder: o.responder,
             response_uri: o.responseUri,
             response_hash: o.responseHash ? Buffer.from(o.responseHash).toString('hex') : null,
+            running_digest: o.runningDigest ? Buffer.from(o.runningDigest).toString('hex') : null,
+            response_count: o.responseCount ? o.responseCount.toString() : null,
             status: 'PENDING',
+            verified_at: null,
             block_slot: o.slot ? Number(o.slot) : 0,
             tx_signature: o.txSignature || '',
             created_at: o.createdAt.toISOString(),
@@ -1496,9 +1522,9 @@ export function createApiServer(options: ApiServerOptions): Express {
         params.set('collection_pointer', `eq.${col}`);
         if (creator) params.set('creator', `eq.${creator}`);
 
-        const status = parsePostgRESTValue(req.query.status);
+        const status = parsePostgRESTComparison(req.query.status);
         const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
-        if (status) params.set('status', `eq.${status}`);
+        if (status?.value) params.set('status', `${status.op}.${status.value}`);
         else if (!includeOrphaned) params.set('status', 'neq.ORPHANED');
 
         const upstreamHeaders = buildSupabaseProxyHeaders(req);
@@ -1586,9 +1612,9 @@ export function createApiServer(options: ApiServerOptions): Express {
         params.set('offset', String(offset));
         params.set('order', safeQueryString(req.query.order) || 'created_at.desc,id.desc');
 
-        const status = parsePostgRESTValue(req.query.status);
+        const status = parsePostgRESTComparison(req.query.status);
         const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
-        if (status) params.set('status', `eq.${status}`);
+        if (status?.value) params.set('status', `${status.op}.${status.value}`);
         else if (!includeOrphaned) params.set('status', 'neq.ORPHANED');
 
         const upstreamRes = await fetch(`${supabaseRestBaseUrl}/agents?${params.toString()}`, {

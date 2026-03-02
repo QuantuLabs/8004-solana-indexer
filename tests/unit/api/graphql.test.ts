@@ -184,6 +184,13 @@ describe('Filter Builder', () => {
     expect(result.params).toEqual([1700000000, 1700000500]);
   });
 
+  it('handles totalFeedback range filters', () => {
+    const result = buildWhereClause('agent', { totalFeedback_gt: 3n, totalFeedback_gte: 5n });
+    expect(result.sql).toContain('COALESCE(adc.digest_feedback_count, a.feedback_count, 0) > $1');
+    expect(result.sql).toContain('COALESCE(adc.digest_feedback_count, a.feedback_count, 0) >= $2');
+    expect(result.params).toEqual(['3', '5']);
+  });
+
   it('ignores unknown filter fields', () => {
     const result = buildWhereClause('agent', { unknownField: 'value', owner: 'test' });
     expect(result.sql).toContain('owner = $1');
@@ -429,6 +436,24 @@ describe('Agent Field Resolvers', () => {
       orderBy: 'feedback_id',
       orderDirection: 'ASC',
     });
+  });
+
+  it('prefers parent feedback_count for Agent.totalFeedback to match agent filter source', async () => {
+    const load = vi.fn().mockResolvedValue(999);
+    const ctx = {
+      loaders: {
+        feedbackCountByAgent: { load },
+      },
+    } as any;
+
+    const total = await agentResolvers.Agent.totalFeedback(
+      { asset: 'asset1', feedback_count: '7' } as any,
+      {},
+      ctx
+    );
+
+    expect(total).toBe('7');
+    expect(load).not.toHaveBeenCalled();
   });
 });
 
@@ -1088,6 +1113,33 @@ describe('Query Aggregated Stats Cache', () => {
       queryResolvers.Query.protocol({}, { id: 'b' }, ctx),
     ]);
 
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies protocols(first, skip) over the single-item protocol result', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        total_agents: '10',
+        total_feedback: '20',
+        total_collections: '4',
+        tags: ['ai'],
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const all = await queryResolvers.Query.protocols({}, { first: 10, skip: 0 }, ctx);
+    const skipped = await queryResolvers.Query.protocols({}, { first: 10, skip: 1 }, ctx);
+    const zeroFirst = await queryResolvers.Query.protocols({}, { first: 0, skip: 0 }, ctx);
+
+    expect(all).toHaveLength(1);
+    expect(skipped).toEqual([]);
+    expect(zeroFirst).toEqual([]);
     expect(query).toHaveBeenCalledTimes(1);
   });
 });

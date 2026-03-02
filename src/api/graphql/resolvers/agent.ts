@@ -79,6 +79,9 @@ export const agentResolvers = {
       return [];
     },
     async totalFeedback(parent: AgentRow, _args: unknown, ctx: GraphQLContext) {
+      if (parent.feedback_count !== null && parent.feedback_count !== undefined) {
+        return parent.feedback_count;
+      }
       const count = await ctx.loaders.feedbackCountByAgent.load(parent.asset);
       return String(count);
     },

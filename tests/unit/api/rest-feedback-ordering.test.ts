@@ -410,4 +410,170 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it("maps orphan responses with digest/count fields and response_count ordering", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue(null),
+      },
+      orphanResponse: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            agentId: "asset-1",
+            client: "client-1",
+            feedbackIndex: 0n,
+            responder: "responder-1",
+            responseUri: "ipfs://resp",
+            responseHash: Buffer.from("ab", "hex"),
+            runningDigest: Buffer.from("cd", "hex"),
+            responseCount: 7n,
+            slot: 42n,
+            txSignature: "tx-1",
+            createdAt: new Date("2026-01-05T00:00:00.000Z"),
+          },
+        ]),
+      },
+      feedbackResponse: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&order=response_count.desc`
+      );
+      expect(res.status).toBe(200);
+
+      expect(prisma.orphanResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { agentId: "asset-1", client: "client-1", feedbackIndex: 0n },
+          orderBy: { responseCount: "desc" },
+        })
+      );
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+
+      const body = await res.json() as Array<Record<string, unknown>>;
+      expect(body).toHaveLength(1);
+      expect(body[0]).toMatchObject({
+        id: null,
+        feedback_id: null,
+        response_id: null,
+        asset: "asset-1",
+        client_address: "client-1",
+        feedback_index: "0",
+        responder: "responder-1",
+        response_uri: "ipfs://resp",
+        response_hash: "ab",
+        running_digest: "cd",
+        response_count: "7",
+        status: "PENDING",
+        verified_at: null,
+        block_slot: 42,
+        tx_signature: "tx-1",
+      });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("returns empty list for orphan responses when status filter excludes PENDING", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue(null),
+      },
+      orphanResponse: {
+        findMany: vi.fn(),
+      },
+      feedbackResponse: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&status=eq.FINALIZED`
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual([]);
+      expect(prisma.orphanResponse.findMany).not.toHaveBeenCalled();
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("treats empty status comparison as no status filter for orphan responses", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue(null),
+      },
+      orphanResponse: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            agentId: "asset-1",
+            client: "client-1",
+            feedbackIndex: 0n,
+            responder: "responder-1",
+            responseUri: null,
+            responseHash: null,
+            runningDigest: null,
+            responseCount: 1n,
+            slot: 10n,
+            txSignature: "tx-1",
+            createdAt: new Date("2026-01-05T00:00:00.000Z"),
+          },
+        ]),
+      },
+      feedbackResponse: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&status=eq.`
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json() as Array<Record<string, unknown>>;
+      expect(body).toHaveLength(1);
+      expect(prisma.orphanResponse.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("returns empty list for orphan responses when response_id is provided", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue(null),
+      },
+      orphanResponse: {
+        findMany: vi.fn(),
+      },
+      feedbackResponse: {
+        findMany: vi.fn(),
+        count: vi.fn(),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&response_id=eq.9`
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual([]);
+      expect(prisma.orphanResponse.findMany).not.toHaveBeenCalled();
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
 });

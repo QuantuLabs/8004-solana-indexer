@@ -307,7 +307,7 @@ describe("API_MODE=both behavior", () => {
       expect(includeOrphanedUrl.searchParams.get("includeOrphaned")).toBe("true");
       expect(includeOrphanedUrl.searchParams.get("status")).toBeNull();
 
-      const statusDefaultProxyPaths = ["/feedbacks", "/feedback_responses", "/revocations"];
+      const statusDefaultProxyPaths = ["/feedbacks", "/responses", "/feedback_responses", "/revocations"];
       for (const path of statusDefaultProxyPaths) {
         const defaultCallStart = fetchSpy.mock.calls.length;
         const defaultRes = await fetch(`${baseUrl}/rest/v1${path}?limit=1`);
@@ -393,6 +393,56 @@ describe("API_MODE=both behavior", () => {
       );
       expect(collectionAssetsRes.status).toBe(200);
       expect(await collectionAssetsRes.json()).toEqual([{ asset: "ProxyAgent11111111111111111111111111111111" }]);
+
+      const collectionCountStatusCallStart = fetchSpy.mock.calls.length;
+      const collectionCountStatusRes = await fetch(
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.Collection11111111111111111111111111111111&status=neq.ORPHANED`
+      );
+      expect(collectionCountStatusRes.status).toBe(200);
+      const collectionCountStatusUpstreamCall = fetchSpy.mock.calls.slice(collectionCountStatusCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string"
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
+          && url.includes("collection_pointer=eq.Collection11111111111111111111111111111111");
+      });
+      expect(collectionCountStatusUpstreamCall).toBeTruthy();
+      const collectionCountStatusUrlRaw = typeof collectionCountStatusUpstreamCall?.[0] === "string"
+        ? collectionCountStatusUpstreamCall[0]
+        : collectionCountStatusUpstreamCall?.[0] instanceof URL
+          ? collectionCountStatusUpstreamCall[0].toString()
+          : collectionCountStatusUpstreamCall?.[0]?.url;
+      expect(typeof collectionCountStatusUrlRaw).toBe("string");
+      const collectionCountStatusUrl = new URL(collectionCountStatusUrlRaw as string);
+      expect(collectionCountStatusUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
+      const collectionAssetsStatusCallStart = fetchSpy.mock.calls.length;
+      const collectionAssetsStatusRes = await fetch(
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&limit=1&status=neq.ORPHANED`
+      );
+      expect(collectionAssetsStatusRes.status).toBe(200);
+      const collectionAssetsStatusUpstreamCall = fetchSpy.mock.calls.slice(collectionAssetsStatusCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string"
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
+          && url.includes("collection_pointer=eq.Collection11111111111111111111111111111111");
+      });
+      expect(collectionAssetsStatusUpstreamCall).toBeTruthy();
+      const collectionAssetsStatusUrlRaw = typeof collectionAssetsStatusUpstreamCall?.[0] === "string"
+        ? collectionAssetsStatusUpstreamCall[0]
+        : collectionAssetsStatusUpstreamCall?.[0] instanceof URL
+          ? collectionAssetsStatusUpstreamCall[0].toString()
+          : collectionAssetsStatusUpstreamCall?.[0]?.url;
+      expect(typeof collectionAssetsStatusUrlRaw).toBe("string");
+      const collectionAssetsStatusUrl = new URL(collectionAssetsStatusUrlRaw as string);
+      expect(collectionAssetsStatusUrl.searchParams.get("status")).toBe("neq.ORPHANED");
 
       const collectionCompatUpstreamCall = fetchSpy.mock.calls.find(([input]) => {
         const url = typeof input === "string"
