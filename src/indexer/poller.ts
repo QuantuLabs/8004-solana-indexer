@@ -429,6 +429,18 @@ export class Poller {
     };
   }
 
+  private logNoSavedCursorWarning(source: "local" | "supabase"): void {
+    logger.warn(
+      {
+        source,
+        rpcUrl: config.rpcUrl,
+        indexerMode: config.indexerMode,
+        programId: this.programId.toBase58(),
+      },
+      "No saved cursor found - starting RPC historical backfill from earliest available history on this endpoint. If RPC history is pruned, older transactions cannot be recovered. Use archival RPC or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT)."
+    );
+  }
+
   private async tryApplyConfiguredStartCursor(source: "local" | "supabase"): Promise<boolean> {
     if (!config.indexerStartSignature) {
       return false;
@@ -520,7 +532,7 @@ export class Poller {
       } else {
         const bootstrapped = await this.tryApplyConfiguredStartCursor("supabase");
         if (!bootstrapped) {
-          logger.info("Supabase mode: starting from latest transactions (no saved state)");
+          this.logNoSavedCursorWarning("supabase");
         }
       }
       return;
@@ -556,7 +568,7 @@ export class Poller {
     } else {
       const bootstrapped = await this.tryApplyConfiguredStartCursor("local");
       if (!bootstrapped) {
-        logger.info("Starting from latest transactions");
+        this.logNoSavedCursorWarning("local");
       }
     }
   }

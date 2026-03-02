@@ -17,6 +17,11 @@ const VALID_METADATA_MODES: MetadataIndexMode[] = ["off", "normal", "full"];
 const VALID_SOLANA_NETWORKS: SolanaNetwork[] = ["devnet", "mainnet-beta", "testnet", "localnet"];
 const DEFAULT_IPFS_GATEWAY_BASE = "https://ipfs.io";
 const TRUSTED_LOCAL_URI_HOSTS = new Set(["localhost", "127.0.0.1"]);
+const PUBLIC_RPC_HOSTS_WITH_LIMITED_HISTORY = new Set([
+  "api.devnet.solana.com",
+  "api.mainnet-beta.solana.com",
+  "api.testnet.solana.com",
+]);
 
 function resolvePreferredEnv(primaryKey: string, aliasKey: string): string | undefined {
   const primaryValue = process.env[primaryKey];
@@ -67,6 +72,18 @@ function defaultWsUrlForNetwork(network: SolanaNetwork): string {
     case "devnet":
     default:
       return "wss://api.devnet.solana.com";
+  }
+}
+
+function isLikelyUnreliableHistoricalRpc(rpcUrl: string): boolean {
+  try {
+    const parsed = new URL(rpcUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return true;
+    }
+    return PUBLIC_RPC_HOSTS_WITH_LIMITED_HISTORY.has(parsed.hostname.toLowerCase());
+  } catch {
+    return true;
   }
 }
 
@@ -341,6 +358,16 @@ export function validateConfig(): void {
   if (config.solanaNetwork === "mainnet-beta" && config.programId === DEFAULT_PROGRAM_ID) {
     console.warn(
       "[CONFIG WARNING] SOLANA_NETWORK=mainnet-beta but PROGRAM_ID is still the default devnet ID. Set PROGRAM_ID to your mainnet deployment before production use."
+    );
+  }
+
+  if (
+    config.indexerMode === "websocket"
+    && !config.indexerStartSignature
+    && isLikelyUnreliableHistoricalRpc(config.rpcUrl)
+  ) {
+    console.warn(
+      "[CONFIG WARNING] INDEXER_MODE=websocket with no INDEXER_START_SIGNATURE and a public/non-HTTP RPC_URL may run as realtime-only ingestion when historical RPC backfill is unavailable. Use a reliable archival RPC and/or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT)."
     );
   }
 

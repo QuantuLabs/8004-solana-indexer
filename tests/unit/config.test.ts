@@ -289,6 +289,25 @@ describe("Config", () => {
       warnSpy.mockRestore();
     });
 
+    it("should warn when websocket mode has no bootstrap cursor on likely non-archival RPC", async () => {
+      process.env.DB_MODE = "local";
+      process.env.INDEXER_MODE = "websocket";
+      process.env.RPC_URL = "https://api.mainnet-beta.solana.com";
+      process.env.SUPABASE_SSL_VERIFY = "true";
+      process.env.SOLANA_NETWORK = "devnet";
+      delete process.env.INDEXER_START_SIGNATURE;
+      delete process.env.INDEXER_START_SLOT;
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const { validateConfig } = await import("../../src/config.js");
+      validateConfig();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("INDEXER_MODE=websocket")
+      );
+      warnSpy.mockRestore();
+    });
+
     it("should throw when DB_MODE=supabase without SUPABASE_DSN", async () => {
       process.env.DB_MODE = "supabase";
       delete process.env.SUPABASE_DSN;
