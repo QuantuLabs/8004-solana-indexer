@@ -7,6 +7,18 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 
+## [1.7.7] - 2026-03-02
+
+### Fixed
+- Docker stack now propagates GraphQL complexity env vars to the indexer container:
+  - `GRAPHQL_MAX_COMPLEXITY`
+  - `GRAPHQL_MAX_FIRST_CAP`
+
+### Changed
+- Added explicit complexity defaults in env templates with medium values:
+  - `GRAPHQL_MAX_COMPLEXITY=3000`
+  - `GRAPHQL_MAX_FIRST_CAP=400`
+
 ## [1.7.6] - 2026-03-02
 
 ### Changed
