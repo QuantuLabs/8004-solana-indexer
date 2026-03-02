@@ -1,204 +1,166 @@
 #!/usr/bin/env node
 /**
- * Initialize Supabase database with fresh schema
+ * Initialize Supabase database from supabase/schema.sql.
+ * WARNING: destructive init-only reset.
  * Usage: node scripts/init-supabase.js
  */
 
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 const { Client } = pg;
 
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error('❌ DATABASE_URL environment variable is required');
-  console.error('   Set it to your Supabase connection string');
-  process.exit(1);
+const DATABASE_URL = process.env.DATABASE_URL || process.env.SUPABASE_DSN;
+const FORCE_SCHEMA_RESET = process.env.FORCE_SCHEMA_RESET === '1';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..');
+const SCHEMA_PATH = path.join(REPO_ROOT, 'supabase', 'schema.sql');
+const MIGRATIONS_DIR = path.join(REPO_ROOT, 'supabase', 'migrations');
+
+const INDEXER_TABLES = [
+  // Current schema
+  'collections',
+  'collection_pointers',
+  'agents',
+  'metadata',
+  'feedbacks',
+  'feedback_responses',
+  'revocations',
+  'validations',
+  'atom_config',
+  'id_counters',
+  'indexer_state',
+  'agent_digest_cache',
+  // Legacy schema
+  'Agent',
+  'AgentMetadata',
+  'Feedback',
+  'FeedbackResponse',
+  'Validation',
+  'Registry',
+  'IndexerState',
+  'EventLog',
+];
+
+class UserAbortError extends Error {}
+
+function abort(message) {
+  throw new UserAbortError(message);
 }
 
-const initSQL = `
--- Drop all tables if they exist
-DROP TABLE IF EXISTS "EventLog" CASCADE;
-DROP TABLE IF EXISTS "IndexerState" CASCADE;
-DROP TABLE IF EXISTS "Registry" CASCADE;
-DROP TABLE IF EXISTS "FeedbackResponse" CASCADE;
-DROP TABLE IF EXISTS "Validation" CASCADE;
-DROP TABLE IF EXISTS "Feedback" CASCADE;
-DROP TABLE IF EXISTS "AgentMetadata" CASCADE;
-DROP TABLE IF EXISTS "Agent" CASCADE;
+async function loadSchemaSql() {
+  const sql = await fs.readFile(SCHEMA_PATH, 'utf8');
+  if (!sql.trim()) {
+    abort(`Schema file is empty: ${SCHEMA_PATH}`);
+  }
+  return sql;
+}
 
--- CreateTable: Agent
-CREATE TABLE "Agent" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "owner" TEXT NOT NULL,
-    "wallet" TEXT,
-    "uri" TEXT NOT NULL,
-    "nftName" TEXT NOT NULL,
-    "collection" TEXT NOT NULL,
-    "registry" TEXT NOT NULL,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP NOT NULL,
-    "createdTxSignature" TEXT,
-    "createdSlot" BIGINT
-);
+async function loadMigrationFiles() {
+  const entries = await fs.readdir(MIGRATIONS_DIR, { withFileTypes: true });
+  const sqlFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.sql'))
+    .map((entry) => entry.name)
+    .sort();
 
--- CreateTable: AgentMetadata
-CREATE TABLE "AgentMetadata" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "agentId" TEXT NOT NULL,
-    "key" TEXT NOT NULL,
-    "value" BYTEA NOT NULL,
-    "immutable" BOOLEAN NOT NULL DEFAULT false,
-    "txSignature" TEXT,
-    "slot" BIGINT,
-    CONSTRAINT "AgentMetadata_agentId_fkey" FOREIGN KEY ("agentId") REFERENCES "Agent" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+  if (sqlFiles.length === 0) {
+    abort('No SQL files found in supabase/migrations. Refusing destructive init.');
+  }
 
--- CreateTable: Feedback (with client in unique constraint)
-CREATE TABLE "Feedback" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "agentId" TEXT NOT NULL,
-    "client" TEXT NOT NULL,
-    "feedbackIndex" BIGINT NOT NULL,
-    "score" INTEGER NOT NULL,
-    "tag1" TEXT NOT NULL,
-    "tag2" TEXT NOT NULL,
-    "endpoint" TEXT NOT NULL,
-    "feedbackUri" TEXT NOT NULL,
-    "feedbackHash" BYTEA NOT NULL,
-    "revoked" BOOLEAN NOT NULL DEFAULT false,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "createdTxSignature" TEXT,
-    "createdSlot" BIGINT,
-    "revokedTxSignature" TEXT,
-    "revokedSlot" BIGINT,
-    CONSTRAINT "Feedback_agentId_fkey" FOREIGN KEY ("agentId") REFERENCES "Agent" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+  const first = sqlFiles[0];
+  const last = sqlFiles[sqlFiles.length - 1];
+  console.log(`📦 Found ${sqlFiles.length} migration SQL files (${first} -> ${last})`);
+  return sqlFiles;
+}
 
--- CreateTable: FeedbackResponse
-CREATE TABLE "FeedbackResponse" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "feedbackId" TEXT NOT NULL,
-    "responder" TEXT NOT NULL,
-    "responseUri" TEXT NOT NULL,
-    "responseHash" BYTEA NOT NULL,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "txSignature" TEXT,
-    "slot" BIGINT,
-    CONSTRAINT "FeedbackResponse_feedbackId_fkey" FOREIGN KEY ("feedbackId") REFERENCES "Feedback" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+async function confirmDestructiveReset(existingTables) {
+  if (FORCE_SCHEMA_RESET) {
+    console.log('⚠️  FORCE_SCHEMA_RESET=1 set, skipping interactive confirmation.');
+    return;
+  }
 
--- CreateTable: Validation
-CREATE TABLE "Validation" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "agentId" TEXT NOT NULL,
-    "validator" TEXT NOT NULL,
-    "requester" TEXT NOT NULL,
-    "nonce" INTEGER NOT NULL,
-    "requestUri" TEXT NOT NULL,
-    "requestHash" BYTEA NOT NULL,
-    "response" INTEGER,
-    "responseUri" TEXT,
-    "responseHash" BYTEA,
-    "tag" TEXT,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "respondedAt" TIMESTAMP,
-    "requestTxSignature" TEXT,
-    "requestSlot" BIGINT,
-    "responseTxSignature" TEXT,
-    "responseSlot" BIGINT,
-    CONSTRAINT "Validation_agentId_fkey" FOREIGN KEY ("agentId") REFERENCES "Agent" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-);
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    abort(
+      `Existing indexer tables detected (${existingTables.join(', ')}) and no interactive TTY is available.\n` +
+      '   Use supabase/migrations/*.sql for upgrades.\n' +
+      '   To force reset in non-interactive runs, set FORCE_SCHEMA_RESET=1.'
+    );
+  }
 
--- CreateTable: Registry
-CREATE TABLE "Registry" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "collection" TEXT NOT NULL,
-    "registryType" TEXT NOT NULL,
-    "authority" TEXT NOT NULL,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "txSignature" TEXT,
-    "slot" BIGINT
-);
-
--- CreateTable: IndexerState
-CREATE TABLE "IndexerState" (
-    "id" TEXT NOT NULL PRIMARY KEY DEFAULT 'main',
-    "lastSignature" TEXT,
-    "lastSlot" BIGINT,
-    "updatedAt" TIMESTAMP NOT NULL
-);
-
--- CreateTable: EventLog
-CREATE TABLE "EventLog" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "eventType" TEXT NOT NULL,
-    "signature" TEXT NOT NULL,
-    "slot" BIGINT NOT NULL,
-    "blockTime" TIMESTAMP NOT NULL,
-    "data" JSONB NOT NULL,
-    "processed" BOOLEAN NOT NULL DEFAULT false,
-    "error" TEXT,
-    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes
-CREATE INDEX "Agent_owner_idx" ON "Agent"("owner");
-CREATE INDEX "Agent_collection_idx" ON "Agent"("collection");
-CREATE INDEX "Agent_registry_idx" ON "Agent"("registry");
-CREATE INDEX "AgentMetadata_agentId_idx" ON "AgentMetadata"("agentId");
-CREATE UNIQUE INDEX "AgentMetadata_agentId_key_key" ON "AgentMetadata"("agentId", "key");
-CREATE INDEX "Feedback_agentId_idx" ON "Feedback"("agentId");
-CREATE INDEX "Feedback_client_idx" ON "Feedback"("client");
-CREATE INDEX "Feedback_score_idx" ON "Feedback"("score");
-CREATE INDEX "Feedback_tag1_idx" ON "Feedback"("tag1");
-CREATE INDEX "Feedback_tag2_idx" ON "Feedback"("tag2");
-CREATE UNIQUE INDEX "Feedback_agentId_client_feedbackIndex_key" ON "Feedback"("agentId", "client", "feedbackIndex");
-CREATE INDEX "FeedbackResponse_feedbackId_idx" ON "FeedbackResponse"("feedbackId");
-CREATE INDEX "Validation_agentId_idx" ON "Validation"("agentId");
-CREATE INDEX "Validation_validator_idx" ON "Validation"("validator");
-CREATE INDEX "Validation_requester_idx" ON "Validation"("requester");
-CREATE UNIQUE INDEX "Validation_agentId_validator_nonce_key" ON "Validation"("agentId", "validator", "nonce");
-CREATE UNIQUE INDEX "Registry_collection_key" ON "Registry"("collection");
-CREATE INDEX "Registry_registryType_idx" ON "Registry"("registryType");
-CREATE INDEX "Registry_authority_idx" ON "Registry"("authority");
-CREATE INDEX "EventLog_eventType_idx" ON "EventLog"("eventType");
-CREATE INDEX "EventLog_signature_idx" ON "EventLog"("signature");
-CREATE INDEX "EventLog_slot_idx" ON "EventLog"("slot");
-CREATE INDEX "EventLog_processed_idx" ON "EventLog"("processed");
-`;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const input = await rl.question(
+      `⚠️  Existing indexer tables detected (${existingTables.join(', ')}).\n` +
+      'Type RESET to continue destructive initialization from supabase/schema.sql: '
+    );
+    if (input.trim() !== 'RESET') {
+      abort('Reset cancelled. Use supabase/migrations/*.sql for upgrades.');
+    }
+  } finally {
+    rl.close();
+  }
+}
 
 async function main() {
-  console.log('🔗 Connecting to Supabase...');
-  const client = new Client({ connectionString: DATABASE_URL });
+  let client = null;
 
   try {
+    await loadMigrationFiles();
+
+    if (!DATABASE_URL) {
+      abort('DATABASE_URL or SUPABASE_DSN environment variable is required.');
+    }
+
+    const schemaSql = await loadSchemaSql();
+
+    console.log('🔗 Connecting to Supabase...');
+    client = new Client({ connectionString: DATABASE_URL });
     await client.connect();
-    console.log('✅ Connected to Supabase\n');
+    console.log('✅ Connected to Supabase');
 
-    console.log('🗑️  Dropping existing tables...');
-    console.log('📋 Creating fresh schema with updated constraints...\n');
+    const tableCheck = await client.query(
+      `
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+        AND table_name = ANY($1::text[])
+      ORDER BY table_name;
+      `,
+      [INDEXER_TABLES]
+    );
 
-    await client.query(initSQL);
+    const existingTables = tableCheck.rows.map((row) => row.table_name);
+    if (existingTables.length > 0) {
+      await confirmDestructiveReset(existingTables);
+    }
 
-    console.log('✅ Database initialized successfully!');
-    console.log('\n📊 Verifying Feedback table constraint:');
-
-    const result = await client.query(`
-      SELECT
-          indexname,
-          indexdef
-      FROM pg_indexes
-      WHERE tablename = 'Feedback'
-        AND indexname LIKE '%feedbackIndex%';
-    `);
-
-    console.log(result.rows);
+    console.log('🧨 Applying supabase/schema.sql ...');
+    await client.query('BEGIN');
+    if (existingTables.length > 0 || FORCE_SCHEMA_RESET) {
+      await client.query("SET LOCAL app.allow_destructive_schema_reset = 'on';");
+    }
+    await client.query(schemaSql);
+    await client.query('COMMIT');
+    console.log('✅ Database initialized from supabase/schema.sql');
 
   } catch (error) {
+    if (client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
     console.error('❌ Initialization failed:', error.message);
-    console.error(error.stack);
+    if (!(error instanceof UserAbortError) && error.stack) {
+      console.error(error.stack);
+    }
     process.exit(1);
   } finally {
-    await client.end();
+    if (client) {
+      await client.end().catch(() => {});
+    }
   }
 }
 

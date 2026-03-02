@@ -5,6 +5,54 @@
 -- =============================================
 
 -- =============================================
+-- SAFETY GUARD (destructive reset protection)
+-- =============================================
+-- schema.sql is for fresh initialization only.
+-- If indexer tables already exist, this script aborts unless the session sets:
+--   SET app.allow_destructive_schema_reset = 'on';
+-- For upgrades, use supabase/migrations/*.sql instead.
+DO $$
+DECLARE
+  existing_table_count INTEGER;
+  allow_reset TEXT;
+BEGIN
+  allow_reset := COALESCE(current_setting('app.allow_destructive_schema_reset', true), '');
+
+  SELECT COUNT(*) INTO existing_table_count
+  FROM information_schema.tables
+  WHERE table_schema = 'public'
+    AND table_type = 'BASE TABLE'
+    AND table_name = ANY (ARRAY[
+      'collections',
+      'collection_pointers',
+      'agents',
+      'metadata',
+      'feedbacks',
+      'feedback_responses',
+      'revocations',
+      'validations',
+      'atom_config',
+      'id_counters',
+      'indexer_state',
+      'agent_digest_cache',
+      'Agent',
+      'AgentMetadata',
+      'Feedback',
+      'FeedbackResponse',
+      'Validation',
+      'Registry',
+      'IndexerState',
+      'EventLog'
+    ]);
+
+  IF existing_table_count > 0 AND lower(allow_reset) NOT IN ('1', 'true', 'yes', 'on') THEN
+    RAISE EXCEPTION
+      'Refusing to run destructive supabase/schema.sql on a non-empty indexer database. Use supabase/migrations/*.sql for upgrades, or explicitly opt in with SET app.allow_destructive_schema_reset = ''on''.';
+  END IF;
+END;
+$$;
+
+-- =============================================
 -- DROP EXISTING (clean slate)
 -- =============================================
 DROP VIEW IF EXISTS global_stats CASCADE;
@@ -12,6 +60,9 @@ DROP VIEW IF EXISTS collection_stats CASCADE;
 DROP VIEW IF EXISTS leaderboard CASCADE;
 DROP FUNCTION IF EXISTS get_leaderboard CASCADE;
 DROP TABLE IF EXISTS atom_config CASCADE;
+DROP TABLE IF EXISTS agent_digest_cache CASCADE;
+DROP TABLE IF EXISTS indexer_state CASCADE;
+DROP TABLE IF EXISTS id_counters CASCADE;
 DROP TABLE IF EXISTS validations CASCADE;
 DROP TABLE IF EXISTS feedback_responses CASCADE;
 DROP TABLE IF EXISTS revocations CASCADE;

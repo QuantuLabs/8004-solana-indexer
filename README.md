@@ -37,6 +37,22 @@ GraphQL v2 endpoint:
 http://localhost:3001/v2/graphql
 ```
 
+## WARNING: Destructive Schema Init Only
+
+`supabase/schema.sql` is destructive and intended for fresh initialization only.
+
+- `scripts/init-supabase.js` drops and recreates indexer tables when applied to an existing database.
+- Upgrades must use `supabase/migrations/*.sql` (in order), not `schema.sql`.
+- When existing indexer tables are detected, init requires explicit `RESET` confirmation in an interactive TTY, or `FORCE_SCHEMA_RESET=1` for non-interactive forced resets.
+
+## WARNING: Historical Sync vs WebSocket
+
+WebSocket subscriptions are live notifications, not historical replay.
+
+- For complete bootstrap/sync, use HTTP RPC history first (`getSignaturesForAddress` + transaction fetch).
+- Then run live tail with `INDEXER_MODE=websocket` or `INDEXER_MODE=auto`.
+- If your provider/network keeps limited history (often devnet/testnet), use archival RPC for bootstrap, or set `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`.
+
 ## Remote API Docs
 
 Canonical API docs are maintained in:
@@ -73,12 +89,12 @@ ATOM_ENGINE_PROGRAM_ID=AToMufS4QD6hEXvcvBDg9m1AHeCLpmZQsyfYa5h9MwAF
 ```
 
 ```bash
-# Mainnet config example (set PROGRAM_ID to your deployed mainnet program)
+# Mainnet config example
 # SOLANA_NETWORK=mainnet-beta
 # RPC_URL=https://api.mainnet-beta.solana.com
 # WS_URL=wss://api.mainnet-beta.solana.com
-# PROGRAM_ID=<MAINNET_PROGRAM_ID>
-# ATOM_ENGINE_PROGRAM_ID=<MAINNET_ATOM_ENGINE_PROGRAM_ID>
+# PROGRAM_ID=8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ
+# ATOM_ENGINE_PROGRAM_ID=AToMw53aiPQ8j7iHVb4fGt6nzUNxUhcPc3tbPBZuzVVb
 ```
 
 Notes:
@@ -89,14 +105,14 @@ Notes:
   - `DB_MODE=supabase` with PostgREST proxy auth (`SUPABASE_URL` + `SUPABASE_KEY`, or `POSTGREST_URL` + `POSTGREST_TOKEN`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
 - `.env.devnet.example` includes current devnet bootstrap cursor (`INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`).
-- `.env.mainnet.example` is a template: set mainnet `PROGRAM_ID` plus mainnet deployment signature/slot.
+- `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`; set startup signature/slot for first sync.
+- IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/default runtime) and `agent_registry_8004.mainnet.json` (mainnet reference copy).
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
 - `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
 - Optional startup cursor bootstrap: `INDEXER_START_SIGNATURE` (and optional `INDEXER_START_SLOT`) is applied only when no persisted `indexer_state` exists.
 - `INDEXER_START_SLOT` requires `INDEXER_START_SIGNATURE`.
-- If `SOLANA_NETWORK=mainnet-beta`, replace `PROGRAM_ID` with your mainnet deployment ID (`<MAINNET_PROGRAM_ID>` placeholder in examples). At runtime, startup validation emits a warning if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
-- If `SOLANA_NETWORK=mainnet-beta`, also set `ATOM_ENGINE_PROGRAM_ID` to your mainnet ATOM deployment (`<MAINNET_ATOM_ENGINE_PROGRAM_ID>` placeholder in examples).
+- If `SOLANA_NETWORK=mainnet-beta`, ensure `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID` match your deployed mainnet programs. Startup validation warns if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
 - `IPFS_GATEWAY_BASE` sets the gateway base used for `ipfs://` URI digest fetches and canonical collection pointer (`c1:<cid>`) fetches (default `https://ipfs.io`).
