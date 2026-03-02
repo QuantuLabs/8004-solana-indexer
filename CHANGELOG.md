@@ -7,6 +7,20 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 
+## [1.7.6] - 2026-03-02
+
+### Changed
+- Mainnet-ready release notes and environment templates now explicitly document production endpoint usage and dual-IDL layout (`devnet` default + companion `mainnet` IDL file).
+- Docker/CI verification coverage was extended in release validation to include IDL loading behavior checks and GraphQL/REST container health assertions.
+
+### Added
+- Companion mainnet IDL file (`idl/agent_registry_8004.mainnet.json`) is shipped alongside the default devnet/runtime IDL without changing default decoder behavior.
+- Local websocket integrity harness and report scripts were added for input/output parity validation under stress.
+
+### Fixed
+- Hardened destructive schema initialization flow: non-empty DB guard, explicit confirmation in init script, migration presence checks, and compatibility with both `DATABASE_URL` and `SUPABASE_DSN`.
+- Startup warnings now explicitly flag risky websocket-only historical backfill configurations (no bootstrap cursor + likely non-archival RPC).
+
 ## [1.7.5] - 2026-03-01
 
 ### Fixed

@@ -1,6 +1,6 @@
 {
   "name": "8004-solana-indexer",
-  "version": "1.7.5",
+  "version": "1.7.6",
   "description": "Custom Solana indexer for 8004 Agent Registry v0.4.0",
   "type": "module",
   "main": "dist/index.js",
