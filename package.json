@@ -25,6 +25,7 @@
     "localnet:start": "bash scripts/localnet-start.sh",
     "localnet:init": "bash scripts/localnet-init.sh",
     "localnet:stop": "bash scripts/localnet-stop.sh",
+    "integrity:localnet:websocket": "bash scripts/run-localnet-websocket-integrity.sh",
     "test:metadata:digestion": "bunx vitest run tests/unit/uriDigest.test.ts tests/unit/uriDigest-coverage.test.ts tests/unit/indexer/collectionDigest.test.ts",
     "test:localnet:only": "RUN_LOCALNET_E2E=1 bunx vitest run --config vitest.e2e.config.ts -t 'Localnet' && bun run test:metadata:digestion",
     "test:localnet": "bash scripts/run-localnet-e2e.sh",

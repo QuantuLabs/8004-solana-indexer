@@ -44,6 +44,7 @@ data/
 coverage/
 
 scripts/*.ts
+!scripts/localnet-websocket-integrity-report.ts
 
 # Audit files (local only)
 audit.md
