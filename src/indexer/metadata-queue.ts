@@ -24,6 +24,38 @@ const TIMEOUT_MS = 30000;      // 30s timeout per operation
 const MAX_QUEUE_SIZE = 5000;   // Max pending tasks in queue (memory protection)
 const RECOVERY_BATCH_SIZE = 1000;
 const RECOVERY_INTERVAL_MS = 60_000;
+const DEFAULT_RECOVERY_RETRY_MS = 15 * 60_000;
+const MIN_RECOVERY_RETRY_MS = 60_000;
+const DEFAULT_RECOVERY_COOLDOWN_MAX_ENTRIES = 10_000;
+const MIN_RECOVERY_COOLDOWN_MAX_ENTRIES = 100;
+
+function parseRecoveryRetryMs(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") {
+    return DEFAULT_RECOVERY_RETRY_MS;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < MIN_RECOVERY_RETRY_MS) {
+    return DEFAULT_RECOVERY_RETRY_MS;
+  }
+  return parsed;
+}
+
+const RECOVERY_RETRY_MS = parseRecoveryRetryMs(process.env.METADATA_RECOVERY_RETRY_MS);
+
+function parseRecoveryCooldownMaxEntries(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") {
+    return DEFAULT_RECOVERY_COOLDOWN_MAX_ENTRIES;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < MIN_RECOVERY_COOLDOWN_MAX_ENTRIES) {
+    return DEFAULT_RECOVERY_COOLDOWN_MAX_ENTRIES;
+  }
+  return parsed;
+}
+
+const RECOVERY_COOLDOWN_MAX_ENTRIES = parseRecoveryCooldownMaxEntries(
+  process.env.METADATA_RECOVERY_MAX_COOLDOWN_ENTRIES
+);
 
 import { STANDARD_URI_FIELDS } from "../constants.js";
 
@@ -32,6 +64,11 @@ export interface MetadataTask {
   uri: string;
   addedAt: number;
 }
+
+type RecoveryRetryEntry = {
+  uri: string;
+  retryAt: number;
+};
 
 /**
  * Singleton metadata extraction queue
@@ -42,6 +79,7 @@ class MetadataQueue {
   private pool: Pool | null = null;
   private pending = new Map<string, MetadataTask>(); // assetId -> latest task
   private deferred = new Map<string, MetadataTask>(); // assetId -> latest deferred task
+  private recoveryRetryAt = new Map<string, RecoveryRetryEntry>(); // assetId -> latest failed URI + next eligibility
   private statsInterval: NodeJS.Timeout | null = null;
   private recoveryInterval: NodeJS.Timeout | null = null;
   private recoveryInFlight = false;
@@ -137,6 +175,7 @@ class MetadataQueue {
 
         if (freshCheck.rows.length === 0) {
           logger.debug({ assetId }, "Agent no longer exists, skipping");
+          this.recoveryRetryAt.delete(assetId);
           this.stats.skippedStale++;
           return;
         }
@@ -144,6 +183,7 @@ class MetadataQueue {
         if (freshCheck.rows[0].agent_uri !== uri) {
           logger.debug({ assetId, expected: uri, current: freshCheck.rows[0].agent_uri },
             "URI changed, skipping stale fetch");
+          this.recoveryRetryAt.delete(assetId);
           this.stats.skippedStale++;
           return;
         }
@@ -174,6 +214,7 @@ class MetadataQueue {
           bytes: result.bytes,
           hash: result.hash,
         }));
+        this.setRecoveryRetry(assetId, uri, Date.now() + RECOVERY_RETRY_MS);
         logger.debug({ assetId, uri, status: result.status }, "URI digest failed");
         this.stats.processed++;
         return;
@@ -213,6 +254,7 @@ class MetadataQueue {
         );
       }
 
+      this.recoveryRetryAt.delete(assetId);
       this.stats.processed++;
       logger.info({ assetId, uri, fieldCount: Object.keys(result.fields).length }, "Metadata extracted");
 
@@ -221,6 +263,41 @@ class MetadataQueue {
       logger.error({ assetId, uri, error: error.message }, "Metadata extraction failed");
     } finally {
       this.promoteDeferredIfCapacity();
+    }
+  }
+
+  private canScheduleRecovery(assetId: string, uri: string, nowMs: number): boolean {
+    const entry = this.recoveryRetryAt.get(assetId);
+    if (!entry) return true;
+    // If URI changed since last failed attempt, allow immediate retry.
+    if (entry.uri !== uri) {
+      this.recoveryRetryAt.delete(assetId);
+      return true;
+    }
+    if (entry.retryAt <= nowMs) {
+      this.recoveryRetryAt.delete(assetId);
+      return true;
+    }
+    return false;
+  }
+
+  private purgeExpiredRecoveryCooldowns(nowMs: number): void {
+    for (const [assetId, entry] of this.recoveryRetryAt.entries()) {
+      if (entry.retryAt <= nowMs) {
+        this.recoveryRetryAt.delete(assetId);
+      }
+    }
+  }
+
+  private setRecoveryRetry(assetId: string, uri: string, retryAt: number): void {
+    if (this.recoveryRetryAt.has(assetId)) {
+      this.recoveryRetryAt.delete(assetId);
+    }
+    this.recoveryRetryAt.set(assetId, { uri, retryAt });
+    while (this.recoveryRetryAt.size > RECOVERY_COOLDOWN_MAX_ENTRIES) {
+      const oldest = this.recoveryRetryAt.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.recoveryRetryAt.delete(oldest);
     }
   }
 
@@ -309,6 +386,7 @@ class MetadataQueue {
       queueSize: this.queue.size,
       pendingCount: this.pending.size,
       deferredCount: this.deferred.size,
+      recoveryCooldownCount: this.recoveryRetryAt.size,
     };
   }
 
@@ -334,6 +412,7 @@ class MetadataQueue {
       clearInterval(this.recoveryInterval);
       this.recoveryInterval = null;
     }
+    this.recoveryRetryAt.clear();
   }
 
   private logStats(): void {
@@ -375,11 +454,24 @@ class MetadataQueue {
           [RECOVERY_BATCH_SIZE]
         );
 
+        const nowMs = Date.now();
+        this.purgeExpiredRecoveryCooldowns(nowMs);
+
         if (rows.length > 0) {
+          let recoveredCount = 0;
           for (const row of rows) {
+            if (!this.canScheduleRecovery(row.asset, row.agent_uri, nowMs)) {
+              continue;
+            }
+            // Reserve a cooldown window immediately so the next sweep does not re-enqueue
+            // the same failed URI before this task is processed.
+            this.setRecoveryRetry(row.asset, row.agent_uri, nowMs + RECOVERY_RETRY_MS);
             this.add(row.asset, row.agent_uri);
+            recoveredCount++;
           }
-          logger.info({ recoveredCount: rows.length }, "Recovered missing URI metadata tasks");
+          if (recoveredCount > 0) {
+            logger.info({ recoveredCount }, "Recovered missing URI metadata tasks");
+          }
         }
       } catch (error: any) {
         logger.warn({ error: error.message }, "Metadata recovery sweep failed");

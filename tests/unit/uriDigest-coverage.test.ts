@@ -711,6 +711,64 @@ describe("URI Digest Coverage", () => {
       expect(result.status).toBe("blocked");
     });
 
+    it("should cache DNS failures and avoid repeated lookups within TTL", async () => {
+      mockLookup.mockRejectedValue(new Error("ENOTFOUND"));
+
+      const uri = "https://cached-dns-fail.invalid/agent.json";
+      const first = await digestUri(uri);
+      const second = await digestUri(uri);
+
+      expect(first.status).toBe("blocked");
+      expect(second.status).toBe("blocked");
+      expect(mockLookup).toHaveBeenCalledTimes(1);
+    });
+
+    it("should cache EAI_AGAIN DNS failures and avoid repeated lookups", async () => {
+      mockLookup.mockRejectedValue(new Error("EAI_AGAIN"));
+
+      const uri = "https://cached-dns-eai.invalid/agent.json";
+      const first = await digestUri(uri);
+      const second = await digestUri(uri);
+
+      expect(first.status).toBe("blocked");
+      expect(second.status).toBe("blocked");
+      expect(mockLookup).toHaveBeenCalledTimes(1);
+    });
+
+    it("should retry DNS lookup after negative-cache TTL expires", async () => {
+      vi.useFakeTimers();
+      try {
+        mockLookup.mockRejectedValue(new Error("ENOTFOUND"));
+        const uri = "https://cached-dns-ttl.invalid/agent.json";
+        const first = await digestUri(uri);
+        const second = await digestUri(uri);
+        expect(first.status).toBe("blocked");
+        expect(second.status).toBe("blocked");
+        expect(mockLookup).toHaveBeenCalledTimes(1);
+
+        const raw = process.env.URI_DIGEST_DNS_NEGATIVE_TTL_MS;
+        const parsed = raw ? parseInt(raw, 10) : NaN;
+        const ttlMs = Number.isFinite(parsed) && parsed >= 10_000 ? parsed : 600_000;
+        vi.advanceTimersByTime(ttlMs + 1);
+
+        const third = await digestUri(uri);
+        expect(third.status).toBe("blocked");
+        expect(mockLookup).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("should not cache non-matching DNS errors", async () => {
+      mockLookup.mockRejectedValue(new Error("ETIMEOUT"));
+      const uri = "https://noncached-dns-error.invalid/agent.json";
+      const first = await digestUri(uri);
+      const second = await digestUri(uri);
+      expect(first.status).toBe("blocked");
+      expect(second.status).toBe("blocked");
+      expect(mockLookup).toHaveBeenCalledTimes(2);
+    });
+
     it("should skip DNS validation for trusted gateway ipfs.io", async () => {
       global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "IPFS" }));
       const result = await digestUri("ipfs://QmTest123");

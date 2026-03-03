@@ -288,6 +288,84 @@ const BLOCKED_HOSTS = new Set([
 ]);
 const ALWAYS_TRUSTED_HOSTS = new Set(["ipfs.io", "arweave.net"]);
 const LOCALHOST_TRUST_OVERRIDE_ALLOWLIST = new Set(["localhost", "127.0.0.1"]);
+const DEFAULT_DNS_NEGATIVE_TTL_MS = 10 * 60_000;
+const MIN_DNS_NEGATIVE_TTL_MS = 10_000;
+const DEFAULT_DNS_NEGATIVE_CACHE_MAX_ENTRIES = 10_000;
+const MIN_DNS_NEGATIVE_CACHE_MAX_ENTRIES = 100;
+
+function parseDnsNegativeTtlMs(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") {
+    return DEFAULT_DNS_NEGATIVE_TTL_MS;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < MIN_DNS_NEGATIVE_TTL_MS) {
+    return DEFAULT_DNS_NEGATIVE_TTL_MS;
+  }
+  return parsed;
+}
+
+const DNS_NEGATIVE_TTL_MS = parseDnsNegativeTtlMs(process.env.URI_DIGEST_DNS_NEGATIVE_TTL_MS);
+
+function parseDnsNegativeCacheMaxEntries(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") {
+    return DEFAULT_DNS_NEGATIVE_CACHE_MAX_ENTRIES;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < MIN_DNS_NEGATIVE_CACHE_MAX_ENTRIES) {
+    return DEFAULT_DNS_NEGATIVE_CACHE_MAX_ENTRIES;
+  }
+  return parsed;
+}
+
+const DNS_NEGATIVE_CACHE_MAX_ENTRIES = parseDnsNegativeCacheMaxEntries(
+  process.env.URI_DIGEST_DNS_NEGATIVE_CACHE_MAX_ENTRIES
+);
+
+type NegativeDnsEntry = {
+  expiresAt: number;
+  error: string;
+};
+
+const negativeDnsCache = new Map<string, NegativeDnsEntry>();
+
+function purgeExpiredNegativeDnsEntries(nowMs: number): void {
+  for (const [hostname, entry] of negativeDnsCache.entries()) {
+    if (entry.expiresAt <= nowMs) {
+      negativeDnsCache.delete(hostname);
+    }
+  }
+}
+
+function getActiveNegativeDnsEntry(hostname: string): NegativeDnsEntry | null {
+  const key = hostname.toLowerCase();
+  const existing = negativeDnsCache.get(key);
+  if (!existing) return null;
+  if (existing.expiresAt <= Date.now()) {
+    negativeDnsCache.delete(key);
+    return null;
+  }
+  return existing;
+}
+
+function shouldCacheDnsFailure(errorText: string): boolean {
+  return /ENOTFOUND|EAI_AGAIN|EAI_FAIL|EAI_NONAME|SERVFAIL|NXDOMAIN/i.test(errorText);
+}
+
+function cacheNegativeDnsFailure(hostname: string, errorText: string, nowMs: number): void {
+  // Refresh insertion order for existing keys.
+  if (negativeDnsCache.has(hostname)) {
+    negativeDnsCache.delete(hostname);
+  }
+  negativeDnsCache.set(hostname, {
+    expiresAt: nowMs + DNS_NEGATIVE_TTL_MS,
+    error: errorText,
+  });
+  while (negativeDnsCache.size > DNS_NEGATIVE_CACHE_MAX_ENTRIES) {
+    const oldest = negativeDnsCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    negativeDnsCache.delete(oldest);
+  }
+}
 
 function getConfiguredIpfsGatewayHost(): string | null {
   try {
@@ -573,12 +651,29 @@ async function validateHostResolution(
   allowTrustedLocalHostOverride: boolean
 ): Promise<{ ip: string; family: number } | null> {
   try {
+    const normalizedHost = hostname.toLowerCase();
+    purgeExpiredNegativeDnsEntries(Date.now());
+
     // Skip validation and pinning for known safe gateways and explicit local test overrides.
     if (isTrustedHost(hostname, allowTrustedLocalHostOverride)) {
       return { ip: hostname, family: 0 }; // family 0 = use hostname directly
     }
 
+    const cachedFailure = getActiveNegativeDnsEntry(normalizedHost);
+    if (cachedFailure) {
+      logger.debug(
+        {
+          hostname,
+          retryAfterMs: Math.max(0, cachedFailure.expiresAt - Date.now()),
+          cachedError: cachedFailure.error,
+        },
+        "DNS resolution failed recently, using cached block"
+      );
+      return null;
+    }
+
     const result = await lookup(hostname, { all: true });
+    negativeDnsCache.delete(normalizedHost);
 
     // Find first non-private IP to use for pinning
     for (const record of result) {
@@ -596,7 +691,16 @@ async function validateHostResolution(
   } catch (error) {
     // DNS resolution failed - block by default (fail-closed)
     // This prevents attacks where DNS times out but later resolves to private IP
-    logger.warn({ hostname, error: String(error) }, "DNS resolution failed, blocking for safety");
+    const errorText = String(error);
+    if (shouldCacheDnsFailure(errorText)) {
+      cacheNegativeDnsFailure(hostname.toLowerCase(), errorText, Date.now());
+      logger.warn(
+        { hostname, error: errorText, ttlMs: DNS_NEGATIVE_TTL_MS },
+        "DNS resolution failed, cached and blocking for safety"
+      );
+      return null;
+    }
+    logger.warn({ hostname, error: errorText }, "DNS resolution failed, blocking for safety");
     return null;
   }
 }

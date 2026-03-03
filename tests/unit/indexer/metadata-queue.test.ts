@@ -90,6 +90,7 @@ function resetQueueState() {
   const q = metadataQueue as any;
   q.pending.clear();
   q.deferred.clear();
+  q.recoveryRetryAt.clear();
   q.queueFullSignals = 0;
   q.stats = {
     queued: 0,
@@ -466,6 +467,28 @@ describe("MetadataQueue", () => {
       expect(stats).toHaveProperty("deferredCount");
       expect(stats).toHaveProperty("deferredQueued");
       expect(stats).toHaveProperty("deferredPromoted");
+      expect(stats).toHaveProperty("recoveryCooldownCount");
+    });
+  });
+
+  describe("recovery cooldown", () => {
+    it("should enforce recovery cooldown per asset", () => {
+      const q = metadataQueue as any;
+      const now = Date.now();
+      q.recoveryRetryAt.set("asset1", { uri: "https://example.com/a.json", retryAt: now + 60_000 });
+
+      expect(q.canScheduleRecovery("asset1", "https://example.com/a.json", now)).toBe(false);
+      expect(q.canScheduleRecovery("asset1", "https://example.com/a.json", now + 60_001)).toBe(true);
+      expect(q.recoveryRetryAt.has("asset1")).toBe(false);
+    });
+
+    it("should allow immediate recovery when URI changed for same asset", () => {
+      const q = metadataQueue as any;
+      const now = Date.now();
+      q.recoveryRetryAt.set("asset1", { uri: "https://example.com/old.json", retryAt: now + 60_000 });
+
+      expect(q.canScheduleRecovery("asset1", "https://example.com/new.json", now)).toBe(true);
+      expect(q.recoveryRetryAt.has("asset1")).toBe(false);
     });
   });
 
