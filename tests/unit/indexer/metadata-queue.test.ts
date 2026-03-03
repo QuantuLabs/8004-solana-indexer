@@ -490,6 +490,22 @@ describe("MetadataQueue", () => {
       expect(q.canScheduleRecovery("asset1", "https://example.com/new.json", now)).toBe(true);
       expect(q.recoveryRetryAt.has("asset1")).toBe(false);
     });
+
+    it("should evict oldest cooldown entries when cap is reached", () => {
+      const q = metadataQueue as any;
+      const now = Date.now();
+      const raw = process.env.METADATA_RECOVERY_MAX_COOLDOWN_ENTRIES;
+      const parsed = raw ? parseInt(raw, 10) : NaN;
+      const cap = Number.isFinite(parsed) && parsed >= 100 ? parsed : 10_000;
+
+      for (let i = 0; i < cap + 20; i++) {
+        q.setRecoveryRetry(`asset-${i}`, `https://example.com/${i}.json`, now + 60_000);
+      }
+
+      expect(q.recoveryRetryAt.size).toBe(cap);
+      expect(q.recoveryRetryAt.has("asset-0")).toBe(false);
+      expect(q.recoveryRetryAt.has(`asset-${cap + 19}`)).toBe(true);
+    });
   });
 
   describe("drain", () => {
