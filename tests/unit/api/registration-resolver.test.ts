@@ -49,4 +49,30 @@ describe('Registration Resolver Service Matching', () => {
     expect(mcpTools).toEqual(['tool-a']);
     expect(a2aSkills).toEqual(['skill-a']);
   });
+
+  it('uses type fallback when name is non-canonical and ignores non-string names safely', async () => {
+    const ctx = makeRegistrationCtx([
+      { name: 123, type: 'mcp', endpoint: 'https://mcp.example.com' },
+      { name: 'A2A Service', type: 'a2a', endpoint: 'https://a2a.example.com' },
+    ]);
+    const parent = { _asset: 'Asset111' };
+
+    const mcpEndpoint = await registrationResolvers.AgentRegistrationFile.mcpEndpoint(parent, {}, ctx);
+    const a2aEndpoint = await registrationResolvers.AgentRegistrationFile.a2aEndpoint(parent, {}, ctx);
+
+    expect(mcpEndpoint).toBe('https://mcp.example.com');
+    expect(a2aEndpoint).toBe('https://a2a.example.com');
+  });
+
+  it('does not surface a2aSkills as oasfSkills', async () => {
+    const ctx = makeRegistrationCtx([
+      { name: 'a2a', endpoint: 'https://a2a.example.com', a2aSkills: ['summarize'] },
+      { name: 'oasf', endpoint: 'https://oasf.example.com', skills: ['finance'] },
+    ]);
+    const parent = { _asset: 'Asset111' };
+
+    const oasfSkills = await registrationResolvers.AgentRegistrationFile.oasfSkills(parent, {}, ctx);
+
+    expect(oasfSkills).toEqual(['finance']);
+  });
 });

@@ -106,8 +106,8 @@ function parseStringArray(raw: string | undefined): string[] | null {
   }
 }
 
-function normalizeServiceName(name: string | undefined): string | null {
-  if (!name) return null;
+function normalizeServiceName(name: unknown): string | null {
+  if (typeof name !== 'string') return null;
   const normalized = name.trim().toLowerCase();
   return normalized.length > 0 ? normalized : null;
 }
@@ -117,8 +117,9 @@ function findService(services: ServiceEntry[], svcName: string): ServiceEntry | 
   if (!target) return undefined;
 
   return services.find((s) => {
-    const name = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
-    return name === target;
+    const name = normalizeServiceName(s.name);
+    const type = normalizeServiceName(s.type);
+    return name === target || type === target;
   });
 }
 
@@ -133,9 +134,8 @@ function getServiceSkills(svc: ServiceEntry | undefined): string[] | null {
 function gatherServiceSkills(services: ServiceEntry[]): string[] {
   const allSkills: string[] = [];
   for (const s of services) {
-    const skills = s.a2aSkills ?? s.skills;
-    if (Array.isArray(skills)) {
-      for (const skill of skills) {
+    if (Array.isArray(s.skills)) {
+      for (const skill of s.skills) {
         if (typeof skill === 'string') allSkills.push(skill);
       }
     }
