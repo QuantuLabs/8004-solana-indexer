@@ -20,11 +20,14 @@ export interface RegistrationParent {
 }
 
 interface ServiceEntry {
+  name?: string;
   type?: string;
   endpoint?: string;
   version?: string;
   tools?: string[];
   skills?: string[];
+  mcpTools?: string[];
+  a2aSkills?: string[];
 }
 
 interface ParsedRegistration {
@@ -103,11 +106,36 @@ function parseStringArray(raw: string | undefined): string[] | null {
   }
 }
 
+function normalizeServiceName(name: string | undefined): string | null {
+  if (!name) return null;
+  const normalized = name.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function findService(services: ServiceEntry[], svcName: string): ServiceEntry | undefined {
+  const target = normalizeServiceName(svcName);
+  if (!target) return undefined;
+
+  return services.find((s) => {
+    const name = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
+    return name === target;
+  });
+}
+
+function getServiceTools(svc: ServiceEntry | undefined): string[] | null {
+  return svc?.mcpTools ?? svc?.tools ?? null;
+}
+
+function getServiceSkills(svc: ServiceEntry | undefined): string[] | null {
+  return svc?.a2aSkills ?? svc?.skills ?? null;
+}
+
 function gatherServiceSkills(services: ServiceEntry[]): string[] {
   const allSkills: string[] = [];
   for (const s of services) {
-    if (Array.isArray(s.skills)) {
-      for (const skill of s.skills) {
+    const skills = s.a2aSkills ?? s.skills;
+    if (Array.isArray(skills)) {
+      for (const skill of skills) {
         if (typeof skill === 'string') allSkills.push(skill);
       }
     }
@@ -139,23 +167,23 @@ export const registrationResolvers = {
     },
     async mcpEndpoint(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
-      const mcp = parsed.services.find(s => s.type === 'mcp');
+      const mcp = findService(parsed.services, 'mcp');
       return mcp?.endpoint ?? null;
     },
     async mcpTools(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
-      const mcp = parsed.services.find(s => s.type === 'mcp');
-      return mcp?.tools ?? null;
+      const mcp = findService(parsed.services, 'mcp');
+      return getServiceTools(mcp);
     },
     async a2aEndpoint(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
-      const a2a = parsed.services.find(s => s.type === 'a2a');
+      const a2a = findService(parsed.services, 'a2a');
       return a2a?.endpoint ?? null;
     },
     async a2aSkills(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
-      const a2a = parsed.services.find(s => s.type === 'a2a');
-      return a2a?.skills ?? null;
+      const a2a = findService(parsed.services, 'a2a');
+      return getServiceSkills(a2a);
     },
     async oasfSkills(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
