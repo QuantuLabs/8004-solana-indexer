@@ -1300,8 +1300,10 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
+      const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
       const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
+      const feedbackIndexNotInState = parsePostgRESTListOperator(req.query.feedback_index, 'not.in');
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
       const is_revoked = parsePostgRESTValue(req.query.is_revoked);
       const tag1 = parsePostgRESTValue(req.query.tag1);
@@ -1349,6 +1351,24 @@ export function createApiServer(options: ApiServerOptions): Express {
           return;
         }
         where.feedbackIndex = { in: indices };
+      } else if (feedbackIndexNotInState.matched) {
+        if (feedbackIndexNotInState.malformed || feedbackIndexNotInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexNotInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        where.feedbackIndex = { notIn: indices };
+      } else if (feedbackIndexRaw?.startsWith('neq.')) {
+        const idx = safeBigInt(feedbackIndexRaw.slice(4));
+        if (idx === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+          return;
+        }
+        where.feedbackIndex = { not: idx };
       } else if (feedbackIndexFilter === null) {
         res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
         return;
@@ -1685,8 +1705,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
       const revocationIdRaw = safeQueryString(req.query.revocation_id);
       const revocationIdFilter = parsePostgRESTBigIntFilter(req.query.revocation_id);
+      const revokeCountRaw = safeQueryString(req.query.revoke_count);
       const revokeCountFilter = parsePostgRESTBigIntFilter(req.query.revoke_count);
       const revokeCountInState = parsePostgRESTListOperator(req.query.revoke_count, 'in');
+      const revokeCountNotInState = parsePostgRESTListOperator(req.query.revoke_count, 'not.in');
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1730,6 +1752,25 @@ export function createApiServer(options: ApiServerOptions): Express {
           return;
         }
         where.revokeCount = { in: counts };
+      } else if (revokeCountNotInState.matched) {
+        if (revokeCountNotInState.malformed || revokeCountNotInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid revoke_count NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+
+        const counts = safeBigIntArray(revokeCountNotInState.values.join(','));
+        if (counts === undefined) {
+          res.status(400).json({ error: 'Invalid revoke_count NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        where.revokeCount = { notIn: counts };
+      } else if (revokeCountRaw?.startsWith('neq.')) {
+        const count = safeBigInt(revokeCountRaw.slice(4));
+        if (count === undefined) {
+          res.status(400).json({ error: 'Invalid revoke_count: must be a valid integer' });
+          return;
+        }
+        where.revokeCount = { not: count };
       } else if (revokeCountFilter === null) {
         res.status(400).json({ error: 'Invalid revoke_count: must be a valid integer' });
         return;
