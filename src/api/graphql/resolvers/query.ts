@@ -171,13 +171,21 @@ const CIDV1_BASE32_REGEX = /^b[a-z2-7]{20,}$/;
 function collectionPointerVariants(raw: string): string[] {
   const trimmed = raw.trim();
   if (!trimmed) return [];
+
   if (trimmed.startsWith('c1:')) {
     const bare = trimmed.slice(3);
-    if (!bare || !CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
+    if (!CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
     return [trimmed, bare];
   }
+
   if (!CIDV1_BASE32_REGEX.test(trimmed)) return [trimmed];
   return [`c1:${trimmed}`, trimmed];
+}
+
+function normalizeCollectionPointer(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  return collectionPointerVariants(trimmed)[0] ?? trimmed;
 }
 
 function isIntegerString(value: string): boolean {
@@ -877,8 +885,14 @@ export const queryResolvers = {
         paramIdx++;
       }
       if (args.collection) {
-        filters.push(`col = ANY($${paramIdx}::text[])`);
-        params.push(collectionPointerVariants(args.collection));
+        const collectionVariants = collectionPointerVariants(args.collection);
+        if (collectionVariants.length > 1) {
+          filters.push(`col = ANY($${paramIdx}::text[])`);
+          params.push(collectionVariants);
+        } else {
+          filters.push(`col = $${paramIdx}::text`);
+          params.push(collectionVariants[0] ?? normalizeCollectionPointer(args.collection));
+        }
         paramIdx++;
       }
       if (args.creator) {
@@ -963,11 +977,17 @@ export const queryResolvers = {
         );
       }
 
-      const params: unknown[] = [collectionPointerVariants(args.collection), creator];
+      const collectionVariants = collectionPointerVariants(args.collection);
+      const params: unknown[] = collectionVariants.length > 1
+        ? [collectionVariants, creator]
+        : [collectionVariants[0] ?? normalizeCollectionPointer(args.collection), creator];
+      const collectionPredicate = collectionVariants.length > 1
+        ? 'canonical_col = ANY($1::text[])'
+        : 'canonical_col = $1::text';
       const sql = `SELECT COUNT(*)::text AS count
                    FROM agents
                    WHERE status != 'ORPHANED'
-                     AND canonical_col = ANY($1::text[])
+                     AND ${collectionPredicate}
                      AND creator = $2::text`;
 
       const { rows } = await ctx.pool.query<{ count: string }>(sql, params);
@@ -997,7 +1017,13 @@ export const queryResolvers = {
           'collectionAssets requires creator (scope is creator+collection).'
         );
       }
-      const params: unknown[] = [collectionPointerVariants(args.collection), creator];
+      const collectionVariants = collectionPointerVariants(args.collection);
+      const params: unknown[] = collectionVariants.length > 1
+        ? [collectionVariants, creator]
+        : [collectionVariants[0] ?? normalizeCollectionPointer(args.collection), creator];
+      const collectionPredicate = collectionVariants.length > 1
+        ? 'a.canonical_col = ANY($1::text[])'
+        : 'a.canonical_col = $1::text';
       let paramIdx = 3;
 
       const sql = `SELECT
@@ -1015,7 +1041,7 @@ export const queryResolvers = {
                      FROM agent_digest_cache
                    ) adc ON adc.agent_id = a.asset
                    WHERE a.status != 'ORPHANED'
-                     AND a.canonical_col = ANY($1::text[])
+                     AND ${collectionPredicate}
                      AND a.creator = $2::text
                    ORDER BY ${orderCol} ${dir}, a.asset ${dir}
                    LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;

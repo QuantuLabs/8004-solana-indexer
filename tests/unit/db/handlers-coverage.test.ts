@@ -134,6 +134,39 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
+    it("should retry atomic transaction once on collection_id unique conflict", async () => {
+      const uniqueError = Object.assign(
+        new Error("Unique constraint failed on the fields: (`collection_id`)"),
+        { code: "P2002", meta: { target: ["collection_id"] } }
+      );
+      (prisma.$transaction as any)
+        .mockRejectedValueOnce(uniqueError)
+        .mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => fn(prisma));
+
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: TEST_OWNER.toBase58(),
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.collection.upsert as any).mockResolvedValue({});
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+
+      await expect(handleEventAtomic(prisma, event, ctx)).resolves.not.toThrow();
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      expect(prisma.collection.upsert).toHaveBeenCalled();
+      expect(prisma.indexerState.upsert).toHaveBeenCalled();
+    });
+
     it("should assign next agentId from max existing assigned id", async () => {
       const event: ProgramEvent = {
         type: "AgentRegistered",
@@ -2139,6 +2172,229 @@ describe("DB Handlers Coverage", () => {
           }),
         })
       );
+    });
+
+    it("CollectionPointerSet should retry collection_id assignment on unique collision (atomic)", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.collection.findMany as any).mockResolvedValue([{ collectionId: 41n }]);
+
+      const uniqueError = Object.assign(
+        new Error("Unique constraint failed on the fields: (`collection_id`)"),
+        { code: "P2002", meta: { target: ["collection_id"] } }
+      );
+      (prisma.collection.upsert as any)
+        .mockRejectedValueOnce(uniqueError)
+        .mockResolvedValueOnce({});
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.collection.upsert).toHaveBeenCalledTimes(2);
+      expect(prisma.collection.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.collection.upsert).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ collectionId: 42n }),
+          update: expect.objectContaining({ collectionId: 42n }),
+        })
+      );
+    });
+
+    it("CollectionPointerSet should use db-side allocation when raw SQL is available (atomic)", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const executeRawUnsafe = vi.fn().mockResolvedValue(1);
+      (prisma as any).$executeRawUnsafe = executeRawUnsafe;
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(executeRawUnsafe).toHaveBeenCalledTimes(1);
+      const [sql, ...params] = (executeRawUnsafe as any).mock.calls[0] ?? [];
+      expect(String(sql)).toContain("ON CONFLICT(\"col\", \"creator\") DO UPDATE");
+      expect(params[0]).toBe("c1:new-pointer");
+      expect(params[1]).toBe(immutableCreator);
+      expect(prisma.collection.findMany).not.toHaveBeenCalled();
+      expect(prisma.collection.upsert).not.toHaveBeenCalled();
+    });
+
+    it("CollectionPointerSet should fallback to max-scan assignment when db-side allocation fails (atomic)", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "c1:old-pointer",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.collection.findMany as any).mockResolvedValue([{ collectionId: 41n }]);
+      (prisma.collection.upsert as any).mockResolvedValue({});
+
+      const executeRawUnsafe = vi.fn().mockRejectedValueOnce(new Error("sqlite raw allocator failed"));
+      (prisma as any).$executeRawUnsafe = executeRawUnsafe;
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(executeRawUnsafe).toHaveBeenCalledTimes(1);
+      expect(prisma.collection.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ collectionId: 42n }),
+          update: expect.objectContaining({ collectionId: 42n }),
+        })
+      );
+    });
+
+    it("CollectionPointerSet should not treat raw-SQL unique conflicts as missing schema", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      let maxCollectionId = 41n;
+      (prisma.collection.findMany as any).mockImplementation(async () => [{ collectionId: maxCollectionId }]);
+      (prisma.collection.upsert as any).mockImplementation(async (args: any) => {
+        const assigned = args?.create?.collectionId;
+        if (typeof assigned === "bigint" && assigned > maxCollectionId) {
+          maxCollectionId = assigned;
+        }
+        return {};
+      });
+
+      const rawUniqueError = Object.assign(
+        new Error("Raw query failed. Code: `2067`. Message: `UNIQUE constraint failed: CollectionPointer.collection_id`"),
+        { code: "P2010" }
+      );
+      const executeRawUnsafe = vi.fn().mockRejectedValue(rawUniqueError);
+      (prisma as any).$executeRawUnsafe = executeRawUnsafe;
+
+      const eventA: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer-a",
+          lock: true,
+        },
+      };
+      const eventB: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer-b",
+          lock: true,
+        },
+      };
+      const ctxB: EventContext = {
+        ...ctx,
+        signature: `${TEST_SIGNATURE}-p2010`,
+        slot: ctx.slot + 1n,
+      };
+
+      await handleEventAtomic(prisma, eventA, ctx);
+      await handleEventAtomic(prisma, eventB, ctxB);
+
+      expect(executeRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.collection.upsert).toHaveBeenCalled();
+    });
+
+    it("CollectionPointerSet should keep sequential collection_id under concurrent atomic calls in fallback mode", async () => {
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      let maxCollectionId = 0n;
+      (prisma.collection.findMany as any).mockImplementation(async () => [{ collectionId: maxCollectionId }]);
+      (prisma.collection.upsert as any).mockImplementation(async (args: any) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const assigned = args?.create?.collectionId;
+        if (typeof assigned === "bigint" && assigned > maxCollectionId) {
+          maxCollectionId = assigned;
+        }
+        return {};
+      });
+
+      const secondAsset = new PublicKey(new Uint8Array(32).fill(9));
+      const eventA: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:pointer-a",
+          lock: true,
+        },
+      };
+      const eventB: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: secondAsset,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:pointer-b",
+          lock: true,
+        },
+      };
+      const ctxB: EventContext = {
+        ...ctx,
+        signature: `${TEST_SIGNATURE}-b`,
+        slot: ctx.slot + 1n,
+      };
+
+      await Promise.all([
+        handleEventAtomic(prisma, eventA, ctx),
+        handleEventAtomic(prisma, eventB, ctxB),
+      ]);
+
+      const assignedIds = ((prisma.collection.upsert as any).mock.calls as Array<[any]>)
+        .map((call) => call[0]?.create?.collectionId)
+        .filter((value): value is bigint => typeof value === "bigint")
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+      expect(assignedIds).toEqual([1n, 2n]);
     });
 
     it("CollectionPointerSet should decrement previous collection and increment new collection count", async () => {

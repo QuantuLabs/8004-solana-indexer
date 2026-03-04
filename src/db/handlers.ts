@@ -120,22 +120,113 @@ type CollectionDelegate = {
   upsert(args: unknown): Promise<unknown>;
 };
 
+type CollectionRawSqlClient = {
+  $executeRawUnsafe?: (query: string, ...values: unknown[]) => Promise<unknown>;
+};
+
 let collectionIdSchemaSupported: boolean | null = null;
 let warnedMissingCollectionIdSchema = false;
 let collectionIdSchemaRetryAfter = 0;
 const COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS = 60_000;
+const COLLECTION_ID_ASSIGNMENT_MAX_RETRIES = 3;
+const ATOMIC_COLLECTION_ID_TX_MAX_RETRIES = 2;
+const COLLECTION_POINTER_DB_ALLOCATED_UPSERT_SQL = `
+INSERT INTO "CollectionPointer" (
+  "col",
+  "creator",
+  "firstSeenAsset",
+  "firstSeenAt",
+  "firstSeenSlot",
+  "firstSeenTxSignature",
+  "lastSeenAt",
+  "lastSeenSlot",
+  "lastSeenTxSignature",
+  "assetCount",
+  "collection_id"
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
+  SELECT COALESCE(MAX("collection_id"), 0) + 1
+  FROM "CollectionPointer"
+  WHERE "collection_id" IS NOT NULL
+))
+ON CONFLICT("col", "creator") DO UPDATE SET
+  "lastSeenAt" = excluded."lastSeenAt",
+  "lastSeenSlot" = excluded."lastSeenSlot",
+  "lastSeenTxSignature" = excluded."lastSeenTxSignature",
+  "collection_id" = COALESCE(
+    "CollectionPointer"."collection_id",
+    (
+      SELECT COALESCE(MAX("collection_id"), 0) + 1
+      FROM "CollectionPointer"
+      WHERE "collection_id" IS NOT NULL
+    )
+  )
+`;
 
 function isMissingCollectionIdSchemaError(error: unknown): boolean {
   const maybe = error as { code?: unknown; message?: unknown } | null;
   const code = typeof maybe?.code === "string" ? maybe.code : "";
   const message = typeof maybe?.message === "string" ? maybe.message : String(error);
-  if (code === "P2022" || code === "P2010") {
+  const missingSchemaPattern = /column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  if (code === "P2022") {
     return /collection_id|collectionId|CollectionPointer/i.test(message);
   }
-  return /column .*collection_id|no such column: collection_id|Unknown arg .*collectionId/i.test(message);
+  if (code === "P2010") {
+    return missingSchemaPattern.test(message);
+  }
+  return missingSchemaPattern.test(message);
+}
+
+function isCollectionIdUniqueConstraintError(error: unknown): boolean {
+  const maybe = error as { code?: unknown; message?: unknown; meta?: unknown } | null;
+  const code = typeof maybe?.code === "string" ? maybe.code : "";
+  if (code !== "P2002") return false;
+
+  const message = typeof maybe?.message === "string" ? maybe.message : "";
+  if (/collection_id|collectionId/i.test(message)) return true;
+
+  const meta = maybe?.meta as { target?: unknown } | undefined;
+  const target = meta?.target;
+  if (Array.isArray(target)) {
+    return target.some((entry) => typeof entry === "string" && /collection_id|collectionId/i.test(entry));
+  }
+  if (typeof target === "string") {
+    return /collection_id|collectionId/i.test(target);
+  }
+  return false;
+}
+
+async function tryDbSideCollectionIdUpsert(
+  client: PrismaClientOrTx,
+  pointer: string,
+  creator: string,
+  assetId: string,
+  ctx: EventContext
+): Promise<boolean> {
+  const sqlClient = client as unknown as CollectionRawSqlClient;
+  if (typeof sqlClient.$executeRawUnsafe !== "function") {
+    return false;
+  }
+
+  await sqlClient.$executeRawUnsafe(
+    COLLECTION_POINTER_DB_ALLOCATED_UPSERT_SQL,
+    pointer,
+    creator,
+    assetId,
+    ctx.blockTime,
+    ctx.slot,
+    ctx.signature,
+    ctx.blockTime,
+    ctx.slot,
+    ctx.signature,
+    0n
+  );
+
+  return true;
 }
 
 async function upsertCollectionPointerWithOptionalCollectionId(
+  client: PrismaClientOrTx,
   collection: CollectionDelegate,
   pointer: string,
   creator: string,
@@ -165,47 +256,88 @@ async function upsertCollectionPointerWithOptionalCollectionId(
     collectionIdSchemaSupported = null;
   }
 
-  if (collectionIdSchemaSupported !== false) {
-    try {
-      const existingCollection = await collection.findUnique({
-        where,
-        select: { collectionId: true },
-      });
-      let assignedCollectionId: bigint | undefined;
-      if (!existingCollection || existingCollection.collectionId === null) {
-        const highestAssigned = await collection.findMany({
-          where: { collectionId: { not: null } },
-          select: { collectionId: true },
-          orderBy: { collectionId: "desc" },
-          take: 1,
-        });
-        assignedCollectionId = asBigInt(highestAssigned[0]?.collectionId) + 1n;
-      }
+  let canAttemptCollectionIdAssignment = collectionIdSchemaSupported !== false;
 
-      await collection.upsert({
-        where,
-        create: {
-          ...createBase,
-          collectionId: assignedCollectionId ?? null,
-        },
-        update: {
-          ...updateBase,
-          ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
-        },
-      });
-      collectionIdSchemaSupported = true;
-      return;
-    } catch (error) {
-      if (!isMissingCollectionIdSchemaError(error)) {
-        throw error;
+  if (canAttemptCollectionIdAssignment) {
+    try {
+      const usedDbAllocator = await tryDbSideCollectionIdUpsert(client, pointer, creator, assetId, ctx);
+      if (usedDbAllocator) {
+        collectionIdSchemaSupported = true;
+        return;
       }
-      collectionIdSchemaSupported = false;
-      collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
-      if (!warnedMissingCollectionIdSchema) {
-        warnedMissingCollectionIdSchema = true;
+    } catch (error) {
+      if (isMissingCollectionIdSchemaError(error)) {
+        collectionIdSchemaSupported = false;
+        collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
+        if (!warnedMissingCollectionIdSchema) {
+          warnedMissingCollectionIdSchema = true;
+          logger.warn(
+            "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
+          );
+        }
+        canAttemptCollectionIdAssignment = false;
+      } else {
         logger.warn(
-          "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
+          { pointer, creator, error: error instanceof Error ? error.message : String(error) },
+          "db-side collection_id allocation failed; falling back to max-scan assignment"
         );
+      }
+    }
+  }
+
+  if (canAttemptCollectionIdAssignment) {
+    for (let attempt = 0; attempt < COLLECTION_ID_ASSIGNMENT_MAX_RETRIES; attempt++) {
+      try {
+        const existingCollection = await collection.findUnique({
+          where,
+          select: { collectionId: true },
+        });
+        let assignedCollectionId: bigint | undefined;
+        if (!existingCollection || existingCollection.collectionId === null) {
+          const highestAssigned = await collection.findMany({
+            where: { collectionId: { not: null } },
+            select: { collectionId: true },
+            orderBy: { collectionId: "desc" },
+            take: 1,
+          });
+          assignedCollectionId = asBigInt(highestAssigned[0]?.collectionId) + 1n;
+        }
+
+        await collection.upsert({
+          where,
+          create: {
+            ...createBase,
+            collectionId: assignedCollectionId ?? null,
+          },
+          update: {
+            ...updateBase,
+            ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
+          },
+        });
+        collectionIdSchemaSupported = true;
+        return;
+      } catch (error) {
+        if (isMissingCollectionIdSchemaError(error)) {
+          collectionIdSchemaSupported = false;
+          collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
+          if (!warnedMissingCollectionIdSchema) {
+            warnedMissingCollectionIdSchema = true;
+            logger.warn(
+              "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
+            );
+          }
+          break;
+        }
+
+        const isLastAttempt = attempt >= COLLECTION_ID_ASSIGNMENT_MAX_RETRIES - 1;
+        if (!isLastAttempt && isCollectionIdUniqueConstraintError(error)) {
+          logger.warn(
+            { pointer, creator, attempt: attempt + 1 },
+            "collection_id assignment hit unique conflict; retrying assignment"
+          );
+          continue;
+        }
+        throw error;
       }
     }
   }
@@ -555,13 +687,30 @@ export async function handleEventAtomic(
 
   startLocalDigestRecoveryLoop(prisma);
 
-  await prisma.$transaction(async (tx) => {
-    // 1. Handle event
-    await handleEventInner(tx, event, ctx);
+  for (let attempt = 0; attempt < ATOMIC_COLLECTION_ID_TX_MAX_RETRIES; attempt++) {
+    try {
+      await prisma.$transaction(async (tx) => {
+        // 1. Handle event
+        await handleEventInner(tx, event, ctx);
 
-    // 2. Update cursor atomically with monotonic guard
-    await updateCursorAtomic(tx, ctx);
-  });
+        // 2. Update cursor atomically with monotonic guard
+        await updateCursorAtomic(tx, ctx);
+      });
+      break;
+    } catch (error) {
+      const canRetry =
+        attempt < ATOMIC_COLLECTION_ID_TX_MAX_RETRIES - 1
+        && isCollectionIdUniqueConstraintError(error);
+      if (canRetry) {
+        logger.warn(
+          { attempt: attempt + 1, signature: ctx.signature, slot: ctx.slot.toString() },
+          "Atomic transaction hit collection_id unique conflict; retrying"
+        );
+        continue;
+      }
+      throw error;
+    }
+  }
 
   // 3. Trigger derived metadata extraction AFTER transaction (fire-and-forget)
   // This is outside the transaction to avoid blocking event processing
@@ -1137,6 +1286,7 @@ async function handleCollectionPointerSetTx(
 
   await withCollectionIdAssignmentLock(async () => {
     await upsertCollectionPointerWithOptionalCollectionId(
+      tx,
       tx.collection as unknown as CollectionDelegate,
       pointer,
       creator,
@@ -1204,6 +1354,7 @@ async function handleCollectionPointerSet(
 
   await withCollectionIdAssignmentLock(async () => {
     await upsertCollectionPointerWithOptionalCollectionId(
+      prisma,
       prisma.collection as unknown as CollectionDelegate,
       pointer,
       creator,

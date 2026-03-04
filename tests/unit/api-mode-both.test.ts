@@ -14,6 +14,10 @@ vi.mock("../../src/api/graphql/index.js", () => ({
   })),
 }));
 
+vi.mock("../../src/utils/compression.js", () => ({
+  decompressFromStorage: vi.fn(async (value: string | Buffer | null) => value),
+}));
+
 const originalEnv = process.env;
 const ARCHIVED_VALIDATIONS_ERROR =
   "Validation endpoints are archived and no longer exposed. /rest/v1/validations has been retired.";
@@ -37,6 +41,10 @@ function makePrismaStub() {
     },
     feedbackResponse: {
       groupBy: vi.fn().mockResolvedValue([]),
+    },
+    collection: {
+      findMany: vi.fn().mockResolvedValue([]),
+      count: vi.fn().mockResolvedValue(0),
     },
   };
 }
@@ -133,7 +141,29 @@ describe("API_MODE=both behavior", () => {
     }
   });
 
-  it("normalizes bare CID collection filters for local REST collection counts", async () => {
+  it("normalizes bare CID collection filters for local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=eq.${BARE_COLLECTION_CID}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            collectionPointer: `c1:${BARE_COLLECTION_CID}`,
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("matches legacy bare rows for local REST collection counts with CIDv1 filters", async () => {
     const creator = "Creator11111111111111111111111111111111";
     const prisma = makePrismaStub();
     prisma.agent.count.mockImplementation(async ({ where }: { where: any }) => (
@@ -147,11 +177,11 @@ describe("API_MODE=both behavior", () => {
 
     try {
       const countRes = await fetch(
-        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}&creator=eq.${creator}`
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.c1:${BARE_COLLECTION_CID}&creator=eq.${creator}`
       );
       expect(countRes.status).toBe(200);
       expect(await countRes.json()).toEqual({
-        collection: BARE_COLLECTION_CID,
+        collection: `c1:${BARE_COLLECTION_CID}`,
         creator,
         asset_count: 22,
       });
@@ -159,13 +189,103 @@ describe("API_MODE=both behavior", () => {
       expect(prisma.agent.count).toHaveBeenCalledWith({
         where: {
           status: { not: "ORPHANED" },
+          creator,
           OR: [
             { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
             { collectionPointer: BARE_COLLECTION_CID },
           ],
-          creator,
         },
       });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("matches legacy bare rows for local REST collection assets with CIDv1 filters", async () => {
+    const creator = "Creator11111111111111111111111111111111";
+    const prisma = makePrismaStub();
+
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const assetsRes = await fetch(
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.c1:${BARE_COLLECTION_CID}&creator=eq.${creator}&limit=1`
+      );
+      expect(assetsRes.status).toBe(200);
+      expect(await assetsRes.json()).toEqual([]);
+
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            status: { not: "ORPHANED" },
+            creator,
+            OR: [
+              { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
+              { collectionPointer: BARE_COLLECTION_CID },
+            ],
+          },
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("validates /rest/v1/collections collection_id filters and returns count headers", async () => {
+    const prisma = makePrismaStub();
+    prisma.collection.findMany.mockResolvedValue([
+      {
+        collectionId: 7n,
+        col: `c1:${BARE_COLLECTION_CID}`,
+        creator: "Creator11111111111111111111111111111111",
+        firstSeenAsset: "Asset11111111111111111111111111111111111",
+        firstSeenAt: new Date("2026-03-01T00:00:00.000Z"),
+        firstSeenSlot: 100n,
+        firstSeenTxSignature: "sig-first",
+        lastSeenAt: new Date("2026-03-02T00:00:00.000Z"),
+        lastSeenSlot: 200n,
+        lastSeenTxSignature: "sig-last",
+        assetCount: 1n,
+        version: "1.0.0",
+        name: "Test Collection",
+        symbol: "TC",
+        description: null,
+        image: null,
+        bannerImage: null,
+        socialWebsite: null,
+        socialX: null,
+        socialDiscord: null,
+        metadataStatus: "ok",
+        metadataHash: null,
+        metadataBytes: 128,
+        metadataUpdatedAt: new Date("2026-03-02T00:00:00.000Z"),
+      },
+    ]);
+    prisma.collection.count.mockResolvedValue(1);
+
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const invalidRes = await fetch(`${baseUrl}/rest/v1/collections?collection_id=eq.not-a-number`);
+      expect(invalidRes.status).toBe(400);
+      expect(await invalidRes.json()).toEqual({
+        error: "Invalid collection_id filter: use eq/gt/gte/lt/lte with a valid integer",
+      });
+
+      const successRes = await fetch(`${baseUrl}/rest/v1/collections?collection_id=eq.7&limit=1&offset=0`, {
+        headers: { Prefer: "count=exact" },
+      });
+      expect(successRes.status).toBe(200);
+      const body = await successRes.json();
+      expect(body).toHaveLength(1);
+      expect(body[0].collection_id).toBe("7");
+      expect(successRes.headers.get("content-range")).toBe("items 0-0/1");
     } finally {
       await stopServer(server);
     }
@@ -534,6 +654,54 @@ describe("API_MODE=both behavior", () => {
       expect(canonicalColAliasUrl.searchParams.get("canonical_col")).toBe("eq.c1:ptr");
       expect(canonicalColAliasUrl.searchParams.get("collection_pointer")).toBeNull();
 
+      const canonicalColNeqBareCallStart = fetchSpy.mock.calls.length;
+      const canonicalColNeqBareRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=neq.${BARE_COLLECTION_CID}`
+      );
+      expect(canonicalColNeqBareRes.status).toBe(200);
+      const canonicalColNeqBareUpstreamCall = fetchSpy.mock.calls.slice(canonicalColNeqBareCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColNeqBareUpstreamCall).toBeTruthy();
+      const canonicalColNeqBareUrlRaw = typeof canonicalColNeqBareUpstreamCall?.[0] === "string"
+        ? canonicalColNeqBareUpstreamCall[0]
+        : canonicalColNeqBareUpstreamCall?.[0] instanceof URL
+          ? canonicalColNeqBareUpstreamCall[0].toString()
+          : canonicalColNeqBareUpstreamCall?.[0]?.url;
+      expect(typeof canonicalColNeqBareUrlRaw).toBe("string");
+      const canonicalColNeqBareUrl = new URL(canonicalColNeqBareUrlRaw as string);
+      expect(canonicalColNeqBareUrl.searchParams.get("canonical_col")).toBe(`neq.c1:${BARE_COLLECTION_CID}`);
+      expect(canonicalColNeqBareUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const canonicalColInBareCallStart = fetchSpy.mock.calls.length;
+      const canonicalColInBareRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=in.(${BARE_COLLECTION_CID},c1:ptr)`
+      );
+      expect(canonicalColInBareRes.status).toBe(200);
+      const canonicalColInBareUpstreamCall = fetchSpy.mock.calls.slice(canonicalColInBareCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColInBareUpstreamCall).toBeTruthy();
+      const canonicalColInBareUrlRaw = typeof canonicalColInBareUpstreamCall?.[0] === "string"
+        ? canonicalColInBareUpstreamCall[0]
+        : canonicalColInBareUpstreamCall?.[0] instanceof URL
+          ? canonicalColInBareUpstreamCall[0].toString()
+          : canonicalColInBareUpstreamCall?.[0]?.url;
+      expect(typeof canonicalColInBareUrlRaw).toBe("string");
+      const canonicalColInBareUrl = new URL(canonicalColInBareUrlRaw as string);
+      expect(canonicalColInBareUrl.searchParams.get("canonical_col")).toBe(`in.(c1:${BARE_COLLECTION_CID},c1:ptr)`);
+      expect(canonicalColInBareUrl.searchParams.get("collection_pointer")).toBeNull();
+
       const canonicalColTrailingSlashRes = await fetch(
         `${baseUrl}/rest/v1/agents/?limit=1&canonical_col=eq.c1:ptr`
       );
@@ -676,11 +844,11 @@ describe("API_MODE=both behavior", () => {
 
       const cidCollectionCountCallStart = fetchSpy.mock.calls.length;
       const cidCollectionCountRes = await fetch(
-        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}&creator=eq.${creator}`
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.c1:${BARE_COLLECTION_CID}&creator=eq.${creator}`
       );
       expect(cidCollectionCountRes.status).toBe(200);
       expect(await cidCollectionCountRes.json()).toEqual({
-        collection: BARE_COLLECTION_CID,
+        collection: `c1:${BARE_COLLECTION_CID}`,
         creator,
         asset_count: 22,
       });
@@ -697,6 +865,25 @@ describe("API_MODE=both behavior", () => {
             === `in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`;
       });
       expect(cidCollectionCountUpstreamCall).toBeTruthy();
+
+      const cidCollectionAssetsCallStart = fetchSpy.mock.calls.length;
+      const cidCollectionAssetsRes = await fetch(
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.c1:${BARE_COLLECTION_CID}&creator=eq.${creator}&limit=1`
+      );
+      expect(cidCollectionAssetsRes.status).toBe(200);
+      const cidCollectionAssetsUpstreamCall = fetchSpy.mock.calls.slice(cidCollectionAssetsCallStart).find(([input]) => {
+        const raw = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof raw !== "string") return false;
+        const parsed = new URL(raw);
+        return parsed.pathname === "/rest/v1/agents"
+          && parsed.searchParams.get("canonical_col")
+            === `in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`;
+      });
+      expect(cidCollectionAssetsUpstreamCall).toBeTruthy();
 
       const collectionAssetsRes = await fetch(
         `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}&limit=1`

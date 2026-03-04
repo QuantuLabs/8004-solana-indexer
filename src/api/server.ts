@@ -204,7 +204,7 @@ function collectionPointerVariants(raw: string): string[] {
   if (!trimmed) return [];
   if (trimmed.startsWith('c1:')) {
     const bare = trimmed.slice(3);
-    if (!bare || !CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
+    if (!CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
     return [trimmed, bare];
   }
   if (!CIDV1_BASE32_REGEX.test(trimmed)) return [trimmed];
@@ -213,10 +213,21 @@ function collectionPointerVariants(raw: string): string[] {
 
 function formatCanonicalCollectionFilter(raw: string): string {
   const variants = [...new Set(collectionPointerVariants(raw))];
-  if (variants.length <= 1) {
-    return `eq.${variants[0] ?? raw}`;
-  }
+  if (variants.length <= 1) return `eq.${variants[0] ?? raw}`;
   return `in.(${variants.join(',')})`;
+}
+
+function normalizeCollectionPointerFilterValue(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  const normalizeSingle = (value: string): string => collectionPointerVariants(value)[0] ?? value;
+  if (trimmed.startsWith('eq.')) return `eq.${normalizeSingle(trimmed.slice(3))}`;
+  if (trimmed.startsWith('neq.')) return `neq.${normalizeSingle(trimmed.slice(4))}`;
+  const inValues = parsePostgRESTIn(trimmed);
+  if (inValues) {
+    return `in.(${inValues.map((value) => normalizeSingle(value)).join(',')})`;
+  }
+  return normalizeSingle(trimmed);
 }
 
 function parsePostgRESTBoolean(value: unknown): boolean | undefined {
@@ -716,7 +727,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             : collectionPointer;
           if (resolvedCollectionPointer && resolvedCollectionPointer.trim().length > 0) {
             // Backward-compatible input alias: canonical_col -> collection_pointer.
-            params.set('canonical_col', resolvedCollectionPointer);
+            params.set('canonical_col', normalizeCollectionPointerFilterValue(resolvedCollectionPointer));
           } else {
             params.delete('canonical_col');
           }
@@ -839,9 +850,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const owner = parsePostgRESTValue(req.query.owner);
       const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
-      const collectionPointer =
+      const collectionPointerRaw =
         parsePostgRESTValue(req.query.canonical_col) ??
         parsePostgRESTValue(req.query.collection_pointer);
+      const collectionPointer = collectionPointerRaw
+        ? collectionPointerVariants(collectionPointerRaw)[0] ?? collectionPointerRaw
+        : undefined;
       const agent_wallet = parsePostgRESTValue(req.query.agent_wallet);
       const parentAsset = parsePostgRESTValue(req.query.parent_asset);
       const parentCreator = parsePostgRESTValue(req.query.parent_creator);
@@ -1557,7 +1571,8 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/collections', async (req: Request, res: Response) => {
     try {
       const collectionIdFilter = parsePostgRESTBigIntFilter(req.query.collection_id);
-      const col = parsePostgRESTValue(req.query.collection);
+      const colRaw = parsePostgRESTValue(req.query.collection);
+      const colVariants = colRaw ? collectionPointerVariants(colRaw) : [];
       const creator = parsePostgRESTValue(req.query.creator);
       const firstSeenAsset = parsePostgRESTValue(req.query.first_seen_asset);
       const limit = safePaginationLimit(req.query.limit);
@@ -1633,9 +1648,13 @@ export function createApiServer(options: ApiServerOptions): Express {
             }
           }
         }
-        if (col) {
+        if (colVariants.length > 1) {
+          filterSql.push(`col = ANY($${paramIdx}::text[])`);
+          filterParams.push(colVariants);
+          paramIdx++;
+        } else if (colVariants.length === 1) {
           filterSql.push(`col = $${paramIdx}::text`);
-          filterParams.push(col);
+          filterParams.push(colVariants[0]);
           paramIdx++;
         }
         if (creator) {
@@ -1727,7 +1746,11 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const where: Prisma.CollectionWhereInput = {};
       if (collectionIdFilter !== undefined) where.collectionId = collectionIdFilter;
-      if (col) where.col = col;
+      if (colVariants.length > 1) {
+        where.OR = colVariants.map((value) => ({ col: value }));
+      } else if (colVariants.length === 1) {
+        where.col = colVariants[0];
+      }
       if (creator) where.creator = creator;
       if (firstSeenAsset) where.firstSeenAsset = firstSeenAsset;
 
@@ -1834,11 +1857,11 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       const where: Prisma.AgentWhereInput = { ...statusFilter };
-      const pointerVariants = collectionPointerVariants(col);
-      if (pointerVariants.length <= 1) {
-        where.collectionPointer = pointerVariants[0] ?? col;
+      const collectionPointerVariantsList = collectionPointerVariants(col);
+      if (collectionPointerVariantsList.length > 1) {
+        where.OR = collectionPointerVariantsList.map((value) => ({ collectionPointer: value }));
       } else {
-        where.OR = pointerVariants.map((pointer) => ({ collectionPointer: pointer }));
+        where.collectionPointer = collectionPointerVariantsList[0] ?? col;
       }
       if (creator) where.creator = creator;
 
@@ -1912,11 +1935,11 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       const where: Prisma.AgentWhereInput = { ...statusFilter };
-      const pointerVariants = collectionPointerVariants(col);
-      if (pointerVariants.length <= 1) {
-        where.collectionPointer = pointerVariants[0] ?? col;
+      const collectionPointerVariantsList = collectionPointerVariants(col);
+      if (collectionPointerVariantsList.length > 1) {
+        where.OR = collectionPointerVariantsList.map((value) => ({ collectionPointer: value }));
       } else {
-        where.OR = pointerVariants.map((pointer) => ({ collectionPointer: pointer }));
+        where.collectionPointer = collectionPointerVariantsList[0] ?? col;
       }
       if (creator) where.creator = creator;
 

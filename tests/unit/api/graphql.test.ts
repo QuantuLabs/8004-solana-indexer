@@ -29,6 +29,8 @@ import { revocationResolvers } from '../../../src/api/graphql/resolvers/revocati
 import { solanaResolvers } from '../../../src/api/graphql/resolvers/solana.js';
 import { validationResolvers } from '../../../src/api/graphql/resolvers/validation.js';
 
+const BARE_COLLECTION_CID = 'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km';
+
 describe('GraphQL Complexity Analysis', () => {
   it('allows simple queries', () => {
     const doc = parse('{ agents(first: 10) { id agentURI } }');
@@ -1209,6 +1211,50 @@ describe('Collection And Tree Queries', () => {
     expect(typeof rows[0].lastSeenAt).toBe('string');
   });
 
+  it('normalizes bare CID filter for collections query', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.collections(
+      {},
+      { first: 10, skip: 0, collection: BARE_COLLECTION_CID },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual([
+      [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
+      10,
+      0,
+    ]);
+  });
+
+  it('rejects non-integer collections.collectionId values', async () => {
+    const query = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.collections(
+        {},
+        { first: 10, skip: 0, collectionId: '7.1' as any },
+        ctx
+      )
+    ).rejects.toMatchObject({
+      message: 'collections.collectionId must be an integer value.',
+    });
+    expect(query).not.toHaveBeenCalled();
+  });
+
   it('counts assets by creator+collection scope', async () => {
     const query = vi.fn().mockResolvedValue({
       rows: [{ count: '42' }],
@@ -1228,7 +1274,7 @@ describe('Collection And Tree Queries', () => {
 
     expect(count).toBe('42');
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]).toEqual([['c1:bafy-test'], 'Creator111']);
+    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111']);
   });
 
   it('normalizes bare CID when counting collection assets', async () => {
@@ -1245,7 +1291,7 @@ describe('Collection And Tree Queries', () => {
     const count = await queryResolvers.Query.collectionAssetCount(
       {},
       {
-        collection: 'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
+        collection: BARE_COLLECTION_CID,
         creator: 'Creator111',
       },
       ctx
@@ -1254,10 +1300,35 @@ describe('Collection And Tree Queries', () => {
     expect(count).toBe('22');
     expect(query).toHaveBeenCalledTimes(1);
     expect(query.mock.calls[0][1]).toEqual([
-      [
-        'c1:bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
-        'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
-      ],
+      [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
+      'Creator111',
+    ]);
+  });
+
+  it('matches legacy bare rows when counting collection assets with CIDv1 filters', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ count: '22' }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const count = await queryResolvers.Query.collectionAssetCount(
+      {},
+      {
+        collection: `c1:${BARE_COLLECTION_CID}`,
+        creator: 'Creator111',
+      },
+      ctx
+    );
+
+    expect(count).toBe('22');
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual([
+      [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
       'Creator111',
     ]);
   });
@@ -1334,8 +1405,39 @@ describe('Collection And Tree Queries', () => {
 
     expect(rows).toHaveLength(1);
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]).toEqual([['c1:bafy-test'], 'Creator111', 25, 5]);
+    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111', 25, 5]);
     expect(prime).toHaveBeenCalledWith('Asset111', expect.any(Object));
+  });
+
+  it('matches legacy bare rows when listing collection assets with CIDv1 filters', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    await queryResolvers.Query.collectionAssets(
+      {},
+      {
+        collection: `c1:${BARE_COLLECTION_CID}`,
+        creator: 'Creator111',
+        first: 10,
+        skip: 0,
+      },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual([
+      [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
+      'Creator111',
+      10,
+      0,
+    ]);
+    expect(String(query.mock.calls[0][0])).toContain('a.canonical_col = ANY($1::text[])');
   });
 
   it('rejects collectionAssets when creator is missing', async () => {
