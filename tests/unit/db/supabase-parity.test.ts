@@ -128,7 +128,7 @@ describe("Supabase Handler Parity", () => {
       expect(insertQuery!.values).toContain(expectedDigest);
       expect(insertQuery!.values).toContain("PENDING");
       expect(insertQuery!.text).toContain("feedback_id");
-      expect(insertQuery!.values[1]).toBe("1");
+      expect(insertQuery!.values[1]).toBeNull();
     });
   });
 
@@ -164,7 +164,7 @@ describe("Supabase Handler Parity", () => {
       expect(revokeInsert!.values).toContain(expectedDigest);
       expect(revokeInsert!.values).toContain("PENDING");
       expect(revokeInsert!.text).toContain("revocation_id");
-      expect(revokeInsert!.values[1]).toBe("1");
+      expect(revokeInsert!.values[1]).toBeNull();
     });
 
     it("should set ORPHANED status when feedback not found", async () => {
@@ -207,7 +207,7 @@ describe("Supabase Handler Parity", () => {
       const expectedDigest = Buffer.from(TEST_HASH).toString("hex");
       expect(insertQuery!.values).toContain(expectedDigest);
       expect(insertQuery!.text).toContain("response_id");
-      expect(insertQuery!.values[1]).toBe("1");
+      expect(insertQuery!.values[1]).toBeNull();
     });
 
     it("should include running_digest and ORPHANED in orphan response INSERT", async () => {

@@ -569,7 +569,8 @@ export class EventBuffer {
     const feedbackCheck = await client.query(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`, [id]
     );
-    const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+    const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
+    const revokeStatus = classifyRevocationStatus(hasFeedback);
     const isOrphan = revokeStatus === "ORPHANED";
 
     if (!isOrphan) {

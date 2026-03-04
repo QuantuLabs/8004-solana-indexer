@@ -775,6 +775,30 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
       });
 
+      it("should treat nullable rowCount with existing rows as non-orphan revoke", async () => {
+        const storedHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query
+          .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: storedHash }], rowCount: null })
+          .mockResolvedValue({ rows: [], rowCount: 1 });
+
+        const event = {
+          type: "FeedbackRevoked" as const,
+          data: makeRevokeData(),
+        };
+        await handleEvent(event, ctx);
+
+        const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("is_revoked = true")
+        );
+        expect(updateCall).toBeDefined();
+
+        const revokeInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO revocations")
+        );
+        expect(revokeInsert).toBeDefined();
+        expect(revokeInsert![1]).toContain("PENDING");
+      });
+
       it("should handle orphan revoke (feedback not found)", async () => {
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // SELECT feedback not found
@@ -1606,6 +1630,44 @@ describe("supabase.ts", () => {
         );
         expect(revokeInsert).toBeDefined();
         expect(revokeInsert![1]).toContain("ORPHANED");
+      });
+
+      it("FeedbackRevoked - treats null rowCount with empty rows as orphan", async () => {
+        mockClientInstance.query
+          .mockResolvedValueOnce(undefined) // BEGIN
+          .mockResolvedValueOnce({ rows: [], rowCount: null })
+          .mockResolvedValue({ rows: [], rowCount: 1 });
+
+        const event = {
+          type: "FeedbackRevoked" as const,
+          data: {
+            asset: TEST_ASSET,
+            clientAddress: TEST_CLIENT,
+            feedbackIndex: 0n,
+            sealHash: TEST_HASH,
+            slot: 123n,
+            originalScore: 80,
+            atomEnabled: false,
+            hadImpact: false,
+            newTrustTier: 0,
+            newQualityScore: 0,
+            newConfidence: 0,
+            newRevokeDigest: TEST_HASH,
+            newRevokeCount: 1n,
+          },
+        };
+        await handleEventAtomic(event, ctx);
+
+        const revokeInsert = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO revocations")
+        );
+        expect(revokeInsert).toBeDefined();
+        expect(revokeInsert![1]).toContain("ORPHANED");
+
+        const revokeUpdate = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("is_revoked = true")
+        );
+        expect(revokeUpdate).toBeUndefined();
       });
 
       it("FeedbackRevoked - hash mismatch", async () => {

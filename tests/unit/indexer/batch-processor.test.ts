@@ -531,6 +531,48 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
+    it("should classify revocations correctly when rowCount is null", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string, params?: any[]) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          const id = params?.[0] as string;
+          if (id === "asset1:client1:0") {
+            return { rows: [{ id, feedback_hash: "ab".repeat(32) }], rowCount: null };
+          }
+          return { rows: [], rowCount: null };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          newRevokeCount: 1,
+        })
+      );
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 1n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          newRevokeCount: 2,
+        })
+      );
+      await buffer.flush();
+
+      const revocationInsertCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO revocations (id, revocation_id")
+      );
+      expect(revocationInsertCalls).toHaveLength(2);
+      expect(revocationInsertCalls[0][1][16]).toBe("PENDING");
+      expect(revocationInsertCalls[1][1][16]).toBe("ORPHANED");
+    });
+
     it("should warn on seal_hash mismatch during revocation", async () => {
       const client = mockPool._client;
       client.query.mockImplementation((sql: string) => {

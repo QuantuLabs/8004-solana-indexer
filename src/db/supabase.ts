@@ -790,8 +790,9 @@ async function handleFeedbackRevokedTx(
     `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
     [id]
   );
+  const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
   let sealMismatch = false;
-  if (feedbackCheck.rowCount === 0) {
+  if (!hasFeedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
@@ -810,7 +811,7 @@ async function handleFeedbackRevokedTx(
     }
   }
 
-  const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+  const revokeStatus = classifyRevocationStatus(hasFeedback);
   const isOrphan = revokeStatus === "ORPHANED";
   if (!isOrphan) {
     await client.query(
@@ -1452,8 +1453,9 @@ async function handleFeedbackRevoked(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
       [id]
     );
+    const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
     let sealMismatch = false;
-    if (feedbackCheck.rowCount === 0) {
+    if (!hasFeedback) {
       logger.warn(
         { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for revocation (orphan revoke)"
@@ -1472,7 +1474,7 @@ async function handleFeedbackRevoked(
       }
     }
 
-    const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+    const revokeStatus = classifyRevocationStatus(hasFeedback);
     const isOrphan = revokeStatus === "ORPHANED";
     if (!isOrphan) {
       await db.query(
