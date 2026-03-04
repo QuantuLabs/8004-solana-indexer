@@ -95,6 +95,7 @@ CREATE INDEX idx_collections_status ON collections(status) WHERE status = 'PENDI
 -- CANONICAL COLLECTION POINTERS (c1:<cid>)
 -- =============================================
 CREATE TABLE collection_pointers (
+  collection_id BIGINT CHECK (collection_id IS NULL OR collection_id >= 1),
   col TEXT NOT NULL,
   creator TEXT NOT NULL,
   first_seen_asset TEXT NOT NULL,
@@ -124,6 +125,9 @@ CREATE TABLE collection_pointers (
 CREATE INDEX idx_collection_pointers_creator ON collection_pointers(creator);
 CREATE INDEX idx_collection_pointers_first_seen_at ON collection_pointers(first_seen_at DESC);
 CREATE INDEX idx_collection_pointers_last_seen_at ON collection_pointers(last_seen_at DESC);
+CREATE UNIQUE INDEX idx_collection_pointers_collection_id
+ON collection_pointers(collection_id)
+WHERE collection_id IS NOT NULL;
 
 -- =============================================
 -- AGENTS (Identity + ATOM Stats + Leaderboard)
@@ -489,6 +493,47 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION assign_collection_id()
+RETURNS TRIGGER AS $$
+DECLARE
+  existing_collection_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.collection_id IS NOT NULL THEN
+    NEW.collection_id := OLD.collection_id;
+    RETURN NEW;
+  END IF;
+
+  -- Ignore caller-provided IDs and assign under DB lock instead.
+  IF NEW.collection_id IS NOT NULL THEN
+    NEW.collection_id := NULL;
+  END IF;
+
+  -- Serialize by canonical collection identity to make duplicate upserts idempotent.
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'collection:id:' || NEW.col || ':' || NEW.creator,
+      0
+    )
+  );
+
+  SELECT collection_id
+  INTO existing_collection_id
+  FROM collection_pointers
+  WHERE col = NEW.col
+    AND creator = NEW.creator
+  LIMIT 1;
+
+  IF FOUND AND existing_collection_id IS NOT NULL THEN
+    NEW.collection_id := existing_collection_id;
+    RETURN NEW;
+  END IF;
+
+  NEW.collection_id := alloc_gapless_id('collection:global');
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION assign_response_id()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -589,6 +634,11 @@ CREATE TRIGGER trg_assign_feedback_id
   BEFORE INSERT OR UPDATE ON feedbacks
   FOR EACH ROW
   EXECUTE FUNCTION assign_feedback_id();
+
+CREATE TRIGGER trg_assign_collection_id
+  BEFORE INSERT OR UPDATE ON collection_pointers
+  FOR EACH ROW
+  EXECUTE FUNCTION assign_collection_id();
 
 CREATE TRIGGER trg_assign_response_id
   BEFORE INSERT OR UPDATE ON feedback_responses

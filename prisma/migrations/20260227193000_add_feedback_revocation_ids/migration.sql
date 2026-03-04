@@ -53,7 +53,7 @@ WITH "feedback_seed" AS (
 )
 UPDATE "Feedback"
 SET "feedback_id" = (
-  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS INTEGER)
+  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS BIGINT)
   FROM "feedback_ranked" r
   LEFT JOIN "feedback_seed" s ON s."agentId" = r."agentId"
   WHERE r."id" = "Feedback"."id"
@@ -88,7 +88,7 @@ WITH "response_seed" AS (
 )
 UPDATE "FeedbackResponse"
 SET "response_id" = (
-  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS INTEGER)
+  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS BIGINT)
   FROM "response_ranked" r
   LEFT JOIN "response_seed" s ON s."feedbackId" = r."feedbackId"
   WHERE r."id" = "FeedbackResponse"."id"
@@ -124,7 +124,7 @@ WITH "revocation_seed" AS (
 )
 UPDATE "Revocation"
 SET "revocation_id" = (
-  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS INTEGER)
+  SELECT CAST(COALESCE(s."max_id", 0) + r."rn" AS BIGINT)
   FROM "revocation_ranked" r
   LEFT JOIN "revocation_seed" s ON s."agentId" = r."agentId"
   WHERE r."id" = "Revocation"."id"

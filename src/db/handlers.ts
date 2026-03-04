@@ -48,6 +48,7 @@ let agentIdAssignmentTail: Promise<void> = Promise.resolve();
 let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
 let responseIdAssignmentTail: Promise<void> = Promise.resolve();
 let revocationIdAssignmentTail: Promise<void> = Promise.resolve();
+let collectionIdAssignmentTail: Promise<void> = Promise.resolve();
 
 async function withAssignmentLock<T>(
   getTail: () => Promise<void>,
@@ -99,10 +100,121 @@ async function withRevocationIdAssignmentLock<T>(task: () => Promise<T>): Promis
   );
 }
 
+async function withCollectionIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => collectionIdAssignmentTail,
+    (tail) => { collectionIdAssignmentTail = tail; },
+    task
+  );
+}
+
 function asBigInt(value: bigint | number | null | undefined): bigint {
   if (typeof value === "bigint") return value;
   if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value));
   return 0n;
+}
+
+type CollectionDelegate = {
+  findUnique(args: unknown): Promise<{ collectionId: bigint | null } | null>;
+  findMany(args: unknown): Promise<Array<{ collectionId: bigint | null }>>;
+  upsert(args: unknown): Promise<unknown>;
+};
+
+let collectionIdSchemaSupported: boolean | null = null;
+let warnedMissingCollectionIdSchema = false;
+let collectionIdSchemaRetryAfter = 0;
+const COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS = 60_000;
+
+function isMissingCollectionIdSchemaError(error: unknown): boolean {
+  const maybe = error as { code?: unknown; message?: unknown } | null;
+  const code = typeof maybe?.code === "string" ? maybe.code : "";
+  const message = typeof maybe?.message === "string" ? maybe.message : String(error);
+  if (code === "P2022" || code === "P2010") {
+    return /collection_id|collectionId|CollectionPointer/i.test(message);
+  }
+  return /column .*collection_id|no such column: collection_id|Unknown arg .*collectionId/i.test(message);
+}
+
+async function upsertCollectionPointerWithOptionalCollectionId(
+  collection: CollectionDelegate,
+  pointer: string,
+  creator: string,
+  assetId: string,
+  ctx: EventContext
+): Promise<void> {
+  const where = { col_creator: { col: pointer, creator } };
+  const createBase = {
+    col: pointer,
+    creator,
+    firstSeenAsset: assetId,
+    firstSeenAt: ctx.blockTime,
+    firstSeenSlot: ctx.slot,
+    firstSeenTxSignature: ctx.signature,
+    lastSeenAt: ctx.blockTime,
+    lastSeenSlot: ctx.slot,
+    lastSeenTxSignature: ctx.signature,
+    assetCount: 0n,
+  };
+  const updateBase = {
+    lastSeenAt: ctx.blockTime,
+    lastSeenSlot: ctx.slot,
+    lastSeenTxSignature: ctx.signature,
+  };
+
+  if (collectionIdSchemaSupported === false && Date.now() >= collectionIdSchemaRetryAfter) {
+    collectionIdSchemaSupported = null;
+  }
+
+  if (collectionIdSchemaSupported !== false) {
+    try {
+      const existingCollection = await collection.findUnique({
+        where,
+        select: { collectionId: true },
+      });
+      let assignedCollectionId: bigint | undefined;
+      if (!existingCollection || existingCollection.collectionId === null) {
+        const highestAssigned = await collection.findMany({
+          where: { collectionId: { not: null } },
+          select: { collectionId: true },
+          orderBy: { collectionId: "desc" },
+          take: 1,
+        });
+        assignedCollectionId = asBigInt(highestAssigned[0]?.collectionId) + 1n;
+      }
+
+      await collection.upsert({
+        where,
+        create: {
+          ...createBase,
+          collectionId: assignedCollectionId ?? null,
+        },
+        update: {
+          ...updateBase,
+          ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
+        },
+      });
+      collectionIdSchemaSupported = true;
+      return;
+    } catch (error) {
+      if (!isMissingCollectionIdSchemaError(error)) {
+        throw error;
+      }
+      collectionIdSchemaSupported = false;
+      collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
+      if (!warnedMissingCollectionIdSchema) {
+        warnedMissingCollectionIdSchema = true;
+        logger.warn(
+          "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
+        );
+      }
+    }
+  }
+
+  await collection.upsert({
+    where,
+    create: createBase,
+    update: updateBase,
+  });
 }
 
 function enqueueUriDigestWorker(assetId: string): void {
@@ -1023,25 +1135,14 @@ async function handleCollectionPointerSetTx(
   });
   const creator = existing?.creator ?? setBy;
 
-  await tx.collection.upsert({
-    where: { col_creator: { col: pointer, creator } },
-    create: {
-      col: pointer,
+  await withCollectionIdAssignmentLock(async () => {
+    await upsertCollectionPointerWithOptionalCollectionId(
+      tx.collection as unknown as CollectionDelegate,
+      pointer,
       creator,
-      firstSeenAsset: assetId,
-      firstSeenAt: ctx.blockTime,
-      firstSeenSlot: ctx.slot,
-      firstSeenTxSignature: ctx.signature,
-      lastSeenAt: ctx.blockTime,
-      lastSeenSlot: ctx.slot,
-      lastSeenTxSignature: ctx.signature,
-      assetCount: 0n,
-    },
-    update: {
-      lastSeenAt: ctx.blockTime,
-      lastSeenSlot: ctx.slot,
-      lastSeenTxSignature: ctx.signature,
-    },
+      assetId,
+      ctx
+    );
   });
 
   const result = await tx.agent.updateMany({
@@ -1101,25 +1202,14 @@ async function handleCollectionPointerSet(
   });
   const creator = existing?.creator ?? setBy;
 
-  await prisma.collection.upsert({
-    where: { col_creator: { col: pointer, creator } },
-    create: {
-      col: pointer,
+  await withCollectionIdAssignmentLock(async () => {
+    await upsertCollectionPointerWithOptionalCollectionId(
+      prisma.collection as unknown as CollectionDelegate,
+      pointer,
       creator,
-      firstSeenAsset: assetId,
-      firstSeenAt: ctx.blockTime,
-      firstSeenSlot: ctx.slot,
-      firstSeenTxSignature: ctx.signature,
-      lastSeenAt: ctx.blockTime,
-      lastSeenSlot: ctx.slot,
-      lastSeenTxSignature: ctx.signature,
-      assetCount: 0n,
-    },
-    update: {
-      lastSeenAt: ctx.blockTime,
-      lastSeenSlot: ctx.slot,
-      lastSeenTxSignature: ctx.signature,
-    },
+      assetId,
+      ctx
+    );
   });
 
   const result = await prisma.agent.updateMany({

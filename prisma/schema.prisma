@@ -71,6 +71,7 @@ model Agent {
 // Canonical collection registry (from c1:<cid>)
 // Tracks first on-chain sighting for each unique creator+collection key.
 model Collection {
+  collectionId         BigInt?  @map("collection_id")
   col                  String
   creator              String
   firstSeenAsset       String
@@ -96,6 +97,8 @@ model Collection {
   metadataUpdatedAt    DateTime?
 
   @@id([col, creator])
+  @@unique([collectionId])
+  @@index([collectionId])
   @@index([col])
   @@index([creator])
   @@index([firstSeenAt])
