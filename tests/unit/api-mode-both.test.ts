@@ -1092,6 +1092,105 @@ describe("API_MODE=both behavior", () => {
         expect(includeUrl.searchParams.get("status")).toBeNull();
       }
 
+      const feedbackIndexNotInCallStart = fetchSpy.mock.calls.length;
+      const feedbackIndexNotInFilter = encodeURIComponent("not.in.(1,2)");
+      const feedbackIndexNotInRes = await fetch(
+        `${baseUrl}/rest/v1/feedbacks?limit=1&feedback_index=${feedbackIndexNotInFilter}`
+      );
+      expect(feedbackIndexNotInRes.status).toBe(200);
+      const feedbackIndexNotInUpstreamCall = fetchSpy.mock.calls.slice(feedbackIndexNotInCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/feedbacks?");
+      });
+      expect(feedbackIndexNotInUpstreamCall).toBeTruthy();
+      const feedbackIndexNotInUrlRaw = typeof feedbackIndexNotInUpstreamCall?.[0] === "string"
+        ? feedbackIndexNotInUpstreamCall[0]
+        : feedbackIndexNotInUpstreamCall?.[0] instanceof URL
+          ? feedbackIndexNotInUpstreamCall[0].toString()
+          : feedbackIndexNotInUpstreamCall?.[0]?.url;
+      expect(typeof feedbackIndexNotInUrlRaw).toBe("string");
+      const feedbackIndexNotInUrl = new URL(feedbackIndexNotInUrlRaw as string);
+      expect(feedbackIndexNotInUrl.searchParams.get("feedback_index")).toBe("not.in.(1,2)");
+      expect(feedbackIndexNotInUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
+      const feedbackIndexNeqCallStart = fetchSpy.mock.calls.length;
+      const feedbackIndexNeqRes = await fetch(
+        `${baseUrl}/rest/v1/feedbacks?limit=1&feedback_index=neq.7`
+      );
+      expect(feedbackIndexNeqRes.status).toBe(200);
+      const feedbackIndexNeqUpstreamCall = fetchSpy.mock.calls.slice(feedbackIndexNeqCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/feedbacks?");
+      });
+      expect(feedbackIndexNeqUpstreamCall).toBeTruthy();
+      const feedbackIndexNeqUrlRaw = typeof feedbackIndexNeqUpstreamCall?.[0] === "string"
+        ? feedbackIndexNeqUpstreamCall[0]
+        : feedbackIndexNeqUpstreamCall?.[0] instanceof URL
+          ? feedbackIndexNeqUpstreamCall[0].toString()
+          : feedbackIndexNeqUpstreamCall?.[0]?.url;
+      expect(typeof feedbackIndexNeqUrlRaw).toBe("string");
+      const feedbackIndexNeqUrl = new URL(feedbackIndexNeqUrlRaw as string);
+      expect(feedbackIndexNeqUrl.searchParams.get("feedback_index")).toBe("neq.7");
+      expect(feedbackIndexNeqUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
+      const revokeCountNotInCallStart = fetchSpy.mock.calls.length;
+      const revokeCountNotInFilter = encodeURIComponent("not.in.(1,2)");
+      const revokeCountNotInRes = await fetch(
+        `${baseUrl}/rest/v1/revocations?limit=1&revoke_count=${revokeCountNotInFilter}`
+      );
+      expect(revokeCountNotInRes.status).toBe(200);
+      const revokeCountNotInUpstreamCall = fetchSpy.mock.calls.slice(revokeCountNotInCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/revocations?");
+      });
+      expect(revokeCountNotInUpstreamCall).toBeTruthy();
+      const revokeCountNotInUrlRaw = typeof revokeCountNotInUpstreamCall?.[0] === "string"
+        ? revokeCountNotInUpstreamCall[0]
+        : revokeCountNotInUpstreamCall?.[0] instanceof URL
+          ? revokeCountNotInUpstreamCall[0].toString()
+          : revokeCountNotInUpstreamCall?.[0]?.url;
+      expect(typeof revokeCountNotInUrlRaw).toBe("string");
+      const revokeCountNotInUrl = new URL(revokeCountNotInUrlRaw as string);
+      expect(revokeCountNotInUrl.searchParams.get("revoke_count")).toBe("not.in.(1,2)");
+      expect(revokeCountNotInUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
+      const revokeCountInCallStart = fetchSpy.mock.calls.length;
+      const revokeCountInFilter = encodeURIComponent("in.(1,2)");
+      const revokeCountInRes = await fetch(
+        `${baseUrl}/rest/v1/revocations?limit=1&revoke_count=${revokeCountInFilter}`
+      );
+      expect(revokeCountInRes.status).toBe(200);
+      const revokeCountInUpstreamCall = fetchSpy.mock.calls.slice(revokeCountInCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/revocations?");
+      });
+      expect(revokeCountInUpstreamCall).toBeTruthy();
+      const revokeCountInUrlRaw = typeof revokeCountInUpstreamCall?.[0] === "string"
+        ? revokeCountInUpstreamCall[0]
+        : revokeCountInUpstreamCall?.[0] instanceof URL
+          ? revokeCountInUpstreamCall[0].toString()
+          : revokeCountInUpstreamCall?.[0]?.url;
+      expect(typeof revokeCountInUrlRaw).toBe("string");
+      const revokeCountInUrl = new URL(revokeCountInUrlRaw as string);
+      expect(revokeCountInUrl.searchParams.get("revoke_count")).toBe("in.(1,2)");
+      expect(revokeCountInUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
       const statsCallStart = fetchSpy.mock.calls.length;
       const statsRes = await fetch(`${baseUrl}/rest/v1/stats?limit=1`);
       expect(statsRes.status).toBe(200);

@@ -187,22 +187,6 @@ function parsePostgRESTComparison(value: unknown): PostgRESTComparison | undefin
   return { op: 'eq', value: str };
 }
 
-/**
- * Parse PostgREST IN query: "in.(val1,val2,val3)" -> ["val1", "val2", "val3"]
- * Returns undefined if not in.() format
- */
-function parsePostgRESTIn(value: unknown): string[] | undefined {
-  const state = parsePostgRESTListOperator(value, 'in');
-  if (!state.matched || state.malformed) return undefined;
-  return state.values;
-}
-
-function parsePostgRESTNotIn(value: unknown): string[] | undefined {
-  const state = parsePostgRESTListOperator(value, 'not.in');
-  if (!state.matched || state.malformed) return undefined;
-  return state.values;
-}
-
 type PostgRESTListOperator = 'in' | 'not.in';
 
 type PostgRESTListState = {
@@ -1514,7 +1498,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const response_id = parsePostgRESTValue(req.query.response_id);
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
-      const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
+      const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
+      const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
+      const feedbackIndexNotInState = parsePostgRESTListOperator(req.query.feedback_index, 'not.in');
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1545,13 +1532,44 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       let parsedFeedbackIndex: bigint | undefined;
-      if (feedback_index !== undefined) {
-        const idx = safeBigInt(feedback_index);
+      let feedbackIndexClause: bigint | Prisma.BigIntFilter | undefined;
+      if (feedbackIndexInState.matched) {
+        if (feedbackIndexInState.malformed || feedbackIndexInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        feedbackIndexClause = { in: indices };
+      } else if (feedbackIndexNotInState.matched) {
+        if (feedbackIndexNotInState.malformed || feedbackIndexNotInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexNotInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        feedbackIndexClause = { notIn: indices };
+      } else if (feedbackIndexRaw?.startsWith('neq.')) {
+        const idx = safeBigInt(feedbackIndexRaw.slice(4));
         if (idx === undefined) {
           res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
           return;
         }
-        parsedFeedbackIndex = idx;
+        feedbackIndexClause = { not: idx };
+      } else if (feedbackIndexFilter === null) {
+        res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+        return;
+      } else if (feedbackIndexFilter !== undefined) {
+        feedbackIndexClause = feedbackIndexFilter;
+        if (typeof feedbackIndexFilter === 'bigint') {
+          parsedFeedbackIndex = feedbackIndexFilter;
+        }
       }
 
       let parsedFeedbackSequentialId: bigint | undefined;
@@ -1640,7 +1658,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         const feedbackWhere: Prisma.FeedbackWhereInput = {};
         if (asset) feedbackWhere.agentId = asset;
         if (client_address) feedbackWhere.client = client_address;
-        if (parsedFeedbackIndex !== undefined) feedbackWhere.feedbackIndex = parsedFeedbackIndex;
+        if (feedbackIndexClause !== undefined) feedbackWhere.feedbackIndex = feedbackIndexClause;
         if (Object.keys(feedbackWhere).length > 0) {
           where.feedback = feedbackWhere;
         }
@@ -1702,7 +1720,10 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const client = parsePostgRESTValue(req.query.client_address) ?? parsePostgRESTValue(req.query.client);
-      const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
+      const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
+      const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
+      const feedbackIndexNotInState = parsePostgRESTListOperator(req.query.feedback_index, 'not.in');
       const revocationIdRaw = safeQueryString(req.query.revocation_id);
       const revocationIdFilter = parsePostgRESTBigIntFilter(req.query.revocation_id);
       const revokeCountRaw = safeQueryString(req.query.revoke_count);
@@ -1732,13 +1753,40 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (revocationIdFilter !== undefined) {
         where.revocationId = revocationIdFilter;
       }
-      if (feedback_index !== undefined) {
-        const idx = safeBigInt(feedback_index);
+      if (feedbackIndexInState.matched) {
+        if (feedbackIndexInState.malformed || feedbackIndexInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        where.feedbackIndex = { in: indices };
+      } else if (feedbackIndexNotInState.matched) {
+        if (feedbackIndexNotInState.malformed || feedbackIndexNotInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexNotInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index NOT IN filter: must be not.in.(int,int,...)' });
+          return;
+        }
+        where.feedbackIndex = { notIn: indices };
+      } else if (feedbackIndexRaw?.startsWith('neq.')) {
+        const idx = safeBigInt(feedbackIndexRaw.slice(4));
         if (idx === undefined) {
           res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
           return;
         }
-        where.feedbackIndex = idx;
+        where.feedbackIndex = { not: idx };
+      } else if (feedbackIndexFilter === null) {
+        res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+        return;
+      } else if (feedbackIndexFilter !== undefined) {
+        where.feedbackIndex = feedbackIndexFilter;
       }
       if (revokeCountInState.matched) {
         if (revokeCountInState.malformed || revokeCountInState.values.length === 0) {

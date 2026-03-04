@@ -214,6 +214,78 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("applies feedback_index neq filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=neq.7`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            feedbackIndex: { not: 7n },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index not.in filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const notInFilter = encodeURIComponent("not.in.(1,5,10)");
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=${notInFilter}`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            feedbackIndex: { notIn: [1n, 5n, 10n] },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects malformed quoted feedback_index NOT IN filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedNotInFilter = encodeURIComponent('not.in.("1,5)');
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=${malformedNotInFilter}`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid feedback_index NOT IN filter");
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("applies revoke_count PostgREST IN filters on revocations endpoint", async () => {
     const prisma = {
       revocation: {
@@ -293,6 +365,108 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("applies revoke_count neq filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&revoke_count=neq.9`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            revokeCount: { not: 9n },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies revoke_count not.in filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const notInFilter = encodeURIComponent("not.in.(1,5,10)");
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&revoke_count=${notInFilter}`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            revokeCount: { notIn: [1n, 5n, 10n] },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index neq filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&feedback_index=neq.4`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            feedbackIndex: { not: 4n },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index IN filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent("in.(1,2)");
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&feedback_index=${inFilter}`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            feedbackIndex: { in: [1n, 2n] },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("rejects invalid revoke_count IN filters on revocations endpoint", async () => {
     const prisma = {
       revocation: {
@@ -335,6 +509,27 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("rejects malformed quoted revoke_count NOT IN filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedNotInFilter = encodeURIComponent('not.in.("1,5)');
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?revoke_count=${malformedNotInFilter}`);
+      expect(res.status).toBe(400);
+
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid revoke_count NOT IN filter");
+      expect(prisma.revocation.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("returns 400 when response_id is provided without canonical feedback scope", async () => {
     const prisma = {
       feedbackResponse: {
@@ -352,6 +547,113 @@ describe("REST feedback deterministic ordering", () => {
       expect(body.error).toContain("response_id requires canonical feedback scope");
       expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
       expect(prisma.feedbackResponse.count).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index neq filters on responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_index=neq.0&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            feedback: {
+              agentId: "asset-1",
+              feedbackIndex: { not: 0n },
+            },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index IN filters on responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent("in.(0,1)");
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_index=${inFilter}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            feedback: {
+              agentId: "asset-1",
+              feedbackIndex: { in: [0n, 1n] },
+            },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies feedback_index NOT IN filters on responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const notInFilter = encodeURIComponent("not.in.(0,1)");
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_index=${notInFilter}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            feedback: {
+              agentId: "asset-1",
+              feedbackIndex: { notIn: [0n, 1n] },
+            },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects malformed quoted feedback_index NOT IN filters on responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedNotInFilter = encodeURIComponent('not.in.("0,1)');
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_index=${malformedNotInFilter}&limit=1`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid feedback_index NOT IN filter");
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
     } finally {
       await stopServer(server);
     }
