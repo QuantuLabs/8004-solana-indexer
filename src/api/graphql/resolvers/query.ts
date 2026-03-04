@@ -978,6 +978,9 @@ export const queryResolvers = {
       }
 
       const collectionVariants = collectionPointerVariants(args.collection);
+      if (collectionVariants.length === 0) {
+        return '0';
+      }
       const params: unknown[] = collectionVariants.length > 1
         ? [collectionVariants, creator]
         : [collectionVariants[0] ?? normalizeCollectionPointer(args.collection), creator];
@@ -1018,6 +1021,9 @@ export const queryResolvers = {
         );
       }
       const collectionVariants = collectionPointerVariants(args.collection);
+      if (collectionVariants.length === 0) {
+        return [];
+      }
       const params: unknown[] = collectionVariants.length > 1
         ? [collectionVariants, creator]
         : [collectionVariants[0] ?? normalizeCollectionPointer(args.collection), creator];

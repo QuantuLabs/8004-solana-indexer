@@ -27,6 +27,7 @@ import {
 import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import { DEFAULT_PUBKEY } from "../constants.js";
+import { classifyRevocationStatus } from "./revocation-classification.js";
 import type { PoolClient } from "pg";
 
 const logger = createChildLogger("supabase-handlers");
@@ -789,6 +790,7 @@ async function handleFeedbackRevokedTx(
     `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
     [id]
   );
+  let sealMismatch = false;
   if (feedbackCheck.rowCount === 0) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
@@ -800,6 +802,7 @@ async function handleFeedbackRevokedTx(
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
     if (!hashesMatchHex(storedHash, eventHash)) {
+      sealMismatch = true;
       logger.warn(
         { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
@@ -807,15 +810,17 @@ async function handleFeedbackRevokedTx(
     }
   }
 
-  await client.query(
-    `UPDATE feedbacks SET
-       is_revoked = true,
-       revoked_at = $1
-     WHERE id = $2`,
-    [ctx.blockTime.toISOString(), id]
-  );
-
-  const isOrphan = feedbackCheck.rowCount === 0;
+  const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+  const isOrphan = revokeStatus === "ORPHANED";
+  if (!isOrphan) {
+    await client.query(
+      `UPDATE feedbacks SET
+         is_revoked = true,
+         revoked_at = $1
+       WHERE id = $2`,
+      [ctx.blockTime.toISOString(), id]
+    );
+  }
   const revokeDigest = data.newRevokeDigest
     ? Buffer.from(data.newRevokeDigest)
     : null;
@@ -841,40 +846,42 @@ async function handleFeedbackRevokedTx(
     [revokeId, null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
      data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
      revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
-     isOrphan ? "ORPHANED" : DEFAULT_STATUS]
+     revokeStatus]
   );
 
-  const baseUpdate = `
-    feedback_count = COALESCE((
-      SELECT COUNT(*)::int
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    raw_avg_score = COALESCE((
-      SELECT ROUND(AVG(score))::smallint
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    updated_at = $1
-  `;
-  await client.query(
-    `UPDATE agents SET
-       ${baseUpdate}
-     WHERE asset = $2`,
-    [ctx.blockTime.toISOString(), assetId]
-  );
-  if (data.atomEnabled && data.hadImpact) {
+  if (!isOrphan) {
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
     await client.query(
       `UPDATE agents SET
-         trust_tier = $3,
-         quality_score = $4,
-         confidence = $5,
-         updated_at = $1
+         ${baseUpdate}
        WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
+      [ctx.blockTime.toISOString(), assetId]
     );
+    if (data.atomEnabled && data.hadImpact) {
+      await client.query(
+        `UPDATE agents SET
+           trust_tier = $3,
+           quality_score = $4,
+           confidence = $5,
+           updated_at = $1
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
+      );
+    }
   }
-  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan, sealMismatch }, "Feedback revoked");
 }
 
 async function handleResponseAppendedTx(
@@ -1445,6 +1452,7 @@ async function handleFeedbackRevoked(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
       [id]
     );
+    let sealMismatch = false;
     if (feedbackCheck.rowCount === 0) {
       logger.warn(
         { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
@@ -1456,6 +1464,7 @@ async function handleFeedbackRevoked(
         ? Buffer.from(data.sealHash).toString("hex")
         : null;
       if (!hashesMatchHex(storedHash, eventHash)) {
+        sealMismatch = true;
         logger.warn(
           { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
           "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
@@ -1463,15 +1472,17 @@ async function handleFeedbackRevoked(
       }
     }
 
-    await db.query(
-      `UPDATE feedbacks SET
-         is_revoked = true,
-         revoked_at = $1
-       WHERE id = $2`,
-      [ctx.blockTime.toISOString(), id]
-    );
-
-    const isOrphan = feedbackCheck.rowCount === 0;
+    const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+    const isOrphan = revokeStatus === "ORPHANED";
+    if (!isOrphan) {
+      await db.query(
+        `UPDATE feedbacks SET
+           is_revoked = true,
+           revoked_at = $1
+         WHERE id = $2`,
+        [ctx.blockTime.toISOString(), id]
+      );
+    }
     const revokeDigest = data.newRevokeDigest
       ? Buffer.from(data.newRevokeDigest)
       : null;
@@ -1496,43 +1507,45 @@ async function handleFeedbackRevoked(
       [id, null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
        data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
        revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
-       isOrphan ? "ORPHANED" : DEFAULT_STATUS]
+       revokeStatus]
     );
 
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
+    if (!isOrphan) {
+      const baseUpdate = `
+        feedback_count = COALESCE((
+          SELECT COUNT(*)::int
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        raw_avg_score = COALESCE((
+          SELECT ROUND(AVG(score))::smallint
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        updated_at = $1
+      `;
 
-    await db.query(
-      `UPDATE agents SET
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId]
-    );
-
-    if (data.atomEnabled && data.hadImpact) {
       await db.query(
         `UPDATE agents SET
-           trust_tier = $3,
-           quality_score = $4,
-           confidence = $5,
-           updated_at = $1
+           ${baseUpdate}
          WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
+        [ctx.blockTime.toISOString(), assetId]
       );
+
+      if (data.atomEnabled && data.hadImpact) {
+        await db.query(
+          `UPDATE agents SET
+             trust_tier = $3,
+             quality_score = $4,
+             confidence = $5,
+             updated_at = $1
+           WHERE asset = $2`,
+          [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
+        );
+      }
     }
 
-    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan, sealMismatch }, "Feedback revoked");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to revoke feedback");
   }

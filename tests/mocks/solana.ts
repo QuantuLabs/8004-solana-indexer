@@ -101,6 +101,34 @@ function getEventDiscriminator(eventName: string): Buffer {
     .subarray(0, 8);
 }
 
+function encodeU64(value: bigint | number | string): Buffer {
+  const normalized = typeof value === "bigint" ? value : BigInt(value);
+  const out = Buffer.alloc(8);
+  out.writeBigUInt64LE(normalized);
+  return out;
+}
+
+function encodeFixedHash32(value: Uint8Array | number[]): Buffer {
+  let bytes: Uint8Array;
+  if (value instanceof Uint8Array) {
+    bytes = value;
+  } else if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const byte = value[i];
+      if (!Number.isInteger(byte) || byte < 0 || byte > 255) {
+        throw new Error(`Invalid hash byte at index ${i}: expected integer in [0,255]`);
+      }
+    }
+    bytes = Uint8Array.from(value);
+  } else {
+    throw new Error("Expected 32-byte hash value as Uint8Array or number[]");
+  }
+  if (bytes.length !== 32) {
+    throw new Error(`Expected 32-byte hash, got ${bytes.length}`);
+  }
+  return Buffer.from(bytes);
+}
+
 /**
  * Encode an Anchor event manually for testing.
  * Anchor events are: discriminator (8 bytes) + borsh-serialized data
@@ -137,6 +165,27 @@ export function encodeAnchorEvent(eventName: string, data: Record<string, any>):
       uriLenBuf.writeUInt32LE(uriBytes.length);
       buffers.push(uriLenBuf);
       buffers.push(uriBytes);
+      break;
+
+    case "ResponseAppended":
+      // asset: Pubkey, client: Pubkey, feedback_index: u64, slot: u64, responder: Pubkey,
+      // response_hash: [u8; 32], seal_hash: [u8; 32], new_response_digest: [u8; 32],
+      // new_response_count: u64, response_uri: String
+      buffers.push(Buffer.from(data.asset.toBytes()));
+      buffers.push(Buffer.from(data.client.toBytes()));
+      buffers.push(encodeU64(data.feedbackIndex ?? data.feedback_index ?? 0n));
+      buffers.push(encodeU64(data.slot ?? 0n));
+      buffers.push(Buffer.from(data.responder.toBytes()));
+      buffers.push(encodeFixedHash32(data.responseHash ?? data.response_hash));
+      buffers.push(encodeFixedHash32(data.sealHash ?? data.seal_hash));
+      buffers.push(encodeFixedHash32(data.newResponseDigest ?? data.new_response_digest));
+      buffers.push(encodeU64(data.newResponseCount ?? data.new_response_count ?? 0n));
+      const responseUri = data.responseUri ?? data.response_uri ?? "";
+      const responseUriBytes = Buffer.from(responseUri, "utf-8");
+      const responseUriLenBuf = Buffer.alloc(4);
+      responseUriLenBuf.writeUInt32LE(responseUriBytes.length);
+      buffers.push(responseUriLenBuf);
+      buffers.push(responseUriBytes);
       break;
 
     default:

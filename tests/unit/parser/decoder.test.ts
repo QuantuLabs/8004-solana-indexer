@@ -109,6 +109,49 @@ describe("Parser Decoder", () => {
       expect(result[0].data.asset.toString()).toBe(TEST_ASSET.toBase58());
     });
 
+    it("should parse ResponseAppended logs and convert hashes to typed event", () => {
+      const eventData = {
+        asset: TEST_ASSET,
+        client: TEST_CLIENT,
+        feedbackIndex: 0n,
+        slot: 123456n,
+        responder: TEST_OWNER,
+        responseHash: TEST_HASH,
+        sealHash: TEST_HASH,
+        newResponseDigest: TEST_HASH,
+        newResponseCount: 1n,
+        responseUri: "ipfs://QmResponse",
+      };
+      const logs = createEventLogs("ResponseAppended", eventData);
+
+      const parsed = parseTransactionLogs(logs);
+
+      expect(parsed).toHaveLength(1);
+      expect(parsed[0].name).toBe("ResponseAppended");
+      const typed = toTypedEvent(parsed[0]);
+      expect(typed).not.toBeNull();
+      expect(typed!.type).toBe("ResponseAppended");
+      expect(typed!.data.responseHash).toEqual(new Uint8Array(TEST_HASH));
+      expect(typed!.data.sealHash).toEqual(new Uint8Array(TEST_HASH));
+    });
+
+    it("should reject invalid bytes in ResponseAppended mock encoding", () => {
+      expect(() =>
+        encodeAnchorEvent("ResponseAppended", {
+          asset: TEST_ASSET,
+          client: TEST_CLIENT,
+          feedbackIndex: 0n,
+          slot: 123456n,
+          responder: TEST_OWNER,
+          responseHash: [...Array.from(TEST_HASH).slice(0, 31), 300],
+          sealHash: TEST_HASH,
+          newResponseDigest: TEST_HASH,
+          newResponseCount: 1n,
+          responseUri: "ipfs://QmResponse",
+        })
+      ).toThrow();
+    });
+
     it("should parse multiple events from logs", () => {
       // Create two encoded events
       const eventData1 = {
@@ -642,7 +685,7 @@ describe("Parser Decoder", () => {
           value: "9500",
           value_decimals: 2,
           score: 85,
-          feedback_hash: Array.from(TEST_HASH),
+          seal_hash: Array.from(TEST_HASH),
           atom_enabled: true,
           new_trust_tier: 1,
           new_quality_score: 8000,
@@ -677,7 +720,7 @@ describe("Parser Decoder", () => {
           asset: TEST_ASSET.toBase58(),
           client_address: TEST_CLIENT.toBase58(),
           feedback_index: "1",
-          feedback_hash: Array.from(TEST_HASH),
+          seal_hash: Array.from(TEST_HASH),
           slot: "123456",
           original_score: 85,
           atom_enabled: true,
@@ -722,6 +765,27 @@ describe("Parser Decoder", () => {
       expect(result!.data.sealHash).toEqual(new Uint8Array(TEST_HASH));
     });
 
+    it("should return null for ResponseAppended when response_hash is not 32 bytes", () => {
+      const event = {
+        name: "ResponseAppended",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          responder: TEST_OWNER.toBase58(),
+          response_hash: Array.from(TEST_HASH).slice(0, 31),
+          seal_hash: Array.from(TEST_HASH),
+          new_response_digest: Array.from(TEST_HASH),
+          new_response_count: "1",
+          response_uri: "ipfs://QmYYY",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).toBeNull();
+    });
+
     it("should convert ValidationRequested event", () => {
       const event = {
         name: "ValidationRequested",
@@ -762,6 +826,90 @@ describe("Parser Decoder", () => {
       expect(result!.type).toBe("ValidationResponded");
       expect(result!.data.response).toBe(90);
       expect(result!.data.tag).toBe("security");
+    });
+
+    it("should return null for ValidationResponded when response_hash contains invalid bytes", () => {
+      const event = {
+        name: "ValidationResponded",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          validator_address: TEST_VALIDATOR.toBase58(),
+          nonce: 1,
+          response: 90,
+          response_uri: "ipfs://QmAAA",
+          response_hash: [...Array.from(TEST_HASH).slice(0, 31), 300],
+          tag: "security",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).toBeNull();
+    });
+
+    it("should convert ValidationResponded when response_hash is a Uint8Array", () => {
+      const event = {
+        name: "ValidationResponded",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          validator_address: TEST_VALIDATOR.toBase58(),
+          nonce: 1,
+          response: 90,
+          response_uri: "ipfs://QmAAA",
+          response_hash: new Uint8Array(TEST_HASH),
+          tag: "security",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("ValidationResponded");
+      expect(result!.data.responseHash).toEqual(new Uint8Array(TEST_HASH));
+    });
+
+    it("should convert ResponseAppended when response_hash is a Uint8Array view with offset", () => {
+      const padded = new Uint8Array(34);
+      padded.set(TEST_HASH, 1);
+      const event = {
+        name: "ResponseAppended",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          responder: TEST_OWNER.toBase58(),
+          response_hash: padded.subarray(1, 33),
+          seal_hash: Array.from(TEST_HASH),
+          new_response_digest: Array.from(TEST_HASH),
+          new_response_count: "1",
+          response_uri: "ipfs://QmYYY",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("ResponseAppended");
+      expect(result!.data.responseHash).toEqual(new Uint8Array(TEST_HASH));
+    });
+
+    it("should return null for ResponseAppended when response_hash Uint8Array length is invalid", () => {
+      const event = {
+        name: "ResponseAppended",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          responder: TEST_OWNER.toBase58(),
+          response_hash: new Uint8Array(TEST_HASH.slice(0, 31)),
+          seal_hash: Array.from(TEST_HASH),
+          new_response_digest: Array.from(TEST_HASH),
+          new_response_count: "1",
+          response_uri: "ipfs://QmYYY",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).toBeNull();
     });
 
     it("should return null for unknown event type", () => {
@@ -941,6 +1089,39 @@ describe("Parser Decoder", () => {
       expect(result).not.toBeNull();
       expect(result!.type).toBe("NewFeedback");
       expect(result!.data.feedbackFileHash).toEqual(new Uint8Array(fileHash));
+    });
+
+    it("should return null when NewFeedback feedback_file_hash is malformed", () => {
+      const event = {
+        name: "NewFeedback",
+        data: {
+          asset: TEST_ASSET.toBase58(),
+          client_address: TEST_CLIENT.toBase58(),
+          feedback_index: "0",
+          slot: "123456",
+          value: "9500",
+          value_decimals: 2,
+          score: 85,
+          feedback_file_hash: Array.from(TEST_HASH).slice(0, 31),
+          seal_hash: Array.from(TEST_HASH),
+          atom_enabled: true,
+          new_trust_tier: 1,
+          new_quality_score: 8000,
+          new_confidence: 9000,
+          new_risk_score: 10,
+          new_diversity_ratio: 42,
+          is_unique_client: true,
+          new_feedback_digest: Array.from(TEST_HASH),
+          new_feedback_count: "1",
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/api/chat",
+          feedback_uri: "ipfs://QmXXX",
+        },
+      };
+
+      const result = toTypedEvent(event);
+      expect(result).toBeNull();
     });
 
     it("should handle NewFeedback with null score (Option<u8>)", () => {

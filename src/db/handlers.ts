@@ -22,6 +22,7 @@ import {
 import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
+import { classifyRevocationStatus } from "./revocation-classification.js";
 import { digestUri, serializeValue } from "../indexer/uriDigest.js";
 import { digestCollectionPointerDoc } from "../indexer/collectionDigest.js";
 import { compressForStorage } from "../utils/compression.js";
@@ -2068,15 +2069,16 @@ async function handleFeedbackRevokedTx(
     );
   }
 
-  await tx.feedback.updateMany({
-    where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
-    data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
-  });
-
   // Parity with Supabase batch path:
   // - missing feedback => ORPHANED
   // - seal mismatch with existing feedback => warn, keep PENDING
-  const revokeStatus = !feedback ? "ORPHANED" as const : DEFAULT_STATUS;
+  const revokeStatus = classifyRevocationStatus(Boolean(feedback));
+  if (revokeStatus !== "ORPHANED") {
+    await tx.feedback.updateMany({
+      where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+      data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
+    });
+  }
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await tx.revocation.findUnique({
       where: {
@@ -2140,18 +2142,20 @@ async function handleFeedbackRevokedTx(
     });
   });
 
-  await syncAgentFeedbackStatsTx(
-    tx,
-    assetId,
-    ctx.blockTime,
-    data.atomEnabled && data.hadImpact
-      ? {
-          trustTier: data.newTrustTier,
-          qualityScore: data.newQualityScore,
-          confidence: data.newConfidence,
-        }
-      : undefined
-  );
+  if (revokeStatus !== "ORPHANED") {
+    await syncAgentFeedbackStatsTx(
+      tx,
+      assetId,
+      ctx.blockTime,
+      data.atomEnabled && data.hadImpact
+        ? {
+            trustTier: data.newTrustTier,
+            qualityScore: data.newQualityScore,
+            confidence: data.newConfidence,
+          }
+        : undefined
+    );
+  }
 
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }
@@ -2190,15 +2194,16 @@ async function handleFeedbackRevoked(
     );
   }
 
-  await prisma.feedback.updateMany({
-    where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
-    data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
-  });
-
   // Parity with Supabase batch path:
   // - missing feedback => ORPHANED
   // - seal mismatch with existing feedback => warn, keep PENDING
-  const revokeStatus = !feedback ? "ORPHANED" as const : DEFAULT_STATUS;
+  const revokeStatus = classifyRevocationStatus(Boolean(feedback));
+  if (revokeStatus !== "ORPHANED") {
+    await prisma.feedback.updateMany({
+      where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+      data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
+    });
+  }
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await prisma.revocation.findUnique({
       where: {
@@ -2262,18 +2267,20 @@ async function handleFeedbackRevoked(
     });
   });
 
-  await syncAgentFeedbackStats(
-    prisma,
-    assetId,
-    ctx.blockTime,
-    data.atomEnabled && data.hadImpact
-      ? {
-          trustTier: data.newTrustTier,
-          qualityScore: data.newQualityScore,
-          confidence: data.newConfidence,
-        }
-      : undefined
-  );
+  if (revokeStatus !== "ORPHANED") {
+    await syncAgentFeedbackStats(
+      prisma,
+      assetId,
+      ctx.blockTime,
+      data.atomEnabled && data.hadImpact
+        ? {
+            trustTier: data.newTrustTier,
+            qualityScore: data.newQualityScore,
+            confidence: data.newConfidence,
+          }
+        : undefined
+    );
+  }
 
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), orphan: !feedback, sealMismatch }, "Feedback revoked");
 }

@@ -192,11 +192,96 @@ function parsePostgRESTComparison(value: unknown): PostgRESTComparison | undefin
  * Returns undefined if not in.() format
  */
 function parsePostgRESTIn(value: unknown): string[] | undefined {
+  const state = parsePostgRESTListOperator(value, 'in');
+  if (!state.matched || state.malformed) return undefined;
+  return state.values;
+}
+
+function parsePostgRESTNotIn(value: unknown): string[] | undefined {
+  const state = parsePostgRESTListOperator(value, 'not.in');
+  if (!state.matched || state.malformed) return undefined;
+  return state.values;
+}
+
+type PostgRESTListOperator = 'in' | 'not.in';
+
+type PostgRESTListState = {
+  matched: boolean;
+  malformed: boolean;
+  values: string[];
+};
+
+function parsePostgRESTListOperator(value: unknown, operator: PostgRESTListOperator): PostgRESTListState {
   const str = safeQueryString(value);
-  if (!str || !str.startsWith('in.(') || !str.endsWith(')')) return undefined;
-  const inner = str.slice(4, -1);
+  const prefix = operator === 'in' ? 'in.(' : 'not.in.(';
+  if (!str || !str.startsWith(prefix)) {
+    return { matched: false, malformed: false, values: [] };
+  }
+  if (!str.endsWith(')')) {
+    return { matched: true, malformed: true, values: [] };
+  }
+  const inner = str.slice(prefix.length, -1);
+  const values = parsePostgRESTList(inner);
+  if (values === undefined) {
+    return { matched: true, malformed: true, values: [] };
+  }
+  return { matched: true, malformed: false, values };
+}
+
+function parsePostgRESTList(inner: string): string[] | undefined {
   if (!inner) return [];
-  return inner.split(',').map(v => v.trim());
+  const values: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let escaped = false;
+
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+
+    if (inQuotes) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inQuotes = false;
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+
+    if (ch === ',') {
+      values.push(current.trim());
+      current = '';
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = true;
+      continue;
+    }
+    current += ch;
+  }
+
+  if (inQuotes || escaped) {
+    return undefined;
+  }
+
+  values.push(current.trim());
+  return values;
+}
+
+function formatPostgRESTList(values: string[]): string {
+  return values.map((value) => {
+    if (!/[,\s()"\\]/.test(value)) return value;
+    const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return `"${escaped}"`;
+  }).join(',');
 }
 
 function collectionPointerVariants(raw: string): string[] {
@@ -213,21 +298,120 @@ function collectionPointerVariants(raw: string): string[] {
 
 function formatCanonicalCollectionFilter(raw: string): string {
   const variants = [...new Set(collectionPointerVariants(raw))];
-  if (variants.length <= 1) return `eq.${variants[0] ?? raw}`;
-  return `in.(${variants.join(',')})`;
+  if (variants.length === 0) return 'in.()';
+  if (variants.length === 1) return `eq.${variants[0]}`;
+  return `in.(${formatPostgRESTList(variants)})`;
 }
 
 function normalizeCollectionPointerFilterValue(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return trimmed;
-  const normalizeSingle = (value: string): string => collectionPointerVariants(value)[0] ?? value;
-  if (trimmed.startsWith('eq.')) return `eq.${normalizeSingle(trimmed.slice(3))}`;
-  if (trimmed.startsWith('neq.')) return `neq.${normalizeSingle(trimmed.slice(4))}`;
-  const inValues = parsePostgRESTIn(trimmed);
-  if (inValues) {
-    return `in.(${inValues.map((value) => normalizeSingle(value)).join(',')})`;
+  if (trimmed.startsWith('eq.')) return formatCanonicalCollectionFilter(trimmed.slice(3));
+  if (trimmed.startsWith('neq.')) {
+    const expanded = [...new Set(collectionPointerVariants(trimmed.slice(4)))];
+    if (expanded.length === 0) {
+      return "in.()";
+    }
+    if (expanded.length === 1) {
+      return `neq.${expanded[0]}`;
+    }
+    return `not.in.(${formatPostgRESTList(expanded)})`;
   }
-  return normalizeSingle(trimmed);
+  const inState = parsePostgRESTListOperator(trimmed, 'in');
+  if (inState.matched) {
+    if (inState.malformed) {
+      return 'in.()';
+    }
+    const inValues = inState.values;
+    const expanded = [...new Set(inValues.flatMap((value) => collectionPointerVariants(value)))];
+    if (expanded.length === 0) {
+      return "in.()";
+    }
+    if (expanded.length <= 1) {
+      return `eq.${expanded[0]}`;
+    }
+    return `in.(${formatPostgRESTList(expanded)})`;
+  }
+  const notInState = parsePostgRESTListOperator(trimmed, 'not.in');
+  if (notInState.matched) {
+    if (notInState.malformed) {
+      return 'in.()';
+    }
+    const notInValues = notInState.values;
+    const expanded = [...new Set(notInValues.flatMap((value) => collectionPointerVariants(value)))];
+    if (expanded.length === 0) {
+      return "in.()";
+    }
+    return `not.in.(${formatPostgRESTList(expanded)})`;
+  }
+  return formatCanonicalCollectionFilter(trimmed);
+}
+
+type CollectionPointerFilter =
+  | { kind: 'none' }
+  | { kind: 'no_match' }
+  | { kind: 'eq'; values: string[] }
+  | { kind: 'neq'; values: string[] };
+
+function resolveCollectionPointerFilter(query: Request['query']): CollectionPointerFilter {
+  const queryRecord = query as Record<string, unknown>;
+  const hasCanonicalCol = Object.prototype.hasOwnProperty.call(queryRecord, 'canonical_col');
+  const hasCollectionPointer = Object.prototype.hasOwnProperty.call(queryRecord, 'collection_pointer');
+  if (!hasCanonicalCol && !hasCollectionPointer) {
+    return { kind: 'none' };
+  }
+
+  const canonicalColRaw = safeQueryString(queryRecord.canonical_col);
+  const collectionPointerRaw = safeQueryString(queryRecord.collection_pointer);
+  const resolvedRaw = canonicalColRaw && canonicalColRaw.trim().length > 0
+    ? canonicalColRaw
+    : collectionPointerRaw;
+
+  if (!resolvedRaw || resolvedRaw.trim().length === 0) {
+    return { kind: 'no_match' };
+  }
+
+  const normalized = normalizeCollectionPointerFilterValue(resolvedRaw);
+  const inState = parsePostgRESTListOperator(normalized, 'in');
+  if (inState.matched) {
+    if (inState.malformed) {
+      return { kind: 'no_match' };
+    }
+    const values = inState.values
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    return values.length > 0
+      ? { kind: 'eq', values }
+      : { kind: 'no_match' };
+  }
+
+  const notInState = parsePostgRESTListOperator(normalized, 'not.in');
+  if (notInState.matched) {
+    if (notInState.malformed) {
+      return { kind: 'no_match' };
+    }
+    const values = notInState.values
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    return values.length > 0
+      ? { kind: 'neq', values }
+      : { kind: 'no_match' };
+  }
+
+  const comparison = parsePostgRESTComparison(normalized);
+  if (!comparison) {
+    return { kind: 'none' };
+  }
+  if (comparison.op === 'neq') {
+    if (comparison.value.trim().length === 0) {
+      return { kind: 'no_match' };
+    }
+    return { kind: 'neq', values: [comparison.value] };
+  }
+  if (comparison.value.trim().length === 0) {
+    return { kind: 'no_match' };
+  }
+  return { kind: 'eq', values: [comparison.value] };
 }
 
 function parsePostgRESTBoolean(value: unknown): boolean | undefined {
@@ -709,6 +893,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       try {
         const upstreamRawPath = req.url.startsWith('/') ? req.url : `/${req.url}`;
         const [upstreamRawPathname, upstreamRawQuery = ''] = upstreamRawPath.split('?', 2);
+        const method = req.method.toUpperCase();
 
         const upstreamPathname = upstreamRawPathname === '/stats'
           ? '/global_stats'
@@ -720,14 +905,29 @@ export function createApiServer(options: ApiServerOptions): Express {
         let upstreamQuery = upstreamRawQuery;
         if (upstreamPathname === '/agents') {
           const params = new URLSearchParams(upstreamRawQuery);
+          const hasCanonicalCol = params.has('canonical_col');
+          const hasCollectionPointer = params.has('collection_pointer');
           const collectionPointer = params.get('collection_pointer');
           const canonicalCol = params.get('canonical_col');
           const resolvedCollectionPointer = (canonicalCol && canonicalCol.trim().length > 0)
             ? canonicalCol
             : collectionPointer;
+          if ((hasCanonicalCol || hasCollectionPointer) && (!resolvedCollectionPointer || resolvedCollectionPointer.trim().length === 0)) {
+            if (method === 'GET' || method === 'HEAD') {
+              res.json([]);
+              return;
+            }
+          }
           if (resolvedCollectionPointer && resolvedCollectionPointer.trim().length > 0) {
             // Backward-compatible input alias: canonical_col -> collection_pointer.
-            params.set('canonical_col', normalizeCollectionPointerFilterValue(resolvedCollectionPointer));
+            const normalized = normalizeCollectionPointerFilterValue(resolvedCollectionPointer);
+            if (normalized === 'in.()') {
+              if (method === 'GET' || method === 'HEAD') {
+                res.json([]);
+                return;
+              }
+            }
+            params.set('canonical_col', normalized);
           } else {
             params.delete('canonical_col');
           }
@@ -749,7 +949,6 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
 
         const upstreamPath = upstreamQuery ? `${upstreamPathname}?${upstreamQuery}` : upstreamPathname;
-        const method = req.method.toUpperCase();
         const isVerificationStatsPath =
           upstreamPathname === '/stats/verification' || upstreamPathname === '/stats/verification/';
         if (isVerificationStatsPath) {
@@ -850,12 +1049,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const owner = parsePostgRESTValue(req.query.owner);
       const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
-      const collectionPointerRaw =
-        parsePostgRESTValue(req.query.canonical_col) ??
-        parsePostgRESTValue(req.query.collection_pointer);
-      const collectionPointer = collectionPointerRaw
-        ? collectionPointerVariants(collectionPointerRaw)[0] ?? collectionPointerRaw
-        : undefined;
+      const collectionPointerFilter = resolveCollectionPointerFilter(req.query);
       const agent_wallet = parsePostgRESTValue(req.query.agent_wallet);
       const parentAsset = parsePostgRESTValue(req.query.parent_asset);
       const parentCreator = parsePostgRESTValue(req.query.parent_creator);
@@ -884,13 +1078,29 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
         return;
       }
+      if (collectionPointerFilter.kind === 'no_match') {
+        res.json([]);
+        return;
+      }
       const where: Prisma.AgentWhereInput = { ...statusFilter };
       if (id) where.id = id;
       if (agentId !== undefined) where.agentId = agentId;
       if (owner) where.owner = owner;
       if (creator) where.creator = creator;
       if (collection) where.collection = collection;
-      if (collectionPointer) where.collectionPointer = collectionPointer;
+      if (collectionPointerFilter.kind === 'eq') {
+        if (collectionPointerFilter.values.length > 1) {
+          where.OR = collectionPointerFilter.values.map((value) => ({ collectionPointer: value }));
+        } else if (collectionPointerFilter.values.length === 1) {
+          where.collectionPointer = collectionPointerFilter.values[0];
+        }
+      } else if (collectionPointerFilter.kind === 'neq') {
+        if (collectionPointerFilter.values.length > 1) {
+          where.NOT = { collectionPointer: { in: collectionPointerFilter.values } };
+        } else if (collectionPointerFilter.values.length === 1) {
+          where.NOT = { collectionPointer: collectionPointerFilter.values[0] };
+        }
+      }
       if (agent_wallet) where.wallet = agent_wallet;
       if (parentAsset) where.parentAsset = parentAsset;
       if (parentCreator) where.parentCreator = parentCreator;
@@ -1090,9 +1300,9 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
-      const feedback_index = parsePostgRESTValue(req.query.feedback_index);
+      const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
+      const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
-      const feedback_index_in = parsePostgRESTIn(req.query.feedback_index);
       const is_revoked = parsePostgRESTValue(req.query.is_revoked);
       const tag1 = parsePostgRESTValue(req.query.tag1);
       const tag2 = parsePostgRESTValue(req.query.tag2);
@@ -1128,12 +1338,22 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
         where.feedbackId = parsedFeedbackId;
       }
-      if (feedback_index_in) {
-        const indices = safeBigIntArray(feedback_index_in.join(','));
-        if (indices) where.feedbackIndex = { in: indices };
-      } else if (feedback_index !== undefined) {
-        const idx = safeBigInt(feedback_index);
-        if (idx !== undefined) where.feedbackIndex = idx;
+      if (feedbackIndexInState.matched) {
+        if (feedbackIndexInState.malformed || feedbackIndexInState.values.length === 0) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        const indices = safeBigIntArray(feedbackIndexInState.values.join(','));
+        if (indices === undefined) {
+          res.status(400).json({ error: 'Invalid feedback_index IN filter: must be in.(int,int,...)' });
+          return;
+        }
+        where.feedbackIndex = { in: indices };
+      } else if (feedbackIndexFilter === null) {
+        res.status(400).json({ error: 'Invalid feedback_index: must be a valid integer' });
+        return;
+      } else if (feedbackIndexFilter !== undefined) {
+        where.feedbackIndex = feedbackIndexFilter;
       }
       if (is_revoked !== undefined) where.revoked = is_revoked === 'true';
       if (tag1) where.tag1 = tag1;
@@ -1465,8 +1685,8 @@ export function createApiServer(options: ApiServerOptions): Express {
       const feedback_index = parsePostgRESTValue(req.query.feedback_index);
       const revocationIdRaw = safeQueryString(req.query.revocation_id);
       const revocationIdFilter = parsePostgRESTBigIntFilter(req.query.revocation_id);
-      const revoke_count = parsePostgRESTValue(req.query.revoke_count);
-      const revoke_count_in = parsePostgRESTIn(req.query.revoke_count);
+      const revokeCountFilter = parsePostgRESTBigIntFilter(req.query.revoke_count);
+      const revokeCountInState = parsePostgRESTListOperator(req.query.revoke_count, 'in');
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1498,25 +1718,23 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
         where.feedbackIndex = idx;
       }
-      if (revoke_count_in) {
-        if (revoke_count_in.length === 0) {
+      if (revokeCountInState.matched) {
+        if (revokeCountInState.malformed || revokeCountInState.values.length === 0) {
           res.status(400).json({ error: 'Invalid revoke_count IN filter: in.() must include at least one integer' });
           return;
         }
 
-        const counts = safeBigIntArray(revoke_count_in.join(','));
+        const counts = safeBigIntArray(revokeCountInState.values.join(','));
         if (counts === undefined) {
           res.status(400).json({ error: 'Invalid revoke_count IN filter: must be in.(int,int,...)' });
           return;
         }
         where.revokeCount = { in: counts };
-      } else if (revoke_count !== undefined) {
-        const count = safeBigInt(revoke_count);
-        if (count === undefined) {
-          res.status(400).json({ error: 'Invalid revoke_count: must be a valid integer' });
-          return;
-        }
-        where.revokeCount = count;
+      } else if (revokeCountFilter === null) {
+        res.status(400).json({ error: 'Invalid revoke_count: must be a valid integer' });
+        return;
+      } else if (revokeCountFilter !== undefined) {
+        where.revokeCount = revokeCountFilter;
       }
 
       const orderBy: { revokeCount?: 'asc' | 'desc'; createdAt?: 'asc' | 'desc' } =

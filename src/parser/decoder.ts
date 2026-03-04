@@ -53,6 +53,37 @@ function parseOptionU8(value: unknown): number | null {
   return null;
 }
 
+function parseRequiredHash32(value: unknown, fieldName: string): Uint8Array<ArrayBuffer> {
+  if (Array.isArray(value)) {
+    if (value.length !== 32) {
+      throw new Error(`${fieldName} must be exactly 32 bytes, got ${value.length}`);
+    }
+    for (let i = 0; i < value.length; i++) {
+      const byte = value[i];
+      if (!Number.isInteger(byte) || byte < 0 || byte > 255) {
+        throw new Error(`${fieldName}[${i}] must be an integer in [0,255]`);
+      }
+    }
+    return Uint8Array.from(value as number[]) as Uint8Array<ArrayBuffer>;
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    const view = value as ArrayBufferView;
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    if (bytes.length !== 32) {
+      throw new Error(`${fieldName} must be exactly 32 bytes, got ${bytes.length}`);
+    }
+    return Uint8Array.from(bytes) as Uint8Array<ArrayBuffer>;
+  }
+
+  throw new Error(`${fieldName} must be a 32-byte array`);
+}
+
+function parseOptionalHash32(value: unknown, fieldName: string): Uint8Array<ArrayBuffer> | null {
+  if (value === null || value === undefined) return null;
+  return parseRequiredHash32(value, fieldName);
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -450,10 +481,8 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             valueDecimals: data.value_decimals as number,
             score: parseOptionU8(data.score),
             // SEAL v1: feedback_file_hash is optional, seal_hash is computed on-chain
-            feedbackFileHash: data.feedback_file_hash
-              ? new Uint8Array(data.feedback_file_hash as number[])
-              : null,
-            sealHash: new Uint8Array(data.seal_hash as number[]),
+            feedbackFileHash: parseOptionalHash32(data.feedback_file_hash, "feedback_file_hash"),
+            sealHash: parseRequiredHash32(data.seal_hash, "seal_hash"),
             atomEnabled: data.atom_enabled as boolean,
             newTrustTier: data.new_trust_tier as number,
             newQualityScore: data.new_quality_score as number,
@@ -490,7 +519,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             clientAddress: new PublicKey(data.client_address as string),
             feedbackIndex: parseBigInt(data.feedback_index),
             // SEAL v1: seal_hash (was feedback_hash)
-            sealHash: new Uint8Array(data.seal_hash as number[]),
+            sealHash: parseRequiredHash32(data.seal_hash, "seal_hash"),
             slot: parseBigInt(data.slot),
             originalScore: data.original_score as number,
             atomEnabled: data.atom_enabled === undefined
@@ -514,9 +543,9 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             feedbackIndex: parseBigInt(data.feedback_index),
             slot: parseBigInt(data.slot),
             responder: new PublicKey(data.responder as string),
-            responseHash: new Uint8Array(data.response_hash as number[]),
+            responseHash: parseRequiredHash32(data.response_hash, "response_hash"),
             // SEAL v1: seal_hash (was feedback_hash)
-            sealHash: new Uint8Array(data.seal_hash as number[]),
+            sealHash: parseRequiredHash32(data.seal_hash, "seal_hash"),
             newResponseDigest: new Uint8Array(data.new_response_digest as number[]),
             newResponseCount: parseBigInt(data.new_response_count),
             responseUri: data.response_uri as string,
@@ -545,7 +574,7 @@ export function toTypedEvent(event: ParsedEvent): ProgramEvent | null {
             nonce: BigInt(data.nonce as string | number),
             response: data.response as number,
             responseUri: data.response_uri as string,                          // snake_case from IDL
-            responseHash: new Uint8Array(data.response_hash as number[]),      // snake_case from IDL
+            responseHash: parseRequiredHash32(data.response_hash, "response_hash"),
             tag: data.tag as string,
           },
         };

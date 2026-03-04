@@ -138,6 +138,82 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("applies feedback_index PostgREST IN filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent("in.(1,5,10)");
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=${inFilter}&limit=5`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            feedbackIndex: { in: [1n, 5n, 10n] },
+          }),
+          take: 5,
+          skip: 0,
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies quoted feedback_index IN filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent('in.("1","5","10")');
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=${inFilter}&limit=5`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            feedbackIndex: { in: [1n, 5n, 10n] },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects malformed quoted feedback_index IN filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedInFilter = encodeURIComponent('in.("1,5)');
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_index=${malformedInFilter}`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid feedback_index IN filter");
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("applies revoke_count PostgREST IN filters on revocations endpoint", async () => {
     const prisma = {
       revocation: {
@@ -148,6 +224,33 @@ describe("REST feedback deterministic ordering", () => {
     const { server, baseUrl } = await startServer(prisma);
     try {
       const inFilter = encodeURIComponent("in.(1,5,10)");
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&revoke_count=${inFilter}&order=revoke_count.asc`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            revokeCount: { in: [1n, 5n, 10n] },
+          }),
+          orderBy: { revokeCount: "asc" },
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies quoted revoke_count PostgREST IN filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent('in.("1","5","10")');
       const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&revoke_count=${inFilter}&order=revoke_count.asc`);
       expect(res.status).toBe(200);
 
@@ -201,6 +304,27 @@ describe("REST feedback deterministic ordering", () => {
     try {
       const invalidInFilter = encodeURIComponent("in.(1,nope)");
       const res = await fetch(`${baseUrl}/rest/v1/revocations?revoke_count=${invalidInFilter}`);
+      expect(res.status).toBe(400);
+
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid revoke_count IN filter");
+      expect(prisma.revocation.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects malformed quoted revoke_count IN filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedInFilter = encodeURIComponent('in.("1,5)');
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?revoke_count=${malformedInFilter}`);
       expect(res.status).toBe(400);
 
       const body = await res.json() as { error?: string };

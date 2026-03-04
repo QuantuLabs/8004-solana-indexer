@@ -997,13 +997,15 @@ describe("DataVerifier", () => {
       (config as any).verifyRecoveryCycles = 1;
 
       const agentId = AGENT_KEY.toBase58();
+      const client = VALIDATOR_KEY.toBase58();
 
       mockPrisma.agent.findMany.mockResolvedValue([]);
       mockPrisma.feedback.findMany.mockResolvedValue([]);
       mockPrisma.feedbackResponse.findMany.mockResolvedValue([]);
       mockPrisma.revocation.findMany
         .mockResolvedValueOnce([]) // verifyRevocations
-        .mockResolvedValueOnce([{ id: "rev1", agentId }]); // recovery
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client, feedbackIndex: 1n }]); // recovery
+      mockPrisma.feedback.findFirst.mockResolvedValue({ id: "f-parent" });
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
         { data: Buffer.alloc(10) },
@@ -1027,7 +1029,7 @@ describe("DataVerifier", () => {
       mockPrisma.feedback.findMany.mockResolvedValue([]);
       mockPrisma.feedbackResponse.findMany
         .mockResolvedValueOnce([]) // verifyFeedbackResponses
-        .mockResolvedValueOnce([{ id: "resp1", feedback: { agentId } }]); // recovery
+        .mockResolvedValueOnce([{ id: "resp1", feedback: { agentId, status: "FINALIZED" } }]); // recovery
       mockPrisma.revocation.findMany.mockResolvedValue([]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
@@ -1038,6 +1040,58 @@ describe("DataVerifier", () => {
       await verifier.start();
 
       expect(verifier.getStats().orphansRecovered).toBeGreaterThanOrEqual(1);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should keep orphaned revocations orphaned when parent feedback is missing", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+      const client = VALIDATOR_KEY.toBase58();
+
+      mockPrisma.agent.findMany.mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([]);
+      mockPrisma.feedbackResponse.findMany.mockResolvedValue([]);
+      mockPrisma.revocation.findMany
+        .mockResolvedValueOnce([]) // verifyRevocations
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client, feedbackIndex: 1n }]); // recovery
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(0);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should keep orphaned responses orphaned when parent feedback is ORPHANED", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPrisma.agent.findMany.mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([]);
+      mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // verifyFeedbackResponses
+        .mockResolvedValueOnce([{ id: "resp1", feedback: { agentId, status: "ORPHANED" } }]); // recovery
+      mockPrisma.revocation.findMany.mockResolvedValue([]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(0);
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
     });
@@ -2046,19 +2100,19 @@ describe("DataVerifier", () => {
       mockPool.query.mockImplementation(async (sql: string) => {
         callNum++;
         // Recovery: orphaned agents
-        if (sql.includes("agents") && sql.includes("ORPHANED")) {
+        if (sql.includes("FROM agents WHERE status = 'ORPHANED'")) {
           return { rows: [] };
         }
         // Recovery: orphaned feedbacks
-        if (sql.includes("feedbacks") && sql.includes("ORPHANED")) {
+        if (sql.includes("FROM feedbacks WHERE status = 'ORPHANED'")) {
           return { rows: [{ id: "f1", agentId }] };
         }
         // Recovery: orphaned revocations
-        if (sql.includes("revocations") && sql.includes("ORPHANED")) {
+        if (sql.includes("FROM revocations r")) {
           return { rows: [] };
         }
         // Recovery: orphaned responses
-        if (sql.includes("feedback_responses") && sql.includes("ORPHANED")) {
+        if (sql.includes("FROM feedback_responses fr")) {
           return { rows: [] };
         }
         return { rows: [], rowCount: 0 };
@@ -2083,10 +2137,10 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPool.query.mockImplementation(async (sql: string) => {
-        if (sql.includes("revocations") && sql.includes("ORPHANED")) {
-          return { rows: [{ id: "rev1", agentId }] };
+        if (sql.includes("FROM revocations r")) {
+          return { rows: [{ id: "rev1", agentId, feedbackStatus: "FINALIZED" }] };
         }
-        if (sql.includes("feedback_responses") && sql.includes("ORPHANED")) {
+        if (sql.includes("FROM feedback_responses fr")) {
           return { rows: [] };
         }
         return { rows: [], rowCount: 0 };
@@ -2111,8 +2165,8 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPool.query.mockImplementation(async (sql: string) => {
-        if (sql.includes("feedback_responses") && sql.includes("ORPHANED")) {
-          return { rows: [{ id: "resp1", agentId }] };
+        if (sql.includes("FROM feedback_responses fr")) {
+          return { rows: [{ id: "resp1", agentId, feedbackStatus: "FINALIZED" }] };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -2125,6 +2179,59 @@ describe("DataVerifier", () => {
       await verifier.start();
 
       expect(verifier.getStats().orphansRecovered).toBeGreaterThanOrEqual(1);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should keep orphaned revocations via pool when parent feedback is ORPHANED", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM revocations r")) {
+          return { rows: [{ id: "rev1", agentId, feedbackStatus: "ORPHANED" }] };
+        }
+        if (sql.includes("FROM feedback_responses fr")) {
+          return { rows: [] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(0);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should keep orphaned responses via pool when parent feedback is ORPHANED", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedback_responses fr")) {
+          return { rows: [{ id: "resp1", agentId, feedbackStatus: "ORPHANED" }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(0);
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
     });

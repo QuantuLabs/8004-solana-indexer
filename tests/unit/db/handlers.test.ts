@@ -434,12 +434,24 @@ describe("DB Handlers", () => {
           },
         };
 
-        // Should not throw (still processes the revocation)
+        // Should not throw (stores revocation as PENDING when feedback exists)
         await handleEvent(prisma, event, ctx);
 
-        // updateMany + revocation still called despite mismatch
-        expect(prisma.feedback.updateMany).toHaveBeenCalled();
-        expect(prisma.revocation.upsert).toHaveBeenCalled();
+        expect(prisma.feedback.updateMany).toHaveBeenCalledWith({
+          where: {
+            agentId: TEST_ASSET.toBase58(),
+            client: TEST_CLIENT.toBase58(),
+            feedbackIndex: 0n,
+          },
+          data: expect.objectContaining({
+            revoked: true,
+          }),
+        });
+        expect(prisma.revocation.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({ status: "PENDING" }),
+          })
+        );
       });
     });
 

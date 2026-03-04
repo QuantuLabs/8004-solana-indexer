@@ -15,6 +15,7 @@ import { createChildLogger } from "../logger.js";
 import { config } from "../config.js";
 import { metadataQueue } from "./metadata-queue.js";
 import { collectionMetadataQueue } from "./collection-metadata-queue.js";
+import { classifyRevocationStatus } from "../db/revocation-classification.js";
 import { compressForStorage } from "../utils/compression.js";
 import { stripNullBytes } from "../utils/sanitize.js";
 import { DEFAULT_PUBKEY } from "../constants.js";
@@ -568,7 +569,8 @@ export class EventBuffer {
     const feedbackCheck = await client.query(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`, [id]
     );
-    const isOrphan = feedbackCheck.rowCount === 0;
+    const revokeStatus = classifyRevocationStatus(feedbackCheck.rowCount > 0);
+    const isOrphan = revokeStatus === "ORPHANED";
 
     if (!isOrphan) {
       const storedHash = feedbackCheck.rows[0].feedback_hash;
@@ -581,11 +583,13 @@ export class EventBuffer {
       }
     }
 
-    // Mark feedback as revoked
-    await client.query(`
-      UPDATE feedbacks SET is_revoked = true, revoked_at = $1
-      WHERE asset = $2 AND client_address = $3 AND feedback_index = $4
-    `, [ctx.blockTime.toISOString(), asset, client_addr, feedbackIndex.toString()]);
+    // Mark feedback as revoked only for valid non-orphan revocations
+    if (revokeStatus !== "ORPHANED") {
+      await client.query(`
+        UPDATE feedbacks SET is_revoked = true, revoked_at = $1
+        WHERE asset = $2 AND client_address = $3 AND feedback_index = $4
+      `, [ctx.blockTime.toISOString(), asset, client_addr, feedbackIndex.toString()]);
+    }
 
     // Insert into revocations table
     const revokeDigest = data.newRevokeDigest
@@ -614,31 +618,33 @@ export class EventBuffer {
         data.atomEnabled || false, data.hadImpact || false,
         revokeDigest, (data.newRevokeCount || 0).toString(),
         ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
-        isOrphan ? "ORPHANED" : "PENDING"]);
+        revokeStatus]);
 
-    // Re-aggregate agent stats
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
-    await client.query(
-      `UPDATE agents SET ${baseUpdate} WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), asset]
-    );
+    // Re-aggregate agent stats only for valid non-orphan revocations
+    if (revokeStatus !== "ORPHANED") {
+      const baseUpdate = `
+        feedback_count = COALESCE((
+          SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        raw_avg_score = COALESCE((
+          SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        updated_at = $1
+      `;
+      await client.query(
+        `UPDATE agents SET ${baseUpdate} WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), asset]
+      );
 
-    // Update ATOM metrics if applicable
-    if (data.atomEnabled && data.hadImpact) {
-      await client.query(`
-        UPDATE agents SET
-          trust_tier = $3, quality_score = $4, confidence = $5, updated_at = $1
-        WHERE asset = $2
-      `, [ctx.blockTime.toISOString(), asset,
-          data.newTrustTier, data.newQualityScore, data.newConfidence]);
+      // Update ATOM metrics if applicable
+      if (data.atomEnabled && data.hadImpact) {
+        await client.query(`
+          UPDATE agents SET
+            trust_tier = $3, quality_score = $4, confidence = $5, updated_at = $1
+          WHERE asset = $2
+        `, [ctx.blockTime.toISOString(), asset,
+            data.newTrustTier, data.newQualityScore, data.newConfidence]);
+      }
     }
   }
 

@@ -154,7 +154,184 @@ describe("API_MODE=both behavior", () => {
       expect(prisma.agent.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            collectionPointer: `c1:${BARE_COLLECTION_CID}`,
+            OR: [
+              { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
+              { collectionPointer: BARE_COLLECTION_CID },
+            ],
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("returns no matches for blank canonical_col filters in local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const eqRes = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=eq.%20%20&limit=1`);
+      expect(eqRes.status).toBe(200);
+      expect(await eqRes.json()).toEqual([]);
+
+      const neqRes = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=neq.%20%20&limit=1`);
+      expect(neqRes.status).toBe(200);
+      expect(await neqRes.json()).toEqual([]);
+      expect(prisma.agent.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("uses collection_pointer when canonical_col is explicitly empty in local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/agents?canonical_col=&collection_pointer=eq.${BARE_COLLECTION_CID}&limit=1`
+      );
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: [
+              { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
+              { collectionPointer: BARE_COLLECTION_CID },
+            ],
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies canonical_col neq filters for local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=neq.${BARE_COLLECTION_CID}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            NOT: {
+              collectionPointer: {
+                in: [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
+              },
+            },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies canonical_col in filters for local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=in.(${BARE_COLLECTION_CID},c1:ptr)&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            OR: [
+              { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
+              { collectionPointer: BARE_COLLECTION_CID },
+              { collectionPointer: "c1:ptr" },
+            ],
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports quoted canonical_col in filters with commas in local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const inFilter = encodeURIComponent('in.("c1:ptr,extra",c1:ptr)');
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=${inFilter}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            OR: [
+              { collectionPointer: "c1:ptr,extra" },
+              { collectionPointer: "c1:ptr" },
+            ],
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("returns no matches for malformed quoted canonical_col IN in local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const malformedInFilter = encodeURIComponent('in.("c1:ptr,extra)');
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=${malformedInFilter}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual([]);
+      expect(prisma.agent.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies canonical_col not.in filters for local REST agents", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=not.in.(${BARE_COLLECTION_CID})&limit=1`);
+      expect(res.status).toBe(200);
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: { not: "ORPHANED" },
+            NOT: {
+              collectionPointer: {
+                in: [`c1:${BARE_COLLECTION_CID}`, BARE_COLLECTION_CID],
+              },
+            },
           }),
         })
       );
@@ -675,8 +852,36 @@ describe("API_MODE=both behavior", () => {
           : canonicalColNeqBareUpstreamCall?.[0]?.url;
       expect(typeof canonicalColNeqBareUrlRaw).toBe("string");
       const canonicalColNeqBareUrl = new URL(canonicalColNeqBareUrlRaw as string);
-      expect(canonicalColNeqBareUrl.searchParams.get("canonical_col")).toBe(`neq.c1:${BARE_COLLECTION_CID}`);
+      expect(canonicalColNeqBareUrl.searchParams.get("canonical_col")).toBe(
+        `not.in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`
+      );
       expect(canonicalColNeqBareUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const canonicalColNotInBareCallStart = fetchSpy.mock.calls.length;
+      const canonicalColNotInBareRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=not.in.(${BARE_COLLECTION_CID})`
+      );
+      expect(canonicalColNotInBareRes.status).toBe(200);
+      const canonicalColNotInBareUpstreamCall = fetchSpy.mock.calls.slice(canonicalColNotInBareCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColNotInBareUpstreamCall).toBeTruthy();
+      const canonicalColNotInBareUrlRaw = typeof canonicalColNotInBareUpstreamCall?.[0] === "string"
+        ? canonicalColNotInBareUpstreamCall[0]
+        : canonicalColNotInBareUpstreamCall?.[0] instanceof URL
+          ? canonicalColNotInBareUpstreamCall[0].toString()
+          : canonicalColNotInBareUpstreamCall?.[0]?.url;
+      expect(typeof canonicalColNotInBareUrlRaw).toBe("string");
+      const canonicalColNotInBareUrl = new URL(canonicalColNotInBareUrlRaw as string);
+      expect(canonicalColNotInBareUrl.searchParams.get("canonical_col")).toBe(
+        `not.in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`
+      );
+      expect(canonicalColNotInBareUrl.searchParams.get("collection_pointer")).toBeNull();
 
       const canonicalColInBareCallStart = fetchSpy.mock.calls.length;
       const canonicalColInBareRes = await fetch(
@@ -699,8 +904,33 @@ describe("API_MODE=both behavior", () => {
           : canonicalColInBareUpstreamCall?.[0]?.url;
       expect(typeof canonicalColInBareUrlRaw).toBe("string");
       const canonicalColInBareUrl = new URL(canonicalColInBareUrlRaw as string);
-      expect(canonicalColInBareUrl.searchParams.get("canonical_col")).toBe(`in.(c1:${BARE_COLLECTION_CID},c1:ptr)`);
+      expect(canonicalColInBareUrl.searchParams.get("canonical_col")).toBe(`in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID},c1:ptr)`);
       expect(canonicalColInBareUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const quotedCanonicalColInCallStart = fetchSpy.mock.calls.length;
+      const quotedCanonicalColInFilter = encodeURIComponent('in.("c1:ptr,extra",c1:ptr)');
+      const quotedCanonicalColInRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=${quotedCanonicalColInFilter}`
+      );
+      expect(quotedCanonicalColInRes.status).toBe(200);
+      const quotedCanonicalColInUpstreamCall = fetchSpy.mock.calls.slice(quotedCanonicalColInCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(quotedCanonicalColInUpstreamCall).toBeTruthy();
+      const quotedCanonicalColInUrlRaw = typeof quotedCanonicalColInUpstreamCall?.[0] === "string"
+        ? quotedCanonicalColInUpstreamCall[0]
+        : quotedCanonicalColInUpstreamCall?.[0] instanceof URL
+          ? quotedCanonicalColInUpstreamCall[0].toString()
+          : quotedCanonicalColInUpstreamCall?.[0]?.url;
+      expect(typeof quotedCanonicalColInUrlRaw).toBe("string");
+      const quotedCanonicalColInUrl = new URL(quotedCanonicalColInUrlRaw as string);
+      expect(quotedCanonicalColInUrl.searchParams.get("canonical_col")).toBe('in.("c1:ptr,extra",c1:ptr)');
+      expect(quotedCanonicalColInUrl.searchParams.get("collection_pointer")).toBeNull();
 
       const canonicalColTrailingSlashRes = await fetch(
         `${baseUrl}/rest/v1/agents/?limit=1&canonical_col=eq.c1:ptr`
@@ -711,6 +941,106 @@ describe("API_MODE=both behavior", () => {
         `${baseUrl}/rest/v1/agents?limit=1&collection_pointer=&canonical_col=eq.c1:ptr`
       );
       expect(canonicalColBypassRes.status).toBe(200);
+
+      const canonicalEmptyWithPointerCallStart = fetchSpy.mock.calls.length;
+      const canonicalEmptyWithPointerRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=&collection_pointer=eq.${BARE_COLLECTION_CID}`
+      );
+      expect(canonicalEmptyWithPointerRes.status).toBe(200);
+      const canonicalEmptyWithPointerUpstreamCall = fetchSpy.mock.calls
+        .slice(canonicalEmptyWithPointerCallStart)
+        .find(([input]) => {
+          const url = typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input?.url;
+          return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+        });
+      expect(canonicalEmptyWithPointerUpstreamCall).toBeTruthy();
+      const canonicalEmptyWithPointerUrlRaw = typeof canonicalEmptyWithPointerUpstreamCall?.[0] === "string"
+        ? canonicalEmptyWithPointerUpstreamCall[0]
+        : canonicalEmptyWithPointerUpstreamCall?.[0] instanceof URL
+          ? canonicalEmptyWithPointerUpstreamCall[0].toString()
+          : canonicalEmptyWithPointerUpstreamCall?.[0]?.url;
+      expect(typeof canonicalEmptyWithPointerUrlRaw).toBe("string");
+      const canonicalEmptyWithPointerUrl = new URL(canonicalEmptyWithPointerUrlRaw as string);
+      expect(canonicalEmptyWithPointerUrl.searchParams.get("canonical_col")).toBe(
+        `in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`
+      );
+      expect(canonicalEmptyWithPointerUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const canonicalColBlankCallStart = fetchSpy.mock.calls.length;
+      const canonicalColBlankRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=eq.%20%20`
+      );
+      expect(canonicalColBlankRes.status).toBe(200);
+      expect(await canonicalColBlankRes.json()).toEqual([]);
+      const canonicalColBlankUpstreamCall = fetchSpy.mock.calls.slice(canonicalColBlankCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColBlankUpstreamCall).toBeUndefined();
+
+      const collectionPointerBlankCallStart = fetchSpy.mock.calls.length;
+      const collectionPointerBlankRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&collection_pointer=%20%20`
+      );
+      expect(collectionPointerBlankRes.status).toBe(200);
+      expect(await collectionPointerBlankRes.json()).toEqual([]);
+      const collectionPointerBlankUpstreamCall = fetchSpy.mock.calls.slice(collectionPointerBlankCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(collectionPointerBlankUpstreamCall).toBeUndefined();
+
+      const canonicalColBlankPostCallStart = fetchSpy.mock.calls.length;
+      const canonicalColBlankPostRes = await fetch(
+        `${baseUrl}/rest/v1/agents?canonical_col=eq.%20%20`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        }
+      );
+      expect(canonicalColBlankPostRes.status).toBe(405);
+      expect(await canonicalColBlankPostRes.json()).toEqual({
+        error: "REST proxy is read-only. Mutating methods are disabled.",
+      });
+      const canonicalColBlankPostUpstreamCall = fetchSpy.mock.calls.slice(canonicalColBlankPostCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColBlankPostUpstreamCall).toBeUndefined();
+
+      const malformedCanonicalColCallStart = fetchSpy.mock.calls.length;
+      const malformedCanonicalColFilter = encodeURIComponent('in.("c1:ptr,extra)');
+      const malformedCanonicalColRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=${malformedCanonicalColFilter}`
+      );
+      expect(malformedCanonicalColRes.status).toBe(200);
+      expect(await malformedCanonicalColRes.json()).toEqual([]);
+      const malformedCanonicalColUpstreamCall = fetchSpy.mock.calls.slice(malformedCanonicalColCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(malformedCanonicalColUpstreamCall).toBeUndefined();
 
       const statusDefaultProxyPaths = ["/feedbacks", "/responses", "/feedback_responses", "/revocations"];
       for (const path of statusDefaultProxyPaths) {

@@ -684,19 +684,41 @@ export class DataVerifier {
     }
 
     // Recover orphaned revocations
-    let orphanedRevocations: Array<{ id: string; agentId: string }> = [];
+    let orphanedRevocations: Array<{ id: string; agentId: string; feedbackRecoverable: boolean }> = [];
     if (this.prisma) {
-      orphanedRevocations = await this.prisma.revocation.findMany({
+      const rows = await this.prisma.revocation.findMany({
         where: { status: "ORPHANED" },
         take: batchSize,
-        select: { id: true, agentId: true },
+        select: { id: true, agentId: true, client: true, feedbackIndex: true },
       });
+      orphanedRevocations = await Promise.all(
+        rows.map(async rev => ({
+          id: rev.id,
+          agentId: rev.agentId,
+          feedbackRecoverable: await this.hasRecoverableFeedbackParent(
+            rev.agentId,
+            rev.client,
+            rev.feedbackIndex
+          ),
+        }))
+      );
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT id, asset AS "agentId" FROM revocations WHERE status = 'ORPHANED' LIMIT $1`,
+        `SELECT r.id, r.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+         FROM revocations r
+         LEFT JOIN feedbacks f ON f.asset = r.asset AND f.client_address = r.client_address AND f.feedback_index = r.feedback_index
+         WHERE r.status = 'ORPHANED'
+         LIMIT $1`,
         [batchSize]
       );
-      orphanedRevocations = result.rows;
+      orphanedRevocations = result.rows.map((r: any) => {
+        const feedbackStatus = typeof r.feedbackStatus === "string" ? r.feedbackStatus : "ORPHANED";
+        return {
+          id: r.id,
+          agentId: r.agentId,
+          feedbackRecoverable: feedbackStatus !== "ORPHANED",
+        };
+      });
     }
 
     if (orphanedRevocations.length > 0) {
@@ -706,7 +728,7 @@ export class DataVerifier {
 
       for (const rev of orphanedRevocations) {
         const exists = existsMap.get(rev.agentId);
-        if (exists === true) {
+        if (exists === true && rev.feedbackRecoverable) {
           await this.batchUpdateStatus('revocations', 'id', [rev.id], 'PENDING', now);
           this.stats.orphansRecovered++;
           logger.info({ revocationId: rev.id, agentId: rev.agentId }, "Recovered orphaned revocation → PENDING");
@@ -715,20 +737,35 @@ export class DataVerifier {
     }
 
     // Recover orphaned responses
-    let orphanedResponses: Array<{ id: string; agentId: string }> = [];
+    let orphanedResponses: Array<{ id: string; agentId: string; feedbackOrphaned: boolean }> = [];
     if (this.prisma) {
       const rows = await this.prisma.feedbackResponse.findMany({
         where: { status: "ORPHANED" },
         take: batchSize,
-        include: { feedback: { select: { agentId: true } } },
+        include: { feedback: { select: { agentId: true, status: true } } },
       });
-      orphanedResponses = rows.map(r => ({ id: r.id, agentId: r.feedback.agentId }));
+      orphanedResponses = rows.map(r => ({
+        id: r.id,
+        agentId: r.feedback.agentId,
+        feedbackOrphaned: r.feedback.status === "ORPHANED",
+      }));
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT fr.id, fr.asset AS "agentId" FROM feedback_responses fr WHERE fr.status = 'ORPHANED' LIMIT $1`,
+        `SELECT fr.id, fr.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+         FROM feedback_responses fr
+         LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
+         WHERE fr.status = 'ORPHANED'
+         LIMIT $1`,
         [batchSize]
       );
-      orphanedResponses = result.rows;
+      orphanedResponses = result.rows.map((r: any) => {
+        const feedbackStatus = typeof r.feedbackStatus === "string" ? r.feedbackStatus : "ORPHANED";
+        return {
+          id: r.id,
+          agentId: r.agentId,
+          feedbackOrphaned: feedbackStatus === "ORPHANED",
+        };
+      });
     }
 
     if (orphanedResponses.length > 0) {
@@ -738,7 +775,7 @@ export class DataVerifier {
 
       for (const resp of orphanedResponses) {
         const exists = existsMap.get(resp.agentId);
-        if (exists === true) {
+        if (exists === true && !resp.feedbackOrphaned) {
           await this.batchUpdateStatus('feedback_responses', 'id', [resp.id], 'PENDING', now);
           this.stats.orphansRecovered++;
           logger.info({ responseId: resp.id, agentId: resp.agentId }, "Recovered orphaned response → PENDING");
@@ -750,6 +787,26 @@ export class DataVerifier {
     if (total > 0) {
       logger.info({ checked: total, recovered: this.stats.orphansRecovered - recoveredBefore }, "Orphan recovery cycle complete");
     }
+  }
+
+  private async hasRecoverableFeedbackParent(
+    agentId: string,
+    client: string,
+    feedbackIndex: bigint
+  ): Promise<boolean> {
+    if (!this.prisma) return false;
+
+    const parent = await this.prisma.feedback.findFirst({
+      where: {
+        agentId,
+        client,
+        feedbackIndex,
+        status: { not: "ORPHANED" },
+      },
+      select: { id: true },
+    });
+
+    return parent !== null;
   }
 
   // =========================================================================
@@ -1502,10 +1559,10 @@ export class DataVerifier {
       );
     }
 
-    if (this.prisma && table === 'revocations' && status !== 'ORPHANED') {
+    if ((this.prisma || this.pool) && table === 'revocations' && status !== 'ORPHANED') {
       await this.backfillRevocationIds(ids);
     }
-    if (this.prisma && table === 'feedback_responses' && status !== 'ORPHANED') {
+    if ((this.prisma || this.pool) && table === 'feedback_responses' && status !== 'ORPHANED') {
       await this.backfillResponseIds(ids);
     }
   }

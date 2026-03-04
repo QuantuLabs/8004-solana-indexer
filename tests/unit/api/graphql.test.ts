@@ -1305,6 +1305,25 @@ describe('Collection And Tree Queries', () => {
     ]);
   });
 
+  it('returns zero without querying when collectionAssetCount receives blank collection', async () => {
+    const query = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const count = await queryResolvers.Query.collectionAssetCount(
+      {},
+      { collection: '   ', creator: 'Creator111' },
+      ctx
+    );
+
+    expect(count).toBe('0');
+    expect(query).not.toHaveBeenCalled();
+  });
+
   it('matches legacy bare rows when counting collection assets with CIDv1 filters', async () => {
     const query = vi.fn().mockResolvedValue({
       rows: [{ count: '22' }],
@@ -1407,6 +1426,27 @@ describe('Collection And Tree Queries', () => {
     expect(query).toHaveBeenCalledTimes(1);
     expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111', 25, 5]);
     expect(prime).toHaveBeenCalledWith('Asset111', expect.any(Object));
+  });
+
+  it('returns empty list without querying when collectionAssets receives blank collection', async () => {
+    const query = vi.fn();
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.collectionAssets(
+      {},
+      { collection: '   ', creator: 'Creator111', first: 10, skip: 0 },
+      ctx
+    );
+
+    expect(rows).toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+    expect(prime).not.toHaveBeenCalled();
   });
 
   it('matches legacy bare rows when listing collection assets with CIDv1 filters', async () => {

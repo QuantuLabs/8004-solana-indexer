@@ -135,6 +135,7 @@ describe("DB Handlers Coverage", () => {
     });
 
     it("should retry atomic transaction once on collection_id unique conflict", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
       const uniqueError = Object.assign(
         new Error("Unique constraint failed on the fields: (`collection_id`)"),
         { code: "P2002", meta: { target: ["collection_id"] } }
@@ -900,7 +901,7 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.feedback.updateMany).toHaveBeenCalled();
+      expect(prisma.feedback.updateMany).not.toHaveBeenCalled();
       expect(prisma.revocation.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
           create: expect.objectContaining({ feedbackIndex: 99n, status: "ORPHANED" }),
@@ -2135,6 +2136,7 @@ describe("DB Handlers Coverage", () => {
     });
 
     it("CollectionPointerSet should preserve existing creator and apply lock (atomic)", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
       const immutableCreator = TEST_OWNER.toBase58();
       const setByDifferent = TEST_NEW_OWNER;
       (prisma.agent.findUnique as any).mockResolvedValue({
@@ -2175,6 +2177,7 @@ describe("DB Handlers Coverage", () => {
     });
 
     it("CollectionPointerSet should retry collection_id assignment on unique collision (atomic)", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
       const immutableCreator = TEST_OWNER.toBase58();
       (prisma.agent.findUnique as any).mockResolvedValue({
         collectionPointer: "c1:old-pointer",
@@ -2340,6 +2343,7 @@ describe("DB Handlers Coverage", () => {
     });
 
     it("CollectionPointerSet should keep sequential collection_id under concurrent atomic calls in fallback mode", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
       const immutableCreator = TEST_OWNER.toBase58();
       (prisma.agent.findUnique as any).mockResolvedValue({
         collectionPointer: "",

@@ -2,6 +2,8 @@ import { vi } from "vitest";
 import type { PrismaClient } from "@prisma/client";
 
 export function createMockPrismaClient(): PrismaClient {
+  const scopedCounters = new Map<string, bigint>();
+
   const mockClient = {
     $connect: vi.fn().mockResolvedValue(undefined),
     $disconnect: vi.fn().mockResolvedValue(undefined),
@@ -9,6 +11,22 @@ export function createMockPrismaClient(): PrismaClient {
     // This allows testing atomic operations with the same mocks
     $transaction: vi.fn().mockImplementation(async (fn: (tx: any) => Promise<any>) => {
       return fn(mockClient);
+    }),
+    $executeRawUnsafe: vi.fn().mockResolvedValue(0),
+    $queryRawUnsafe: vi.fn().mockImplementation(async (query: string, ...values: unknown[]) => {
+      if (query.includes('INSERT INTO "IdCounter"')) {
+        const scope = String(values[0] ?? "");
+        const current = scopedCounters.get(scope) ?? 1n;
+        scopedCounters.set(scope, current + 1n);
+        return [{ allocated: current }];
+      }
+      if (query.includes('SELECT COALESCE(MAX("agent_id"), 0) AS max_id FROM "Agent"')) {
+        return [{ max_id: 0n }];
+      }
+      if (query.includes('SELECT COALESCE(MAX("collection_id"), 0) AS max_id FROM "CollectionPointer"')) {
+        return [{ max_id: 0n }];
+      }
+      return [];
     }),
     agent: {
       findUnique: vi.fn(),
