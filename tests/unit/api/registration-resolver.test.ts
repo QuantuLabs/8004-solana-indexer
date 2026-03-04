@@ -36,6 +36,32 @@ describe('Registration Resolver Service Matching', () => {
     expect(a2aSkills).toEqual(['summarize']);
   });
 
+  it('prefers canonical name over conflicting type when resolving services', async () => {
+    const ctx = makeRegistrationCtx([
+      { name: 'mcp', type: 'a2a', endpoint: 'https://mcp.example.com', mcpTools: ['search'] },
+    ]);
+    const parent = { _asset: 'Asset111' };
+
+    const mcpEndpoint = await registrationResolvers.AgentRegistrationFile.mcpEndpoint(parent, {}, ctx);
+    const a2aEndpoint = await registrationResolvers.AgentRegistrationFile.a2aEndpoint(parent, {}, ctx);
+
+    expect(mcpEndpoint).toBe('https://mcp.example.com');
+    expect(a2aEndpoint).toBeNull();
+  });
+
+  it('does not classify a conflicting non-OASF service as OASF', async () => {
+    const ctx = makeRegistrationCtx([
+      { name: 'mcp', type: 'oasf', endpoint: 'https://mcp.example.com', skills: ['should/not/appear'] },
+    ]);
+    const parent = { _asset: 'Asset111' };
+
+    const oasfSkills = await registrationResolvers.AgentRegistrationFile.oasfSkills(parent, {}, ctx);
+    const hasOASF = await registrationResolvers.AgentRegistrationFile.hasOASF(parent, {}, ctx);
+
+    expect(oasfSkills).toBeNull();
+    expect(hasOASF).toBe(false);
+  });
+
   it('falls back from mcpTools/a2aSkills to legacy tools/skills', async () => {
     const ctx = makeRegistrationCtx([
       { name: 'mcp', endpoint: 'https://mcp.example.com', tools: ['tool-a'] },
@@ -109,5 +135,93 @@ describe('Registration Resolver Service Matching', () => {
     expect(oasfDomains).toEqual(['finance/investment']);
     expect(hasOASF).toBe(true);
     expect(supportedTrusts).toEqual(['reputation', 'tee-attestation']);
+  });
+
+  it('detects OASF by type when service name is non-canonical', async () => {
+    const ctx = makeRegistrationCtx([
+      { name: 'Trust Service', type: 'oasf', endpoint: 'https://oasf.example.com', skills: ['trust/risk'], domains: ['risk'] },
+    ]);
+    const parent = { _asset: 'Asset111' };
+
+    const oasfSkills = await registrationResolvers.AgentRegistrationFile.oasfSkills(parent, {}, ctx);
+    const oasfDomains = await registrationResolvers.AgentRegistrationFile.oasfDomains(parent, {}, ctx);
+    const hasOASF = await registrationResolvers.AgentRegistrationFile.hasOASF(parent, {}, ctx);
+
+    expect(oasfSkills).toEqual(['trust/risk']);
+    expect(oasfDomains).toEqual(['risk']);
+    expect(hasOASF).toBe(true);
+  });
+
+  it('falls back to _uri skills/domains when OASF service arrays are empty', async () => {
+    const ctx = {
+      loaders: {
+        registrationByAgent: {
+          load: vi.fn().mockResolvedValue([
+            {
+              asset: 'Asset111',
+              key: '_uri:services',
+              value: Buffer.concat([
+                Buffer.from([0x00]),
+                Buffer.from(JSON.stringify([
+                  { type: 'oasf', endpoint: 'https://oasf.example.com', skills: [], domains: [] },
+                ]), 'utf8'),
+              ]),
+            },
+            {
+              asset: 'Asset111',
+              key: '_uri:skills',
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from(JSON.stringify(['tax/filing']), 'utf8')]),
+            },
+            {
+              asset: 'Asset111',
+              key: '_uri:domains',
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from(JSON.stringify(['finance/accounting']), 'utf8')]),
+            },
+          ]),
+        },
+      },
+    } as any;
+    const parent = { _asset: 'Asset111' };
+
+    const oasfSkills = await registrationResolvers.AgentRegistrationFile.oasfSkills(parent, {}, ctx);
+    const oasfDomains = await registrationResolvers.AgentRegistrationFile.oasfDomains(parent, {}, ctx);
+    const hasOASF = await registrationResolvers.AgentRegistrationFile.hasOASF(parent, {}, ctx);
+
+    expect(oasfSkills).toEqual(['tax/filing']);
+    expect(oasfDomains).toEqual(['finance/accounting']);
+    expect(hasOASF).toBe(true);
+  });
+
+  it('returns null for malformed supportedTrusts payloads', async () => {
+    const parent = { _asset: 'Asset111' };
+    const ctxMixed = {
+      loaders: {
+        registrationByAgent: {
+          load: vi.fn().mockResolvedValue([
+            {
+              asset: 'Asset111',
+              key: '_uri:supported_trust',
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from(JSON.stringify(['reputation', 42]), 'utf8')]),
+            },
+          ]),
+        },
+      },
+    } as any;
+    const ctxInvalidJson = {
+      loaders: {
+        registrationByAgent: {
+          load: vi.fn().mockResolvedValue([
+            {
+              asset: 'Asset111',
+              key: '_uri:supported_trust',
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from('{"broken":', 'utf8')]),
+            },
+          ]),
+        },
+      },
+    } as any;
+
+    expect(await registrationResolvers.AgentRegistrationFile.supportedTrusts(parent, {}, ctxMixed)).toBeNull();
+    expect(await registrationResolvers.AgentRegistrationFile.supportedTrusts(parent, {}, ctxInvalidJson)).toBeNull();
   });
 });

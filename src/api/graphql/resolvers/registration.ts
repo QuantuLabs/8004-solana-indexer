@@ -36,6 +36,16 @@ interface ParsedRegistration {
   services: ServiceEntry[];
 }
 
+const CANONICAL_SERVICE_NAMES = new Set([
+  'mcp',
+  'a2a',
+  'oasf',
+  'ens',
+  'did',
+  'agentwallet',
+  'wallet',
+]);
+
 const registrationCache = new WeakMap<GraphQLContext, Map<string, Promise<ParsedRegistration>>>();
 
 function getRequestCache(ctx: GraphQLContext): Map<string, Promise<ParsedRegistration>> {
@@ -113,15 +123,23 @@ function normalizeServiceName(name: unknown): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
+function canonicalServiceKind(service: ServiceEntry): string | null {
+  const name = normalizeServiceName(service.name);
+  if (name && CANONICAL_SERVICE_NAMES.has(name)) {
+    return name;
+  }
+  const type = normalizeServiceName(service.type);
+  if (type && CANONICAL_SERVICE_NAMES.has(type)) {
+    return type;
+  }
+  return null;
+}
+
 function findService(services: ServiceEntry[], svcName: string): ServiceEntry | undefined {
   const target = normalizeServiceName(svcName);
   if (!target) return undefined;
 
-  return services.find((s) => {
-    const name = normalizeServiceName(s.name);
-    const type = normalizeServiceName(s.type);
-    return name === target || type === target;
-  });
+  return services.find((s) => canonicalServiceKind(s) === target);
 }
 
 function getServiceTools(svc: ServiceEntry | undefined): string[] | null {
@@ -135,8 +153,7 @@ function getServiceSkills(svc: ServiceEntry | undefined): string[] | null {
 function gatherServiceSkills(services: ServiceEntry[]): string[] {
   const allSkills: string[] = [];
   for (const s of services) {
-    const serviceName = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
-    if (serviceName !== 'oasf') continue;
+    if (canonicalServiceKind(s) !== 'oasf') continue;
     if (Array.isArray(s.skills)) {
       for (const skill of s.skills) {
         if (typeof skill === 'string') allSkills.push(skill);
@@ -149,8 +166,7 @@ function gatherServiceSkills(services: ServiceEntry[]): string[] {
 function gatherServiceDomains(services: ServiceEntry[]): string[] {
   const allDomains: string[] = [];
   for (const s of services) {
-    const serviceName = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
-    if (serviceName !== 'oasf') continue;
+    if (canonicalServiceKind(s) !== 'oasf') continue;
     if (Array.isArray(s.domains)) {
       for (const domain of s.domains) {
         if (typeof domain === 'string') allDomains.push(domain);

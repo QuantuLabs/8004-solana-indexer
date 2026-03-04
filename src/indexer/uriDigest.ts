@@ -17,6 +17,9 @@ const logger = createChildLogger("uri-digest");
 
 /** Allowed URL protocols for metadata fields (image, endpoints, etc.) */
 const ALLOWED_URL_PROTOCOLS = new Set(["https:", "http:", "ipfs:", "ar:"]);
+const ENS_NAME_REGEX = /^(?=.{1,255}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const DID_URI_REGEX = /^did:[a-z0-9]+:[A-Za-z0-9._:%-]+(?::[A-Za-z0-9._:%-]+)*(?:[/?#][^\s]*)?$/;
+const EIP155_ACCOUNT_REGEX = /^eip155:\d+:0x[a-fA-F0-9]{40}$/;
 
 /** Max string length before DOMPurify (prevent CPU exhaustion from nested HTML) */
 const MAX_SANITIZE_INPUT_LENGTH = 1000;
@@ -87,6 +90,17 @@ export function sanitizeUrl(url: string): string {
   }
 }
 
+function sanitizeEnsName(value: string): string {
+  const candidate = sanitizeText(value).toLowerCase();
+  return ENS_NAME_REGEX.test(candidate) ? candidate : "";
+}
+
+function sanitizeDidUri(value: string): string {
+  const candidate = sanitizeText(value);
+  if (!candidate || /\s/.test(candidate)) return "";
+  return DID_URI_REGEX.test(candidate) ? candidate : "";
+}
+
 /**
  * Sanitize services array (ERC-8004 spec)
  * Format: [{ name: "MCP"|"A2A"|"OASF"|..., endpoint: "https://...", version: "1.0", ... }]
@@ -104,25 +118,40 @@ function sanitizeServices(arr: unknown): Array<Record<string, unknown>> {
     .map((item) => {
       const service: Record<string, unknown> = {};
 
-      // Required: name (service type)
-      if (typeof item.name === "string") {
-        const name = sanitizeText(item.name.toLowerCase());
-        if (validServiceNames.has(name)) {
-          service.name = name;
-        } else {
-          return null; // Invalid service name
-        }
-      } else {
-        return null;
+      // Required: canonical service kind from name or type.
+      const normalizedName = typeof item.name === "string"
+        ? sanitizeText(item.name.toLowerCase())
+        : "";
+      const normalizedType = typeof item.type === "string"
+        ? sanitizeText(item.type.toLowerCase())
+        : "";
+      const hasValidName = validServiceNames.has(normalizedName);
+      const hasValidType = validServiceNames.has(normalizedType);
+      const serviceKind = hasValidName
+        ? normalizedName
+        : hasValidType
+          ? normalizedType
+          : "";
+      if (!serviceKind) return null;
+      service.name = serviceKind;
+      if (normalizedType && normalizedType === serviceKind) {
+        service.type = normalizedType;
       }
 
       // Required: endpoint URL
       if (typeof item.endpoint === "string") {
-        const isWalletService = service.name === "agentwallet" || service.name === "wallet";
-        const walletRef = sanitizeText(item.endpoint);
-        const endpoint = isWalletService && /^eip155:\d+:[a-zA-Z0-9]+$/.test(walletRef)
-          ? walletRef
-          : sanitizeUrl(item.endpoint);
+        const canonicalServiceName = service.name as string;
+        const isWalletService = canonicalServiceName === "agentwallet" || canonicalServiceName === "wallet";
+        const isEnsService = canonicalServiceName === "ens";
+        const isDidService = canonicalServiceName === "did";
+        const endpointRef = sanitizeText(item.endpoint);
+        const endpoint = isWalletService
+          ? (EIP155_ACCOUNT_REGEX.test(endpointRef) ? endpointRef : "")
+          : isEnsService
+            ? sanitizeEnsName(endpointRef)
+            : isDidService
+              ? sanitizeDidUri(endpointRef)
+              : sanitizeUrl(item.endpoint);
         if (endpoint) {
           service.endpoint = endpoint;
         } else {

@@ -251,7 +251,7 @@ describe("URI Digest Coverage", () => {
       expect(services).toHaveLength(1);
     });
 
-    it("should filter out services without name", async () => {
+    it("should filter out services without name/type", async () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockFetchOk({
           services: [{ endpoint: "https://api.example.com" }],
@@ -259,6 +259,38 @@ describe("URI Digest Coverage", () => {
       );
       const result = await digestUri("https://example.com/agent.json");
       expect(result.fields!["_uri:services"]).toBeUndefined(); // Empty after filtering
+    });
+
+    it("should accept service entries with type when name is missing", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ type: "a2a", endpoint: "https://api.example.com/a2a" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
+      expect(services).toHaveLength(1);
+      expect(services[0]).toEqual({
+        name: "a2a",
+        type: "a2a",
+        endpoint: "https://api.example.com/a2a",
+      });
+    });
+
+    it("should accept valid type even when name is invalid", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "invalid-name", type: "mcp", endpoint: "https://api.example.com" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
+      expect(services).toHaveLength(1);
+      expect(services[0]).toEqual({
+        name: "mcp",
+        type: "mcp",
+        endpoint: "https://api.example.com/",
+      });
     });
 
     it("should filter out services with invalid name", async () => {
@@ -385,15 +417,76 @@ describe("URI Digest Coverage", () => {
         { name: "mcp", endpoint: "https://a.com" },
         { name: "a2a", endpoint: "https://b.com" },
         { name: "oasf", endpoint: "https://c.com" },
-        { name: "ens", endpoint: "https://d.com" },
-        { name: "did", endpoint: "https://e.com" },
-        { name: "agentwallet", endpoint: "https://f.com" },
+        { name: "ens", endpoint: "dataanalyst.eth" },
+        { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
+        { name: "agentwallet", endpoint: "eip155:1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7" },
         { name: "wallet", endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678" },
       ];
       global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ services }));
       const result = await digestUri("https://example.com/agent.json");
       const svc = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
       expect(svc.length).toBe(7);
+    });
+
+    it("should reject agentwallet endpoint that is not eip155", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "agentwallet", endpoint: "https://wallet.example.com" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      expect(result.fields!["_uri:services"]).toBeUndefined();
+    });
+
+    it("should reject malformed eip155 wallet account id", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "wallet", endpoint: "eip155:1:abc" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      expect(result.fields!["_uri:services"]).toBeUndefined();
+    });
+
+    it("should enforce canonical service kind when name/type conflict", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "mcp", type: "wallet", endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      expect(result.fields!["_uri:services"]).toBeUndefined();
+    });
+
+    it("should accept ENS and DID canonical endpoints", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [
+            { name: "ens", endpoint: "DataAnalyst.eth" },
+            { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
+          ],
+        })
+      );
+
+      const result = await digestUri("https://example.com/agent.json");
+      const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
+      expect(services).toEqual([
+        { name: "ens", endpoint: "dataanalyst.eth" },
+        { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
+      ]);
+    });
+
+    it("should reject ENS and DID services with URL endpoints", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [
+            { name: "ens", endpoint: "https://ens.example.com" },
+            { name: "did", endpoint: "https://did.example.com" },
+          ],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      expect(result.fields!["_uri:services"]).toBeUndefined();
     });
   });
 
