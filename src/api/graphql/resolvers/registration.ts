@@ -28,6 +28,7 @@ interface ServiceEntry {
   skills?: string[];
   mcpTools?: string[];
   a2aSkills?: string[];
+  domains?: string[];
 }
 
 interface ParsedRegistration {
@@ -134,6 +135,8 @@ function getServiceSkills(svc: ServiceEntry | undefined): string[] | null {
 function gatherServiceSkills(services: ServiceEntry[]): string[] {
   const allSkills: string[] = [];
   for (const s of services) {
+    const serviceName = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
+    if (serviceName !== 'oasf') continue;
     if (Array.isArray(s.skills)) {
       for (const skill of s.skills) {
         if (typeof skill === 'string') allSkills.push(skill);
@@ -141,6 +144,20 @@ function gatherServiceSkills(services: ServiceEntry[]): string[] {
     }
   }
   return allSkills;
+}
+
+function gatherServiceDomains(services: ServiceEntry[]): string[] {
+  const allDomains: string[] = [];
+  for (const s of services) {
+    const serviceName = normalizeServiceName(s.name) ?? normalizeServiceName(s.type);
+    if (serviceName !== 'oasf') continue;
+    if (Array.isArray(s.domains)) {
+      for (const domain of s.domains) {
+        if (typeof domain === 'string') allDomains.push(domain);
+      }
+    }
+  }
+  return allDomains;
 }
 
 export const registrationResolvers = {
@@ -193,14 +210,21 @@ export const registrationResolvers = {
     },
     async oasfDomains(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
+      const allDomains = gatherServiceDomains(parsed.services);
+      if (allDomains.length > 0) return allDomains;
       return parseStringArray(parsed.fields.get('_uri:domains'));
     },
     async hasOASF(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
       const parsed = await getParsedRegistration(parent._asset, ctx);
-      return !!(parsed.fields.get('_uri:skills') || parsed.fields.get('_uri:domains'));
+      return (
+        gatherServiceSkills(parsed.services).length > 0
+        || gatherServiceDomains(parsed.services).length > 0
+        || !!(parsed.fields.get('_uri:skills') || parsed.fields.get('_uri:domains'))
+      );
     },
-    supportedTrusts() {
-      return null;
+    async supportedTrusts(parent: RegistrationParent, _args: unknown, ctx: GraphQLContext) {
+      const parsed = await getParsedRegistration(parent._asset, ctx);
+      return parseStringArray(parsed.fields.get('_uri:supported_trust'));
     },
   },
 };

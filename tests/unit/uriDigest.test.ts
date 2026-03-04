@@ -560,12 +560,14 @@ describe("URI Digest Module", () => {
               endpoint: "https://example.com/oasf",
               skills: [
                 "web-search", // Valid
+                "advanced_reasoning_planning/hypothesis_generation", // Valid SDK taxonomy slug
                 '<script>alert(1)</script>', // Invalid
                 "code-generation", // Valid
                 "INVALID SLUG!", // Invalid (spaces, special chars)
               ],
               domains: [
                 "finance", // Valid
+                "technology/software_engineering/software_engineering", // Valid SDK taxonomy slug
                 "<img onerror=alert(1)>", // Invalid
               ],
             },
@@ -594,8 +596,15 @@ describe("URI Digest Module", () => {
         const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
         expect(services.length).toBe(1);
         // Only valid slugs remain
-        expect(services[0].skills).toEqual(["web-search", "code-generation"]);
-        expect(services[0].domains).toEqual(["finance"]);
+        expect(services[0].skills).toEqual([
+          "web-search",
+          "advanced_reasoning_planning/hypothesis_generation",
+          "code-generation",
+        ]);
+        expect(services[0].domains).toEqual([
+          "finance",
+          "technology/software_engineering/software_engineering",
+        ]);
       });
     });
   });

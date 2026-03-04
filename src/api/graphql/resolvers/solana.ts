@@ -1,5 +1,17 @@
 import type { AgentRow, FeedbackRow, ResponseRow, RevocationRow } from '../dataloaders.js';
 
+function normalizeRunningDigest(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    if (value.startsWith('\\x')) return value.slice(2);
+    if (value.startsWith('0x')) return value.slice(2);
+    return value;
+  }
+  if (Buffer.isBuffer(value)) return value.toString('hex');
+  if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+  return String(value);
+}
+
 export const solanaResolvers = {
   SolanaAgentExtension: {
     assetPubkey(parent: AgentRow) { return parent.asset; },
@@ -20,14 +32,14 @@ export const solanaResolvers = {
     valueRaw(parent: FeedbackRow) { return parent.value; },
     valueDecimals(parent: FeedbackRow) { return parent.value_decimals; },
     score(parent: FeedbackRow) { return parent.score; },
-    runningDigest(parent: FeedbackRow) { return parent.running_digest; },
+    runningDigest(parent: FeedbackRow) { return normalizeRunningDigest(parent.running_digest); },
     verificationStatus(parent: FeedbackRow) { return parent.status; },
     txSignature(parent: FeedbackRow) { return parent.tx_signature; },
     blockSlot(parent: FeedbackRow) { return parent.block_slot; },
   },
 
   SolanaResponseExtension: {
-    runningDigest(parent: ResponseRow) { return parent.running_digest; },
+    runningDigest(parent: ResponseRow) { return normalizeRunningDigest(parent.running_digest); },
     responseCount(parent: ResponseRow) { return parent.response_count; },
     verificationStatus(parent: ResponseRow) { return parent.status; },
     txSignature(parent: ResponseRow) { return parent.tx_signature; },
@@ -35,7 +47,7 @@ export const solanaResolvers = {
   },
 
   SolanaRevocationExtension: {
-    runningDigest(parent: RevocationRow) { return parent.running_digest; },
+    runningDigest(parent: RevocationRow) { return normalizeRunningDigest(parent.running_digest); },
     revokeCount(parent: RevocationRow) { return parent.revoke_count; },
     verificationStatus(parent: RevocationRow) { return parent.status; },
     txSignature(parent: RevocationRow) { return parent.tx_signature; },

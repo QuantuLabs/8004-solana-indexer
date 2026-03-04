@@ -73,7 +73,7 @@ export const feedbackResolvers = {
       return parent.endpoint || null;
     },
     feedbackURI(parent: FeedbackRow) {
-      return parent.feedback_uri || null;
+      return parent.feedback_uri ?? null;
     },
     feedbackURIType(parent: FeedbackRow) {
       return detectUriType(parent.feedback_uri);

@@ -94,8 +94,8 @@ export function sanitizeUrl(url: string): string {
 function sanitizeServices(arr: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(arr)) return [];
 
-  const validServiceNames = new Set(["mcp", "a2a", "oasf", "ens", "did", "agentwallet"]);
-  const slugRegex = /^[a-z0-9-]+$/;
+  const validServiceNames = new Set(["mcp", "a2a", "oasf", "ens", "did", "agentwallet", "wallet"]);
+  const slugRegex = /^[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?(?:\/[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?)*$/;
 
   // SLICE FIRST to prevent CPU exhaustion via large arrays
   return arr
@@ -118,7 +118,11 @@ function sanitizeServices(arr: unknown): Array<Record<string, unknown>> {
 
       // Required: endpoint URL
       if (typeof item.endpoint === "string") {
-        const endpoint = sanitizeUrl(item.endpoint);
+        const isWalletService = service.name === "agentwallet" || service.name === "wallet";
+        const walletRef = sanitizeText(item.endpoint);
+        const endpoint = isWalletService && /^eip155:\d+:[a-zA-Z0-9]+$/.test(walletRef)
+          ? walletRef
+          : sanitizeUrl(item.endpoint);
         if (endpoint) {
           service.endpoint = endpoint;
         } else {
@@ -187,9 +191,14 @@ function sanitizeRegistrationsArray(arr: unknown): Array<{ agentId: number | str
       // agentId can be number or string (for large IDs)
       let agentId: number | string | null = null;
       if (typeof item.agentId === "number") {
-        agentId = item.agentId;
+        if (Number.isInteger(item.agentId) && item.agentId >= 0) {
+          agentId = item.agentId;
+        }
       } else if (typeof item.agentId === "string") {
-        agentId = sanitizeText(item.agentId);
+        const parsed = sanitizeText(item.agentId);
+        if (/^\d+$/.test(parsed)) {
+          agentId = parsed;
+        }
       }
 
       // agentRegistry must match format
@@ -238,7 +247,7 @@ function sanitizeField(key: string, value: unknown): unknown {
   // Trust mechanisms array (ERC-8004 spec)
   if (key === "_uri:supported_trust") {
     if (!Array.isArray(value)) return [];
-    const validTrusts = ["reputation", "crypto-economic", "8004", "oasf", "x402"];
+    const validTrusts = ["reputation", "crypto-economic", "tee-attestation", "8004", "oasf", "x402"];
     // SLICE FIRST to prevent CPU exhaustion, then filter/sanitize
     return value
       .slice(0, 20) // Limit BEFORE processing

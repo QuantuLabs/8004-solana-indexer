@@ -200,10 +200,10 @@ describe("URI Digest Coverage", () => {
 
     it("should handle supportedTrust with invalid entries", async () => {
       global.fetch = vi.fn().mockResolvedValue(
-        mockFetchOk({ supportedTrust: ["reputation", "invalid", 123, "8004"] })
+        mockFetchOk({ supportedTrust: ["reputation", "tee-attestation", "invalid", 123, "8004"] })
       );
       const result = await digestUri("https://example.com/agent.json");
-      expect(result.fields!["_uri:supported_trust"]).toEqual(["reputation", "8004"]);
+      expect(result.fields!["_uri:supported_trust"]).toEqual(["reputation", "tee-attestation", "8004"]);
     });
 
     it("should handle non-array supportedTrust", async () => {
@@ -303,6 +303,21 @@ describe("URI Digest Coverage", () => {
       expect(services[0].name).toBe("mcp");
     });
 
+    it("should accept wallet service with eip155 endpoint", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "wallet", endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678" }],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
+      expect(services).toHaveLength(1);
+      expect(services[0]).toEqual({
+        name: "wallet",
+        endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678",
+      });
+    });
+
     it("should handle mcpTools array", async () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockFetchOk({
@@ -373,11 +388,12 @@ describe("URI Digest Coverage", () => {
         { name: "ens", endpoint: "https://d.com" },
         { name: "did", endpoint: "https://e.com" },
         { name: "agentwallet", endpoint: "https://f.com" },
+        { name: "wallet", endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678" },
       ];
       global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ services }));
       const result = await digestUri("https://example.com/agent.json");
       const svc = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
-      expect(svc.length).toBe(6);
+      expect(svc.length).toBe(7);
     });
   });
 

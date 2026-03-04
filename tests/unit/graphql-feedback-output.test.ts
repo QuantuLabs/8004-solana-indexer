@@ -26,4 +26,28 @@ describe("GraphQL feedback output parity", () => {
     );
     expect(solanaResolvers.SolanaFeedbackExtension.valueDecimals(row)).toBe(18);
   });
+
+  it("preserves empty feedbackURI as empty string", () => {
+    const row = {
+      feedback_uri: "",
+    } as any;
+
+    expect(feedbackResolvers.Feedback.feedbackURI(row)).toBe("");
+  });
+
+  it("normalizes Solana runningDigest from postgres bytea string", () => {
+    const row = {
+      running_digest: "\\xdeadbeef",
+    } as any;
+
+    expect(solanaResolvers.SolanaFeedbackExtension.runningDigest(row)).toBe("deadbeef");
+  });
+
+  it("normalizes Solana runningDigest from Buffer", () => {
+    const row = {
+      running_digest: Buffer.from([0xde, 0xad, 0xbe, 0xef]),
+    } as any;
+
+    expect(solanaResolvers.SolanaFeedbackExtension.runningDigest(row)).toBe("deadbeef");
+  });
 });

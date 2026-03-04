@@ -75,4 +75,39 @@ describe('Registration Resolver Service Matching', () => {
 
     expect(oasfSkills).toEqual(['finance']);
   });
+
+  it('resolves oasfDomains/hasOASF from OASF service payload and supportedTrusts from _uri field', async () => {
+    const ctx = {
+      loaders: {
+        registrationByAgent: {
+          load: vi.fn().mockResolvedValue([
+            {
+              asset: 'Asset111',
+              key: '_uri:services',
+              value: Buffer.concat([
+                Buffer.from([0x00]),
+                Buffer.from(JSON.stringify([
+                  { name: 'oasf', endpoint: 'https://oasf.example.com', skills: ['ai/plan'], domains: ['finance/investment'] },
+                ]), 'utf8'),
+              ]),
+            },
+            {
+              asset: 'Asset111',
+              key: '_uri:supported_trust',
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from(JSON.stringify(['reputation', 'tee-attestation']), 'utf8')]),
+            },
+          ]),
+        },
+      },
+    } as any;
+    const parent = { _asset: 'Asset111' };
+
+    const oasfDomains = await registrationResolvers.AgentRegistrationFile.oasfDomains(parent, {}, ctx);
+    const hasOASF = await registrationResolvers.AgentRegistrationFile.hasOASF(parent, {}, ctx);
+    const supportedTrusts = await registrationResolvers.AgentRegistrationFile.supportedTrusts(parent, {}, ctx);
+
+    expect(oasfDomains).toEqual(['finance/investment']);
+    expect(hasOASF).toBe(true);
+    expect(supportedTrusts).toEqual(['reputation', 'tee-attestation']);
+  });
 });

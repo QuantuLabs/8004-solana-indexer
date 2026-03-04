@@ -404,6 +404,31 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
+    it("should preserve empty feedbackUri as empty string (not null)", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("NewFeedback", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          value: 100n,
+          valueDecimals: 0,
+          score: 85,
+          feedbackUri: "",
+          sealHash: new Uint8Array(32).fill(0xab),
+          atomEnabled: false,
+        })
+      );
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedbacks (id, feedback_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][11]).toBe("");
+    });
+
     it("should insert NewFeedback without ATOM update", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(

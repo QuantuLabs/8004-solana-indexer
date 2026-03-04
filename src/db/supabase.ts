@@ -553,14 +553,17 @@ async function handleCollectionPointerSetTx(
   const lock = typeof data.lock === "boolean" ? data.lock : null;
   await client.query(
     `WITH previous AS (
-       SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
+       SELECT canonical_col AS prev_col, creator AS prev_creator
        FROM agents
        WHERE asset = $1
+     ),
+     resolved AS (
+       SELECT COALESCE((SELECT prev_creator FROM previous), $3) AS creator_key
      ),
      updated AS (
        UPDATE agents
        SET canonical_col = $2,
-           creator = COALESCE(creator, $3),
+           creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
            block_slot = $4,
            updated_at = $5,
            col_locked = COALESCE($7, col_locked)
@@ -572,7 +575,7 @@ async function handleCollectionPointerSetTx(
          col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
          last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
        )
-       SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 1
+       SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $6, 1
        WHERE EXISTS (SELECT 1 FROM updated)
        ON CONFLICT (col, creator) DO NOTHING
      ),
@@ -582,7 +585,7 @@ async function handleCollectionPointerSetTx(
        WHERE cp.col = COALESCE((SELECT prev_col FROM previous), '')
          AND cp.creator = COALESCE((SELECT prev_creator FROM previous), '')
          AND cp.col <> ''
-         AND (cp.col <> $2 OR cp.creator <> $3)
+         AND (cp.col <> $2 OR cp.creator <> (SELECT creator_key FROM resolved))
          AND EXISTS (SELECT 1 FROM updated)
        RETURNING 1
      )
@@ -592,10 +595,10 @@ async function handleCollectionPointerSetTx(
          last_seen_tx_signature = $6,
          asset_count = cp.asset_count + CASE
            WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
-             OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+             OR COALESCE((SELECT prev_creator FROM previous), '') <> (SELECT creator_key FROM resolved)
            THEN 1 ELSE 0 END
      WHERE cp.col = $2
-       AND cp.creator = $3
+       AND cp.creator = (SELECT creator_key FROM resolved)
        AND EXISTS (SELECT 1 FROM updated)`,
      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
    );
@@ -719,7 +722,7 @@ async function handleNewFeedbackTx(
     [
       id, null, assetId, clientAddress, data.feedbackIndex.toString(),
       data.value.toString(), data.valueDecimals, data.score,
-      data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
+      data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri ?? null,
       feedbackHash, runningDigest,
       false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
     ]
@@ -1168,14 +1171,17 @@ async function handleCollectionPointerSet(
   try {
     await db.query(
       `WITH previous AS (
-         SELECT canonical_col AS prev_col, COALESCE(creator, owner) AS prev_creator
+         SELECT canonical_col AS prev_col, creator AS prev_creator
          FROM agents
          WHERE asset = $1
+       ),
+       resolved AS (
+         SELECT COALESCE((SELECT prev_creator FROM previous), $3) AS creator_key
        ),
        updated AS (
          UPDATE agents
          SET canonical_col = $2,
-             creator = COALESCE(creator, $3),
+             creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
              block_slot = $4,
              updated_at = $5,
              col_locked = COALESCE($7, col_locked)
@@ -1187,7 +1193,7 @@ async function handleCollectionPointerSet(
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
            last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
          )
-         SELECT $2, $3, $1, $5, $4, $6, $5, $4, $6, 1
+         SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $6, 1
          WHERE EXISTS (SELECT 1 FROM updated)
          ON CONFLICT (col, creator) DO NOTHING
        ),
@@ -1197,7 +1203,7 @@ async function handleCollectionPointerSet(
          WHERE cp.col = COALESCE((SELECT prev_col FROM previous), '')
            AND cp.creator = COALESCE((SELECT prev_creator FROM previous), '')
            AND cp.col <> ''
-           AND (cp.col <> $2 OR cp.creator <> $3)
+           AND (cp.col <> $2 OR cp.creator <> (SELECT creator_key FROM resolved))
            AND EXISTS (SELECT 1 FROM updated)
          RETURNING 1
        )
@@ -1207,10 +1213,10 @@ async function handleCollectionPointerSet(
            last_seen_tx_signature = $6,
            asset_count = cp.asset_count + CASE
              WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
-               OR COALESCE((SELECT prev_creator FROM previous), '') <> $3
+               OR COALESCE((SELECT prev_creator FROM previous), '') <> (SELECT creator_key FROM resolved)
              THEN 1 ELSE 0 END
        WHERE cp.col = $2
-         AND cp.creator = $3
+         AND cp.creator = (SELECT creator_key FROM resolved)
          AND EXISTS (SELECT 1 FROM updated)`,
       [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
     );
@@ -1364,7 +1370,7 @@ async function handleNewFeedback(
       [
         id, null, assetId, clientAddress, data.feedbackIndex.toString(),
         data.value.toString(), data.valueDecimals, data.score,
-        data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri || null,
+        data.tag1 || null, data.tag2 || null, data.endpoint || null, data.feedbackUri ?? null,
         feedbackHash, runningDigest,
         false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
       ]

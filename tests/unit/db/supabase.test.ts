@@ -673,6 +673,20 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
       });
 
+      it("should preserve empty feedbackUri as empty string (not null)", async () => {
+        mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 1 });
+        const event = {
+          type: "NewFeedback" as const,
+          data: makeFeedbackData({ atomEnabled: false, feedbackUri: "" }),
+        };
+        await handleEvent(event, ctx);
+        const insertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedbacks")
+        );
+        expect(insertCall).toBeDefined();
+        expect(insertCall![1][11]).toBe("");
+      });
+
       it("should handle duplicate feedback (rowCount=0)", async () => {
         mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 0 });
         const event = {
@@ -1485,6 +1499,11 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("UPDATE agents SET") && !c[0].includes("trust_tier")
         );
         expect(updateCall).toBeDefined();
+        const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedbacks")
+        );
+        expect(insertCall).toBeDefined();
+        expect(insertCall![1][11]).toBe("");
       });
 
       it("NewFeedback duplicate (rowCount=0)", async () => {
