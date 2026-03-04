@@ -15,6 +15,12 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
   - response `seal_hash` mismatch => `ORPHANED`
   - GraphQL filters exclude `ORPHANED` records by default
 
+## Transition Notes
+
+If you are upgrading from `v1.7.7`, read:
+
+- [docs/transition-from-v1.7.7.md](docs/transition-from-v1.7.7.md)
+
 ## Quick Start
 
 ```bash

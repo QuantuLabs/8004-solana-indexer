@@ -79,6 +79,7 @@ interface DecodedCursor {
 }
 
 interface CollectionRow {
+  collection_id: string | null;
   col: string;
   creator: string;
   first_seen_asset: string;
@@ -163,6 +164,20 @@ function assertCursorOrderCompatibility(after: string | undefined, orderCol: str
 
 function resolveAssetId(input: string): string {
   return decodeAgentId(input) ?? input;
+}
+
+const CIDV1_BASE32_REGEX = /^b[a-z2-7]{20,}$/;
+
+function collectionPointerVariants(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('c1:')) {
+    const bare = trimmed.slice(3);
+    if (!bare || !CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
+    return [trimmed, bare];
+  }
+  if (!CIDV1_BASE32_REGEX.test(trimmed)) return [trimmed];
+  return [`c1:${trimmed}`, trimmed];
 }
 
 function isIntegerString(value: string): boolean {
@@ -837,6 +852,7 @@ export const queryResolvers = {
       args: {
         first?: number;
         skip?: number;
+        collectionId?: bigint | number | string;
         collection?: string;
         creator?: string;
       },
@@ -848,9 +864,21 @@ export const queryResolvers = {
       const filters: string[] = [];
       let paramIdx = 1;
 
+      if (args.collectionId !== undefined && args.collectionId !== null) {
+        if (!isNumericIdValue(args.collectionId)) {
+          throw createBadUserInputError('collections.collectionId must be an integer value.');
+        }
+        const parsedCollectionId = String(args.collectionId);
+        if (!isIntegerString(parsedCollectionId)) {
+          throw createBadUserInputError('collections.collectionId must be an integer value.');
+        }
+        filters.push(`collection_id = $${paramIdx}::bigint`);
+        params.push(parsedCollectionId);
+        paramIdx++;
+      }
       if (args.collection) {
-        filters.push(`col = $${paramIdx}::text`);
-        params.push(args.collection);
+        filters.push(`col = ANY($${paramIdx}::text[])`);
+        params.push(collectionPointerVariants(args.collection));
         paramIdx++;
       }
       if (args.creator) {
@@ -861,6 +889,7 @@ export const queryResolvers = {
 
       const whereSql = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
       const sql = `SELECT
+                          collection_id::text,
                           col,
                           creator,
                           first_seen_asset,
@@ -892,6 +921,7 @@ export const queryResolvers = {
 
       const { rows } = await ctx.pool.query<CollectionRow>(sql, params);
       return rows.map((row) => ({
+        collectionId: row.collection_id,
         collection: row.col,
         creator: row.creator,
         firstSeenAsset: row.first_seen_asset,
@@ -926,16 +956,19 @@ export const queryResolvers = {
       },
       ctx: GraphQLContext
     ) {
-      const params: unknown[] = [args.collection];
-      let sql = `SELECT COUNT(*)::text AS count
-                 FROM agents
-                 WHERE status != 'ORPHANED'
-                   AND canonical_col = $1::text`;
-
-      if (args.creator) {
-        params.push(args.creator);
-        sql += ` AND creator = $2::text`;
+      const creator = args.creator?.trim();
+      if (!creator) {
+        throw createBadUserInputError(
+          'collectionAssetCount requires creator (scope is creator+collection).'
+        );
       }
+
+      const params: unknown[] = [collectionPointerVariants(args.collection), creator];
+      const sql = `SELECT COUNT(*)::text AS count
+                   FROM agents
+                   WHERE status != 'ORPHANED'
+                     AND canonical_col = ANY($1::text[])
+                     AND creator = $2::text`;
 
       const { rows } = await ctx.pool.query<{ count: string }>(sql, params);
       return rows[0]?.count ?? '0';
@@ -958,14 +991,14 @@ export const queryResolvers = {
       const dir = resolveDirection(args.orderDirection);
       const orderCol = resolveAgentOrderColumn(args.orderBy);
 
-      const params: unknown[] = [args.collection];
-      let paramIdx = 2;
-      let creatorSql = '';
-      if (args.creator) {
-        creatorSql = ` AND a.creator = $${paramIdx}::text`;
-        params.push(args.creator);
-        paramIdx++;
+      const creator = args.creator?.trim();
+      if (!creator) {
+        throw createBadUserInputError(
+          'collectionAssets requires creator (scope is creator+collection).'
+        );
       }
+      const params: unknown[] = [collectionPointerVariants(args.collection), creator];
+      let paramIdx = 3;
 
       const sql = `SELECT
                           ${AGENT_SELECT_WITH_DIGESTS}
@@ -982,8 +1015,8 @@ export const queryResolvers = {
                      FROM agent_digest_cache
                    ) adc ON adc.agent_id = a.asset
                    WHERE a.status != 'ORPHANED'
-                     AND a.canonical_col = $1::text
-                     ${creatorSql}
+                     AND a.canonical_col = ANY($1::text[])
+                     AND a.creator = $2::text
                    ORDER BY ${orderCol} ${dir}, a.asset ${dir}
                    LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
       params.push(first, skip);

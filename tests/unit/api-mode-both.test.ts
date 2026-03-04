@@ -17,6 +17,7 @@ vi.mock("../../src/api/graphql/index.js", () => ({
 const originalEnv = process.env;
 const ARCHIVED_VALIDATIONS_ERROR =
   "Validation endpoints are archived and no longer exposed. /rest/v1/validations has been retired.";
+const BARE_COLLECTION_CID = "bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km";
 
 function makePrismaStub() {
   return {
@@ -107,6 +108,9 @@ describe("API_MODE=both behavior", () => {
       const restRes = await fetch(`${baseUrl}/rest/v1/agents`);
       expect(restRes.status).toBe(200);
 
+      const deprecatedCanonicalColRes = await fetch(`${baseUrl}/rest/v1/agents?canonical_col=eq.c1:ptr`);
+      expect(deprecatedCanonicalColRes.status).toBe(200);
+
       const archivedValidationsRes = await fetch(`${baseUrl}/rest/v1/validations?limit=1`);
       expect(archivedValidationsRes.status).toBe(410);
       expect(await archivedValidationsRes.json()).toEqual({
@@ -124,6 +128,121 @@ describe("API_MODE=both behavior", () => {
         body: JSON.stringify({ query: "{ stats { totalAgents } }" }),
       });
       expect(gqlRes.status).toBe(404);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("normalizes bare CID collection filters for local REST collection counts", async () => {
+    const creator = "Creator11111111111111111111111111111111";
+    const prisma = makePrismaStub();
+    prisma.agent.count.mockImplementation(async ({ where }: { where: any }) => (
+      Array.isArray(where?.OR) ? 22 : 2
+    ));
+
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const countRes = await fetch(
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}&creator=eq.${creator}`
+      );
+      expect(countRes.status).toBe(200);
+      expect(await countRes.json()).toEqual({
+        collection: BARE_COLLECTION_CID,
+        creator,
+        asset_count: 22,
+      });
+
+      expect(prisma.agent.count).toHaveBeenCalledWith({
+        where: {
+          status: { not: "ORPHANED" },
+          OR: [
+            { collectionPointer: `c1:${BARE_COLLECTION_CID}` },
+            { collectionPointer: BARE_COLLECTION_CID },
+          ],
+          creator,
+        },
+      });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects blank creator for creator+collection scoped endpoints in local mode", async () => {
+    const prisma = makePrismaStub();
+    const { server, baseUrl } = await startServer({
+      prisma: prisma as any,
+      pool: null as any,
+    });
+
+    try {
+      const countRes = await fetch(
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}&creator=eq.%20%20%20`
+      );
+      expect(countRes.status).toBe(400);
+      expect(await countRes.json()).toEqual({
+        error: "Missing required query param: creator (scope is creator+collection)",
+      });
+
+      const assetsRes = await fetch(
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.${BARE_COLLECTION_CID}&creator=eq.%20%20%20&limit=1`
+      );
+      expect(assetsRes.status).toBe(400);
+      expect(await assetsRes.json()).toEqual({
+        error: "Missing required query param: creator (scope is creator+collection)",
+      });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects missing creator in proxy mode without upstream calls", async () => {
+    process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
+    process.env.SUPABASE_KEY = "service-role-key";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return realFetch(input, init);
+    });
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: vi.fn() } as any,
+    });
+
+    try {
+      const countRes = await fetch(
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}`
+      );
+      expect(countRes.status).toBe(400);
+
+      const assetsRes = await fetch(
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.${BARE_COLLECTION_CID}&limit=1`
+      );
+      expect(assetsRes.status).toBe(400);
+
+      const proxyCalls = fetchSpy.mock.calls.filter(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
+      });
+      expect(proxyCalls).toHaveLength(0);
     } finally {
       await stopServer(server);
     }
@@ -219,6 +338,16 @@ describe("API_MODE=both behavior", () => {
   it("serves GraphQL and proxies REST when only Supabase pool is available with SUPABASE_URL + SUPABASE_KEY", async () => {
     process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
     process.env.SUPABASE_KEY = "service-role-key";
+    const poolQuery = vi.fn().mockResolvedValue({
+      rows: [
+        { model: "agents", pending_count: "2", finalized_count: "8", orphaned_count: "0" },
+        { model: "feedbacks", pending_count: "0", finalized_count: "5", orphaned_count: "0" },
+        { model: "collections", pending_count: "0", finalized_count: "0", orphaned_count: "1" },
+        { model: "metadata", pending_count: "3", finalized_count: "0", orphaned_count: "0" },
+        { model: "feedback_responses", pending_count: "0", finalized_count: "4", orphaned_count: "0" },
+        { model: "revocations", pending_count: "9", finalized_count: "9", orphaned_count: "9" },
+      ],
+    });
     const realFetch = globalThis.fetch;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
       const url = typeof input === "string"
@@ -226,6 +355,45 @@ describe("API_MODE=both behavior", () => {
         : input instanceof URL
           ? input.toString()
           : input?.url;
+
+      if (typeof url === "string") {
+        try {
+          const parsed = new URL(url);
+          if (
+            parsed.pathname === "/rest/v1/agents"
+            && parsed.searchParams.get("select") === "asset"
+            && parsed.searchParams.get("limit") === "1"
+            && parsed.searchParams.get("canonical_col")
+              === `in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`
+          ) {
+            return new Response(
+              JSON.stringify([{ asset: "ProxyAgentCid1111111111111111111111111111111" }]),
+              {
+                status: 200,
+                headers: {
+                  "content-type": "application/json",
+                  "content-range": "items 0-0/22",
+                },
+              }
+            );
+          }
+        } catch {
+          // Non-URL values fall through to default mock behavior.
+        }
+      }
+
+      if (typeof url === "string" && url.includes("/rest/v1/agents?") && url.includes("select=asset%2Ccanonical_col")) {
+        return new Response(
+          JSON.stringify([{ asset: "ProxyAgent11111111111111111111111111111111", canonical_col: "c1:proxy" }]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "content-range": "items 0-0/1",
+            },
+          }
+        );
+      }
 
       if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
         return new Response(
@@ -245,7 +413,7 @@ describe("API_MODE=both behavior", () => {
 
     const { server, baseUrl } = await startServer({
       prisma: null as any,
-      pool: { query: vi.fn() } as any,
+      pool: { query: poolQuery } as any,
     });
 
     try {
@@ -258,6 +426,17 @@ describe("API_MODE=both behavior", () => {
       expect(restRes.status).toBe(200);
       expect(restRes.headers.get("content-range")).toBe("items 0-0/1");
       expect(await restRes.json()).toEqual([{ asset: "ProxyAgent11111111111111111111111111111111" }]);
+
+      const pointerAliasRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&select=asset,canonical_col&includeOrphaned=true`
+      );
+      expect(pointerAliasRes.status).toBe(200);
+      const pointerAliasBody = await pointerAliasRes.json();
+      expect(pointerAliasBody).toEqual([{
+        asset: "ProxyAgent11111111111111111111111111111111",
+        canonical_col: "c1:proxy",
+        collection_pointer: "c1:proxy",
+      }]);
 
       const upstreamCall = fetchSpy.mock.calls.find(([input]) => {
         const url = typeof input === "string"
@@ -307,8 +486,67 @@ describe("API_MODE=both behavior", () => {
       expect(includeOrphanedUrl.searchParams.get("includeOrphaned")).toBe("true");
       expect(includeOrphanedUrl.searchParams.get("status")).toBeNull();
 
+      const collectionPointerCallStart = fetchSpy.mock.calls.length;
+      const collectionPointerRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&collection_pointer=eq.c1:ptr`
+      );
+      expect(collectionPointerRes.status).toBe(200);
+      const collectionPointerUpstreamCall = fetchSpy.mock.calls.slice(collectionPointerCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(collectionPointerUpstreamCall).toBeTruthy();
+      const collectionPointerUrlRaw = typeof collectionPointerUpstreamCall?.[0] === "string"
+        ? collectionPointerUpstreamCall[0]
+        : collectionPointerUpstreamCall?.[0] instanceof URL
+          ? collectionPointerUpstreamCall[0].toString()
+          : collectionPointerUpstreamCall?.[0]?.url;
+      expect(typeof collectionPointerUrlRaw).toBe("string");
+      const collectionPointerUrl = new URL(collectionPointerUrlRaw as string);
+      expect(collectionPointerUrl.searchParams.get("canonical_col")).toBe("eq.c1:ptr");
+      expect(collectionPointerUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const canonicalColAliasCallStart = fetchSpy.mock.calls.length;
+      const canonicalColAliasRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&canonical_col=eq.c1:ptr`
+      );
+      expect(canonicalColAliasRes.status).toBe(200);
+      const canonicalColAliasUpstreamCall = fetchSpy.mock.calls.slice(canonicalColAliasCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?");
+      });
+      expect(canonicalColAliasUpstreamCall).toBeTruthy();
+      const canonicalColAliasUrlRaw = typeof canonicalColAliasUpstreamCall?.[0] === "string"
+        ? canonicalColAliasUpstreamCall[0]
+        : canonicalColAliasUpstreamCall?.[0] instanceof URL
+          ? canonicalColAliasUpstreamCall[0].toString()
+          : canonicalColAliasUpstreamCall?.[0]?.url;
+      expect(typeof canonicalColAliasUrlRaw).toBe("string");
+      const canonicalColAliasUrl = new URL(canonicalColAliasUrlRaw as string);
+      expect(canonicalColAliasUrl.searchParams.get("canonical_col")).toBe("eq.c1:ptr");
+      expect(canonicalColAliasUrl.searchParams.get("collection_pointer")).toBeNull();
+
+      const canonicalColTrailingSlashRes = await fetch(
+        `${baseUrl}/rest/v1/agents/?limit=1&canonical_col=eq.c1:ptr`
+      );
+      expect(canonicalColTrailingSlashRes.status).toBe(200);
+
+      const canonicalColBypassRes = await fetch(
+        `${baseUrl}/rest/v1/agents?limit=1&collection_pointer=&canonical_col=eq.c1:ptr`
+      );
+      expect(canonicalColBypassRes.status).toBe(200);
+
       const statusDefaultProxyPaths = ["/feedbacks", "/responses", "/feedback_responses", "/revocations"];
       for (const path of statusDefaultProxyPaths) {
+        const upstreamPath = path === "/responses" ? "/feedback_responses" : path;
         const defaultCallStart = fetchSpy.mock.calls.length;
         const defaultRes = await fetch(`${baseUrl}/rest/v1${path}?limit=1`);
         expect(defaultRes.status).toBe(200);
@@ -318,7 +556,7 @@ describe("API_MODE=both behavior", () => {
             : input instanceof URL
               ? input.toString()
               : input?.url;
-          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${path}?`);
+          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${upstreamPath}?`);
         });
         expect(defaultUpstreamCall).toBeTruthy();
         const defaultUrlRaw = typeof defaultUpstreamCall?.[0] === "string"
@@ -341,7 +579,7 @@ describe("API_MODE=both behavior", () => {
             : input instanceof URL
               ? input.toString()
               : input?.url;
-          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${path}?`);
+          return typeof url === "string" && url.startsWith(`https://proxy-test.supabase.co/rest/v1${upstreamPath}?`);
         });
         expect(includeUpstreamCall).toBeTruthy();
         const includeUrlRaw = typeof includeUpstreamCall?.[0] === "string"
@@ -378,25 +616,97 @@ describe("API_MODE=both behavior", () => {
       expect(statsUpstreamUrl.pathname).toBe("/rest/v1/global_stats");
       expect(statsUpstreamUrl.searchParams.get("limit")).toBe("1");
 
+      const verificationCallStart = fetchSpy.mock.calls.length;
+      const verificationPoolCallStart = poolQuery.mock.calls.length;
+      const verificationRes = await fetch(`${baseUrl}/rest/v1/stats/verification`);
+      expect(verificationRes.status).toBe(200);
+      expect(await verificationRes.json()).toEqual({
+        agents: { PENDING: 2, FINALIZED: 8, ORPHANED: 0 },
+        feedbacks: { PENDING: 0, FINALIZED: 5, ORPHANED: 0 },
+        registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 1 },
+        metadata: { PENDING: 3, FINALIZED: 0, ORPHANED: 0 },
+        feedback_responses: { PENDING: 0, FINALIZED: 4, ORPHANED: 0 },
+      });
+      const verificationProxyCall = fetchSpy.mock.calls.slice(verificationCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/stats/verification");
+      });
+      expect(verificationProxyCall).toBeUndefined();
+      const verificationPoolCall = poolQuery.mock.calls.slice(verificationPoolCallStart).find(([query]) =>
+        typeof query === "string"
+          && query.includes("FROM verification_stats")
+      );
+      expect(verificationPoolCall).toBeTruthy();
+      const verificationSlashCallStart = fetchSpy.mock.calls.length;
+      const verificationSlashRes = await fetch(`${baseUrl}/rest/v1/stats/verification/`);
+      expect(verificationSlashRes.status).toBe(200);
+      const verificationSlashProxyCall = fetchSpy.mock.calls.slice(verificationSlashCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/stats/verification/");
+      });
+      expect(verificationSlashProxyCall).toBeUndefined();
+      const verificationWriteRes = await fetch(`${baseUrl}/rest/v1/stats/verification`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(verificationWriteRes.status).toBe(405);
+      expect(await verificationWriteRes.json()).toEqual({
+        error: "REST proxy is read-only. Mutating methods are disabled.",
+      });
+
+      const creator = "Creator11111111111111111111111111111111";
       const collectionCountRes = await fetch(
-        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.Collection11111111111111111111111111111111`
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}`
       );
       expect(collectionCountRes.status).toBe(200);
       expect(await collectionCountRes.json()).toEqual({
         collection: "Collection11111111111111111111111111111111",
-        creator: null,
+        creator,
         asset_count: 1,
       });
 
+      const cidCollectionCountCallStart = fetchSpy.mock.calls.length;
+      const cidCollectionCountRes = await fetch(
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.${BARE_COLLECTION_CID}&creator=eq.${creator}`
+      );
+      expect(cidCollectionCountRes.status).toBe(200);
+      expect(await cidCollectionCountRes.json()).toEqual({
+        collection: BARE_COLLECTION_CID,
+        creator,
+        asset_count: 22,
+      });
+      const cidCollectionCountUpstreamCall = fetchSpy.mock.calls.slice(cidCollectionCountCallStart).find(([input]) => {
+        const raw = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof raw !== "string") return false;
+        const parsed = new URL(raw);
+        return parsed.pathname === "/rest/v1/agents"
+          && parsed.searchParams.get("canonical_col")
+            === `in.(c1:${BARE_COLLECTION_CID},${BARE_COLLECTION_CID})`;
+      });
+      expect(cidCollectionCountUpstreamCall).toBeTruthy();
+
       const collectionAssetsRes = await fetch(
-        `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&limit=1`
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}&limit=1`
       );
       expect(collectionAssetsRes.status).toBe(200);
       expect(await collectionAssetsRes.json()).toEqual([{ asset: "ProxyAgent11111111111111111111111111111111" }]);
 
       const collectionCountStatusCallStart = fetchSpy.mock.calls.length;
       const collectionCountStatusRes = await fetch(
-        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.Collection11111111111111111111111111111111&status=neq.ORPHANED`
+        `${baseUrl}/rest/v1/collection_asset_count?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}&status=neq.ORPHANED`
       );
       expect(collectionCountStatusRes.status).toBe(200);
       const collectionCountStatusUpstreamCall = fetchSpy.mock.calls.slice(collectionCountStatusCallStart).find(([input]) => {
@@ -407,7 +717,7 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
-          && url.includes("collection_pointer=eq.Collection11111111111111111111111111111111");
+          && url.includes("canonical_col=eq.Collection11111111111111111111111111111111");
       });
       expect(collectionCountStatusUpstreamCall).toBeTruthy();
       const collectionCountStatusUrlRaw = typeof collectionCountStatusUpstreamCall?.[0] === "string"
@@ -421,7 +731,7 @@ describe("API_MODE=both behavior", () => {
 
       const collectionAssetsStatusCallStart = fetchSpy.mock.calls.length;
       const collectionAssetsStatusRes = await fetch(
-        `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&limit=1&status=neq.ORPHANED`
+        `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}&limit=1&status=neq.ORPHANED`
       );
       expect(collectionAssetsStatusRes.status).toBe(200);
       const collectionAssetsStatusUpstreamCall = fetchSpy.mock.calls.slice(collectionAssetsStatusCallStart).find(([input]) => {
@@ -432,7 +742,7 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
-          && url.includes("collection_pointer=eq.Collection11111111111111111111111111111111");
+          && url.includes("canonical_col=eq.Collection11111111111111111111111111111111");
       });
       expect(collectionAssetsStatusUpstreamCall).toBeTruthy();
       const collectionAssetsStatusUrlRaw = typeof collectionAssetsStatusUpstreamCall?.[0] === "string"
@@ -452,7 +762,7 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
-          && url.includes("collection_pointer=eq.Collection11111111111111111111111111111111");
+          && url.includes("canonical_col=eq.Collection11111111111111111111111111111111");
       });
       expect(collectionCompatUpstreamCall).toBeTruthy();
 

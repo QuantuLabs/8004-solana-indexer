@@ -1148,6 +1148,7 @@ describe('Collection And Tree Queries', () => {
   it('maps collections rows to GraphQL shape', async () => {
     const query = vi.fn().mockResolvedValue({
       rows: [{
+        collection_id: '7',
         col: 'c1:bafy-test',
         creator: 'Creator111',
         first_seen_asset: 'Asset111',
@@ -1190,6 +1191,7 @@ describe('Collection And Tree Queries', () => {
     expect(query).toHaveBeenCalledTimes(1);
     expect(rows).toEqual([
       expect.objectContaining({
+        collectionId: '7',
         collection: 'c1:bafy-test',
         creator: 'Creator111',
         firstSeenAsset: 'Asset111',
@@ -1226,7 +1228,59 @@ describe('Collection And Tree Queries', () => {
 
     expect(count).toBe('42');
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111']);
+    expect(query.mock.calls[0][1]).toEqual([['c1:bafy-test'], 'Creator111']);
+  });
+
+  it('normalizes bare CID when counting collection assets', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ count: '22' }],
+    });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const count = await queryResolvers.Query.collectionAssetCount(
+      {},
+      {
+        collection: 'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
+        creator: 'Creator111',
+      },
+      ctx
+    );
+
+    expect(count).toBe('22');
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][1]).toEqual([
+      [
+        'c1:bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
+        'bafkreihvfphhye3jom6ewfrlvy4wx7itxmkjc6bjtzrlgfnmfs7dwxc7km',
+      ],
+      'Creator111',
+    ]);
+  });
+
+  it('rejects collectionAssetCount when creator is missing', async () => {
+    const query = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.collectionAssetCount(
+        {},
+        { collection: 'c1:bafy-test' },
+        ctx
+      )
+    ).rejects.toMatchObject({
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+    expect(query).not.toHaveBeenCalled();
   });
 
   it('lists collection assets with pagination and primes dataloader', async () => {
@@ -1280,8 +1334,31 @@ describe('Collection And Tree Queries', () => {
 
     expect(rows).toHaveLength(1);
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]).toEqual(['c1:bafy-test', 'Creator111', 25, 5]);
+    expect(query.mock.calls[0][1]).toEqual([['c1:bafy-test'], 'Creator111', 25, 5]);
     expect(prime).toHaveBeenCalledWith('Asset111', expect.any(Object));
+  });
+
+  it('rejects collectionAssets when creator is missing', async () => {
+    const query = vi.fn();
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    await expect(
+      queryResolvers.Query.collectionAssets(
+        {},
+        { collection: 'c1:bafy-test', first: 10, skip: 0 },
+        ctx
+      )
+    ).rejects.toMatchObject({
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+    expect(query).not.toHaveBeenCalled();
+    expect(prime).not.toHaveBeenCalled();
   });
 
   it('loads direct children and primes dataloader', async () => {

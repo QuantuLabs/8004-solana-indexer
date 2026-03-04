@@ -243,7 +243,7 @@ type AgentRegistrationFile {
   oasfSkills: [String!]
   oasfDomains: [String!]
   hasOASF: Boolean
-  supportedTrusts: [Int!]
+  supportedTrusts: [String!]
 }
 
 type SolanaAgentExtension {
@@ -330,6 +330,7 @@ type HashChainReplayPage {
 }
 
 type Collection {
+  collectionId: BigInt
   collection: String!
   creator: String!
   firstSeenAsset: String!
@@ -426,6 +427,7 @@ type Query {
   collections(
     first: Int = 100
     skip: Int = 0
+    collectionId: BigInt
     collection: String
     creator: String
   ): [Collection!]!
@@ -443,11 +445,11 @@ type Query {
   ): [AgentTreeNode!]!
   collectionAssetCount(
     collection: String!
-    creator: String
+    creator: String!
   ): BigInt!
   collectionAssets(
     collection: String!
-    creator: String
+    creator: String!
     first: Int = 100
     skip: Int = 0
     orderBy: AgentOrderBy

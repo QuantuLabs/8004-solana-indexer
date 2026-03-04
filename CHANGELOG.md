@@ -75,7 +75,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Renamed internal deterministic registration key from `global_id` to `agent_id` across schema, migrations, Prisma, and API query/resolver mappings; API output field remains `agentid`.
-- Collection pointer naming and accounting were aligned around `collection_pointers`, with idempotent count updates and REST `/rest/v1/agents` aliases for `asset` (id) and `collection_pointer` (canonical_col).
+- Collection pointer naming and accounting were aligned around `collection_pointers`, with idempotent count updates and REST `/rest/v1/agents` aliases for `asset` (id) and `collection_pointer`.
 - Added `SOLANA_NETWORK`-driven RPC/WS defaults (`devnet`, `mainnet-beta`, `testnet`, `localnet`) plus startup warning when mainnet uses the default devnet `PROGRAM_ID`.
 
 ### Added

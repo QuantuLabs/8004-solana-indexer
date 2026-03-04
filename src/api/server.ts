@@ -43,6 +43,7 @@ const REPLAY_RATE_LIMIT_WINDOW_MS = 30 * 1000; // 30 seconds
 const REPLAY_RATE_LIMIT_MAX_REQUESTS = 1; // 1 request per 30s per IP
 const REPLAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minute cache for replay results
 const REPLAY_CACHE_MAX_SIZE = 50;
+const CIDV1_BASE32_REGEX = /^b[a-z2-7]{20,}$/;
 
 export interface ApiServerOptions {
   prisma?: PrismaClient | null;
@@ -198,6 +199,26 @@ function parsePostgRESTIn(value: unknown): string[] | undefined {
   return inner.split(',').map(v => v.trim());
 }
 
+function collectionPointerVariants(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('c1:')) {
+    const bare = trimmed.slice(3);
+    if (!bare || !CIDV1_BASE32_REGEX.test(bare)) return [trimmed];
+    return [trimmed, bare];
+  }
+  if (!CIDV1_BASE32_REGEX.test(trimmed)) return [trimmed];
+  return [`c1:${trimmed}`, trimmed];
+}
+
+function formatCanonicalCollectionFilter(raw: string): string {
+  const variants = [...new Set(collectionPointerVariants(raw))];
+  if (variants.length <= 1) {
+    return `eq.${variants[0] ?? raw}`;
+  }
+  return `in.(${variants.join(',')})`;
+}
+
 function parsePostgRESTBoolean(value: unknown): boolean | undefined {
   const parsed = parsePostgRESTValue(value);
   if (parsed === undefined) return undefined;
@@ -341,6 +362,7 @@ function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
 
 function mapCollectionToApi(collection: PrismaCollection): Record<string, unknown> {
   return {
+    collection_id: collection.collectionId != null ? collection.collectionId.toString() : null,
     collection: collection.col,
     creator: collection.creator,
     first_seen_asset: collection.firstSeenAsset,
@@ -473,6 +495,7 @@ const REST_PROXY_PATH_ALLOWLIST = [
 ] as const;
 
 const REST_PROXY_LOCAL_COMPAT_PATHS = [
+  '/collections',
   '/collection_asset_count',
   '/collection_assets',
 ] as const;
@@ -500,6 +523,45 @@ function hasUnsafeRestProxyPath(pathname: string): boolean {
     lowered.includes("%2f") ||
     lowered.includes("%5c")
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeAgentsProxyPayload(payload: Uint8Array, contentType: string | null): Uint8Array {
+  if (!contentType || !contentType.toLowerCase().includes('application/json')) {
+    return payload;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(payload).toString('utf8'));
+    let changed = false;
+
+    const normalizeRow = (row: Record<string, unknown>): void => {
+      if (!Object.prototype.hasOwnProperty.call(row, 'canonical_col')) return;
+      if (!Object.prototype.hasOwnProperty.call(row, 'collection_pointer')) {
+        row.collection_pointer = row.canonical_col ?? null;
+        changed = true;
+      }
+    };
+
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (isRecord(item)) normalizeRow(item);
+      }
+      return changed ? Buffer.from(JSON.stringify(parsed)) : payload;
+    }
+
+    if (isRecord(parsed)) {
+      normalizeRow(parsed);
+      return changed ? Buffer.from(JSON.stringify(parsed)) : payload;
+    }
+
+    return payload;
+  } catch {
+    return payload;
+  }
 }
 
 function buildSupabaseProxyHeaders(req: Request): Headers {
@@ -637,12 +699,32 @@ export function createApiServer(options: ApiServerOptions): Express {
         const upstreamRawPath = req.url.startsWith('/') ? req.url : `/${req.url}`;
         const [upstreamRawPathname, upstreamRawQuery = ''] = upstreamRawPath.split('?', 2);
 
-        const upstreamPathname = upstreamRawPathname === '/stats' ? '/global_stats' : upstreamRawPathname;
+        const upstreamPathname = upstreamRawPathname === '/stats'
+          ? '/global_stats'
+          : upstreamRawPathname === '/responses'
+            ? '/feedback_responses'
+            : upstreamRawPathname === '/agents/'
+              ? '/agents'
+            : upstreamRawPathname;
         let upstreamQuery = upstreamRawQuery;
         if (upstreamPathname === '/agents') {
           const params = new URLSearchParams(upstreamRawQuery);
+          const collectionPointer = params.get('collection_pointer');
+          const canonicalCol = params.get('canonical_col');
+          const resolvedCollectionPointer = (canonicalCol && canonicalCol.trim().length > 0)
+            ? canonicalCol
+            : collectionPointer;
+          if (resolvedCollectionPointer && resolvedCollectionPointer.trim().length > 0) {
+            // Backward-compatible input alias: canonical_col -> collection_pointer.
+            params.set('canonical_col', resolvedCollectionPointer);
+          } else {
+            params.delete('canonical_col');
+          }
+          params.delete('collection_pointer');
           if (!params.has('status') && params.get('includeOrphaned') !== 'true') {
             params.append('status', 'neq.ORPHANED');
+            upstreamQuery = params.toString();
+          } else {
             upstreamQuery = params.toString();
           }
         } else if (REST_PROXY_STATUS_DEFAULT_PATHS.has(upstreamPathname)) {
@@ -656,12 +738,26 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
 
         const upstreamPath = upstreamQuery ? `${upstreamPathname}?${upstreamQuery}` : upstreamPathname;
+        const method = req.method.toUpperCase();
+        const isVerificationStatsPath =
+          upstreamPathname === '/stats/verification' || upstreamPathname === '/stats/verification/';
+        if (isVerificationStatsPath) {
+          if (method === 'OPTIONS') {
+            res.status(204).end();
+            return;
+          }
+          if (method !== 'GET' && method !== 'HEAD') {
+            res.status(405).json({ error: 'REST proxy is read-only. Mutating methods are disabled.' });
+            return;
+          }
+          next();
+          return;
+        }
         if (isLocalRestCompatPath(upstreamPathname)) {
           next();
           return;
         }
 
-        const method = req.method.toUpperCase();
         if (method === 'OPTIONS') {
           res.status(204).end();
           return;
@@ -712,7 +808,10 @@ export function createApiServer(options: ApiServerOptions): Express {
           }
         }
 
-        const payload = Buffer.from(await upstreamRes.arrayBuffer());
+        let payload: Uint8Array = Buffer.from(await upstreamRes.arrayBuffer());
+        if (upstreamPathname === '/agents') {
+          payload = normalizeAgentsProxyPayload(payload, upstreamRes.headers.get('content-type'));
+        }
         res.status(upstreamRes.status).send(payload);
       } catch (error) {
         logger.error({ error }, 'Supabase REST proxy request failed');
@@ -1457,13 +1556,177 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/collections - Canonical collections (creator + collection pointer key)
   app.get('/rest/v1/collections', async (req: Request, res: Response) => {
     try {
+      const collectionIdFilter = parsePostgRESTBigIntFilter(req.query.collection_id);
       const col = parsePostgRESTValue(req.query.collection);
       const creator = parsePostgRESTValue(req.query.creator);
       const firstSeenAsset = parsePostgRESTValue(req.query.first_seen_asset);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
+      if (collectionIdFilter === null) {
+        res.status(400).json({ error: 'Invalid collection_id filter: use eq/gt/gte/lt/lte with a valid integer' });
+        return;
+      }
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Collections endpoint unavailable without database backend' });
+          return;
+        }
+
+        type CollectionSqlRow = {
+          collection_id: string | null;
+          col: string;
+          creator: string;
+          first_seen_asset: string;
+          first_seen_at: Date | string;
+          first_seen_slot: string;
+          first_seen_tx_signature: string | null;
+          last_seen_at: Date | string;
+          last_seen_slot: string;
+          last_seen_tx_signature: string | null;
+          asset_count: string;
+          version: string | null;
+          name: string | null;
+          symbol: string | null;
+          description: string | null;
+          image: string | null;
+          banner_image: string | null;
+          social_website: string | null;
+          social_x: string | null;
+          social_discord: string | null;
+          metadata_status: string | null;
+          metadata_hash: string | null;
+          metadata_bytes: number | null;
+          metadata_updated_at: Date | string | null;
+        };
+
+        const filterSql: string[] = [];
+        const filterParams: unknown[] = [];
+        let paramIdx = 1;
+
+        if (collectionIdFilter !== undefined) {
+          if (typeof collectionIdFilter === 'bigint') {
+            filterSql.push(`collection_id = $${paramIdx}::bigint`);
+            filterParams.push(collectionIdFilter.toString());
+            paramIdx++;
+          } else {
+            if (collectionIdFilter.gt !== undefined) {
+              filterSql.push(`collection_id > $${paramIdx}::bigint`);
+              filterParams.push(collectionIdFilter.gt.toString());
+              paramIdx++;
+            }
+            if (collectionIdFilter.gte !== undefined) {
+              filterSql.push(`collection_id >= $${paramIdx}::bigint`);
+              filterParams.push(collectionIdFilter.gte.toString());
+              paramIdx++;
+            }
+            if (collectionIdFilter.lt !== undefined) {
+              filterSql.push(`collection_id < $${paramIdx}::bigint`);
+              filterParams.push(collectionIdFilter.lt.toString());
+              paramIdx++;
+            }
+            if (collectionIdFilter.lte !== undefined) {
+              filterSql.push(`collection_id <= $${paramIdx}::bigint`);
+              filterParams.push(collectionIdFilter.lte.toString());
+              paramIdx++;
+            }
+          }
+        }
+        if (col) {
+          filterSql.push(`col = $${paramIdx}::text`);
+          filterParams.push(col);
+          paramIdx++;
+        }
+        if (creator) {
+          filterSql.push(`creator = $${paramIdx}::text`);
+          filterParams.push(creator);
+          paramIdx++;
+        }
+        if (firstSeenAsset) {
+          filterSql.push(`first_seen_asset = $${paramIdx}::text`);
+          filterParams.push(firstSeenAsset);
+          paramIdx++;
+        }
+
+        const whereSql = filterSql.length > 0 ? `WHERE ${filterSql.join(' AND ')}` : '';
+        const needsCount = wantsCount(req);
+        const rowsSql = `SELECT
+                            collection_id::text,
+                            col,
+                            creator,
+                            first_seen_asset,
+                            first_seen_at,
+                            first_seen_slot::text,
+                            first_seen_tx_signature,
+                            last_seen_at,
+                            last_seen_slot::text,
+                            last_seen_tx_signature,
+                            asset_count::text,
+                            version,
+                            name,
+                            symbol,
+                            description,
+                            image,
+                            banner_image,
+                            social_website,
+                            social_x,
+                            social_discord,
+                            metadata_status,
+                            metadata_hash,
+                            metadata_bytes,
+                            metadata_updated_at
+                         FROM collection_pointers
+                         ${whereSql}
+                         ORDER BY first_seen_at DESC, col ASC, creator ASC
+                         LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
+
+        const [rowsResult, countResult] = await Promise.all([
+          options.pool.query<CollectionSqlRow>(rowsSql, [...filterParams, limit, offset]),
+          needsCount
+            ? options.pool.query<{ total: string }>(
+              `SELECT COUNT(*)::text AS total FROM collection_pointers ${whereSql}`,
+              filterParams
+            )
+            : Promise.resolve({ rows: [{ total: '0' }] } as { rows: { total: string }[] }),
+        ]);
+
+        if (needsCount) {
+          const totalCount = Number(countResult.rows[0]?.total ?? '0');
+          setContentRange(res, offset, rowsResult.rows.length, Number.isFinite(totalCount) ? totalCount : 0);
+        }
+
+        res.json(rowsResult.rows.map((row) => ({
+          collection_id: row.collection_id,
+          collection: row.col,
+          creator: row.creator,
+          first_seen_asset: row.first_seen_asset,
+          first_seen_at: new Date(row.first_seen_at).toISOString(),
+          first_seen_slot: row.first_seen_slot,
+          first_seen_tx_signature: row.first_seen_tx_signature,
+          last_seen_at: new Date(row.last_seen_at).toISOString(),
+          last_seen_slot: row.last_seen_slot,
+          last_seen_tx_signature: row.last_seen_tx_signature,
+          asset_count: row.asset_count,
+          version: row.version,
+          name: row.name,
+          symbol: row.symbol,
+          description: row.description,
+          image: row.image,
+          banner_image: row.banner_image,
+          social_website: row.social_website,
+          social_x: row.social_x,
+          social_discord: row.social_discord,
+          metadata_status: row.metadata_status,
+          metadata_hash: row.metadata_hash,
+          metadata_bytes: row.metadata_bytes,
+          metadata_updated_at: row.metadata_updated_at ? new Date(row.metadata_updated_at).toISOString() : null,
+        })));
+        return;
+      }
+
       const where: Prisma.CollectionWhereInput = {};
+      if (collectionIdFilter !== undefined) where.collectionId = collectionIdFilter;
       if (col) where.col = col;
       if (creator) where.creator = creator;
       if (firstSeenAsset) where.firstSeenAsset = firstSeenAsset;
@@ -1502,7 +1765,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Missing required query param: collection' });
         return;
       }
-      const creator = parsePostgRESTValue(req.query.creator);
+      const creator = parsePostgRESTValue(req.query.creator)?.trim();
+      if (!creator) {
+        res.status(400).json({ error: 'Missing required query param: creator (scope is creator+collection)' });
+        return;
+      }
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -1519,8 +1786,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         const params = new URLSearchParams();
         params.set('select', 'asset');
         params.set('limit', '1');
-        params.set('collection_pointer', `eq.${col}`);
-        if (creator) params.set('creator', `eq.${creator}`);
+        params.set('canonical_col', formatCanonicalCollectionFilter(col));
+        params.set('creator', `eq.${creator}`);
 
         const status = parsePostgRESTComparison(req.query.status);
         const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
@@ -1560,19 +1827,25 @@ export function createApiServer(options: ApiServerOptions): Express {
 
         res.json({
           collection: col,
-          creator: creator || null,
+          creator,
           asset_count: count,
         });
         return;
       }
 
-      const where: Prisma.AgentWhereInput = { ...statusFilter, collectionPointer: col };
+      const where: Prisma.AgentWhereInput = { ...statusFilter };
+      const pointerVariants = collectionPointerVariants(col);
+      if (pointerVariants.length <= 1) {
+        where.collectionPointer = pointerVariants[0] ?? col;
+      } else {
+        where.OR = pointerVariants.map((pointer) => ({ collectionPointer: pointer }));
+      }
       if (creator) where.creator = creator;
 
       const count = await prisma.agent.count({ where });
       res.json({
         collection: col,
-        creator: creator || null,
+        creator,
         asset_count: count,
       });
     } catch (error) {
@@ -1589,7 +1862,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Missing required query param: collection' });
         return;
       }
-      const creator = parsePostgRESTValue(req.query.creator);
+      const creator = parsePostgRESTValue(req.query.creator)?.trim();
+      if (!creator) {
+        res.status(400).json({ error: 'Missing required query param: creator (scope is creator+collection)' });
+        return;
+      }
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
 
@@ -1606,11 +1883,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
 
         const params = new URLSearchParams();
-        params.set('collection_pointer', `eq.${col}`);
-        if (creator) params.set('creator', `eq.${creator}`);
+        params.set('canonical_col', formatCanonicalCollectionFilter(col));
+        params.set('creator', `eq.${creator}`);
         params.set('limit', String(limit));
         params.set('offset', String(offset));
-        params.set('order', safeQueryString(req.query.order) || 'created_at.desc,id.desc');
+        params.set('order', safeQueryString(req.query.order) || 'created_at.desc,asset.desc');
 
         const status = parsePostgRESTComparison(req.query.status);
         const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
@@ -1634,7 +1911,13 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
 
-      const where: Prisma.AgentWhereInput = { ...statusFilter, collectionPointer: col };
+      const where: Prisma.AgentWhereInput = { ...statusFilter };
+      const pointerVariants = collectionPointerVariants(col);
+      if (pointerVariants.length <= 1) {
+        where.collectionPointer = pointerVariants[0] ?? col;
+      } else {
+        where.OR = pointerVariants.map((pointer) => ({ collectionPointer: pointer }));
+      }
       if (creator) where.creator = creator;
 
       const needsCount = wantsCount(req);
@@ -1850,14 +2133,6 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/stats/verification - Verification status stats
   app.get('/rest/v1/stats/verification', async (_req: Request, res: Response) => {
     try {
-      const [agents, feedbacks, registries, metadata, responses] = await Promise.all([
-        prisma.agent.groupBy({ by: ['status'], _count: true }),
-        prisma.feedback.groupBy({ by: ['status'], _count: true }),
-        prisma.registry.groupBy({ by: ['status'], _count: true }),
-        prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
-        prisma.feedbackResponse.groupBy({ by: ['status'], _count: true }),
-      ]);
-
       const toStatusMap = (groups: { _count: number; status?: string; chainStatus?: string }[]) => {
         const result: Record<string, number> = { PENDING: 0, FINALIZED: 0, ORPHANED: 0 };
         for (const g of groups) {
@@ -1866,6 +2141,65 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
         return result;
       };
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Verification stats unavailable without database backend' });
+          return;
+        }
+
+        type VerificationStatRow = {
+          model: string;
+          pending_count: string | number | null;
+          finalized_count: string | number | null;
+          orphaned_count: string | number | null;
+        };
+        const grouped = await options.pool.query<VerificationStatRow>(
+          `SELECT model, pending_count, finalized_count, orphaned_count FROM verification_stats`
+        );
+
+        const parseCount = (value: string | number | null | undefined): number => {
+          if (value === null || value === undefined) return 0;
+          if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : 0;
+        };
+
+        const statusMaps: Record<string, Record<string, number>> = {
+          agents: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          feedbacks: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          feedback_responses: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        };
+
+        for (const row of grouped.rows) {
+          const key = row.model === 'collections' ? 'registries' : row.model;
+          if (!statusMaps[key]) continue;
+          statusMaps[key] = {
+            PENDING: parseCount(row.pending_count),
+            FINALIZED: parseCount(row.finalized_count),
+            ORPHANED: parseCount(row.orphaned_count),
+          };
+        }
+
+        res.json({
+          agents: statusMaps.agents,
+          feedbacks: statusMaps.feedbacks,
+          registries: statusMaps.registries,
+          metadata: statusMaps.metadata,
+          feedback_responses: statusMaps.feedback_responses,
+        });
+        return;
+      }
+
+      const [agents, feedbacks, registries, metadata, responses] = await Promise.all([
+        prisma.agent.groupBy({ by: ['status'], _count: true }),
+        prisma.feedback.groupBy({ by: ['status'], _count: true }),
+        prisma.registry.groupBy({ by: ['status'], _count: true }),
+        prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
+        prisma.feedbackResponse.groupBy({ by: ['status'], _count: true }),
+      ]);
 
       res.json({
         agents: toStatusMap(agents),
