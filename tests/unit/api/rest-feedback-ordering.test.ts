@@ -386,7 +386,7 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -417,7 +417,7 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -447,7 +447,7 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -457,6 +457,40 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it.each([
+    ["revoke_count.desc", "revokeCount", "desc"],
+    ["revocation_id.desc", "revocationId", "desc"],
+    ["block_slot.asc", "slot", "asc"],
+    ["block_slot.desc", "slot", "desc"],
+    [undefined, "createdAt", "desc"],
+  ])(
+    "keeps revocation ordering deterministic with txSignature nulls-last for order=%s",
+    async (order, primaryField, primaryDir) => {
+      const prisma = {
+        revocation: {
+          findMany: vi.fn().mockResolvedValue([]),
+          count: vi.fn().mockResolvedValue(0),
+        },
+      };
+
+      const { server, baseUrl } = await startServer(prisma);
+      try {
+        const orderParam = order ? `&order=${order}` : "";
+        const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1${orderParam}`);
+        expect(res.status).toBe(200);
+
+        const callArgs = prisma.revocation.findMany.mock.calls[0]?.[0];
+        expect(callArgs).toBeDefined();
+        expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
+        expect(callArgs.orderBy).toContainEqual({ txSignature: { sort: "asc", nulls: "last" } });
+        expect(callArgs.orderBy).toContainEqual({ txIndex: "asc" });
+        expect(callArgs.orderBy).toContainEqual({ eventOrdinal: "asc" });
+      } finally {
+        await stopServer(server);
+      }
+    }
+  );
 
   it("applies quoted revoke_count PostgREST IN filters on revocations endpoint", async () => {
     const prisma = {
@@ -482,7 +516,7 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -1056,7 +1090,7 @@ describe("REST feedback deterministic ordering", () => {
           orderBy: [
             { responseCount: "desc" },
             { responder: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { slot: "asc" },
           ],
         })
@@ -1113,7 +1147,7 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -1150,7 +1184,7 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -1160,6 +1194,45 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it.each([
+    ["response_count.asc", "responseCount", "asc"],
+    ["response_count.desc", "responseCount", "desc"],
+    ["response_id.desc", "responseId", "desc"],
+    ["block_slot.asc", "slot", "asc"],
+    [undefined, "createdAt", "desc"],
+  ])(
+    "keeps canonical response ordering deterministic with txSignature nulls-last for order=%s",
+    async (order, primaryField, primaryDir) => {
+      const prisma = {
+        feedback: {
+          findFirst: vi.fn().mockResolvedValue({ id: "fb-1" }),
+        },
+        feedbackResponse: {
+          findMany: vi.fn().mockResolvedValue([]),
+          count: vi.fn().mockResolvedValue(0),
+        },
+      };
+
+      const { server, baseUrl } = await startServer(prisma);
+      try {
+        const orderParam = order ? `&order=${order}` : "";
+        const res = await fetch(
+          `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0${orderParam}`
+        );
+        expect(res.status).toBe(200);
+
+        const callArgs = prisma.feedbackResponse.findMany.mock.calls[0]?.[0];
+        expect(callArgs).toBeDefined();
+        expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
+        expect(callArgs.orderBy).toContainEqual({ txSignature: { sort: "asc", nulls: "last" } });
+        expect(callArgs.orderBy).toContainEqual({ txIndex: "asc" });
+        expect(callArgs.orderBy).toContainEqual({ eventOrdinal: "asc" });
+      } finally {
+        await stopServer(server);
+      }
+    }
+  );
 
   it("supports response_id ordering without canonical feedback scope using deterministic tie-breakers", async () => {
     const prisma = {
@@ -1181,7 +1254,7 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
@@ -1244,6 +1317,46 @@ describe("REST feedback deterministic ordering", () => {
       await stopServer(server);
     }
   });
+
+  it.each([
+    ["response_count.asc", "responseCount", "asc"],
+    ["block_slot.asc", "slot", "asc"],
+    ["block_slot.desc", "slot", "desc"],
+    [undefined, "createdAt", "desc"],
+  ])(
+    "keeps orphan response ordering deterministic with txSignature nulls-last for order=%s",
+    async (order, primaryField, primaryDir) => {
+      const prisma = {
+        feedback: {
+          findFirst: vi.fn().mockResolvedValue(null),
+        },
+        orphanResponse: {
+          findMany: vi.fn().mockResolvedValue([]),
+        },
+        feedbackResponse: {
+          findMany: vi.fn(),
+          count: vi.fn(),
+        },
+      };
+
+      const { server, baseUrl } = await startServer(prisma);
+      try {
+        const orderParam = order ? `&order=${order}` : "";
+        const res = await fetch(
+          `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0${orderParam}`
+        );
+        expect(res.status).toBe(200);
+        expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+
+        const callArgs = prisma.orphanResponse.findMany.mock.calls[0]?.[0];
+        expect(callArgs).toBeDefined();
+        expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
+        expect(callArgs.orderBy).toContainEqual({ txSignature: { sort: "asc", nulls: "last" } });
+      } finally {
+        await stopServer(server);
+      }
+    }
+  );
 
   it("treats empty status comparison as no status filter for orphan responses", async () => {
     const prisma = {

@@ -1667,32 +1667,32 @@ export function createApiServer(options: ApiServerOptions): Express {
                   ? [
                       { responseCount: 'asc' as const },
                       { responder: 'asc' as const },
-                      { txSignature: 'asc' as const },
+                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       { slot: 'asc' as const },
                     ]
                 : order === 'response_count.desc'
                   ? [
                       { responseCount: 'desc' as const },
                       { responder: 'asc' as const },
-                      { txSignature: 'asc' as const },
+                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       { slot: 'asc' as const },
                     ]
                 : order === 'block_slot.asc'
                   ? [
                       { slot: 'asc' as const },
                       { responder: 'asc' as const },
-                      { txSignature: 'asc' as const },
+                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                     ]
                   : order === 'block_slot.desc'
                     ? [
                         { slot: 'desc' as const },
                         { responder: 'asc' as const },
-                        { txSignature: 'asc' as const },
+                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       ]
                     : [
                         { createdAt: 'desc' as const },
                         { responder: 'asc' as const },
-                        { txSignature: 'asc' as const },
+                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                         { slot: 'asc' as const },
                       ];
 
@@ -1743,18 +1743,18 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const orderBy: Prisma.FeedbackResponseOrderByWithRelationInput[] =
         order === 'response_count.asc'
-          ? [{ responseCount: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+          ? [{ responseCount: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
           : order === 'response_count.desc'
-            ? [{ responseCount: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            ? [{ responseCount: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
             : order === 'response_id.asc'
-              ? [{ responseId: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              ? [{ responseId: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
               : order === 'response_id.desc'
-                ? [{ responseId: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                ? [{ responseId: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
                 : order === 'block_slot.asc'
-                  ? [{ slot: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  ? [{ slot: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
                   : order === 'block_slot.desc'
-                    ? [{ slot: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
-                    : [{ createdAt: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
+                    ? [{ slot: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                    : [{ createdAt: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
 
       const needsCount = wantsCount(req);
       const [responses, totalCount] = await Promise.all([
@@ -1921,18 +1921,18 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const orderBy: Prisma.RevocationOrderByWithRelationInput[] =
         order === 'revoke_count.asc'
-          ? [{ revokeCount: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+          ? [{ revokeCount: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
           : order === 'revoke_count.desc'
-            ? [{ revokeCount: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            ? [{ revokeCount: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
             : order === 'revocation_id.asc'
-              ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
               : order === 'revocation_id.desc'
-                ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
                 : order === 'block_slot.asc'
-                  ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
                   : order === 'block_slot.desc'
-                    ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
-            : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
+                    ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
 
       const needsCount = wantsCount(req);
       const [revocations, totalCount] = await Promise.all([
