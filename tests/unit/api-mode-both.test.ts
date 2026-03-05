@@ -780,7 +780,7 @@ describe("API_MODE=both behavior", () => {
           : includeOrphanedUpstreamCall?.[0]?.url;
       expect(typeof includeOrphanedUrlRaw).toBe("string");
       const includeOrphanedUrl = new URL(includeOrphanedUrlRaw as string);
-      expect(includeOrphanedUrl.searchParams.get("includeOrphaned")).toBe("true");
+      expect(includeOrphanedUrl.searchParams.get("includeOrphaned")).toBeNull();
       expect(includeOrphanedUrl.searchParams.get("status")).toBeNull();
 
       const collectionPointerCallStart = fetchSpy.mock.calls.length;

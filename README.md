@@ -20,7 +20,7 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
 If you are upgrading from `v1.7.7`, read:
 
 - [docs/transition-from-v1.7.7.md](docs/transition-from-v1.7.7.md)
-- Collection scope is `creator + collection_pointer` (`canonical_col` alias still accepted on `/rest/v1/agents`).
+- Canonical collection identity is `creator + collection_pointer` (collection endpoints enforce this scope).
 - Migration path for this transition is database migrations + restart only; no chain replay/reindex is required for already indexed data.
 
 ## Quick Start
@@ -51,6 +51,7 @@ http://localhost:3001/v2/graphql
 `supabase/schema.sql` is destructive and intended for fresh initialization only.
 
 - `scripts/init-supabase.js` drops and recreates indexer tables when applied to an existing database.
+- `scripts/migrate-supabase.js` and `scripts/run-supabase-migration.js` are legacy helpers and are intentionally disabled.
 - Upgrades must use `supabase/migrations/*.sql` (in order), not `schema.sql`.
 - When existing indexer tables are detected, init requires explicit `RESET` confirmation in an interactive TTY, or `FORCE_SCHEMA_RESET=1` for non-interactive forced resets.
 
@@ -117,6 +118,7 @@ Notes:
 - `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`; set startup signature/slot for first sync.
 - IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/default runtime) and `agent_registry_8004.mainnet.json` (mainnet reference copy).
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
+- `TRUST_PROXY` defaults to `false`; set it explicitly (for example `1`) only when running behind a trusted reverse proxy.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
 - `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
 - Optional startup cursor bootstrap: `INDEXER_START_SIGNATURE` (and optional `INDEXER_START_SLOT`) is applied only when no persisted `indexer_state` exists.
@@ -127,7 +129,7 @@ Notes:
 - `IPFS_GATEWAY_BASE` sets the gateway base used for `ipfs://` URI digest fetches and canonical collection pointer (`c1:<cid>`) fetches (default `https://ipfs.io`).
 - `URI_DIGEST_TRUSTED_HOSTS` is optional and only accepts `localhost`/`127.0.0.1` to allow local IPFS gateway tests without disabling SSRF protections globally.
 - Validation module is archived on-chain in v0.5.0+; validation indexing is opt-in via `INDEX_VALIDATIONS=true` (default `false` outside tests).
-- Validation entity endpoints are removed from the public API surface: REST exposes no `/rest/v1/validations` route and GraphQL exposes no `validation`/`validations` query fields.
+- Validation entity endpoints are removed from the public API surface: REST `/rest/v1/validations` is retired and returns `410 Gone`, and GraphQL exposes no `validation`/`validations` query fields.
 
 ## Commands
 

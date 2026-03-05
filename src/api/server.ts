@@ -826,7 +826,7 @@ export function createApiServer(options: ApiServerOptions): Express {
   const app = express();
 
   const trustProxyRaw = process.env.TRUST_PROXY;
-  let trustProxy: string | number | boolean = 1;
+  let trustProxy: string | number | boolean = false;
   if (trustProxyRaw !== undefined) {
     if (trustProxyRaw === 'true') trustProxy = true;
     else if (trustProxyRaw === 'false') trustProxy = false;
@@ -940,7 +940,9 @@ export function createApiServer(options: ApiServerOptions): Express {
             params.delete('canonical_col');
           }
           params.delete('collection_pointer');
-          if (!params.has('status') && params.get('includeOrphaned') !== 'true') {
+          const includeOrphaned = params.get('includeOrphaned') === 'true';
+          params.delete('includeOrphaned');
+          if (!params.has('status') && !includeOrphaned) {
             params.append('status', 'neq.ORPHANED');
             upstreamQuery = params.toString();
           } else {
@@ -948,9 +950,9 @@ export function createApiServer(options: ApiServerOptions): Express {
           }
         } else if (REST_PROXY_STATUS_DEFAULT_PATHS.has(upstreamPathname)) {
           const params = new URLSearchParams(upstreamRawQuery);
-          if (params.get('includeOrphaned') === 'true') {
-            params.delete('includeOrphaned');
-          } else if (!params.has('status')) {
+          const includeOrphaned = params.get('includeOrphaned') === 'true';
+          params.delete('includeOrphaned');
+          if (!includeOrphaned && !params.has('status')) {
             params.append('status', 'neq.ORPHANED');
           }
           upstreamQuery = params.toString();
@@ -1313,7 +1315,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
       const feedbackIndexNotInState = parsePostgRESTListOperator(req.query.feedback_index, 'not.in');
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
-      const is_revoked = parsePostgRESTValue(req.query.is_revoked);
+      const isRevokedComparison = parsePostgRESTComparison(req.query.is_revoked);
       const tag1 = parsePostgRESTValue(req.query.tag1);
       const tag2 = parsePostgRESTValue(req.query.tag2);
       const endpoint = parsePostgRESTValue(req.query.endpoint);
@@ -1385,7 +1387,17 @@ export function createApiServer(options: ApiServerOptions): Express {
       } else if (feedbackIndexFilter !== undefined) {
         where.feedbackIndex = feedbackIndexFilter;
       }
-      if (is_revoked !== undefined) where.revoked = is_revoked === 'true';
+      if (isRevokedComparison) {
+        const revokedValue = isRevokedComparison.value.toLowerCase();
+        if (revokedValue !== 'true' && revokedValue !== 'false') {
+          res.status(400).json({ error: 'Invalid is_revoked: allowed values are true or false' });
+          return;
+        }
+        const revokedBool = revokedValue === 'true';
+        where.revoked = isRevokedComparison.op === 'neq'
+          ? { not: revokedBool }
+          : revokedBool;
+      }
       if (tag1) where.tag1 = tag1;
       if (tag2) where.tag2 = tag2;
       if (endpoint) where.endpoint = endpoint;

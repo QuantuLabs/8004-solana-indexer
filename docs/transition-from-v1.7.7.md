@@ -8,12 +8,12 @@ This guide covers integrator-facing changes introduced after `v1.7.7`.
 - Input compatibility:
   - `canonical_col` is still accepted (deprecated alias).
   - `collection_pointer` is accepted and mapped internally.
-  - If both are provided, `canonical_col` is used first (v1.7.7-compatible precedence).
+  - If both are provided, non-empty `canonical_col` is used first (v1.7.7-compatible precedence); empty `canonical_col` falls back to `collection_pointer`.
 - Output compatibility (proxy mode):
   - `canonical_col` is preserved.
   - `collection_pointer` is added when available.
 
-No client break is expected for existing consumers of `canonical_col`.
+No client break is expected for existing consumers of `canonical_col` in proxy mode.
 
 ### `/rest/v1/collections`
 - Added `collection_id` in response payload.
@@ -34,6 +34,16 @@ If you relied on arbitrary PostgREST `select/order` on proxied `/collections`, v
   - `created_at.desc,asset.desc`
 
 If your pagination logic depends on previous implicit ordering, send an explicit `order=` query param.
+
+### `/rest/v1/responses` and `/rest/v1/feedback_responses`
+- `response_id` filtering requires canonical feedback scope:
+  - `asset + feedback_id`, or
+  - `asset + client_address + feedback_index`.
+- Requests using `response_id` outside these scopes return `400`.
+
+### `tx_signature` filters (REST v1)
+- Supported operators are `eq`, `neq`, `in`, `not.in`.
+- Malformed or empty values return `400` (for example `eq.`, `in.()`, `in.(sig,)`, unmatched quotes).
 
 ## Migration path (no reindex)
 

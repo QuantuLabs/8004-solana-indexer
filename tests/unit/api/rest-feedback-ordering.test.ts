@@ -316,6 +316,76 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("applies is_revoked eq filter on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?is_revoked=eq.true`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            revoked: true,
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies is_revoked neq filter on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?is_revoked=neq.true`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            revoked: { not: true },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects invalid is_revoked value on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?is_revoked=neq.invalid`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid is_revoked");
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("applies tx_signature filters on feedbacks endpoint", async () => {
     const prisma = {
       feedback: {
