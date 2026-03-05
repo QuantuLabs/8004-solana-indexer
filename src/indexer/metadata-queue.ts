@@ -10,7 +10,7 @@
 import PQueue from "p-queue";
 import { createHash } from "crypto";
 import { Pool } from "pg";
-import { digestUri, serializeValue } from "./uriDigest.js";
+import { digestUri, serializeValue, toDeterministicUriStatus } from "./uriDigest.js";
 import { compressForStorage } from "../utils/compression.js";
 import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
@@ -208,12 +208,7 @@ class MetadataQueue {
 
       if (result.status !== "ok" || !result.fields) {
         // Store error status
-        await this.storeMetadata(assetId, "_uri:_status", JSON.stringify({
-          status: result.status,
-          error: result.error,
-          bytes: result.bytes,
-          hash: result.hash,
-        }));
+        await this.storeMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
         this.setRecoveryRetry(assetId, uri, Date.now() + RECOVERY_RETRY_MS);
         logger.debug({ assetId, uri, status: result.status }, "URI digest failed");
         this.stats.processed++;
@@ -237,13 +232,7 @@ class MetadataQueue {
       }
 
       // Store success status
-      await this.storeMetadata(assetId, "_uri:_status", JSON.stringify({
-        status: "ok",
-        bytes: result.bytes,
-        hash: result.hash,
-        fieldCount: Object.keys(result.fields).length,
-        truncatedKeys: result.truncatedKeys || false,
-      }));
+      await this.storeMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
 
       // Sync nft_name from _uri:name if present
       const uriName = result.fields["_uri:name"];
@@ -444,11 +433,16 @@ class MetadataQueue {
              AND a.agent_uri != ''
              AND (
                m_source.id IS NULL
+               OR m_source.value IS NULL
                OR get_byte(m_source.value, 0) != 0
                OR convert_from(substring(m_source.value from 2), 'UTF8') != a.agent_uri
                OR m_status.id IS NULL
+               OR m_status.value IS NULL
                OR get_byte(m_status.value, 0) != 0
-               OR convert_from(substring(m_status.value from 2), 'UTF8') NOT LIKE '%"status":"ok"%'
+               OR (
+                 convert_from(substring(m_status.value from 2), 'UTF8') NOT LIKE '%"status":"ok"%'
+                 AND convert_from(substring(m_status.value from 2), 'UTF8') NOT LIKE '%"retryable":false%'
+               )
              )
            LIMIT $1`,
           [RECOVERY_BATCH_SIZE]

@@ -66,7 +66,9 @@ function createMockPrisma() {
   return {
     agent: {
       findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     validation: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -391,6 +393,137 @@ describe("DataVerifier", () => {
       await verifier.stop();
       // Some agents may have been processed, some may not
     });
+
+    it("should backfill missing agent_id after non-orphan verification", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.agent.updateMany.mockResolvedValue({ count: 1 });
+
+      mockPrisma.agent.findMany
+        .mockResolvedValueOnce([{ id: AGENT_KEY.toBase58() }])
+        .mockResolvedValueOnce([
+          {
+            id: "agent-b",
+            createdSlot: 11n,
+            createdTxSignature: "sig-b",
+            eventOrdinal: 0,
+          },
+          {
+            id: "agent-a",
+            createdSlot: 10n,
+            createdTxSignature: "sig-a",
+            eventOrdinal: 0,
+          },
+        ]);
+      mockPrisma.agent.findFirst.mockResolvedValueOnce({ agentId: 100n });
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(10) }]);
+
+      await verifier.start();
+
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: "agent-a",
+            status: { not: "ORPHANED" },
+            agentId: null,
+          }),
+          data: { agentId: 101n },
+        }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: "agent-b",
+            status: { not: "ORPHANED" },
+            agentId: null,
+          }),
+          data: { agentId: 102n },
+        }),
+      );
+      await verifier.stop();
+    });
+
+    it("orders null signatures last when backfilling agent_id", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.agent.updateMany.mockResolvedValue({ count: 1 });
+
+      mockPrisma.agent.findMany.mockResolvedValueOnce([
+        {
+          id: "agent-null-sig",
+          createdSlot: 9n,
+          createdTxSignature: null,
+          eventOrdinal: 0,
+        },
+        {
+          id: "agent-with-sig",
+          createdSlot: 9n,
+          createdTxSignature: "sig-a",
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.agent.findFirst.mockResolvedValueOnce({ agentId: 7n });
+
+      await (verifier as any).backfillAgentIds(["agent-null-sig", "agent-with-sig"]);
+
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: "agent-with-sig",
+            status: { not: "ORPHANED" },
+            agentId: null,
+          }),
+          data: { agentId: 8n },
+        }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: "agent-null-sig",
+            status: { not: "ORPHANED" },
+            agentId: null,
+          }),
+          data: { agentId: 9n },
+        }),
+      );
+    });
+
+    it("retries agent_id assignment on prisma unique constraint conflict", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.agent.findMany.mockResolvedValueOnce([
+        {
+          id: "agent-retry",
+          createdSlot: 10n,
+          createdTxSignature: "sig-a",
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.agent.findFirst
+        .mockResolvedValueOnce({ agentId: 5n })
+        .mockResolvedValueOnce({ agentId: 6n });
+      mockPrisma.agent.updateMany
+        .mockRejectedValueOnce({ code: "P2002", message: "Unique constraint failed on agent_id" })
+        .mockResolvedValueOnce({ count: 1 });
+
+      await (verifier as any).backfillAgentIds(["agent-retry"]);
+
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "agent-retry" }),
+          data: { agentId: 6n },
+        }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "agent-retry" }),
+          data: { agentId: 7n },
+        }),
+      );
+    });
   });
 
   describe("verifyAgents (Pool)", () => {
@@ -428,6 +561,37 @@ describe("DataVerifier", () => {
       const stats = verifier.getStats();
       expect(stats.agentsOrphaned).toBe(1);
       await verifier.stop();
+    });
+
+    it("retries agent_id assignment on pool unique constraint conflict", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      const assigned: string[] = [];
+      let maxReads = 0;
+
+      mockPool.query.mockImplementation(async (sql: string, params?: any[]) => {
+        if (sql.includes("SELECT asset AS id") && sql.includes("FROM agents")) {
+          return { rows: [{ id: "pool-agent" }], rowCount: 1 };
+        }
+        if (sql.includes("SELECT MAX(agent_id)::text AS max_id")) {
+          maxReads += 1;
+          return { rows: [{ max_id: maxReads === 1 ? "9" : "10" }], rowCount: 1 };
+        }
+        if (sql.includes("UPDATE agents") && sql.includes("SET agent_id")) {
+          assigned.push(String(params?.[0]));
+          if (assigned.length === 1) {
+            const err = new Error("duplicate key value violates unique constraint");
+            (err as any).code = "23505";
+            throw err;
+          }
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      await (verifier as any).backfillAgentIds(["pool-agent"]);
+
+      expect(assigned).toEqual(["10", "11"]);
+      expect(maxReads).toBe(2);
     });
   });
 
@@ -1537,6 +1701,207 @@ describe("DataVerifier", () => {
       // No updates called
       expect(mockPrisma.feedback.updateMany).not.toHaveBeenCalled();
       await verifier.stop();
+    });
+
+    it("backfills missing feedback_id when feedbacks become non-orphaned (prisma path)", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedback.findMany.mockResolvedValueOnce([
+        {
+          id: "fb-1",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 10n,
+          createdTxSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 1n,
+        },
+      ]);
+      mockPrisma.feedback.findFirst.mockResolvedValueOnce({ feedbackId: 4n });
+      mockPrisma.feedback.updateMany.mockResolvedValue({ count: 1 });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-1"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedback.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "fb-1" }),
+          data: { feedbackId: 5n },
+        })
+      );
+    });
+
+    it("assigns feedback_id in canonical on-chain order, not UUID order (prisma path)", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedback.findMany.mockResolvedValueOnce([
+        {
+          id: "uuid-z",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 12n,
+          createdTxSignature: "sig-b",
+          txIndex: 1,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 2n,
+        },
+        {
+          id: "uuid-a",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 11n,
+          createdTxSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 1n,
+        },
+      ]);
+      mockPrisma.feedback.findFirst.mockResolvedValueOnce({ feedbackId: 7n });
+      mockPrisma.feedback.updateMany.mockResolvedValue({ count: 1 });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["uuid-z", "uuid-a"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedback.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "uuid-a" }),
+          data: { feedbackId: 8n },
+        })
+      );
+      expect(mockPrisma.feedback.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "uuid-z" }),
+          data: { feedbackId: 9n },
+        })
+      );
+    });
+
+    it("retries feedback_id assignment on prisma unique constraint conflict", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedback.findMany.mockResolvedValueOnce([
+        {
+          id: "fb-conflict",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 10n,
+          createdTxSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 1n,
+        },
+      ]);
+      mockPrisma.feedback.findFirst
+        .mockResolvedValueOnce({ feedbackId: 9n })
+        .mockResolvedValueOnce({ feedbackId: 10n });
+      mockPrisma.feedback.updateMany
+        .mockResolvedValueOnce({ count: 1 } as any) // status update in batchUpdateStatus
+        .mockRejectedValueOnce({ code: "P2002", message: "Unique constraint failed on feedback_id" } as any)
+        .mockResolvedValueOnce({ count: 1 } as any);
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-conflict"],
+        "FINALIZED",
+        new Date()
+      );
+
+      const idAssignCalls = mockPrisma.feedback.updateMany.mock.calls.filter((call: any[]) =>
+        call[0]?.data?.feedbackId !== undefined
+      );
+      expect(idAssignCalls.length).toBe(2);
+      expect(idAssignCalls[0][0].data.feedbackId).toBe(10n);
+      expect(idAssignCalls[1][0].data.feedbackId).toBe(11n);
+    });
+
+    it("backfills missing feedback_id when feedbacks become non-orphaned (pool path)", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      const assigned: string[] = [];
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("UPDATE feedbacks SET status")) return { rows: [], rowCount: 1 };
+        if (sql.includes("SELECT id, asset") && sql.includes("FROM feedbacks")) {
+          return {
+            rows: [
+              {
+                id: "fb-2",
+                asset: AGENT_KEY.toBase58(),
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes("SELECT MAX(feedback_id)::text AS max_id")) {
+          return { rows: [{ max_id: "6" }], rowCount: 1 };
+        }
+        if (sql.includes("UPDATE feedbacks") && sql.includes("SET feedback_id")) {
+          assigned.push(params[0]);
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-2"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(assigned).toEqual(["7"]);
+    });
+
+    it("retries feedback_id assignment on pool unique constraint conflict", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      const assigned: string[] = [];
+      let updateAttempt = 0;
+
+      mockPool.query.mockImplementation(async (sql: string, params: any[]) => {
+        if (sql.includes("UPDATE feedbacks SET status")) return { rows: [], rowCount: 1 };
+        if (sql.includes("SELECT id, asset") && sql.includes("FROM feedbacks")) {
+          return {
+            rows: [{ id: "fb-3", asset: AGENT_KEY.toBase58() }],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes("SELECT MAX(feedback_id)::text AS max_id")) {
+          return { rows: [{ max_id: "6" }], rowCount: 1 };
+        }
+        if (sql.includes("UPDATE feedbacks") && sql.includes("SET feedback_id")) {
+          updateAttempt += 1;
+          if (updateAttempt === 1) {
+            const err: any = new Error("duplicate key value violates unique constraint");
+            err.code = "23505";
+            throw err;
+          }
+          assigned.push(params[0]);
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-3"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(assigned).toEqual(["7"]);
+      expect(updateAttempt).toBe(2);
     });
 
     it("backfills missing response_id when feedback responses become non-orphaned (prisma path)", async () => {

@@ -279,6 +279,7 @@ export class DataVerifier {
     const existsMap = await this.batchVerifyAccounts(pubkeys, "finalized");
 
     const now = new Date();
+    const finalizedAgentIds: string[] = [];
 
     for (const [agentPda, agent] of pdaMap) {
       if (!this.isRunning) break;
@@ -313,6 +314,7 @@ export class DataVerifier {
         }
 
         if (exists) {
+          finalizedAgentIds.push(agent.id);
           this.stats.agentsVerified++;
         } else {
           this.stats.agentsOrphaned++;
@@ -321,6 +323,10 @@ export class DataVerifier {
       } catch (error: any) {
         logger.error({ agentId: agent.id, error: error.message }, "Agent verification failed");
       }
+    }
+
+    if (finalizedAgentIds.length > 0) {
+      await this.backfillAgentIds(finalizedAgentIds);
     }
   }
 
@@ -1524,6 +1530,179 @@ export class DataVerifier {
     'id': 'id',
   };
 
+  private static readonly AGENT_ID_BACKFILL_MAX_RETRIES = 3;
+
+  private static isPrismaUniqueViolation(error: unknown): boolean {
+    const code = (error as { code?: string } | null)?.code;
+    return code === 'P2002';
+  }
+
+  private static isPgUniqueViolation(error: unknown): boolean {
+    const code = (error as { code?: string } | null)?.code;
+    return code === '23505';
+  }
+
+  private async getNextAgentIdPrisma(): Promise<bigint> {
+    if (!this.prisma) return 1n;
+    const last = await this.prisma.agent.findFirst({
+      where: { agentId: { not: null } },
+      select: { agentId: true },
+      orderBy: { agentId: 'desc' },
+    });
+    return (last?.agentId ?? 0n) + 1n;
+  }
+
+  private async getNextAgentIdPool(): Promise<bigint> {
+    if (!this.pool) return 1n;
+    const maxRes = await this.pool.query<{ max_id: string | null }>(
+      `SELECT MAX(agent_id)::text AS max_id FROM agents WHERE agent_id IS NOT NULL`
+    );
+    return (maxRes.rows[0]?.max_id ? BigInt(maxRes.rows[0].max_id) : 0n) + 1n;
+  }
+
+  private async getNextFeedbackIdPrisma(agentId: string): Promise<bigint> {
+    if (!this.prisma) return 1n;
+    const last = await this.prisma.feedback.findFirst({
+      where: {
+        agentId,
+        feedbackId: { not: null },
+      },
+      select: { feedbackId: true },
+      orderBy: { feedbackId: 'desc' },
+    });
+    return (last?.feedbackId ?? 0n) + 1n;
+  }
+
+  private async getNextFeedbackIdPool(agentId: string): Promise<bigint> {
+    if (!this.pool) return 1n;
+    const maxRes = await this.pool.query<{ max_id: string | null }>(
+      `SELECT MAX(feedback_id)::text AS max_id
+       FROM feedbacks
+       WHERE asset = $1
+         AND feedback_id IS NOT NULL`,
+      [agentId]
+    );
+    return (maxRes.rows[0]?.max_id ? BigInt(maxRes.rows[0].max_id) : 0n) + 1n;
+  }
+
+  private async backfillAgentIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+
+    if (this.prisma) {
+      const pending = await this.prisma.agent.findMany({
+        where: {
+          id: { in: ids },
+          status: { not: 'ORPHANED' },
+          agentId: null,
+        },
+        select: {
+          id: true,
+          createdSlot: true,
+          createdTxSignature: true,
+          eventOrdinal: true,
+        },
+      });
+      if (pending.length === 0) return;
+
+      pending.sort((a, b) => {
+        const aSlot = a.createdSlot ?? BigInt("9223372036854775807");
+        const bSlot = b.createdSlot ?? BigInt("9223372036854775807");
+        if (aSlot !== bSlot) return aSlot < bSlot ? -1 : 1;
+
+        const aSig = a.createdTxSignature;
+        const bSig = b.createdTxSignature;
+        if (aSig === null && bSig !== null) return 1;
+        if (aSig !== null && bSig === null) return -1;
+        if (aSig !== bSig) return (aSig ?? "").localeCompare(bSig ?? "");
+
+        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        return a.id.localeCompare(b.id);
+      });
+
+      let next = await this.getNextAgentIdPrisma();
+
+      for (const row of pending) {
+        let retries = 0;
+        while (true) {
+          const candidate = next;
+          try {
+            await this.prisma.agent.updateMany({
+              where: {
+                id: row.id,
+                status: { not: 'ORPHANED' },
+                agentId: null,
+              },
+              data: { agentId: candidate },
+            });
+            next = candidate + 1n;
+            break;
+          } catch (error) {
+            if (
+              DataVerifier.isPrismaUniqueViolation(error)
+              && retries < DataVerifier.AGENT_ID_BACKFILL_MAX_RETRIES
+            ) {
+              retries += 1;
+              next = await this.getNextAgentIdPrisma();
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
+      return;
+    }
+
+    if (this.pool) {
+      const { rows } = await this.pool.query<{ id: string }>(
+        `SELECT asset AS id
+         FROM agents
+         WHERE asset = ANY($1::text[])
+           AND status != 'ORPHANED'
+           AND agent_id IS NULL
+         ORDER BY block_slot ASC NULLS LAST,
+                  tx_signature ASC NULLS LAST,
+                  event_ordinal ASC NULLS LAST,
+                  asset ASC`,
+        [ids]
+      );
+      if (rows.length === 0) return;
+
+      let next = await this.getNextAgentIdPool();
+
+      for (const row of rows) {
+        let retries = 0;
+        while (true) {
+          const candidate = next;
+          try {
+            await this.pool.query(
+              `UPDATE agents
+               SET agent_id = $1::bigint
+               WHERE asset = $2
+                 AND status != 'ORPHANED'
+                 AND agent_id IS NULL`,
+              [candidate.toString(), row.id]
+            );
+            next = candidate + 1n;
+            break;
+          } catch (error) {
+            if (
+              DataVerifier.isPgUniqueViolation(error)
+              && retries < DataVerifier.AGENT_ID_BACKFILL_MAX_RETRIES
+            ) {
+              retries += 1;
+              next = await this.getNextAgentIdPool();
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
+    }
+  }
+
   private async batchUpdateStatus(
     table: string,
     idColumn: string,
@@ -1559,11 +1738,156 @@ export class DataVerifier {
       );
     }
 
+    if ((this.prisma || this.pool) && table === 'feedbacks' && status !== 'ORPHANED') {
+      await this.backfillFeedbackIds(ids);
+    }
     if ((this.prisma || this.pool) && table === 'revocations' && status !== 'ORPHANED') {
       await this.backfillRevocationIds(ids);
     }
     if ((this.prisma || this.pool) && table === 'feedback_responses' && status !== 'ORPHANED') {
       await this.backfillResponseIds(ids);
+    }
+  }
+
+  private async backfillFeedbackIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+
+    if (this.prisma) {
+      const pending = await this.prisma.feedback.findMany({
+        where: {
+          id: { in: ids },
+          status: { not: 'ORPHANED' },
+          feedbackId: null,
+        },
+        select: {
+          id: true,
+          agentId: true,
+          createdSlot: true,
+          createdTxSignature: true,
+          txIndex: true,
+          eventOrdinal: true,
+          client: true,
+          feedbackIndex: true,
+        },
+      });
+      if (pending.length === 0) return;
+
+      pending.sort((a, b) => {
+        if (a.agentId !== b.agentId) return a.agentId.localeCompare(b.agentId);
+
+        const aCreatedSlot = a.createdSlot ?? BigInt("9223372036854775807");
+        const bCreatedSlot = b.createdSlot ?? BigInt("9223372036854775807");
+        if (aCreatedSlot !== bCreatedSlot) return aCreatedSlot < bCreatedSlot ? -1 : 1;
+
+        const aSig = a.createdTxSignature ?? "";
+        const bSig = b.createdTxSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
+
+        const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
+        if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
+
+        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        if (a.client !== b.client) return a.client.localeCompare(b.client);
+        if (a.feedbackIndex !== b.feedbackIndex) return a.feedbackIndex < b.feedbackIndex ? -1 : 1;
+
+        return a.id.localeCompare(b.id);
+      });
+
+      const nextByAgent = new Map<string, bigint>();
+      for (const row of pending) {
+        let next = nextByAgent.get(row.agentId);
+        if (next === undefined) {
+          next = await this.getNextFeedbackIdPrisma(row.agentId);
+        }
+        let retries = 0;
+        while (true) {
+          const candidate = next;
+          try {
+            const updated = await this.prisma.feedback.updateMany({
+              where: {
+                id: row.id,
+                status: { not: 'ORPHANED' },
+                feedbackId: null,
+              },
+              data: { feedbackId: candidate },
+            });
+            if (updated.count === 0) {
+              nextByAgent.set(row.agentId, await this.getNextFeedbackIdPrisma(row.agentId));
+              break;
+            }
+            nextByAgent.set(row.agentId, candidate + 1n);
+            break;
+          } catch (error) {
+            if (
+              DataVerifier.isPrismaUniqueViolation(error)
+              && retries < DataVerifier.AGENT_ID_BACKFILL_MAX_RETRIES
+            ) {
+              retries += 1;
+              next = await this.getNextFeedbackIdPrisma(row.agentId);
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
+      return;
+    }
+
+    if (this.pool) {
+      const { rows } = await this.pool.query<{ id: string; asset: string }>(
+        `SELECT id, asset
+         FROM feedbacks
+         WHERE id = ANY($1::text[])
+           AND status != 'ORPHANED'
+           AND feedback_id IS NULL
+         ORDER BY asset ASC, block_slot ASC NULLS LAST,
+                  tx_signature ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST,
+                  client_address ASC, feedback_index ASC, id ASC`,
+        [ids]
+      );
+      if (rows.length === 0) return;
+
+      const nextByAgent = new Map<string, bigint>();
+      for (const row of rows) {
+        let next = nextByAgent.get(row.asset);
+        if (next === undefined) {
+          next = await this.getNextFeedbackIdPool(row.asset);
+        }
+        let retries = 0;
+        while (true) {
+          const candidate = next;
+          try {
+            const result = await this.pool.query(
+              `UPDATE feedbacks
+               SET feedback_id = $1::bigint
+               WHERE id = $2
+                 AND status != 'ORPHANED'
+                 AND feedback_id IS NULL`,
+              [candidate.toString(), row.id]
+            );
+            if ((result.rowCount ?? 0) === 0) {
+              nextByAgent.set(row.asset, await this.getNextFeedbackIdPool(row.asset));
+              break;
+            }
+            nextByAgent.set(row.asset, candidate + 1n);
+            break;
+          } catch (error) {
+            if (
+              DataVerifier.isPgUniqueViolation(error)
+              && retries < DataVerifier.AGENT_ID_BACKFILL_MAX_RETRIES
+            ) {
+              retries += 1;
+              next = await this.getNextFeedbackIdPool(row.asset);
+              continue;
+            }
+            throw error;
+          }
+        }
+      }
     }
   }
 

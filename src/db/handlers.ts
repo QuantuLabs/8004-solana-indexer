@@ -23,7 +23,7 @@ import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
 import { classifyRevocationStatus } from "./revocation-classification.js";
-import { digestUri, serializeValue } from "../indexer/uriDigest.js";
+import { digestUri, serializeValue, toDeterministicUriStatus } from "../indexer/uriDigest.js";
 import { digestCollectionPointerDoc } from "../indexer/collectionDigest.js";
 import { compressForStorage } from "../utils/compression.js";
 import { stripNullBytes } from "../utils/sanitize.js";
@@ -441,6 +441,18 @@ function decodeRawMetadataValue(value: Uint8Array | Buffer | null | undefined): 
   return buffer.slice(1).toString("utf8");
 }
 
+function shouldRetryUriRecovery(status: string | null | undefined): boolean {
+  if (!status || status.length === 0) return true;
+  if (status.includes('"status":"ok"')) return false;
+  try {
+    const parsed = JSON.parse(status) as { retryable?: unknown };
+    if (parsed.retryable === false) return false;
+  } catch {
+    // Keep retrying legacy/non-JSON payloads for backward compatibility.
+  }
+  return true;
+}
+
 function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
   if (process.env.NODE_ENV === "test" || localRecoveryInterval) {
     return;
@@ -490,8 +502,7 @@ function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
           for (const agent of agents) {
             const source = sourceByAgent.get(agent.id);
             const status = statusByAgent.get(agent.id);
-            const statusOk = !!status && status.includes('"status":"ok"');
-            if (source !== agent.uri || !statusOk) {
+            if (source !== agent.uri || shouldRetryUriRecovery(status)) {
               scheduleUriDigest(prisma, agent.id, agent.uri);
             }
           }
@@ -998,6 +1009,8 @@ async function handleAgentRegisteredCore(
         eventOrdinal: ctx.eventOrdinal ?? null,
         agentId: assignedAgentId ?? null,
         status: DEFAULT_STATUS,
+        createdAt: ctx.blockTime,
+        updatedAt: ctx.blockTime,
       },
       update: {
         collection: collectionId,
@@ -1007,6 +1020,7 @@ async function handleAgentRegisteredCore(
         creator: canonicalCreator,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
+        updatedAt: ctx.blockTime,
         ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
       },
     });
@@ -1617,6 +1631,7 @@ async function handleRegistryInitializedTx(
       txSignature: ctx.signature,
       slot: ctx.slot,
       status: DEFAULT_STATUS,
+      createdAt: ctx.blockTime,
     },
     update: {},
   });
@@ -1639,6 +1654,7 @@ async function handleRegistryInitialized(
       txSignature: ctx.signature,
       slot: ctx.slot,
       status: DEFAULT_STATUS,
+      createdAt: ctx.blockTime,
     },
     update: {},
   });
@@ -1703,6 +1719,7 @@ async function handleNewFeedbackTx(
         eventOrdinal: ctx.eventOrdinal ?? null,
         feedbackId: assignedFeedbackId ?? null,
         status: DEFAULT_STATUS,
+        createdAt: ctx.blockTime,
       },
       update: {
         ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
@@ -1757,6 +1774,7 @@ async function handleNewFeedbackTx(
           slot: orphan.slot,
           responseId: assignedResponseId ?? null,
           status: DEFAULT_STATUS,
+          createdAt: orphan.createdAt,
         },
         update: {
           responseCount: orphan.responseCount,
@@ -1893,6 +1911,7 @@ async function handleNewFeedback(
         eventOrdinal: ctx.eventOrdinal ?? null,
         feedbackId: assignedFeedbackId ?? null,
         status: DEFAULT_STATUS,
+        createdAt: ctx.blockTime,
       },
       update: {
         ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
@@ -1949,6 +1968,7 @@ async function handleNewFeedback(
           slot: orphan.slot,
           responseId: assignedResponseId ?? null,
           status: DEFAULT_STATUS,
+          createdAt: orphan.createdAt,
         },
         update: {
           responseCount: orphan.responseCount,
@@ -2120,6 +2140,7 @@ async function handleFeedbackRevokedTx(
         eventOrdinal: ctx.eventOrdinal ?? null,
         revocationId: revokeStatus === "ORPHANED" ? null : (assignedRevocationId ?? null),
         status: revokeStatus,
+        createdAt: ctx.blockTime,
       },
       update: {
         feedbackHash: eventSealHash,
@@ -2245,6 +2266,7 @@ async function handleFeedbackRevoked(
         eventOrdinal: ctx.eventOrdinal ?? null,
         revocationId: revokeStatus === "ORPHANED" ? null : (assignedRevocationId ?? null),
         status: revokeStatus,
+        createdAt: ctx.blockTime,
       },
       update: {
         feedbackHash: eventSealHash,
@@ -2328,6 +2350,7 @@ async function handleResponseAppendedTx(
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
+        createdAt: ctx.blockTime,
       },
       update: {
         responseCount: data.newResponseCount,
@@ -2392,6 +2415,7 @@ async function handleResponseAppendedTx(
         eventOrdinal: ctx.eventOrdinal ?? null,
         responseId: responseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
         status: responseStatus,
+        createdAt: ctx.blockTime,
       },
       update: {
         ...(responseStatus === "ORPHANED"
@@ -2451,6 +2475,7 @@ async function handleResponseAppended(
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
+        createdAt: ctx.blockTime,
       },
       update: {
         responseCount: data.newResponseCount,
@@ -2519,6 +2544,7 @@ async function handleResponseAppended(
         eventOrdinal: ctx.eventOrdinal ?? null,
         responseId: responseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
         status: responseStatus,
+        createdAt: ctx.blockTime,
       },
       update: {
         ...(responseStatus === "ORPHANED"
@@ -2804,12 +2830,7 @@ async function digestAndStoreUriMetadataLocal(
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify({
-      status: result.status,
-      error: result.error,
-      bytes: result.bytes,
-      hash: result.hash,
-    }));
+    await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
     return;
   }
 
@@ -2831,13 +2852,7 @@ async function digestAndStoreUriMetadataLocal(
   }
 
   // Store success status with truncation info
-  await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify({
-    status: "ok",
-    bytes: result.bytes,
-    hash: result.hash,
-    fieldCount: Object.keys(result.fields).length,
-    truncatedKeys: result.truncatedKeys || false,
-  }));
+  await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
 
   // Sync nftName from _uri:name if not already set
   const uriName = result.fields["_uri:name"];
@@ -2893,8 +2908,12 @@ async function digestAndStoreCollectionMetadataLocal(
 
   const creator = agent.creator ?? agent.owner;
   const result = await digestCollectionPointerDoc(pointer);
+  const collectionRow = await prisma.collection.findUnique({
+    where: { col_creator: { col: pointer, creator } },
+    select: { lastSeenAt: true },
+  });
   const baseUpdate = {
-    metadataUpdatedAt: new Date(),
+    metadataUpdatedAt: collectionRow?.lastSeenAt ?? null,
     metadataStatus: result.status,
     metadataHash: result.hash ?? null,
     metadataBytes: result.bytes ?? null,
@@ -3004,10 +3023,18 @@ export async function cleanupOrphanResponses(
   prisma: PrismaClient,
   maxAgeMinutes: number = 30
 ): Promise<number> {
-  const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000);
+  const state = await prisma.indexerState.findUnique({
+    where: { id: "main" },
+    select: { lastSlot: true },
+  });
+  if (state?.lastSlot === null || state?.lastSlot === undefined) {
+    return 0;
+  }
+  const slotsToKeep = BigInt(Math.max(1, Math.ceil((maxAgeMinutes * 60_000) / 400)));
+  const cutoffSlot = state.lastSlot > slotsToKeep ? state.lastSlot - slotsToKeep : 0n;
 
   const result = await prisma.orphanResponse.deleteMany({
-    where: { createdAt: { lt: cutoff } },
+    where: { slot: { not: null, lt: cutoffSlot } },
   });
 
   if (result.count > 0) {

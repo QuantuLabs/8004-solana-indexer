@@ -59,6 +59,18 @@ vi.mock("../../../src/db/supabase.js", () => ({
 vi.mock("../../../src/indexer/uriDigest.js", () => ({
   digestUri: mockDigestUri,
   serializeValue: mockSerializeValue,
+  toDeterministicUriStatus: vi.fn().mockImplementation((result: any) => {
+    if (result?.status === "ok") {
+      return {
+        status: "ok",
+        bytes: result.bytes ?? null,
+        hash: result.hash ?? null,
+        fieldCount: Object.keys(result.fields ?? {}).length,
+        truncatedKeys: Boolean(result.truncatedKeys),
+      };
+    }
+    return { status: "error", kind: "fetch_failed", retryable: true };
+  }),
 }));
 
 vi.mock("../../../src/utils/compression.js", () => ({
@@ -1327,17 +1339,19 @@ describe("DB Handlers Coverage", () => {
   describe("cleanupOrphanResponses", () => {
     it("should delete old orphans and return count", async () => {
       (prisma.orphanResponse.deleteMany as any).mockResolvedValue({ count: 5 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue({ lastSlot: 1000n });
 
       const result = await cleanupOrphanResponses(prisma, 30);
 
       expect(result).toBe(5);
-      expect(prisma.orphanResponse.deleteMany).toHaveBeenCalledWith({
-        where: { createdAt: { lt: expect.any(Date) } },
-      });
+      const call = (prisma.orphanResponse.deleteMany as any).mock.calls[0][0];
+      expect(call.where.slot.not).toBeNull();
+      expect(typeof call.where.slot.lt).toBe("bigint");
     });
 
     it("should return 0 when no orphans to clean", async () => {
       (prisma.orphanResponse.deleteMany as any).mockResolvedValue({ count: 0 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue({ lastSlot: 1000n });
 
       const result = await cleanupOrphanResponses(prisma);
 
@@ -1346,29 +1360,36 @@ describe("DB Handlers Coverage", () => {
 
     it("should use default maxAgeMinutes of 30", async () => {
       (prisma.orphanResponse.deleteMany as any).mockResolvedValue({ count: 0 });
-
-      const before = Date.now();
+      (prisma.indexerState.findUnique as any).mockResolvedValue({ lastSlot: 10_000n });
       await cleanupOrphanResponses(prisma);
 
       const call = (prisma.orphanResponse.deleteMany as any).mock.calls[0][0];
-      const cutoff = call.where.createdAt.lt as Date;
-      const expectedCutoff = before - 30 * 60 * 1000;
-
-      expect(Math.abs(cutoff.getTime() - expectedCutoff)).toBeLessThan(1000);
+      const cutoff = call.where.slot.lt as bigint;
+      const slotsToKeep = BigInt(Math.ceil((30 * 60_000) / 400));
+      const expectedCutoff = 10_000n > slotsToKeep ? 10_000n - slotsToKeep : 0n;
+      expect(cutoff).toBe(expectedCutoff);
     });
 
     it("should respect custom maxAgeMinutes", async () => {
       (prisma.orphanResponse.deleteMany as any).mockResolvedValue({ count: 3 });
-
-      const before = Date.now();
+      (prisma.indexerState.findUnique as any).mockResolvedValue({ lastSlot: 20_000n });
       const result = await cleanupOrphanResponses(prisma, 60);
 
       expect(result).toBe(3);
       const call = (prisma.orphanResponse.deleteMany as any).mock.calls[0][0];
-      const cutoff = call.where.createdAt.lt as Date;
-      const expectedCutoff = before - 60 * 60 * 1000;
+      const cutoff = call.where.slot.lt as bigint;
+      const slotsToKeep = BigInt(Math.ceil((60 * 60_000) / 400));
+      const expectedCutoff = 20_000n > slotsToKeep ? 20_000n - slotsToKeep : 0n;
+      expect(cutoff).toBe(expectedCutoff);
+    });
 
-      expect(Math.abs(cutoff.getTime() - expectedCutoff)).toBeLessThan(1000);
+    it("should skip cleanup when lastSlot is missing", async () => {
+      (prisma.indexerState.findUnique as any).mockResolvedValue({ lastSlot: null });
+
+      const result = await cleanupOrphanResponses(prisma, 30);
+
+      expect(result).toBe(0);
+      expect(prisma.orphanResponse.deleteMany).not.toHaveBeenCalled();
     });
   });
 

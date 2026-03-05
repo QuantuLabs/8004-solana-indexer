@@ -123,7 +123,7 @@ class CollectionMetadataQueue {
            SET metadata_status = $1,
                metadata_hash = $2,
                metadata_bytes = $3,
-               metadata_updated_at = NOW()
+               metadata_updated_at = last_seen_at
            WHERE col = $4
              AND creator = $5`,
           [result.status, result.hash || null, result.bytes ?? null, col, creator]
@@ -146,7 +146,7 @@ class CollectionMetadataQueue {
              metadata_status = $10,
              metadata_hash = $11,
              metadata_bytes = $12,
-             metadata_updated_at = NOW()
+             metadata_updated_at = last_seen_at
          WHERE col = $13
            AND creator = $14`,
         [
