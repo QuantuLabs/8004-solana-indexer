@@ -1417,13 +1417,25 @@ export class DataVerifier {
       const [lastFb, fbCount, lastResp, respCount, lastRev, revCount] = await Promise.all([
         this.prisma.feedback.findFirst({
           where: { agentId, runningDigest: { not: null }, status: notOrphaned },
-          orderBy: { feedbackIndex: 'desc' },
+          orderBy: [
+            { createdSlot: { sort: 'desc', nulls: 'last' } },
+            { createdTxSignature: { sort: 'desc', nulls: 'last' } },
+            { txIndex: { sort: 'desc', nulls: 'last' } },
+            { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { id: 'desc' },
+          ],
           select: { runningDigest: true, createdTxSignature: true, createdSlot: true },
         }),
         this.prisma.feedback.count({ where: { agentId, status: notOrphaned } }),
         this.prisma.feedbackResponse.findFirst({
           where: { feedback: { agentId }, runningDigest: { not: null }, status: notOrphaned },
-          orderBy: { slot: 'desc' },
+          orderBy: [
+            { slot: { sort: 'desc', nulls: 'last' } },
+            { txSignature: { sort: 'desc', nulls: 'last' } },
+            { txIndex: { sort: 'desc', nulls: 'last' } },
+            { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { id: 'desc' },
+          ],
           select: { runningDigest: true, txSignature: true, slot: true },
         }),
         this.prisma.feedbackResponse.count({ where: { feedback: { agentId }, status: notOrphaned } }),
@@ -1455,7 +1467,7 @@ export class DataVerifier {
           `SELECT running_digest, tx_signature, block_slot
            FROM feedbacks
            WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY feedback_index DESC
+           ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
            LIMIT 1`,
           [agentId]
         ),
@@ -1464,7 +1476,7 @@ export class DataVerifier {
           `SELECT running_digest, tx_signature, block_slot
            FROM feedback_responses
            WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY block_slot DESC, tx_signature DESC, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+           ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
            LIMIT 1`,
           [agentId]
         ),

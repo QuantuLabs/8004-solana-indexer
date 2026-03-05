@@ -21,6 +21,8 @@ const logger = createChildLogger("poller");
 // Batch DB writes: only for Supabase mode (uses raw SQL)
 const USE_BATCH_RPC = true;
 const USE_BATCH_DB = config.dbMode === "supabase";
+const MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE =
+  "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer.";
 
 export interface PollerOptions {
   connection: Connection;
@@ -46,6 +48,20 @@ function shouldAdvanceCursor(
 function compareSignatures(a: string, b: string): number {
   if (a === b) return 0;
   return a < b ? -1 : 1;
+}
+
+function isMissingCollectionIdSchemaError(error: unknown): boolean {
+  const maybe = error as { code?: unknown; message?: unknown } | null;
+  const code = typeof maybe?.code === "string" ? maybe.code : "";
+  const message = typeof maybe?.message === "string" ? maybe.message : String(error);
+  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  if (code === "P2022") {
+    return /collection_id|collectionId|CollectionPointer/i.test(message);
+  }
+  if (code === "P2010") {
+    return missingSchemaPattern.test(message);
+  }
+  return missingSchemaPattern.test(message);
 }
 
 export class Poller {
@@ -353,11 +369,24 @@ export class Poller {
           }
         } catch (error) {
           this.errorCount++;
-          logger.error({
+          this.isRunning = false;
+          if (isMissingCollectionIdSchemaError(error)) {
+            logger.fatal(
+              {
+                error: error instanceof Error ? error.message : String(error),
+                signature: sig.signature,
+                slot: sig.slot,
+              },
+              "Backfill aborted: missing collection_id schema in local database"
+            );
+            throw new Error(MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE);
+          }
+          logger.fatal({
             error: error instanceof Error ? error.message : String(error),
             signature: sig.signature,
             slot: sig.slot
-          }, "Error processing backfill transaction");
+          }, "Backfill aborted: transaction processing error");
+          throw (error instanceof Error ? error : new Error(String(error)));
         }
       }
     }

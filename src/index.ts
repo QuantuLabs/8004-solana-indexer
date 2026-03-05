@@ -12,6 +12,34 @@ import { IDL_VERSION, IDL_PROGRAM_ID } from "./parser/decoder.js";
 import { metadataQueue } from "./indexer/metadata-queue.js";
 import { collectionMetadataQueue } from "./indexer/collection-metadata-queue.js";
 
+const MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE =
+  "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer.";
+
+function isMissingCollectionIdSchemaError(error: unknown): boolean {
+  const maybe = error as { code?: unknown; message?: unknown } | null;
+  const code = typeof maybe?.code === "string" ? maybe.code : "";
+  const message = typeof maybe?.message === "string" ? maybe.message : String(error);
+  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  if (code === "P2022") {
+    return /collection_id|collectionId|CollectionPointer/i.test(message);
+  }
+  if (code === "P2010") {
+    return missingSchemaPattern.test(message);
+  }
+  return missingSchemaPattern.test(message);
+}
+
+async function assertLocalCollectionIdSchema(prisma: PrismaClient): Promise<void> {
+  try {
+    await prisma.$queryRawUnsafe('SELECT "collection_id" FROM "CollectionPointer" LIMIT 1');
+  } catch (error) {
+    if (isMissingCollectionIdSchemaError(error)) {
+      throw new Error(MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE);
+    }
+    throw error;
+  }
+}
+
 async function main() {
   try {
     validateConfig();
@@ -65,10 +93,15 @@ async function main() {
     try {
       await prisma.$connect();
       logger.info("Database connected (SQLite via Prisma)");
+      await assertLocalCollectionIdSchema(prisma);
       // Cleanup old orphan responses at startup (> 30 min)
       await cleanupOrphanResponses(prisma);
     } catch (error) {
-      logger.fatal({ error }, "Failed to connect to database");
+      if (isMissingCollectionIdSchemaError(error)) {
+        logger.fatal({ error }, MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE);
+      } else {
+        logger.fatal({ error }, "Failed to connect to database");
+      }
       process.exit(1);
     }
   } else {

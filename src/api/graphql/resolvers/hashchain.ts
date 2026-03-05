@@ -69,7 +69,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedbacks
          WHERE asset = $1 AND status != 'ORPHANED'
-         ORDER BY block_slot DESC NULLS LAST, tx_signature DESC, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+         ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
       ),
@@ -91,7 +91,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedback_responses
          WHERE asset = $1 AND status != 'ORPHANED'
-         ORDER BY block_slot DESC NULLS LAST, tx_signature DESC, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+         ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
       ),

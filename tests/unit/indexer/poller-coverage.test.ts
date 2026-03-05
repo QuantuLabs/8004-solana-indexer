@@ -1665,7 +1665,7 @@ describe("Poller Coverage", () => {
       expect(typeof processed).toBe("number");
     });
 
-    it("should handle processTransaction errors in batch and increment errorCount (lines 327-334)", async () => {
+    it("should abort backfill batch on processTransaction error and increment errorCount", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -1683,10 +1683,9 @@ describe("Poller Coverage", () => {
       // Null out batchFetcher so it goes through processTransaction path
       (poller as any).batchFetcher = null;
 
-      const processed = await (poller as any).processSignatureBatch([sig], 0, 1);
-
-      expect(processed).toBe(0);
+      await expect((poller as any).processSignatureBatch([sig], 0, 1)).rejects.toThrow("TX fetch failed");
       expect((poller as any).errorCount).toBe(1);
+      expect((poller as any).isRunning).toBe(false);
     });
 
     it("should log progress every 100 transactions during backfill (lines 317-326)", async () => {
