@@ -366,6 +366,26 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("rejects unsupported neq filter on feedback_id", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?feedback_id=neq.7`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid feedback_id");
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("rejects invalid is_revoked value on feedbacks endpoint", async () => {
     const prisma = {
       feedback: {

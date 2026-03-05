@@ -48,8 +48,15 @@ If your pagination logic depends on previous implicit ordering, send an explicit
 ## Migration path (no reindex)
 
 1. Apply pending DB migrations (Supabase SQL migrations or Prisma migrations, depending on your backend).
-2. Restart the indexer.
-3. No chain replay/reindex is required for already indexed data: existing collection-pointer rows are backfilled from current agent snapshots and `collection_id` is assigned in-place.
+2. For local Prisma upgrades, use `prisma migrate deploy` (do not use `db push` on existing data).
+3. Restart the indexer.
+4. No chain replay/reindex is required for already indexed data: existing collection-pointer rows are backfilled from current agent snapshots and `collection_id` is assigned in-place.
+
+## Sequential IDs and backend parity
+
+- Sequential IDs are deterministic per backend migration path.
+- If you compare upgraded historical datasets across different DB engines (PostgreSQL vs SQLite), legacy IDs may differ.
+- For strict cross-engine parity checks, bootstrap each backend from the same canonical chain window and migration baseline.
 
 ## Rollout checklist
 

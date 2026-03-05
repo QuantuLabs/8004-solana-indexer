@@ -29,8 +29,10 @@ If you are upgrading from `v1.7.7`, read:
 npm install
 cp .env.devnet.example .env
 npm run db:generate
-# Optional: only when DB_MODE=local (Prisma local DB)
+# Optional (fresh local DB only) when DB_MODE=local (Prisma local DB)
 # npm run db:push
+# Upgrades must use Prisma migrations:
+# npx prisma migrate deploy
 npm run dev
 ```
 

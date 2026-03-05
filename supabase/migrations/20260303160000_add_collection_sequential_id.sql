@@ -21,8 +21,8 @@ ranked AS (
     creator,
     ROW_NUMBER() OVER (
       ORDER BY
-        first_seen_at ASC NULLS LAST,
         first_seen_slot ASC NULLS LAST,
+        first_seen_at ASC NULLS LAST,
         first_seen_tx_signature ASC NULLS LAST,
         col ASC,
         creator ASC

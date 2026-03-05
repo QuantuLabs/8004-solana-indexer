@@ -162,14 +162,14 @@ function setContentRange(res: Response, offset: number, items: number, total: nu
 
 /**
  * Parse PostgREST-style query parameter value
- * Examples: "eq.value" -> value, "neq.value" -> value, "false" -> "false"
+ * Examples: "eq.value" -> value, "value" -> value
+ * Note: neq/in/not.in require dedicated comparison/list parsers.
  */
 function parsePostgRESTValue(value: unknown): string | undefined {
   const str = safeQueryString(value);
   if (!str) return undefined;
   // Handle PostgREST format: eq.value, neq.value, etc.
   if (str.startsWith('eq.')) return str.slice(3);
-  if (str.startsWith('neq.')) return str.slice(4);
   // Return as-is for non-PostgREST format
   return str;
 }

@@ -125,10 +125,6 @@ type CollectionRawSqlClient = {
   $executeRawUnsafe?: (query: string, ...values: unknown[]) => Promise<unknown>;
 };
 
-let collectionIdSchemaSupported: boolean | null = null;
-let warnedMissingCollectionIdSchema = false;
-let collectionIdSchemaRetryAfter = 0;
-const COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS = 60_000;
 const COLLECTION_ID_ASSIGNMENT_MAX_RETRIES = 3;
 const ATOMIC_COLLECTION_ID_TX_MAX_RETRIES = 2;
 const COLLECTION_POINTER_DB_ALLOCATED_UPSERT_SQL = `
@@ -253,30 +249,19 @@ async function upsertCollectionPointerWithOptionalCollectionId(
     lastSeenTxSignature: ctx.signature,
   };
 
-  if (collectionIdSchemaSupported === false && Date.now() >= collectionIdSchemaRetryAfter) {
-    collectionIdSchemaSupported = null;
-  }
-
-  let canAttemptCollectionIdAssignment = collectionIdSchemaSupported !== false;
+  const canAttemptCollectionIdAssignment = true;
 
   if (canAttemptCollectionIdAssignment) {
     try {
       const usedDbAllocator = await tryDbSideCollectionIdUpsert(client, pointer, creator, assetId, ctx);
       if (usedDbAllocator) {
-        collectionIdSchemaSupported = true;
         return;
       }
     } catch (error) {
       if (isMissingCollectionIdSchemaError(error)) {
-        collectionIdSchemaSupported = false;
-        collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
-        if (!warnedMissingCollectionIdSchema) {
-          warnedMissingCollectionIdSchema = true;
-          logger.warn(
-            "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
-          );
-        }
-        canAttemptCollectionIdAssignment = false;
+        throw new Error(
+          "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer."
+        );
       } else {
         logger.warn(
           { pointer, creator, error: error instanceof Error ? error.message : String(error) },
@@ -315,19 +300,12 @@ async function upsertCollectionPointerWithOptionalCollectionId(
             ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
           },
         });
-        collectionIdSchemaSupported = true;
         return;
       } catch (error) {
         if (isMissingCollectionIdSchemaError(error)) {
-          collectionIdSchemaSupported = false;
-          collectionIdSchemaRetryAfter = Date.now() + COLLECTION_ID_SCHEMA_RETRY_INTERVAL_MS;
-          if (!warnedMissingCollectionIdSchema) {
-            warnedMissingCollectionIdSchema = true;
-            logger.warn(
-              "collection_id schema is missing locally; falling back without sequential collection_id until migration is applied."
-            );
-          }
-          break;
+          throw new Error(
+            "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer."
+          );
         }
 
         const isLastAttempt = attempt >= COLLECTION_ID_ASSIGNMENT_MAX_RETRIES - 1;
