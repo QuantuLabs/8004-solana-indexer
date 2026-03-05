@@ -40,6 +40,8 @@ describe("metrics endpoint", () => {
   beforeEach(() => {
     vi.resetModules();
     process.env = { ...originalEnv };
+    process.env.API_MODE = "graphql";
+    process.env.ENABLE_GRAPHQL = "true";
   });
 
   afterEach(async () => {

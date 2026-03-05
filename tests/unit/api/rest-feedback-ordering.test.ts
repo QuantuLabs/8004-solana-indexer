@@ -70,6 +70,36 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("supports block_slot ordering on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?limit=5&order=block_slot.desc`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { createdSlot: "desc" },
+            { createdAt: "desc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { id: "asc" },
+          ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("maps revoked_at from revocation records when feedback is revoked", async () => {
     const createdAt = new Date("2026-01-01T00:00:00.000Z");
     const revokedAt = new Date("2026-01-02T03:04:05.000Z");
@@ -305,7 +335,76 @@ describe("REST feedback deterministic ordering", () => {
             agentId: "asset-1",
             revokeCount: { in: [1n, 5n, 10n] },
           }),
-          orderBy: { revokeCount: "asc" },
+          orderBy: [
+            { revokeCount: "asc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports revocation_id ordering on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&order=revocation_id.asc`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ agentId: "asset-1" }),
+          orderBy: [
+            { revocationId: "asc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports revocation_id ordering without asset scope using deterministic tie-breakers", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?order=revocation_id.asc`);
+      expect(res.status).toBe(200);
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { revocationId: "asc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
         })
       );
     } finally {
@@ -332,7 +431,15 @@ describe("REST feedback deterministic ordering", () => {
             agentId: "asset-1",
             revokeCount: { in: [1n, 5n, 10n] },
           }),
-          orderBy: { revokeCount: "asc" },
+          orderBy: [
+            { revokeCount: "asc" },
+            { agentId: "asc" },
+            { client: "asc" },
+            { feedbackIndex: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
         })
       );
     } finally {
@@ -875,7 +982,12 @@ describe("REST feedback deterministic ordering", () => {
       expect(prisma.orphanResponse.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { agentId: "asset-1", client: "client-1", feedbackIndex: 0n },
-          orderBy: { responseCount: "desc" },
+          orderBy: [
+            { responseCount: "desc" },
+            { responder: "asc" },
+            { txSignature: "asc" },
+            { slot: "asc" },
+          ],
         })
       );
       expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
@@ -899,6 +1011,111 @@ describe("REST feedback deterministic ordering", () => {
         block_slot: 42,
         tx_signature: "tx-1",
       });
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports response_id ordering on responses endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue({ id: "fb-1" }),
+      },
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&order=response_id.asc`
+      );
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { responseId: "asc" },
+            { feedback: { agentId: "asc" } },
+            { feedback: { client: "asc" } },
+            { feedback: { feedbackIndex: "asc" } },
+            { responder: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports block_slot ordering on responses endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findFirst: vi.fn().mockResolvedValue({ id: "fb-1" }),
+      },
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(
+        `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&order=block_slot.desc`
+      );
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { slot: "desc" },
+            { feedback: { agentId: "asc" } },
+            { feedback: { client: "asc" } },
+            { feedback: { feedbackIndex: "asc" } },
+            { responder: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("supports response_id ordering without canonical feedback scope using deterministic tie-breakers", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/responses?order=response_id.asc`);
+      expect(res.status).toBe(200);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { responseId: "asc" },
+            { feedback: { agentId: "asc" } },
+            { feedback: { client: "asc" } },
+            { feedback: { feedbackIndex: "asc" } },
+            { responder: "asc" },
+            { txSignature: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+          ],
+        })
+      );
     } finally {
       await stopServer(server);
     }

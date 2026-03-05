@@ -1302,6 +1302,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const orFilter = orFilterRaw && orFilterRaw.length <= 200 ? orFilterRaw : undefined; // Limit filter length
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
 
       if ((createdAtGtRaw && !createdAtGt) || (createdAtLtRaw && !createdAtLt)) {
         res.status(400).json({ error: 'Invalid created_at filter value' });
@@ -1385,18 +1386,25 @@ export function createApiServer(options: ApiServerOptions): Express {
         if (orConditions.length > 0) where.OR = orConditions;
       }
 
+      const feedbackOrderBy: Prisma.FeedbackOrderByWithRelationInput[] =
+        order === 'block_slot.asc'
+          ? [{ createdSlot: 'asc' }, { createdAt: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { id: 'asc' }]
+          : order === 'block_slot.desc'
+            ? [{ createdSlot: 'desc' }, { createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { id: 'asc' }]
+            : [
+                { createdAt: 'desc' },
+                { agentId: 'asc' },
+                { client: 'asc' },
+                { feedbackIndex: 'asc' },
+                { id: 'asc' },
+              ];
+
       // If Prefer: count=exact, also get total count
       const needsCount = wantsCount(req);
       const [feedbacks, totalCount] = await Promise.all([
         prisma.feedback.findMany({
           where,
-          orderBy: [
-            { createdAt: 'desc' },
-            { agentId: 'asc' },
-            { client: 'asc' },
-            { feedbackIndex: 'asc' },
-            { id: 'asc' },
-          ],
+          orderBy: feedbackOrderBy,
           take: limit,
           skip: offset,
         }),
@@ -1622,10 +1630,37 @@ export function createApiServer(options: ApiServerOptions): Express {
 
           const orphanOrderBy =
             order === 'response_count.asc'
-              ? { responseCount: 'asc' as const }
-              : order === 'response_count.desc'
-                ? { responseCount: 'desc' as const }
-                : { createdAt: 'desc' as const };
+                  ? [
+                      { responseCount: 'asc' as const },
+                      { responder: 'asc' as const },
+                      { txSignature: 'asc' as const },
+                      { slot: 'asc' as const },
+                    ]
+                : order === 'response_count.desc'
+                  ? [
+                      { responseCount: 'desc' as const },
+                      { responder: 'asc' as const },
+                      { txSignature: 'asc' as const },
+                      { slot: 'asc' as const },
+                    ]
+                : order === 'block_slot.asc'
+                  ? [
+                      { slot: 'asc' as const },
+                      { responder: 'asc' as const },
+                      { txSignature: 'asc' as const },
+                    ]
+                  : order === 'block_slot.desc'
+                    ? [
+                        { slot: 'desc' as const },
+                        { responder: 'asc' as const },
+                        { txSignature: 'asc' as const },
+                      ]
+                    : [
+                        { createdAt: 'desc' as const },
+                        { responder: 'asc' as const },
+                        { txSignature: 'asc' as const },
+                        { slot: 'asc' as const },
+                      ];
 
           const orphans = await prisma.orphanResponse.findMany({
             where: { agentId: asset, client: client_address, feedbackIndex: parsedFeedbackIndex },
@@ -1664,10 +1699,20 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
       }
 
-      const orderBy: Prisma.FeedbackResponseOrderByWithRelationInput =
-        order === 'response_count.asc' ? { responseCount: 'asc' } :
-        order === 'response_count.desc' ? { responseCount: 'desc' } :
-        { createdAt: 'desc' };
+      const orderBy: Prisma.FeedbackResponseOrderByWithRelationInput[] =
+        order === 'response_count.asc'
+          ? [{ responseCount: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+          : order === 'response_count.desc'
+            ? [{ responseCount: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            : order === 'response_id.asc'
+              ? [{ responseId: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              : order === 'response_id.desc'
+                ? [{ responseId: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                : order === 'block_slot.asc'
+                  ? [{ slot: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  : order === 'block_slot.desc'
+                    ? [{ slot: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                    : [{ createdAt: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
 
       const needsCount = wantsCount(req);
       const [responses, totalCount] = await Promise.all([
@@ -1826,12 +1871,20 @@ export function createApiServer(options: ApiServerOptions): Express {
         where.revokeCount = revokeCountFilter;
       }
 
-      const orderBy: { revokeCount?: 'asc' | 'desc'; createdAt?: 'asc' | 'desc' } =
+      const orderBy: Prisma.RevocationOrderByWithRelationInput[] =
         order === 'revoke_count.asc'
-          ? { revokeCount: 'asc' }
+          ? [{ revokeCount: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
           : order === 'revoke_count.desc'
-            ? { revokeCount: 'desc' }
-            : { createdAt: 'desc' };
+            ? [{ revokeCount: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            : order === 'revocation_id.asc'
+              ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              : order === 'revocation_id.desc'
+                ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                : order === 'block_slot.asc'
+                  ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  : order === 'block_slot.desc'
+                    ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
 
       const needsCount = wantsCount(req);
       const [revocations, totalCount] = await Promise.all([
@@ -1860,7 +1913,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         atom_enabled: r.atomEnabled,
         had_impact: r.hadImpact,
         running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
-        revoke_count: Number(r.revokeCount),
+        revoke_count: r.revokeCount.toString(),
         tx_signature: r.txSignature,
         status: r.status,
         verified_at: r.verifiedAt?.toISOString() || null,
@@ -2948,7 +3001,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             feedback_hash: r.feedbackHash ? Buffer.from(r.feedbackHash).toString('hex') : null,
             slot: Number(r.slot),
             running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
-            revoke_count: Number(r.revokeCount),
+            revoke_count: r.revokeCount.toString(),
           })),
           hasMore: events.length === limit,
           nextFromCount: events.length > 0
