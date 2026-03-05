@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 
+### Changed
+- Transition docs now explicitly define collection scope as `creator + collection_pointer` and document the migration path as DB migrations + restart (no chain reindex required for already indexed data).
+
 ## [1.7.7] - 2026-03-02
 
 ### Fixed

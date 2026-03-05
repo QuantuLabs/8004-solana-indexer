@@ -19,19 +19,33 @@ No client break is expected for existing consumers of `canonical_col`.
 - Added `collection_id` in response payload.
 - Added `collection_id` filtering (`eq`, `gt`, `gte`, `lt`, `lte`).
 - In proxy mode, this endpoint is now served by local compatibility logic (not raw PostgREST passthrough).
+- Canonical uniqueness is `(creator, collection)`; the same collection pointer under different creators is represented as separate collection rows (and separate `collection_id` values).
 
 If you relied on arbitrary PostgREST `select/order` on proxied `/collections`, validate behavior before rollout.
 
+### `/rest/v1/collection_asset_count`
+- `creator` is required (scope is `creator + collection`).
+- Requests missing `creator` now return `400`.
+
 ### `/rest/v1/collection_assets`
+- `creator` is required (scope is `creator + collection`).
+- Requests missing `creator` now return `400`.
 - Proxy fallback default order changed to:
   - `created_at.desc,asset.desc`
 
 If your pagination logic depends on previous implicit ordering, send an explicit `order=` query param.
 
+## Migration path (no reindex)
+
+1. Apply pending DB migrations (Supabase SQL migrations or Prisma migrations, depending on your backend).
+2. Restart the indexer.
+3. No chain replay/reindex is required for already indexed data: existing collection-pointer rows are backfilled from current agent snapshots and `collection_id` is assigned in-place.
+
 ## Rollout checklist
 
 1. Update clients to read `collection_pointer` when present.
 2. Keep `canonical_col` support until all clients migrate.
-3. Add explicit `order` to `/collection_assets` queries for stable pagination.
-4. Validate `/collections` queries in staging if you used advanced PostgREST query options.
-5. Apply DB migrations before enabling new `collection_id`-dependent features.
+3. Send `creator` for `/collection_asset_count` and `/collection_assets` queries.
+4. Add explicit `order` to `/collection_assets` queries for stable pagination.
+5. Validate `/collections` queries in staging if you used advanced PostgREST query options.
+6. Apply DB migrations and restart; no reindex is needed for already indexed data.

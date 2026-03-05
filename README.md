@@ -20,6 +20,8 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
 If you are upgrading from `v1.7.7`, read:
 
 - [docs/transition-from-v1.7.7.md](docs/transition-from-v1.7.7.md)
+- Collection scope is `creator + collection_pointer` (`canonical_col` alias still accepted on `/rest/v1/agents`).
+- Migration path for this transition is database migrations + restart only; no chain replay/reindex is required for already indexed data.
 
 ## Quick Start
 
@@ -27,7 +29,8 @@ If you are upgrading from `v1.7.7`, read:
 npm install
 cp .env.devnet.example .env
 npm run db:generate
-npm run db:push
+# Optional: only when DB_MODE=local (Prisma local DB)
+# npm run db:push
 npm run dev
 ```
 
@@ -223,10 +226,10 @@ scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.7.3
 
 ```graphql
 query Dashboard {
-  stats {
+  globalStats {
     totalAgents
     totalFeedback
-    totalValidations
+    totalCollections
   }
   agents(first: 10, orderBy: createdAt, orderDirection: desc) {
     id
