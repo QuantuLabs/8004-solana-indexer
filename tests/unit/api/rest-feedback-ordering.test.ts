@@ -316,6 +316,52 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it("applies tx_signature filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?tx_signature=eq.sig-feedback-1`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedback.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            createdTxSignature: "sig-feedback-1",
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("rejects malformed tx_signature IN filters on feedbacks endpoint", async () => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const malformedInFilter = encodeURIComponent('in.("sig-a,sig-b)');
+      const res = await fetch(`${baseUrl}/rest/v1/feedbacks?tx_signature=${malformedInFilter}`);
+      expect(res.status).toBe(400);
+      const body = await res.json() as { error?: string };
+      expect(body.error).toContain("Invalid tx_signature filter");
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("applies revoke_count PostgREST IN filters on revocations endpoint", async () => {
     const prisma = {
       revocation: {
@@ -515,6 +561,31 @@ describe("REST feedback deterministic ordering", () => {
           where: expect.objectContaining({
             agentId: "asset-1",
             revokeCount: { notIn: [1n, 5n, 10n] },
+          }),
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies tx_signature neq filters on revocations endpoint", async () => {
+    const prisma = {
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/revocations?asset=asset-1&tx_signature=neq.sig-revoke-1`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId: "asset-1",
+            txSignature: { not: "sig-revoke-1" },
           }),
         })
       );
@@ -1114,6 +1185,31 @@ describe("REST feedback deterministic ordering", () => {
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
           ],
+        })
+      );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies tx_signature IN filters on responses endpoint", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const inFilter = encodeURIComponent("in.(sig-resp-1,sig-resp-2)");
+      const res = await fetch(`${baseUrl}/rest/v1/responses?tx_signature=${inFilter}`);
+      expect(res.status).toBe(200);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            txSignature: { in: ["sig-resp-1", "sig-resp-2"] },
+          }),
         })
       );
     } finally {

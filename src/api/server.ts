@@ -480,6 +480,24 @@ function parsePostgRESTBigIntFilter(value: unknown): bigint | Prisma.BigIntFilte
   return equals ?? null;
 }
 
+function parsePostgRESTTextFilter(value: unknown): string | Prisma.StringNullableFilter | undefined | null {
+  const inState = parsePostgRESTListOperator(value, 'in');
+  if (inState.matched) {
+    if (inState.malformed || inState.values.length === 0) return null;
+    return { in: inState.values };
+  }
+
+  const notInState = parsePostgRESTListOperator(value, 'not.in');
+  if (notInState.matched) {
+    if (notInState.malformed || notInState.values.length === 0) return null;
+    return { notIn: notInState.values };
+  }
+
+  const comparison = parsePostgRESTComparison(value);
+  if (!comparison) return undefined;
+  return comparison.op === 'neq' ? { not: comparison.value } : comparison.value;
+}
+
 type AgentApiRow = Pick<
   PrismaAgent,
   | 'id'
@@ -1298,6 +1316,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const createdAtLtRaw = parsePostgRESTValue(req.query.created_at_lt);
       const createdAtGt = createdAtGtRaw ? parseTimestampValue(createdAtGtRaw) : undefined;
       const createdAtLt = createdAtLtRaw ? parseTimestampValue(createdAtLtRaw) : undefined;
+      const txSignatureFilter = parsePostgRESTTextFilter(req.query.tx_signature);
       const orFilterRaw = safeQueryString(req.query.or); // Handle OR filter for tag search
       const orFilter = orFilterRaw && orFilterRaw.length <= 200 ? orFilterRaw : undefined; // Limit filter length
       const limit = safePaginationLimit(req.query.limit);
@@ -1370,6 +1389,13 @@ export function createApiServer(options: ApiServerOptions): Express {
           ...(createdAtGt ? { gt: createdAtGt } : {}),
           ...(createdAtLt ? { lt: createdAtLt } : {}),
         };
+      }
+      if (txSignatureFilter === null) {
+        res.status(400).json({ error: 'Invalid tx_signature filter: use eq/neq/in/not.in with non-empty values' });
+        return;
+      }
+      if (txSignatureFilter !== undefined) {
+        where.createdTxSignature = txSignatureFilter;
       }
       // Handle OR filter: (tag1.eq.value,tag2.eq.value)
       if (orFilter) {
@@ -1510,6 +1536,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
       const feedbackIndexNotInState = parsePostgRESTListOperator(req.query.feedback_index, 'not.in');
+      const txSignatureFilter = parsePostgRESTTextFilter(req.query.tx_signature);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1517,6 +1544,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+        return;
+      }
+      if (txSignatureFilter === null) {
+        res.status(400).json({ error: 'Invalid tx_signature filter: use eq/neq/in/not.in with non-empty values' });
         return;
       }
       const parsedStatusComparison = parsePostgRESTComparison(req.query.status);
@@ -1529,6 +1560,9 @@ export function createApiServer(options: ApiServerOptions): Express {
             : 'PENDING' === statusComparison.value
         );
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
+      if (txSignatureFilter !== undefined) {
+        where.txSignature = txSignatureFilter;
+      }
       let parsedResponseId: bigint | undefined;
       if (response_id !== undefined) {
         parsedResponseId = safeBigInt(response_id);
@@ -1662,8 +1696,16 @@ export function createApiServer(options: ApiServerOptions): Express {
                         { slot: 'asc' as const },
                       ];
 
+          const orphanWhere: Prisma.OrphanResponseWhereInput = {
+            agentId: asset,
+            client: client_address,
+            feedbackIndex: parsedFeedbackIndex,
+          };
+          if (txSignatureFilter !== undefined) {
+            orphanWhere.txSignature = txSignatureFilter;
+          }
           const orphans = await prisma.orphanResponse.findMany({
-            where: { agentId: asset, client: client_address, feedbackIndex: parsedFeedbackIndex },
+            where: orphanWhere,
             orderBy: orphanOrderBy,
             take: limit,
             skip: offset,
@@ -1775,6 +1817,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const revokeCountFilter = parsePostgRESTBigIntFilter(req.query.revoke_count);
       const revokeCountInState = parsePostgRESTListOperator(req.query.revoke_count, 'in');
       const revokeCountNotInState = parsePostgRESTListOperator(req.query.revoke_count, 'not.in');
+      const txSignatureFilter = parsePostgRESTTextFilter(req.query.tx_signature);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
@@ -1784,9 +1827,14 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
         return;
       }
+      if (txSignatureFilter === null) {
+        res.status(400).json({ error: 'Invalid tx_signature filter: use eq/neq/in/not.in with non-empty values' });
+        return;
+      }
       const where: Prisma.RevocationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
+      if (txSignatureFilter !== undefined) where.txSignature = txSignatureFilter;
       if (revocationIdRaw !== undefined && !asset) {
         res.status(400).json({ error: 'revocation_id is scoped by agent. Provide asset filter when using revocation_id.' });
         return;
