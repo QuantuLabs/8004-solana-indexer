@@ -362,6 +362,55 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
+  it.each([
+    "gt.sig-feedback-1",
+    "not.eq.sig-feedback-1",
+    "eq.",
+    "neq.",
+    "in.()",
+    "in.(sig-feedback-1,)",
+    "not.in.(,sig-feedback-1)",
+    'in.("sig-feedback-1,sig-feedback-2)',
+  ])("rejects invalid tx_signature filters across REST endpoints: %s", async (rawFilter) => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const encoded = encodeURIComponent(rawFilter);
+      const urls = [
+        `${baseUrl}/rest/v1/feedbacks?tx_signature=${encoded}`,
+        `${baseUrl}/rest/v1/responses?tx_signature=${encoded}`,
+        `${baseUrl}/rest/v1/revocations?asset=asset-1&tx_signature=${encoded}`,
+      ];
+
+      for (const url of urls) {
+        const res = await fetch(url);
+        expect(res.status).toBe(400);
+        const body = await res.json() as { error?: string };
+        expect(body.error).toContain("Invalid tx_signature filter");
+      }
+
+      expect(prisma.feedback.findMany).not.toHaveBeenCalled();
+      expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+      expect(prisma.revocation.findMany).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("applies revoke_count PostgREST IN filters on revocations endpoint", async () => {
     const prisma = {
       revocation: {
@@ -911,6 +960,33 @@ describe("REST feedback deterministic ordering", () => {
         expect.objectContaining({
           where: expect.objectContaining({
             responseId: 9n,
+            feedback: { agentId: "asset-1", feedbackId: 10n },
+          }),
+        })
+      );
+      expect(prisma.feedbackResponse.count).not.toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("applies response_id neq filters when canonical feedback scope is provided", async () => {
+    const prisma = {
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/responses?asset=asset-1&feedback_id=eq.10&response_id=neq.9`);
+      expect(res.status).toBe(200);
+
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            responseId: { not: 9n },
             feedback: { agentId: "asset-1", feedbackId: 10n },
           }),
         })

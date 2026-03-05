@@ -481,20 +481,26 @@ function parsePostgRESTBigIntFilter(value: unknown): bigint | Prisma.BigIntFilte
 }
 
 function parsePostgRESTTextFilter(value: unknown): string | Prisma.StringNullableFilter | undefined | null {
+  const raw = safeQueryString(value);
+  if (raw === undefined) return undefined;
+  if (raw.trim().length === 0) return null;
+
   const inState = parsePostgRESTListOperator(value, 'in');
   if (inState.matched) {
-    if (inState.malformed || inState.values.length === 0) return null;
+    if (inState.malformed || inState.values.length === 0 || inState.values.some((entry) => entry.length === 0)) return null;
     return { in: inState.values };
   }
 
   const notInState = parsePostgRESTListOperator(value, 'not.in');
   if (notInState.matched) {
-    if (notInState.malformed || notInState.values.length === 0) return null;
+    if (notInState.malformed || notInState.values.length === 0 || notInState.values.some((entry) => entry.length === 0)) return null;
     return { notIn: notInState.values };
   }
 
-  const comparison = parsePostgRESTComparison(value);
-  if (!comparison) return undefined;
+  if (raw.includes('.') && !raw.startsWith('eq.') && !raw.startsWith('neq.')) return null;
+
+  const comparison = parsePostgRESTComparison(raw);
+  if (!comparison || comparison.value.trim().length === 0) return null;
   return comparison.op === 'neq' ? { not: comparison.value } : comparison.value;
 }
 
@@ -1529,7 +1535,7 @@ export function createApiServer(options: ApiServerOptions): Express {
   const responsesHandler = async (req: Request, res: Response) => {
     try {
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
-      const response_id = parsePostgRESTValue(req.query.response_id);
+      const responseIdComparison = parsePostgRESTComparison(req.query.response_id);
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
       const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
@@ -1564,13 +1570,15 @@ export function createApiServer(options: ApiServerOptions): Express {
         where.txSignature = txSignatureFilter;
       }
       let parsedResponseId: bigint | undefined;
-      if (response_id !== undefined) {
-        parsedResponseId = safeBigInt(response_id);
+      if (responseIdComparison) {
+        parsedResponseId = safeBigInt(responseIdComparison.value);
         if (parsedResponseId === undefined) {
           res.status(400).json({ error: 'Invalid response_id: must be a valid integer' });
           return;
         }
-        where.responseId = parsedResponseId;
+        where.responseId = responseIdComparison.op === 'neq'
+          ? { not: parsedResponseId }
+          : parsedResponseId;
       }
 
       let parsedFeedbackIndex: bigint | undefined;
@@ -1632,7 +1640,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         (!!asset && !!client_address && parsedFeedbackIndex !== undefined)
       );
 
-      if (response_id !== undefined && !hasCanonicalFeedbackScope) {
+      if (responseIdComparison && !hasCanonicalFeedbackScope) {
         res.status(400).json({
           error: 'response_id requires canonical feedback scope (asset + client_address + feedback_index, or asset + feedback_id).',
         });
