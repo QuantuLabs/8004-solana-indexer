@@ -1,11 +1,8 @@
-ALTER TABLE "CollectionPointer"
-ADD COLUMN "collection_id" BIGINT;
-
-CREATE UNIQUE INDEX IF NOT EXISTS "CollectionPointer_collection_id_key"
-ON "CollectionPointer"("collection_id");
-
-CREATE INDEX IF NOT EXISTS "CollectionPointer_collection_id_idx"
-ON "CollectionPointer"("collection_id");
+-- Non-blocking optimistic backfill for missing collection_id values:
+-- - deterministic ordering for assignment
+-- - 3 optimistic passes (OR IGNORE) to reduce transient conflicts
+-- - 1 strict convergence pass
+-- - final guard that aborts if unresolved NULL remains
 
 -- Pass 1: non-blocking optimistic assignment using materialized ranking.
 DROP TABLE IF EXISTS "__collection_pointer_ranked";
@@ -148,7 +145,7 @@ WHERE "collection_id" IS NULL;
 
 DROP TABLE "__collection_pointer_ranked";
 
--- Final strict convergence pass: should succeed when no concurrent writers mutate the same rows.
+-- Final strict convergence pass.
 DROP TABLE IF EXISTS "__collection_pointer_ranked";
 CREATE TEMP TABLE "__collection_pointer_ranked" (
   "col" TEXT NOT NULL,

@@ -16,6 +16,21 @@ const prismaMigrationSql = readFileSync(
   "utf8"
 );
 
+const prismaAgentIdMigrationSql = readFileSync(
+  resolve(__dirname, "../../../prisma/migrations/20260304120000_add_agent_sequential_id/migration.sql"),
+  "utf8"
+);
+
+const prismaCollectionIdInitMigrationSql = readFileSync(
+  resolve(__dirname, "../../../prisma/migrations/20260303161000_add_collection_sequential_id/migration.sql"),
+  "utf8"
+);
+
+const prismaCollectionIdBackfillMigrationSql = readFileSync(
+  resolve(__dirname, "../../../prisma/migrations/20260305113000_backfill_collection_sequential_id/migration.sql"),
+  "utf8"
+);
+
 const scopedHardeningMigrationSql = readFileSync(
   resolve(__dirname, "../../../supabase/migrations/20260228235500_harden_scoped_sequential_id_assignment.sql"),
   "utf8"
@@ -76,6 +91,35 @@ describe("scoped sequential ID backfill migrations", () => {
     expect(prismaMigrationSql).toContain('"revocation_ranked"');
     expect(prismaMigrationSql).toContain('PARTITION BY r."agentId"');
     expect(prismaMigrationSql).toContain('COALESCE(r."revokeCount"');
+  });
+
+  it("adds deterministic local Prisma agent_id rollout for no-reindex upgrades", () => {
+    expect(prismaAgentIdMigrationSql).toContain('ADD COLUMN "agent_id" BIGINT');
+    expect(prismaAgentIdMigrationSql).toContain('"agent_ranked" AS');
+    expect(prismaAgentIdMigrationSql).toContain('COALESCE(a."createdSlot"');
+    expect(prismaAgentIdMigrationSql).toContain("a.\"status\" != 'ORPHANED'");
+  });
+
+  it("uses non-blocking retries for initial local Prisma collection_id rollout", () => {
+    expect(prismaCollectionIdInitMigrationSql).toContain('UPDATE OR IGNORE "CollectionPointer"');
+    expect(prismaCollectionIdInitMigrationSql).toContain('UPDATE "CollectionPointer"');
+    expect(prismaCollectionIdInitMigrationSql).toContain('WHERE cp."collection_id" IS NULL');
+    expect(prismaCollectionIdInitMigrationSql).toContain('CREATE TEMP TABLE "__collection_pointer_unresolved_guard"');
+    expect(prismaCollectionIdInitMigrationSql).toContain('CHECK ("remaining" = 0)');
+    const retryPassCount = prismaCollectionIdInitMigrationSql.split('UPDATE OR IGNORE "CollectionPointer"').length - 1;
+    expect(retryPassCount).toBeGreaterThanOrEqual(3);
+  });
+
+  it("backfills missing collection_id rows deterministically in follow-up Prisma migration", () => {
+    expect(prismaCollectionIdBackfillMigrationSql).toContain("Non-blocking optimistic backfill");
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('UPDATE OR IGNORE "CollectionPointer"');
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('UPDATE "CollectionPointer"');
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('WHERE cp."collection_id" IS NULL');
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('CAST((SELECT max_id FROM seed) + r.rn AS BIGINT)');
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('CREATE TEMP TABLE "__collection_pointer_unresolved_guard"');
+    expect(prismaCollectionIdBackfillMigrationSql).toContain('CHECK ("remaining" = 0)');
+    const retryPassCount = prismaCollectionIdBackfillMigrationSql.split('UPDATE OR IGNORE "CollectionPointer"').length - 1;
+    expect(retryPassCount).toBeGreaterThanOrEqual(3);
   });
 
   it("hardens scoped IDs with DB trigger assignment and advisory locks", () => {
