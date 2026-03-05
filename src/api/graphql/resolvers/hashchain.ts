@@ -68,7 +68,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
       ctx.pool.query<{ digest: string | null }>(
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedbacks
-         WHERE asset = $1 AND status != 'ORPHANED'
+         WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
          ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
@@ -90,7 +90,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
       ctx.pool.query<{ digest: string | null }>(
         `SELECT encode(running_digest, 'hex') AS digest
          FROM feedback_responses
-         WHERE asset = $1 AND status != 'ORPHANED'
+         WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
          ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
          LIMIT 1`,
         [asset]
@@ -111,7 +111,7 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
     ctx.pool.query<{ digest: string | null }>(
       `SELECT encode(running_digest, 'hex') AS digest
        FROM revocations
-       WHERE asset = $1 AND status != 'ORPHANED'
+       WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
        ORDER BY revoke_count DESC
        LIMIT 1`,
       [asset]
