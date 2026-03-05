@@ -368,15 +368,16 @@ describe("Poller Coverage", () => {
       );
 
       // Call backfill directly to avoid the full start() flow
-      await (poller as any).backfill();
+      await expect((poller as any).backfill()).rejects.toThrow("Backfill scan failed after repeated RPC errors");
 
       // Should have attempted multiple times (up to 5 scan errors)
       expect((mockConnection.getSignaturesForAddress as any).mock.calls.length).toBeGreaterThanOrEqual(5);
+      expect((poller as any).isRunning).toBe(false);
     }, 25000);
   });
 
   describe("fetchSignatureWindow", () => {
-    it("should retry on error and return partial results after 3 failures", async () => {
+    it("should retry on error and abort after 3 failures", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -400,11 +401,10 @@ describe("Poller Coverage", () => {
         return Promise.reject(new Error("Network timeout"));
       });
 
-      const result = await (poller as any).fetchSignatureWindow("after-sig", "until-sig");
-
-      // Should have partial results (first batch succeeded, then errors + retries)
-      expect(result.length).toBe(2); // Got the 2 sigs from first batch
+      await expect((poller as any).fetchSignatureWindow("after-sig", "until-sig"))
+        .rejects.toThrow("Backfill window fetch failed after repeated RPC errors");
       expect(callNum).toBeGreaterThan(1); // Retried
+      expect((poller as any).isRunning).toBe(false);
     }, 10000);
 
     it("should return empty array when no signatures found", async () => {

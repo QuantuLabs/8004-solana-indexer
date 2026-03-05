@@ -190,8 +190,9 @@ export class Poller {
 
         // Retry with exponential backoff
         if (scanErrors >= 5) {
-          logger.error("Too many scan errors, aborting backfill");
-          return;
+          this.isRunning = false;
+          logger.fatal("Too many scan errors during backfill scan; aborting startup to avoid partial history gaps");
+          throw new Error("Backfill scan failed after repeated RPC errors");
         }
         await new Promise((resolve) => setTimeout(resolve, 1000 * scanErrors));
       }
@@ -270,8 +271,9 @@ export class Poller {
         logger.warn({ error, retryCount, windowSize: windowSigs.length }, "Error fetching signature window");
 
         if (retryCount >= 3) {
-          logger.error("Too many errors fetching signature window, returning partial results");
-          break;
+          this.isRunning = false;
+          logger.fatal({ windowSize: windowSigs.length }, "Too many errors fetching signature window; aborting backfill to avoid partial history gaps");
+          throw new Error("Backfill window fetch failed after repeated RPC errors");
         }
         await new Promise((resolve) => setTimeout(resolve, 500 * retryCount));
       }
