@@ -56,6 +56,9 @@ If your pagination logic depends on previous implicit ordering, send an explicit
 
 - Sequential IDs are deterministic per backend migration path.
 - If you compare upgraded historical datasets across different DB engines (PostgreSQL vs SQLite), legacy IDs may differ.
+- Collection `collection_id` backfill ranking keys are backend-specific for no-reindex upgrades:
+  - PostgreSQL/Supabase migration key: `first_seen_at`, `first_seen_slot`, `first_seen_tx_signature`, `col`, `creator`.
+  - SQLite/Prisma migration key: `firstSeenSlot`, `firstSeenTxSignature` (NULL-last), `col`, `creator`.
 - For strict cross-engine parity checks, bootstrap each backend from the same canonical chain window and migration baseline.
 
 ## Rollout checklist
