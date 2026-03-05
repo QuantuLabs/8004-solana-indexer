@@ -174,6 +174,18 @@ function parsePostgRESTValue(value: unknown): string | undefined {
   return str;
 }
 
+function hasUnsupportedEqOnlyOperator(value: unknown): boolean {
+  const str = safeQueryString(value);
+  if (!str) return false;
+  if (str.startsWith('eq.')) return false;
+  const lowered = str.toLowerCase();
+  return (
+    lowered.startsWith('neq.') ||
+    lowered.startsWith('in.(') ||
+    lowered.startsWith('not.in.(')
+  );
+}
+
 type PostgRESTComparison = {
   op: 'eq' | 'neq';
   value: string;
@@ -1341,6 +1353,18 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
         return;
       }
+      if (
+        hasUnsupportedEqOnlyOperator(req.query.asset) ||
+        hasUnsupportedEqOnlyOperator(req.query.client_address) ||
+        hasUnsupportedEqOnlyOperator(req.query.tag1) ||
+        hasUnsupportedEqOnlyOperator(req.query.tag2) ||
+        hasUnsupportedEqOnlyOperator(req.query.endpoint)
+      ) {
+        res.status(400).json({
+          error: 'Invalid eq-only filter: asset, client_address, tag1, tag2, and endpoint accept plain values or eq.<value> only',
+        });
+        return;
+      }
       const where: Prisma.FeedbackWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client_address) where.client = client_address;
@@ -1566,6 +1590,15 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
       if (txSignatureFilter === null) {
         res.status(400).json({ error: 'Invalid tx_signature filter: use eq/neq/in/not.in with non-empty values' });
+        return;
+      }
+      if (
+        hasUnsupportedEqOnlyOperator(req.query.asset) ||
+        hasUnsupportedEqOnlyOperator(req.query.client_address)
+      ) {
+        res.status(400).json({
+          error: 'Invalid eq-only filter: asset and client_address accept plain values or eq.<value> only',
+        });
         return;
       }
       const parsedStatusComparison = parsePostgRESTComparison(req.query.status);
@@ -1849,6 +1882,15 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
       if (txSignatureFilter === null) {
         res.status(400).json({ error: 'Invalid tx_signature filter: use eq/neq/in/not.in with non-empty values' });
+        return;
+      }
+      if (
+        hasUnsupportedEqOnlyOperator(req.query.asset) ||
+        hasUnsupportedEqOnlyOperator(req.query.client_address ?? req.query.client)
+      ) {
+        res.status(400).json({
+          error: 'Invalid eq-only filter: asset, client_address, and client accept plain values or eq.<value> only',
+        });
         return;
       }
       const where: Prisma.RevocationWhereInput = { ...statusFilter };
