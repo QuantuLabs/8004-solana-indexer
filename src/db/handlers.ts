@@ -731,7 +731,9 @@ export async function handleEventAtomic(
 
 /**
  * Update indexer cursor with monotonic guard
- * Only advances if the new slot is greater than the current slot
+ * Advances only when:
+ * - new slot is greater than current slot, or
+ * - same slot and new signature is lexicographically >= current signature
  */
 async function updateCursorAtomic(
   tx: PrismaTransactionClient,
@@ -739,11 +741,24 @@ async function updateCursorAtomic(
 ): Promise<void> {
   const current = await tx.indexerState.findUnique({
     where: { id: "main" },
-    select: { lastSlot: true },
+    select: { lastSlot: true, lastSignature: true },
   });
 
-  // Monotonic guard: reject backward slot movement
-  if (current && current.lastSlot !== null && ctx.slot < current.lastSlot) {
+  // Monotonic guard:
+  // - reject backward slot movement
+  // - for same slot, reject lexicographically older signatures
+  if (
+    current
+    && current.lastSlot !== null
+    && (
+      ctx.slot < current.lastSlot
+      || (
+        ctx.slot === current.lastSlot
+        && current.lastSignature !== null
+        && ctx.signature < current.lastSignature
+      )
+    )
+  ) {
     return;
   }
 

@@ -47,7 +47,6 @@ function hashesMatchHex(stored: string | null, event: string | null): boolean {
 }
 
 // EventData type for batch event data - uses Record for type safety while allowing runtime values
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type EventData = Record<string, any>;
 
 export interface BatchEvent {
@@ -381,7 +380,13 @@ export class EventBuffer {
             last_slot = EXCLUDED.last_slot,
             source = EXCLUDED.source,
             updated_at = NOW()
-          WHERE indexer_state.last_slot < EXCLUDED.last_slot OR indexer_state.last_slot IS NULL
+          WHERE indexer_state.last_slot IS NULL
+             OR indexer_state.last_slot < EXCLUDED.last_slot
+             OR (
+               indexer_state.last_slot = EXCLUDED.last_slot
+               AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
+                 <= EXCLUDED.last_signature COLLATE "C"
+             )
         `, [lastCtx.signature, lastCtx.slot.toString()]);
       }
 
@@ -669,8 +674,9 @@ export class EventBuffer {
       `SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
       [asset, client_addr, feedbackIndex.toString()]
     );
+    const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
 
-    if (feedbackCheck.rowCount === 0) {
+    if (!hasFeedback) {
       await client.query(
         `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)

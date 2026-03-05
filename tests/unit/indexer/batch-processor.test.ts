@@ -916,6 +916,9 @@ describe("EventBuffer", () => {
         (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
       );
       expect(cursorCall).toBeDefined();
+      expect(cursorCall[0]).toContain("indexer_state.last_slot = EXCLUDED.last_slot");
+      expect(cursorCall[0]).toContain("COALESCE(indexer_state.last_signature, '') COLLATE \"C\"");
+      expect(cursorCall[0]).toContain("<= EXCLUDED.last_signature COLLATE \"C\"");
     });
 
     it("should not queue metadata when metadataIndexMode is off", async () => {
@@ -1078,6 +1081,9 @@ describe("EventBuffer", () => {
           if (feedbackIndex === "10") {
             return { rows: [{ id: "fb:10", feedback_hash: "ff".repeat(32) }], rowCount: 1 };
           }
+          if (feedbackIndex === "11") {
+            return { rows: [{ id: "fb:11", feedback_hash: "ab".repeat(32) }], rowCount: null };
+          }
           return { rows: [{ id: "fb:ok", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
         }
         if (typeof sql === "string" && sql.includes("INSERT INTO feedback_responses (id, response_id")) {
@@ -1135,12 +1141,22 @@ describe("EventBuffer", () => {
           sealHash: new Uint8Array(32).fill(0xab),
         }, { signature: "sig-5" })
       );
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder6",
+          feedbackIndex: 11n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          responseHash: new Uint8Array(32).fill(0xab),
+        }, { signature: "sig-6" })
+      );
       await buffer.flush();
 
       const responseInsertCalls = client.query.mock.calls.filter(
         (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
       );
-      expect(responseInsertCalls).toHaveLength(5);
+      expect(responseInsertCalls).toHaveLength(6);
 
       expect(responseInsertCalls[0][1][1]).toBeNull();
       expect(responseInsertCalls[0][1][15]).toBe("PENDING");
@@ -1156,6 +1172,9 @@ describe("EventBuffer", () => {
       expect(responseInsertCalls[4][1][1]).toBeNull();
       expect(responseInsertCalls[4][1][15]).toBe("ORPHANED");
       expect(responseInsertCalls[4][0]).not.toContain("response_id = CASE");
+
+      expect(responseInsertCalls[5][1][1]).toBeNull();
+      expect(responseInsertCalls[5][1][15]).toBe("PENDING");
     });
   });
 

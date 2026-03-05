@@ -12,6 +12,7 @@ import { parseTransaction, parseTransactionLogs, toTypedEvent } from "../parser/
 import { handleEventAtomic, EventContext } from "../db/handlers.js";
 import { saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
+import { resolveEventBlockTime } from "./block-time.js";
 
 const logger = createChildLogger("websocket");
 
@@ -29,6 +30,19 @@ export interface WebSocketIndexerOptions {
   programId: PublicKey;
   reconnectInterval?: number;
   maxRetries?: number;
+}
+
+function shouldAdvanceCursor(
+  currentSlot: bigint | null | undefined,
+  currentSignature: string | null | undefined,
+  nextSlot: bigint,
+  nextSignature: string
+): boolean {
+  if (currentSlot === null || currentSlot === undefined) return true;
+  if (nextSlot > currentSlot) return true;
+  if (nextSlot < currentSlot) return false;
+  if (!currentSignature) return true;
+  return nextSignature >= currentSignature;
 }
 
 export class WebSocketIndexer {
@@ -332,10 +346,7 @@ export class WebSocketIndexer {
       );
 
       // Prefer confirmed blockTime from parsed transaction when available.
-      const blockTime =
-        parsedTx?.blockTime !== null && parsedTx?.blockTime !== undefined
-          ? new Date(parsedTx.blockTime * 1000)
-          : new Date();
+      let blockTimeSeconds: number | null | undefined = parsedTx?.blockTime;
 
       // Resolve tx_index from block for metadata/tie-break parity with other indexers
       let txIndex: number | undefined;
@@ -344,6 +355,9 @@ export class WebSocketIndexer {
           maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
           transactionDetails: "full",
         });
+        if (block?.blockTime !== null && block?.blockTime !== undefined) {
+          blockTimeSeconds = block.blockTime;
+        }
         if (block?.transactions) {
           const idx = block.transactions.findIndex(
             (tx) => tx.transaction.signatures[0] === logs.signature,
@@ -356,6 +370,8 @@ export class WebSocketIndexer {
           "Failed to resolve tx_index from block (non-fatal)",
         );
       }
+
+      const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
 
       let allEventsProcessed = true;
 
@@ -425,11 +441,18 @@ export class WebSocketIndexer {
         if (this.prisma) {
           const current = await this.prisma.indexerState.findUnique({
             where: { id: "main" },
-            select: { lastSlot: true },
+            select: { lastSlot: true, lastSignature: true },
           });
-          if (current && current.lastSlot !== null && newSlot < current.lastSlot) {
-            logger.debug({ slot: ctx.slot, currentSlot: Number(current.lastSlot) },
-              "WS cursor update skipped — slot behind current");
+          if (!shouldAdvanceCursor(current?.lastSlot, current?.lastSignature, newSlot, logs.signature)) {
+            logger.debug(
+              {
+                slot: ctx.slot,
+                currentSlot: current?.lastSlot?.toString() ?? null,
+                signature: logs.signature,
+                currentSignature: current?.lastSignature ?? null,
+              },
+              "WS cursor update skipped — monotonic guard"
+            );
           } else {
             await this.prisma.indexerState.upsert({
               where: { id: "main" },
@@ -482,7 +505,7 @@ export class WebSocketIndexer {
               eventType: "PROCESSING_FAILED",
               signature: logs.signature,
               slot: BigInt(ctx.slot),
-              blockTime: new Date(),
+              blockTime: resolveEventBlockTime(undefined, ctx.slot),
               data: { logs: logs.logs },
               processed: false,
               error: errorMessage,

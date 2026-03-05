@@ -719,6 +719,86 @@ describe("Poller Coverage", () => {
       expect(result.length).toBe(3);
     });
 
+    it("should include only same-slot newer signatures found after stop signature", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-m";
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
+        createMockSignatureInfo("sig-z", 600),
+        createMockSignatureInfo("sig-m", 500),
+        createMockSignatureInfo("sig-a", 500),
+        createMockSignatureInfo("sig-y", 500),
+        createMockSignatureInfo("sig-old-slot", 499),
+      ]);
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toContain("sig-z");
+      expect(signatures).toContain("sig-y");
+      expect(signatures).not.toContain("sig-a");
+      expect(signatures).not.toContain("sig-old-slot");
+    });
+
+    it("should continue same-slot scan across next pages after stop signature", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 3,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-m";
+
+      let callNum = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+        callNum++;
+        if (callNum === 1) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-z", 600),
+            createMockSignatureInfo("sig-q", 500),
+            createMockSignatureInfo("sig-j", 500),
+          ]);
+        }
+        if (callNum === 2) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-m", 500),
+            createMockSignatureInfo("sig-a", 500),
+            createMockSignatureInfo("sig-0", 500),
+          ]);
+        }
+        if (callNum === 3) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-y", 500),
+            createMockSignatureInfo("sig-n", 500),
+            createMockSignatureInfo("sig-old-slot", 499),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toContain("sig-z");
+      expect(signatures).toContain("sig-q");
+      expect(signatures).toContain("sig-y");
+      expect(signatures).toContain("sig-n");
+      expect(signatures).not.toContain("sig-j");
+      expect(signatures).not.toContain("sig-a");
+      expect(signatures).not.toContain("sig-0");
+      expect(signatures).not.toContain("sig-old-slot");
+      expect(callNum).toBeGreaterThanOrEqual(3);
+    });
+
     it("should handle pagination errors with retry", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -1193,6 +1273,55 @@ describe("Poller Coverage", () => {
 
       expect(saveIndexerState).toHaveBeenCalledWith("test-sig-supa", 67890n);
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
+
+    it("should skip local cursor update when slot is equal and signature is older", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: 5000n,
+        lastSignature: "sig-z",
+      });
+
+      await (poller as any).saveState("sig-a", 5000n);
+
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
+
+    it("should update local cursor when slot is equal and signature is newer", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: 5000n,
+        lastSignature: "sig-a",
+      });
+
+      await (poller as any).saveState("sig-z", 5000n);
+
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: "main" },
+        create: {
+          id: "main",
+          lastSignature: "sig-z",
+          lastSlot: 5000n,
+        },
+        update: {
+          lastSignature: "sig-z",
+          lastSlot: 5000n,
+        },
+      });
     });
   });
 

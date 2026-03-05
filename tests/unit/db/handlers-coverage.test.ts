@@ -440,6 +440,37 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.indexerState.upsert).not.toHaveBeenCalled();
     });
 
+    it("should reject same-slot cursor regression when signature is older", async () => {
+      (prisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: 5000n,
+        lastSignature: "sig-z",
+      });
+
+      const staleCtx = { ...ctx, slot: 5000n, signature: "sig-a" };
+      await handleEventAtomic(prisma, simpleEvent, staleCtx);
+
+      expect(prisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
+
+    it("should allow same-slot cursor advance when signature is newer", async () => {
+      (prisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: 5000n,
+        lastSignature: "sig-a",
+      });
+
+      const advancedCtx = { ...ctx, slot: 5000n, signature: "sig-z" };
+      await handleEventAtomic(prisma, simpleEvent, advancedCtx);
+
+      expect(prisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "sig-z",
+            lastSlot: 5000n,
+          }),
+        })
+      );
+    });
+
     it("should default source to 'poller' when ctx.source is undefined", async () => {
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 

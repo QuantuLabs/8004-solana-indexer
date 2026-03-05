@@ -114,6 +114,18 @@ const mockSerializeValue = vi.fn().mockReturnValue({ value: "test", oversize: fa
 vi.mock("../../../src/indexer/uriDigest.js", () => ({
   digestUri: mockDigestUri,
   serializeValue: mockSerializeValue,
+  toDeterministicUriStatus: vi.fn().mockImplementation((result: any) => {
+    if (result?.status === "ok") {
+      return {
+        status: "ok",
+        bytes: result.bytes ?? null,
+        hash: result.hash ?? null,
+        fieldCount: Object.keys(result.fields ?? {}).length,
+        truncatedKeys: Boolean(result.truncatedKeys),
+      };
+    }
+    return { status: "error", kind: "fetch_failed", retryable: true };
+  }),
 }));
 
 // ─── Mock compression ────────────────────────────────────────────────────────
@@ -954,6 +966,24 @@ describe("supabase.ts", () => {
         expect(insertCall![1]).toContain("ORPHANED");
       });
 
+      it("should treat nullable rowCount with existing rows as non-orphan response", async () => {
+        const storedHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query
+          .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: storedHash }], rowCount: null })
+          .mockResolvedValue({ rows: [], rowCount: 1 });
+
+        const event = {
+          type: "ResponseAppended" as const,
+          data: makeResponseData(),
+        };
+        await handleEvent(event, ctx);
+        const insertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        );
+        expect(insertCall).toBeDefined();
+        expect(insertCall![1]).toContain("PENDING");
+      });
+
       it("should warn on seal_hash mismatch", async () => {
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: "ff".repeat(32) }], rowCount: 1 })
@@ -1757,6 +1787,36 @@ describe("supabase.ts", () => {
         expect(insertCall![1]).toContain("ORPHANED");
       });
 
+      it("ResponseAppended - treats null rowCount with rows as non-orphan", async () => {
+        const storedHash = Buffer.from(TEST_HASH).toString("hex");
+        mockClientInstance.query
+          .mockResolvedValueOnce(undefined) // BEGIN
+          .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: storedHash }], rowCount: null })
+          .mockResolvedValue({ rows: [], rowCount: 1 });
+
+        const event = {
+          type: "ResponseAppended" as const,
+          data: {
+            asset: TEST_ASSET,
+            client: TEST_CLIENT,
+            feedbackIndex: 0n,
+            slot: 123n,
+            responder: TEST_RESPONDER,
+            responseUri: "ipfs://QmResp",
+            responseHash: TEST_HASH,
+            sealHash: TEST_HASH,
+            newResponseDigest: TEST_HASH,
+            newResponseCount: 1n,
+          },
+        };
+        await handleEventAtomic(event, ctx);
+        const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        );
+        expect(insertCall).toBeDefined();
+        expect(insertCall![1]).toContain("PENDING");
+      });
+
       it("ResponseAppended - hash mismatch", async () => {
         mockClientInstance.query
           .mockResolvedValueOnce(undefined) // BEGIN
@@ -1956,7 +2016,11 @@ describe("supabase.ts", () => {
         };
         await handleEventAtomic(event, { ...ctx, source: "websocket" as const });
         const cursorCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("indexer_state") && c[0].includes("last_slot <= EXCLUDED.last_slot")
+          typeof c[0] === "string"
+          && c[0].includes("indexer_state")
+          && c[0].includes("indexer_state.last_slot < EXCLUDED.last_slot")
+          && c[0].includes("COALESCE(indexer_state.last_signature, '') COLLATE \"C\"")
+          && c[0].includes("<= EXCLUDED.last_signature COLLATE \"C\"")
         );
         expect(cursorCall).toBeDefined();
         expect(cursorCall![1]).toContain("websocket");
@@ -2294,6 +2358,9 @@ describe("supabase.ts", () => {
         typeof c[0] === "string" && c[0].includes("INSERT INTO indexer_state")
       );
       expect(upsertCall).toBeDefined();
+      expect(upsertCall![0]).toContain("indexer_state.last_slot < EXCLUDED.last_slot");
+      expect(upsertCall![0]).toContain("COALESCE(indexer_state.last_signature, '') COLLATE \"C\"");
+      expect(upsertCall![0]).toContain("<= EXCLUDED.last_signature COLLATE \"C\"");
       expect(upsertCall![1]).toContain("sig456");
       expect(upsertCall![1]).toContain("100000");
     });

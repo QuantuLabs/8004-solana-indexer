@@ -60,6 +60,18 @@ vi.mock("../../../src/indexer/uriDigest.js", () => ({
     oversize: false,
     bytes: 10,
   }),
+  toDeterministicUriStatus: vi.fn().mockImplementation((result: any) => {
+    if (result?.status === "ok") {
+      return {
+        status: "ok",
+        bytes: result.bytes ?? null,
+        hash: result.hash ?? null,
+        fieldCount: Object.keys(result.fields ?? {}).length,
+        truncatedKeys: Boolean(result.truncatedKeys),
+      };
+    }
+    return { status: "error", kind: "fetch_failed", retryable: true };
+  }),
 }));
 
 vi.mock("../../../src/utils/compression.js", () => ({

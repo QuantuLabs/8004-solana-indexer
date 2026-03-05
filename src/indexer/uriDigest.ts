@@ -754,6 +754,44 @@ export interface UriDigestResult {
   truncatedKeys?: boolean;
 }
 
+export function toDeterministicUriStatus(result: UriDigestResult): Record<string, unknown> {
+  if (result.status === "ok") {
+    return {
+      status: "ok",
+      bytes: result.bytes ?? null,
+      hash: result.hash ?? null,
+      fieldCount: Object.keys(result.fields ?? {}).length,
+      truncatedKeys: Boolean(result.truncatedKeys),
+    };
+  }
+
+  if (result.status === "blocked") {
+    return { status: "error", kind: "blocked", retryable: false };
+  }
+
+  if (result.status === "oversize") {
+    return {
+      status: "error",
+      kind: "oversize",
+      retryable: false,
+      bytes: result.bytes ?? null,
+    };
+  }
+
+  if (result.status === "invalid_json") {
+    return {
+      status: "error",
+      kind: "invalid_json",
+      retryable: false,
+      bytes: result.bytes ?? null,
+      hash: result.hash ?? null,
+    };
+  }
+
+  // timeout + generic fetch errors are stored in a deterministic retryable bucket.
+  return { status: "error", kind: "fetch_failed", retryable: true };
+}
+
 /**
  * Standard ERC-8004 registration file fields
  * Maps builder field names to metadata keys

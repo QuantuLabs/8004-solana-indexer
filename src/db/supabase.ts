@@ -288,7 +288,9 @@ export async function handleEventAtomic(
 
 /**
  * Update indexer cursor with monotonic guard
- * Only advances if the new slot is greater than the current slot
+ * Advances only when:
+ * - new slot is greater than current slot, or
+ * - same slot and new signature is lexicographically >= current signature
  */
 async function updateCursorAtomic(
   client: PoolClient,
@@ -297,12 +299,18 @@ async function updateCursorAtomic(
   await client.query(
     `INSERT INTO indexer_state (id, last_signature, last_slot, source, updated_at)
      VALUES ('main', $1, $2, $3, NOW())
-     ON CONFLICT (id) DO UPDATE SET
-       last_signature = EXCLUDED.last_signature,
-       last_slot = EXCLUDED.last_slot,
-       source = EXCLUDED.source,
-       updated_at = NOW()
-     WHERE indexer_state.last_slot IS NULL OR indexer_state.last_slot <= EXCLUDED.last_slot`,
+       ON CONFLICT (id) DO UPDATE SET
+         last_signature = EXCLUDED.last_signature,
+         last_slot = EXCLUDED.last_slot,
+         source = EXCLUDED.source,
+         updated_at = NOW()
+       WHERE indexer_state.last_slot IS NULL
+          OR indexer_state.last_slot < EXCLUDED.last_slot
+          OR (
+            indexer_state.last_slot = EXCLUDED.last_slot
+            AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
+              <= EXCLUDED.last_signature COLLATE "C"
+          )`,
     [ctx.signature, ctx.slot.toString(), ctx.source || "poller"]
   );
 }
@@ -898,6 +906,7 @@ async function handleResponseAppendedTx(
     `SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
     [assetId, clientAddress, data.feedbackIndex.toString()]
   );
+  const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
 
   const responseHash = data.responseHash
     ? Buffer.from(data.responseHash).toString("hex")
@@ -906,7 +915,7 @@ async function handleResponseAppendedTx(
     ? Buffer.from(data.newResponseDigest)
     : null;
 
-  if (feedbackCheck.rowCount === 0) {
+  if (!hasFeedback) {
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
     await client.query(
@@ -1568,6 +1577,7 @@ async function handleResponseAppended(
       `SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
       [assetId, clientAddress, data.feedbackIndex.toString()]
     );
+    const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
 
     const responseHash = data.responseHash
       ? Buffer.from(data.responseHash).toString("hex")
@@ -1576,7 +1586,7 @@ async function handleResponseAppended(
       ? Buffer.from(data.newResponseDigest)
       : null;
 
-    if (feedbackCheck.rowCount === 0) {
+    if (!hasFeedback) {
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
       await db.query(
@@ -1758,7 +1768,13 @@ export async function saveIndexerState(
          last_slot = EXCLUDED.last_slot,
          source = EXCLUDED.source,
          updated_at = NOW()
-       WHERE indexer_state.last_slot IS NULL OR indexer_state.last_slot <= EXCLUDED.last_slot`,
+       WHERE indexer_state.last_slot IS NULL
+          OR indexer_state.last_slot < EXCLUDED.last_slot
+          OR (
+            indexer_state.last_slot = EXCLUDED.last_slot
+            AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
+              <= EXCLUDED.last_signature COLLATE "C"
+          )`,
       [signature, slot.toString(), source]
     );
   } catch (error: any) {
@@ -1770,7 +1786,7 @@ export async function saveIndexerState(
 // URI METADATA EXTRACTION
 // =============================================
 
-import { digestUri, serializeValue } from "../indexer/uriDigest.js";
+import { digestUri, serializeValue, toDeterministicUriStatus } from "../indexer/uriDigest.js";
 import { compressForStorage } from "../utils/compression.js";
 import { stripNullBytes } from "../utils/sanitize.js";
 import { metadataQueue } from "../indexer/metadata-queue.js";
@@ -1835,12 +1851,7 @@ export async function digestAndStoreUriMetadata(assetId: string, uri: string): P
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadata(assetId, "_uri:_status", JSON.stringify({
-      status: result.status,
-      error: result.error,
-      bytes: result.bytes,
-      hash: result.hash,
-    }));
+    await storeUriMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
     return;
   }
 
@@ -1862,13 +1873,7 @@ export async function digestAndStoreUriMetadata(assetId: string, uri: string): P
   }
 
   // Store success status with truncation info
-  await storeUriMetadata(assetId, "_uri:_status", JSON.stringify({
-    status: "ok",
-    bytes: result.bytes,
-    hash: result.hash,
-    fieldCount: Object.keys(result.fields).length,
-    truncatedKeys: result.truncatedKeys || false,
-  }));
+  await storeUriMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
 
   // Sync nft_name from _uri:name if not already set
   const uriName = result.fields["_uri:name"];

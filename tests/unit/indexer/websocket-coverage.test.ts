@@ -583,6 +583,77 @@ describe("WebSocketIndexer Coverage", () => {
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
     });
 
+    it("should skip cursor update when slot is equal and signature is older", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTest",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+
+      vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: BigInt(TEST_SLOT),
+        lastSignature: "sig-z",
+      });
+
+      logsHandler!(
+        { signature: "sig-a", err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
+
+    it("should advance cursor when slot is equal and signature is newer", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTest",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+
+      vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: BigInt(TEST_SLOT),
+        lastSignature: "sig-a",
+      });
+
+      logsHandler!(
+        { signature: "sig-z", err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: "main" },
+        create: expect.objectContaining({
+          id: "main",
+          lastSignature: "sig-z",
+          lastSlot: BigInt(TEST_SLOT),
+        }),
+        update: expect.objectContaining({
+          lastSignature: "sig-z",
+          lastSlot: BigInt(TEST_SLOT),
+        }),
+      });
+    });
+
     it("should advance cursor when slot is ahead of current", async () => {
       createIndexer();
       await wsIndexer.start();

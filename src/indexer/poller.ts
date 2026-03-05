@@ -11,6 +11,7 @@ import { handleEventAtomic, EventContext } from "../db/handlers.js";
 import { loadIndexerState, saveIndexerState, getPool } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { BatchRpcFetcher, EventBuffer } from "./batch-processor.js";
+import { resolveEventBlockTime } from "./block-time.js";
 import { metadataQueue } from "./metadata-queue.js";
 
 const logger = createChildLogger("poller");
@@ -27,6 +28,24 @@ export interface PollerOptions {
   programId: PublicKey;
   pollingInterval?: number;
   batchSize?: number;
+}
+
+function shouldAdvanceCursor(
+  currentSlot: bigint | null | undefined,
+  currentSignature: string | null | undefined,
+  nextSlot: bigint,
+  nextSignature: string
+): boolean {
+  if (currentSlot === null || currentSlot === undefined) return true;
+  if (nextSlot > currentSlot) return true;
+  if (nextSlot < currentSlot) return false;
+  if (!currentSignature) return true;
+  return nextSignature >= currentSignature;
+}
+
+function compareSignatures(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 export class Poller {
@@ -297,7 +316,7 @@ export class Poller {
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
-        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        const sigCmp = compareSignatures(a.sig.signature, b.sig.signature);
         if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
@@ -580,6 +599,14 @@ export class Poller {
       return;
     }
 
+    const current = await this.prisma.indexerState.findUnique({
+      where: { id: "main" },
+      select: { lastSlot: true, lastSignature: true },
+    });
+    if (!shouldAdvanceCursor(current?.lastSlot, current?.lastSignature, slot, signature)) {
+      return;
+    }
+
     // Local mode - save to Prisma
     await this.prisma.indexerState.upsert({
       where: { id: "main" },
@@ -652,7 +679,7 @@ export class Poller {
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
       })).sort((a, b) => {
-        const sigCmp = a.sig.signature.localeCompare(b.sig.signature);
+        const sigCmp = compareSignatures(a.sig.signature, b.sig.signature);
         if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
@@ -728,11 +755,19 @@ export class Poller {
 
       // Paginate backwards from newest until we reach lastSignature (or pendingStopSignature if resuming)
       const allSignatures: ConfirmedSignatureInfo[] = [];
+      const seenSignatures = new Set<string>();
       // Resume from continuation point if we hit memory limit in previous cycle
       let beforeSignature: string | undefined = this.pendingContinuation || undefined;
       // Use pendingStopSignature if resuming, otherwise use lastSignature
       const stopSignature = this.pendingStopSignature || this.lastSignature;
       let retryCount = 0;
+
+      const pushUniqueSignature = (entry: ConfirmedSignatureInfo): void => {
+        if (entry.err !== null) return;
+        if (seenSignatures.has(entry.signature)) return;
+        seenSignatures.add(entry.signature);
+        allSignatures.push(entry);
+      };
 
       if (this.pendingContinuation) {
         logger.info({
@@ -765,15 +800,59 @@ export class Poller {
           }
 
           // Filter out failed transactions and check for stop signature
-          for (const sig of batch) {
+          for (let i = 0; i < batch.length; i++) {
+            const sig = batch[i];
             if (sig.signature === stopSignature) {
-              // Reached our checkpoint, we're done with the large batch
+              // Reached our checkpoint. To avoid same-slot misses when RPC order drifts,
+              // keep scanning the current page and include only same-slot signatures that
+              // are lexicographically newer than the stop signature.
+              const stopSlot = sig.slot;
+              const filtered = allSignatures.filter(
+                (existing) =>
+                  existing.slot !== stopSlot
+                  || existing.signature > stopSignature
+              );
+              allSignatures.length = 0;
+              seenSignatures.clear();
+              allSignatures.push(...filtered);
+              for (const entry of allSignatures) {
+                seenSignatures.add(entry.signature);
+              }
+              const pushSameSlotCandidate = (candidate: ConfirmedSignatureInfo): void => {
+                if (candidate.slot !== stopSlot) return;
+                if (candidate.err !== null) return;
+                if (candidate.signature <= stopSignature) return;
+                pushUniqueSignature(candidate);
+              };
+              for (let j = i + 1; j < batch.length; j++) {
+                pushSameSlotCandidate(batch[j]);
+              }
+              // Continue one-or-more extra pages while the slot is still present.
+              // This covers same-slot overflow when stopSignature appears before page end.
+              let sameSlotBefore: string | undefined = batch[batch.length - 1]?.signature;
+              while (sameSlotBefore && this.isRunning) {
+                const sameSlotBatch = await this.connection.getSignaturesForAddress(
+                  this.programId,
+                  { limit: this.batchSize, before: sameSlotBefore }
+                );
+                if (sameSlotBatch.length === 0) break;
+                let sawStopSlot = false;
+                for (const sameSlotSig of sameSlotBatch) {
+                  if (sameSlotSig.slot !== stopSlot) continue;
+                  sawStopSlot = true;
+                  pushSameSlotCandidate(sameSlotSig);
+                }
+                const nextBefore = sameSlotBatch[sameSlotBatch.length - 1].signature;
+                if (!sawStopSlot) break;
+                if (sameSlotBatch.length < this.batchSize) break;
+                if (nextBefore === sameSlotBefore) break;
+                sameSlotBefore = nextBefore;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
               this.pendingStopSignature = null;
               return allSignatures;
             }
-            if (sig.err === null) {
-              allSignatures.push(sig);
-            }
+            pushUniqueSignature(sig);
           }
 
           // Move to older signatures for next iteration
@@ -856,9 +935,7 @@ export class Poller {
       const ctx: EventContext = {
         signature: sig.signature,
         slot: BigInt(sig.slot),
-        blockTime: sig.blockTime
-          ? new Date(sig.blockTime * 1000)
-          : new Date(),
+        blockTime: resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot),
         txIndex,
         eventOrdinal,
       };
@@ -920,9 +997,7 @@ export class Poller {
       const ctx = {
         signature: sig.signature,
         slot: BigInt(sig.slot),
-        blockTime: sig.blockTime
-          ? new Date(sig.blockTime * 1000)
-          : new Date(),
+        blockTime: resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot),
         txIndex,
         eventOrdinal,
       };
@@ -953,9 +1028,7 @@ export class Poller {
         eventType: "PROCESSING_FAILED",
         signature: sig.signature,
         slot: BigInt(sig.slot),
-        blockTime: sig.blockTime
-          ? new Date(sig.blockTime * 1000)
-          : new Date(),
+        blockTime: resolveEventBlockTime(sig.blockTime, sig.slot),
         data: {},
         processed: false,
         error: error instanceof Error ? error.message : String(error),
