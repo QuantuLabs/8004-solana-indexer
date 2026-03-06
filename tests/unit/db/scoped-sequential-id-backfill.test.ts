@@ -51,6 +51,11 @@ const globalStatsAlignmentMigrationSql = readFileSync(
   "utf8"
 );
 
+const globalStatsCollectionPointersMigrationSql = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260306230000_align_global_stats_collection_pointers.sql"),
+  "utf8"
+);
+
 describe("scoped sequential ID backfill migrations", () => {
   it("defines deterministic supabase backfill for feedbacks, responses, and revocations", () => {
     expect(supabaseMigrationSql).toContain("feedback_pending AS");
@@ -152,6 +157,9 @@ describe("scoped sequential ID backfill migrations", () => {
     );
     expect(globalStatsAlignmentMigrationSql).toContain(
       "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+    );
+    expect(globalStatsCollectionPointersMigrationSql).toContain(
+      "(SELECT COUNT(*) FROM collection_pointers) AS total_collections"
     );
   });
 });

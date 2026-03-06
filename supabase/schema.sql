@@ -860,7 +860,7 @@ CREATE OR REPLACE VIEW global_stats
 WITH (security_invoker = true) AS
 SELECT
   (SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED') AS total_agents,
-  (SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections,
+  (SELECT COUNT(*) FROM collection_pointers) AS total_collections,
   (SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,

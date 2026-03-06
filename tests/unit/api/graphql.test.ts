@@ -145,13 +145,13 @@ describe('Filter Builder', () => {
 
   it('maps agentId filter to sequential DB agent_id column', () => {
     const result = buildWhereClause('agent', { agentId: 42n });
-    expect(result.sql).toContain('agent_id = $1');
+    expect(result.sql).toContain('a.agent_id = $1');
     expect(result.params).toEqual(['42']);
   });
 
   it('maps legacy agentid filter alias to sequential DB agent_id column', () => {
     const result = buildWhereClause('agent', { agentid: 7n });
-    expect(result.sql).toContain('agent_id = $1');
+    expect(result.sql).toContain('a.agent_id = $1');
     expect(result.params).toEqual(['7']);
   });
 

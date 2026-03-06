@@ -297,8 +297,8 @@ Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.0 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.0
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.1 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.1
 ```
 
 ## GraphQL Example

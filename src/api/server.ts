@@ -697,6 +697,7 @@ const ARCHIVED_VALIDATIONS_ERROR =
 
 const REST_PROXY_PATH_ALLOWLIST = [
   '/agents',
+  '/agent_reputation',
   '/feedbacks',
   '/responses',
   '/feedback_responses',
@@ -707,6 +708,8 @@ const REST_PROXY_PATH_ALLOWLIST = [
   '/global_stats',
   '/metadata',
   '/leaderboard',
+  '/rpc/get_collection_agents',
+  '/rpc/get_leaderboard',
 ] as const;
 
 const REST_PROXY_LOCAL_COMPAT_PATHS = [
@@ -720,6 +723,10 @@ const REST_PROXY_STATUS_DEFAULT_PATHS = new Set([
   '/responses',
   '/feedback_responses',
   '/revocations',
+]);
+
+const REST_PROXY_READ_POST_PATHS = new Set([
+  '/rpc/get_leaderboard',
 ]);
 
 function isAllowedRestProxyPath(pathname: string): boolean {
@@ -857,15 +864,13 @@ async function fetchFallbackGlobalStats(
   if (!includeOrphaned) feedbackParams.append('status', 'neq.ORPHANED');
 
   const collectionParams = new URLSearchParams({
-    select: 'collection',
-    registry_type: 'neq.BASE',
+    select: 'col',
   });
-  if (!includeOrphaned) collectionParams.append('status', 'neq.ORPHANED');
 
   const [totalAgents, totalFeedbacks, totalCollections] = await Promise.all([
     fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/agents', agentParams),
     fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/feedbacks', feedbackParams),
-    fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/collections', collectionParams),
+    fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/collection_pointers', collectionParams),
   ]);
 
   return [{
@@ -1084,7 +1089,9 @@ export function createApiServer(options: ApiServerOptions): Express {
           res.status(204).end();
           return;
         }
-        if (method !== 'GET' && method !== 'HEAD') {
+        const allowReadPost = REST_PROXY_READ_POST_PATHS.has(upstreamPathname);
+        const isAllowedReadMethod = method === 'GET' || method === 'HEAD' || (allowReadPost && method === 'POST');
+        if (!isAllowedReadMethod) {
           res.status(405).json({ error: 'REST proxy is read-only. Mutating methods are disabled.' });
           return;
         }

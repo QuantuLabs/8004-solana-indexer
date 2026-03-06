@@ -1416,6 +1416,58 @@ describe("API_MODE=both behavior", () => {
       });
       expect(directCollectionCompatProxyCall).toBeUndefined();
 
+      const agentReputationCallStart = fetchSpy.mock.calls.length;
+      const agentReputationRes = await fetch(
+        `${baseUrl}/rest/v1/agent_reputation?asset=eq.ProxyAgent11111111111111111111111111111111`
+      );
+      expect(agentReputationRes.status).toBe(200);
+      const agentReputationUpstreamCall = fetchSpy.mock.calls.slice(agentReputationCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string"
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/agent_reputation?");
+      });
+      expect(agentReputationUpstreamCall).toBeTruthy();
+
+      const collectionAgentsCallStart = fetchSpy.mock.calls.length;
+      const collectionAgentsRes = await fetch(
+        `${baseUrl}/rest/v1/rpc/get_collection_agents?collection_id=38&page_limit=1&page_offset=0`
+      );
+      expect(collectionAgentsRes.status).toBe(200);
+      const collectionAgentsUpstreamCall = fetchSpy.mock.calls.slice(collectionAgentsCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string"
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/rpc/get_collection_agents?");
+      });
+      expect(collectionAgentsUpstreamCall).toBeTruthy();
+
+      const leaderboardRpcCallStart = fetchSpy.mock.calls.length;
+      const leaderboardRpcRes = await fetch(`${baseUrl}/rest/v1/rpc/get_leaderboard`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ p_limit: 1, p_min_tier: 0, p_collection: null, p_cursor_sort_key: null }),
+      });
+      expect(leaderboardRpcRes.status).toBe(200);
+      const leaderboardRpcUpstreamCall = fetchSpy.mock.calls.slice(leaderboardRpcCallStart).find(([input, init]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        const method = (init as RequestInit | undefined)?.method?.toUpperCase() ?? "GET";
+        return typeof url === "string"
+          && url === "https://proxy-test.supabase.co/rest/v1/rpc/get_leaderboard"
+          && method === "POST";
+      });
+      expect(leaderboardRpcUpstreamCall).toBeTruthy();
+
       const writeAttempt = await fetch(`${baseUrl}/rest/v1/agents`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1435,6 +1487,7 @@ describe("API_MODE=both behavior", () => {
         const method = (init as RequestInit | undefined)?.method?.toUpperCase() ?? "GET";
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/")
+          && !url.endsWith("/rpc/get_leaderboard")
           && method === "POST";
       });
       expect(proxiedWriteCall).toBeUndefined();
@@ -1615,6 +1668,12 @@ describe("API_MODE=both behavior", () => {
             { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/3" } }
           );
         }
+        if (parsed.pathname === "/collection_pointers") {
+          return new Response(
+            JSON.stringify([{ collection: "c1:bafy..." }]),
+            { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/3" } }
+          );
+        }
       }
 
       return realFetch(input, init);
@@ -1696,7 +1755,7 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         if (typeof url !== "string") return false;
         const parsed = new URL(url);
-        return parsed.pathname === "/collections" && parsed.searchParams.get("select") === "collection";
+        return parsed.pathname === "/collection_pointers" && parsed.searchParams.get("select") === "col";
       });
       expect(collectionCountCall).toBeTruthy();
       const collectionCountUrl = new URL(
@@ -1706,8 +1765,8 @@ describe("API_MODE=both behavior", () => {
             ? collectionCountCall?.[0].toString()
             : collectionCountCall?.[0]?.url) as string
       );
-      expect(collectionCountUrl.searchParams.get("registry_type")).toBe("neq.BASE");
-      expect(collectionCountUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+      expect(collectionCountUrl.searchParams.get("registry_type")).toBeNull();
+      expect(collectionCountUrl.searchParams.get("status")).toBeNull();
 
       await waitForGraphqlMount(baseUrl);
       const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {

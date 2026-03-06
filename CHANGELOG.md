@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-03-07
+
+### Fixed
+- GraphQL `agents(where: { agentId })` no longer hits an ambiguous `agent_id` SQL predicate when digest joins are present.
+- REST `/rest/v1/stats` and `/rest/v1/global_stats` now count canonical collections from `collection_pointers`, matching GraphQL `totalCollections`.
+- `API_MODE=both` / REST proxy compatibility now forwards the read-only compatibility paths used by the SDK for agent reputation, collection agents, and leaderboard RPC reads.
+
+### Added
+- PostgreSQL migration `20260306230000_align_global_stats_collection_pointers.sql` to realign legacy `global_stats` views with canonical collection counting.
+
 ## [1.8.0] - 2026-03-06
 
 ### Fixed

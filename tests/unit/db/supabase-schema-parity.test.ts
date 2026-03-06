@@ -105,7 +105,7 @@ describe("supabase schema revocations bootstrap parity", () => {
       "(SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED') AS total_agents"
     );
     expect(schemaSql).toContain(
-      "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+      "(SELECT COUNT(*) FROM collection_pointers) AS total_collections"
     );
     expect(schemaSql).toContain(
       "(SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks"
