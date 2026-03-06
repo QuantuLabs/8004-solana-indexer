@@ -150,7 +150,7 @@ describe("Poller", () => {
       expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
     });
 
-    it("should handle null transaction gracefully", async () => {
+    it("should not advance cursor when transaction fetch returns null", async () => {
       const sig = createMockSignatureInfo();
 
       (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
@@ -165,8 +165,15 @@ describe("Poller", () => {
       await poller.start();
       await new Promise((r) => setTimeout(r, 150));
 
-      // Null tx => processTransaction returns early, no state save for empty result
       expect(mockConnection.getSignaturesForAddress).toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: expect.stringContaining("Transaction not found"),
+        }),
+      });
     });
 
     it("should save state after processing", async () => {

@@ -79,6 +79,7 @@ describe("Poller Coverage", () => {
     mockPrisma = createMockPrismaClient();
     vi.mocked(loadIndexerState).mockClear();
     vi.mocked(saveIndexerState).mockClear();
+    (config as any).pollerBatchRpcEnabled = true;
     (config as any).indexerStartSignature = null;
     (config as any).indexerStartSlot = null;
   });
@@ -102,6 +103,20 @@ describe("Poller Coverage", () => {
         processedCount: 0,
         errorCount: 0,
       });
+    });
+
+    it("should not initialize batch RPC fetcher when disabled by config", () => {
+      (config as any).pollerBatchRpcEnabled = false;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      expect((poller as any).batchFetcher).toBeNull();
     });
   });
 
@@ -458,7 +473,7 @@ describe("Poller Coverage", () => {
       });
     });
 
-    it("should use fallback order when getBlock fails", async () => {
+    it("should abort multi-tx batch when getBlock fails", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -476,10 +491,8 @@ describe("Poller Coverage", () => {
       const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
       (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
 
-      // Should not throw
-      const result = await (poller as any).processSignatureBatch([sig1, sig2], 0, 2);
-
-      expect(typeof result).toBe("number");
+      await expect((poller as any).processSignatureBatch([sig1, sig2], 0, 2))
+        .rejects.toThrow("Deterministic tx_index unavailable for slot 300");
     });
 
     it("should skip getBlock for single signature in slot (returns index 0)", async () => {
@@ -729,6 +742,7 @@ describe("Poller Coverage", () => {
       });
       (poller as any).isRunning = true;
       (poller as any).lastSignature = "sig-m";
+      (poller as any).lastTxIndex = 1;
 
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
         createMockSignatureInfo("sig-z", 600),
@@ -737,6 +751,14 @@ describe("Poller Coverage", () => {
         createMockSignatureInfo("sig-y", 500),
         createMockSignatureInfo("sig-old-slot", 499),
       ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-a"] } },
+          { transaction: { signatures: ["sig-m"] } },
+          { transaction: { signatures: ["sig-y"] } },
+        ],
+      });
 
       const result = await (poller as any).fetchSignatures();
       const signatures = result.map((s: any) => s.signature);
@@ -779,6 +801,38 @@ describe("Poller Coverage", () => {
       expect(signatures).not.toContain("sig-old-slot");
     });
 
+    it("should include same-slot signatures with resolved tx_index when persisted lastTxIndex is null", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-z";
+      (poller as any).lastTxIndex = null;
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
+        createMockSignatureInfo("sig-z", 500),
+        createMockSignatureInfo("sig-a", 500),
+        createMockSignatureInfo("sig-old-slot", 499),
+      ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-z"] } },
+          { transaction: { signatures: ["sig-a"] } },
+        ],
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toContain("sig-a");
+      expect(signatures).not.toContain("sig-old-slot");
+    });
+
     it("should continue same-slot scan across next pages after stop signature", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -789,6 +843,7 @@ describe("Poller Coverage", () => {
       });
       (poller as any).isRunning = true;
       (poller as any).lastSignature = "sig-m";
+      (poller as any).lastTxIndex = 3;
 
       let callNum = 0;
       (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
@@ -815,6 +870,18 @@ describe("Poller Coverage", () => {
           ]);
         }
         return Promise.resolve([]);
+      });
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-a"] } },
+          { transaction: { signatures: ["sig-0"] } },
+          { transaction: { signatures: ["sig-j"] } },
+          { transaction: { signatures: ["sig-m"] } },
+          { transaction: { signatures: ["sig-q"] } },
+          { transaction: { signatures: ["sig-y"] } },
+          { transaction: { signatures: ["sig-n"] } },
+        ],
       });
 
       const result = await (poller as any).fetchSignatures();
@@ -985,7 +1052,7 @@ describe("Poller Coverage", () => {
       });
     });
 
-    it("should handle null transaction from RPC", async () => {
+    it("should throw when transaction from RPC is null", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -997,9 +1064,9 @@ describe("Poller Coverage", () => {
       const sig = createMockSignatureInfo();
       (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
 
-      await (poller as any).processTransaction(sig, 0);
-
-      expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
+      await expect((poller as any).processTransaction(sig, 0)).rejects.toThrow(
+        `Transaction not found for signature ${sig.signature}`
+      );
     });
 
     it("should handle transaction without blockTime", async () => {
@@ -1090,7 +1157,7 @@ describe("Poller Coverage", () => {
       );
     });
 
-    it("should handle null result from fallback fetch", async () => {
+    it("should throw when fallback fetch still returns null", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -1102,7 +1169,9 @@ describe("Poller Coverage", () => {
       const sig = createMockSignatureInfo();
       (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
 
-      await (poller as any).processTransactionBatch(sig, 0, undefined);
+      await expect((poller as any).processTransactionBatch(sig, 0, undefined)).rejects.toThrow(
+        `Transaction not found for signature ${sig.signature}`
+      );
 
       expect(mockConnection.getParsedTransaction).toHaveBeenCalled();
     });
@@ -1666,7 +1735,7 @@ describe("Poller Coverage", () => {
   });
 
   describe("processSignatureBatch - error handling and progress logging", () => {
-    it("should catch getTxIndexMap errors and use default order (lines 289-291)", async () => {
+    it("should abort when getTxIndexMap throws unexpectedly", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -1693,10 +1762,8 @@ describe("Poller Coverage", () => {
       const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
       (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
 
-      const processed = await (poller as any).processSignatureBatch([sig1, sig2], 0, 2);
-
-      // Should still process with default order
-      expect(typeof processed).toBe("number");
+      await expect((poller as any).processSignatureBatch([sig1, sig2], 0, 2))
+        .rejects.toThrow("Unexpected getTxIndexMap failure");
     });
 
     it("should abort backfill batch on processTransaction error and increment errorCount", async () => {
@@ -1820,6 +1887,98 @@ describe("Poller Coverage", () => {
 
       expect((poller as any).batchFetcher.fetchTransactions).toHaveBeenCalled();
       expect((poller as any).processedCount).toBeGreaterThanOrEqual(2);
+    });
+
+    it("should abort live processing when tx_index is unresolved for a multi-tx slot", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "prev-live-slot";
+
+      const sig1 = createMockSignatureInfo("live-slot-a", 900);
+      const sig2 = createMockSignatureInfo("live-slot-b", 900);
+
+      let sigCallCount = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+        sigCallCount++;
+        if (sigCallCount === 1) {
+          return Promise.resolve([sig2, sig1, createMockSignatureInfo("prev-live-slot", 800)]);
+        }
+        return Promise.resolve([]);
+      });
+
+      (mockConnection as any).getBlock = vi.fn().mockRejectedValue(new Error("Block unavailable"));
+
+      await expect((poller as any).processNewTransactions()).rejects.toThrow(
+        "Deterministic tx_index unavailable for live slot 900"
+      );
+
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("prev-live-slot");
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
+
+    it("should not advance cursor when batch RPC cache misses a tx and fallback fetch still returns null", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "prev-sig-batch-null";
+
+      const sig1 = createMockSignatureInfo("live-null-1", 900);
+      const sig2 = createMockSignatureInfo("live-null-2", 901);
+
+      let sigCallCount = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+        sigCallCount++;
+        if (sigCallCount === 1) {
+          return Promise.resolve([sig2, sig1, createMockSignatureInfo("prev-sig-batch-null", 800)]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTest",
+      };
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, createEventLogs("AgentRegistered", eventData));
+      const txCache = new Map<string, any>();
+      txCache.set("live-null-2", tx);
+
+      (poller as any).batchFetcher = {
+        fetchTransactions: vi.fn().mockResolvedValue(txCache),
+        getStats: vi.fn().mockReturnValue({}),
+      };
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
+
+      await (poller as any).processNewTransactions();
+
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("live-null-1", {
+        maxSupportedTransactionVersion: 0,
+      });
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("prev-sig-batch-null");
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          signature: "live-null-1",
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: expect.stringContaining("Transaction not found"),
+        }),
+      });
     });
 
     it("should handle batchFailed and break slot loop (lines 538-562)", async () => {

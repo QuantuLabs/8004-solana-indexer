@@ -8,6 +8,7 @@ import { PrismaClient } from "@prisma/client";
 import { config } from "../config.js";
 import { parseTransaction, toTypedEvent } from "../parser/decoder.js";
 import { handleEventAtomic, EventContext } from "../db/handlers.js";
+import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { loadIndexerState, saveIndexerState, getPool } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { BatchRpcFetcher, EventBuffer } from "./batch-processor.js";
@@ -17,9 +18,8 @@ import { metadataQueue } from "./metadata-queue.js";
 const logger = createChildLogger("poller");
 
 // Batch processing configuration
-// Batch RPC fetching: enabled for ALL modes (has built-in fallback)
+// Batch RPC fetching: enabled by default, can be disabled per instance via env
 // Batch DB writes: only for Supabase mode (uses raw SQL)
-const USE_BATCH_RPC = true;
 const USE_BATCH_DB = config.dbMode === "supabase";
 const MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE =
   "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer.";
@@ -43,8 +43,8 @@ function shouldAdvanceCursor(
   if (currentSlot === null || currentSlot === undefined) return true;
   if (nextSlot > currentSlot) return true;
   if (nextSlot < currentSlot) return false;
-  const currentOrderTxIndex = currentTxIndex ?? Number.MAX_SAFE_INTEGER;
-  const nextOrderTxIndex = nextTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const currentOrderTxIndex = currentTxIndex ?? -1;
+  const nextOrderTxIndex = nextTxIndex ?? -1;
   if (nextOrderTxIndex > currentOrderTxIndex) return true;
   if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
@@ -62,12 +62,22 @@ function compareTransactionCursor(
   bTxIndex: number | null | undefined,
   bSignature: string
 ): number {
-  const aOrderTxIndex = aTxIndex ?? Number.MAX_SAFE_INTEGER;
-  const bOrderTxIndex = bTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const aOrderTxIndex = aTxIndex ?? -1;
+  const bOrderTxIndex = bTxIndex ?? -1;
   if (aOrderTxIndex !== bOrderTxIndex) {
     return aOrderTxIndex - bOrderTxIndex;
   }
   return compareSignatures(aSignature, bSignature);
+}
+
+function hasUnresolvedTxIndex(
+  txIndexMap: Map<string, number | null>,
+  signatures: ConfirmedSignatureInfo[]
+): boolean {
+  return signatures.some((sig) => {
+    const value = txIndexMap.get(sig.signature);
+    return value === null || value === undefined;
+  });
 }
 
 function toErrorMessage(error: unknown): string {
@@ -148,6 +158,7 @@ export class Poller {
   private hadPaginationPartial = false;
 
   // Batch processing components (Supabase mode only)
+  private useBatchRpc: boolean;
   private batchFetcher: BatchRpcFetcher | null = null;
   private eventBuffer: EventBuffer | null = null;
 
@@ -157,11 +168,14 @@ export class Poller {
     this.programId = options.programId;
     this.pollingInterval = options.pollingInterval || config.pollingInterval;
     this.batchSize = options.batchSize || config.batchSize;
+    this.useBatchRpc = config.pollerBatchRpcEnabled;
 
-    // Initialize batch RPC fetcher (always enabled, has built-in fallback)
-    if (USE_BATCH_RPC) {
+    // Initialize batch RPC fetcher when enabled (has built-in fallback)
+    if (this.useBatchRpc) {
       this.batchFetcher = new BatchRpcFetcher(this.connection);
       logger.info("Batch RPC fetching enabled (with fallback)");
+    } else {
+      logger.info("Batch RPC fetching disabled; using individual transaction RPC");
     }
 
     // Initialize batch DB writer (Supabase mode only)
@@ -364,7 +378,7 @@ export class Poller {
 
     // BATCH RPC: Fetch all transactions in batch first (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
-    if (USE_BATCH_RPC && this.batchFetcher) {
+    if (this.useBatchRpc && this.batchFetcher) {
       const sigList = signatures.map(s => s.signature);
       txCache = await this.batchFetcher.fetchTransactions(sigList);
       logger.debug({ requested: sigList.length, fetched: txCache.size }, "Batch RPC fetch complete");
@@ -389,9 +403,15 @@ export class Poller {
       let txIndexMap: Map<string, number | null>;
       try {
         txIndexMap = await this.getTxIndexMap(slot, sigs);
+        if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
+          throw new Error(`Deterministic tx_index unavailable for slot ${slot}`);
+        }
       } catch (error) {
-        logger.warn({ slot, error: error instanceof Error ? error.message : String(error) }, "Failed to get tx index map, tx_index will be NULL");
-        txIndexMap = new Map(sigs.map((s) => [s.signature, null]));
+        logger.fatal(
+          { slot, error: error instanceof Error ? error.message : String(error) },
+          "Backfill aborted: deterministic tx_index unavailable for multi-transaction slot"
+        );
+        throw (error instanceof Error ? error : new Error(String(error)));
       }
 
       const sigsWithIndex = sigs.map((sig) => ({
@@ -406,7 +426,7 @@ export class Poller {
 
         try {
           // Use cached transaction from batch RPC if available
-          if (USE_BATCH_RPC && txCache) {
+          if (this.useBatchRpc && txCache) {
             await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
           } else {
             await this.processTransaction(sig, txIndex);
@@ -426,7 +446,7 @@ export class Poller {
               processed: previousCount + processed,
               total: totalEstimate,
               rate: `${Math.round(processed / elapsed)} tx/s`,
-              batchRpc: USE_BATCH_RPC,
+              batchRpc: this.useBatchRpc,
               batchDb: USE_BATCH_DB
             }, "Backfill progress");
           }
@@ -499,7 +519,7 @@ export class Poller {
           logger.warn({ slot, attempt, error: error instanceof Error ? error.message : String(error) }, "getBlock failed, retrying");
           await new Promise(r => setTimeout(r, 500 * attempt));
         } else {
-          logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index will be NULL (signature-order fallback)");
+          logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index is unavailable");
           sigs.forEach(sig => txIndexMap.set(sig.signature, null));
         }
       }
@@ -725,6 +745,14 @@ export class Poller {
     }
 
     // Local mode - save to Prisma
+    if (await trySaveLocalIndexerStateWithSql(this.prisma, {
+      signature,
+      slot,
+      txIndex,
+    })) {
+      return;
+    }
+
     await this.prisma.indexerState.upsert({
       where: { id: "main" },
       create: {
@@ -775,14 +803,14 @@ export class Poller {
       return;
     }
 
-    logger.info({ count: signatures.length, batchRpc: USE_BATCH_RPC, batchDb: USE_BATCH_DB }, "Processing transactions");
+    logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
 
     // Reverse to process oldest first
     const reversed = signatures.reverse();
 
     // BATCH RPC: Pre-fetch all transactions in batch (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
-    if (USE_BATCH_RPC && this.batchFetcher && reversed.length > 1) {
+    if (this.useBatchRpc && this.batchFetcher && reversed.length > 1) {
       const sigList = reversed.map(s => s.signature);
       txCache = await this.batchFetcher.fetchTransactions(sigList);
       logger.debug({ requested: sigList.length, fetched: txCache.size }, "Live poll batch RPC fetch");
@@ -803,6 +831,9 @@ export class Poller {
     for (const slot of sortedSlots) {
       const sigs = bySlot.get(slot)!;
       const txIndexMap = await this.getTxIndexMap(slot, sigs);
+      if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
+        throw new Error(`Deterministic tx_index unavailable for live slot ${slot}`);
+      }
 
       const sigsWithIndex = sigs.map((sig) => ({
         sig,
@@ -815,7 +846,7 @@ export class Poller {
       for (const { sig, txIndex } of sigsWithIndex) {
         try {
           // Use cached transaction from batch RPC if available
-          if (USE_BATCH_RPC && txCache) {
+          if (this.useBatchRpc && txCache) {
             await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
           } else {
             await this.processTransaction(sig, txIndex);
@@ -970,12 +1001,15 @@ export class Poller {
                 sameSlotBefore = nextBefore;
                 await new Promise((resolve) => setTimeout(resolve, 100));
               }
-              let stopTxIndex = this.lastTxIndex ?? null;
+              let stopTxIndex = this.lastTxIndex ?? -1;
               const sameSlotCursorEntries = [sig, ...sameSlotCandidates];
               try {
                 const sameSlotTxIndexMap = await this.getTxIndexMap(stopSlot, sameSlotCursorEntries);
+                if (hasUnresolvedTxIndex(sameSlotTxIndexMap, sameSlotCursorEntries)) {
+                  throw new Error(`Deterministic tx_index unavailable for pagination stop slot ${stopSlot}`);
+                }
                 if (sameSlotTxIndexMap.has(stopSignature)) {
-                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
+                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? -1;
                 }
                 sameSlotCandidates.sort((a, b) =>
                   compareTransactionCursor(
@@ -1011,16 +1045,7 @@ export class Poller {
                   },
                   "Failed to resolve same-slot tx_index map during pagination stop handling"
                 );
-                allSignatures.length = 0;
-                seenSignatures.clear();
-                for (const entry of keepDifferentSlot) {
-                  pushUniqueSignature(entry);
-                }
-                for (const candidate of sameSlotCandidates) {
-                  if (compareTransactionCursor(stopTxIndex, stopSignature, null, candidate.signature) < 0) {
-                    pushUniqueSignature(candidate);
-                  }
-                }
+                throw error;
               }
               this.pendingStopSignature = null;
               return allSignatures;
@@ -1120,8 +1145,7 @@ export class Poller {
     });
 
     if (!tx) {
-      logger.warn({ signature: sig.signature }, "Transaction not found");
-      return;
+      throw new Error(`Transaction not found for signature ${sig.signature}`);
     }
 
     const parsed = parseTransaction(tx);
@@ -1182,8 +1206,7 @@ export class Poller {
     }
 
     if (!tx) {
-      logger.warn({ signature: sig.signature }, "Transaction not found");
-      return;
+      throw new Error(`Transaction not found for signature ${sig.signature}`);
     }
 
     const parsed = parseTransaction(tx);

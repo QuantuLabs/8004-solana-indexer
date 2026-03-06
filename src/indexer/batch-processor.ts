@@ -16,6 +16,7 @@ import { config } from "../config.js";
 import { metadataQueue } from "./metadata-queue.js";
 import { collectionMetadataQueue } from "./collection-metadata-queue.js";
 import { classifyRevocationStatus } from "../db/revocation-classification.js";
+import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { REVOCATION_CONFLICT_UPDATE_WHERE_SQL } from "../db/revocation-upsert-order.js";
 import { compressForStorage } from "../utils/compression.js";
 import { stripNullBytes } from "../utils/sanitize.js";
@@ -24,10 +25,10 @@ import { DEFAULT_PUBKEY } from "../constants.js";
 const logger = createChildLogger("batch-processor");
 
 // Batch configuration
-const BATCH_SIZE_RPC = 100;        // Max transactions per RPC call
+const DEFAULT_BATCH_SIZE_RPC = 100;        // Max transactions per RPC call
 const BATCH_SIZE_DB = 500;         // Max events per DB transaction
 const FLUSH_INTERVAL_MS = 500;     // Flush every 500ms even if batch not full
-const MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
+const DEFAULT_MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
 const MAX_DEAD_LETTER = 10000;     // Max diagnostic events retained in dead letter queue
 const DEAD_LETTER_BACKPRESSURE = 0.8; // Warn at 80% diagnostic queue capacity
 
@@ -76,15 +77,24 @@ export interface BatchStats {
   avgRpcBatchTime: number;
 }
 
+interface BatchRpcFetcherOptions {
+  chunkSize?: number;
+  maxParallelChunks?: number;
+}
+
 /**
  * Batch RPC Fetcher - Fetches multiple transactions in parallel
  */
 export class BatchRpcFetcher {
   private connection: Connection;
+  private chunkSize: number;
+  private maxParallelChunks: number;
   private stats = { batchCount: 0, totalTime: 0 };
 
-  constructor(connection: Connection) {
+  constructor(connection: Connection, options: BatchRpcFetcherOptions = {}) {
     this.connection = connection;
+    this.chunkSize = options.chunkSize ?? config.pollerRpcChunkSize ?? DEFAULT_BATCH_SIZE_RPC;
+    this.maxParallelChunks = options.maxParallelChunks ?? config.pollerRpcChunkConcurrency ?? DEFAULT_MAX_PARALLEL_RPC;
   }
 
   /**
@@ -96,17 +106,17 @@ export class BatchRpcFetcher {
   ): Promise<Map<string, ParsedTransactionWithMeta>> {
     const results = new Map<string, ParsedTransactionWithMeta>();
 
-    // Split into chunks of BATCH_SIZE_RPC
+    // Split into chunks of configured getParsedTransactions size
     const chunks: string[][] = [];
-    for (let i = 0; i < signatures.length; i += BATCH_SIZE_RPC) {
-      chunks.push(signatures.slice(i, i + BATCH_SIZE_RPC));
+    for (let i = 0; i < signatures.length; i += this.chunkSize) {
+      chunks.push(signatures.slice(i, i + this.chunkSize));
     }
 
     const startTime = Date.now();
 
     // Process chunks with limited parallelism
-    for (let i = 0; i < chunks.length; i += MAX_PARALLEL_RPC) {
-      const parallelChunks = chunks.slice(i, i + MAX_PARALLEL_RPC);
+    for (let i = 0; i < chunks.length; i += this.maxParallelChunks) {
+      const parallelChunks = chunks.slice(i, i + this.maxParallelChunks);
 
       const batchResults = await Promise.all(
         parallelChunks.map(chunk => this.fetchChunk(chunk))
@@ -137,6 +147,7 @@ export class BatchRpcFetcher {
     signatures: string[]
   ): Promise<Map<string, ParsedTransactionWithMeta>> {
     const results = new Map<string, ParsedTransactionWithMeta>();
+    const missing: string[] = [];
 
     try {
       // Use getParsedTransactions (plural) for batch fetching
@@ -149,6 +160,8 @@ export class BatchRpcFetcher {
         const tx = transactions[i];
         if (tx) {
           results.set(signatures[i], tx);
+        } else {
+          missing.push(signatures[i]);
         }
       }
     } catch (error) {
@@ -165,6 +178,23 @@ export class BatchRpcFetcher {
           }
         } catch (e) {
           logger.warn({ signature: sig, error: e }, "Individual fetch failed");
+        }
+      }
+      return results;
+    }
+
+    if (missing.length > 0) {
+      logger.warn({ missing: missing.length, count: signatures.length }, "Batch RPC returned partial nulls, refetching missing transactions individually");
+      for (const sig of missing) {
+        try {
+          const tx = await this.connection.getParsedTransaction(sig, {
+            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion
+          });
+          if (tx) {
+            results.set(sig, tx);
+          }
+        } catch (error) {
+          logger.warn({ signature: sig, error }, "Individual refetch after partial batch null failed");
         }
       }
     }
@@ -395,11 +425,11 @@ export class EventBuffer {
              OR (
                indexer_state.last_slot = EXCLUDED.last_slot
                AND (
-                 COALESCE(indexer_state.last_tx_index, 2147483647)
-                   < COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                 COALESCE(indexer_state.last_tx_index, -1)
+                   < COALESCE(EXCLUDED.last_tx_index, -1)
                  OR (
-                   COALESCE(indexer_state.last_tx_index, 2147483647)
-                     = COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                   COALESCE(indexer_state.last_tx_index, -1)
+                     = COALESCE(EXCLUDED.last_tx_index, -1)
                    AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                      <= EXCLUDED.last_signature COLLATE "C"
                  )
@@ -626,6 +656,8 @@ export class EventBuffer {
     );
 
     for (const row of pending.rows) {
+      const feedbackIndex = BigInt(row.feedback_index?.toString?.() ?? row.feedback_index ?? "0");
+      const feedbackHash = row.feedback_hash ?? null;
       const insertResult = await client.query(`
         INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'PENDING')
@@ -668,6 +700,20 @@ export class EventBuffer {
         }
       }
 
+      await this.replayOrphanResponsesSupabase(
+        client,
+        row.asset,
+        row.client_address,
+        feedbackIndex,
+        feedbackHash
+      );
+      await this.reconcileOrphanRevocationSupabase(
+        client,
+        row.asset,
+        row.client_address,
+        feedbackIndex,
+        feedbackHash
+      );
       await client.query(`DELETE FROM orphan_feedbacks WHERE id = $1`, [row.id]);
     }
   }
@@ -1305,17 +1351,28 @@ export class EventBuffer {
       // via the standard poller path. This method only updates the cursor.
 
       if (lastCtx) {
+        if (await trySaveLocalIndexerStateWithSql(tx, {
+          signature: lastCtx.signature,
+          slot: lastCtx.slot,
+          txIndex: lastCtx.txIndex ?? null,
+          source: "poller",
+        })) {
+          return;
+        }
+
         await tx.indexerState.upsert({
           where: { id: "main" },
           create: {
             id: "main",
             lastSignature: lastCtx.signature,
             lastSlot: lastCtx.slot,
+            lastTxIndex: lastCtx.txIndex ?? null,
             source: "poller",
           },
           update: {
             lastSignature: lastCtx.signature,
             lastSlot: lastCtx.slot,
+            lastTxIndex: lastCtx.txIndex ?? null,
             source: "poller",
           },
         });

@@ -6,6 +6,7 @@ vi.mock("../../../src/config.js", () => ({
     dbMode: "supabase",
     metadataIndexMode: "normal",
     validationIndexEnabled: true,
+    maxSupportedTransactionVersion: 0,
   },
 }));
 
@@ -148,15 +149,21 @@ describe("BatchRpcFetcher", () => {
       expect(result.get("sig1")).toBe(tx);
     });
 
-    it("should handle null transactions in batch", async () => {
-      mockConnection.getParsedTransactions.mockResolvedValue([null, { slot: 1 }]);
+    it("should refetch null transactions in batch individually", async () => {
+      const tx1 = { slot: 1, transaction: { signatures: ["sig1"] } };
+      const tx2 = { slot: 1, transaction: { signatures: ["sig2"] } };
+      mockConnection.getParsedTransactions.mockResolvedValue([null, tx2]);
+      mockConnection.getParsedTransaction.mockResolvedValue(tx1);
 
       const fetcher = new BatchRpcFetcher(mockConnection);
       const result = await fetcher.fetchTransactions(["sig1", "sig2"]);
 
-      expect(result.size).toBe(1);
-      expect(result.has("sig1")).toBe(false);
+      expect(result.size).toBe(2);
+      expect(result.get("sig1")).toBe(tx1);
       expect(result.has("sig2")).toBe(true);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("sig1", {
+        maxSupportedTransactionVersion: 0,
+      });
     });
 
     it("should split into chunks of 100", async () => {
@@ -169,6 +176,19 @@ describe("BatchRpcFetcher", () => {
       await fetcher.fetchTransactions(sigs);
 
       expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(2);
+    });
+
+    it("should allow smaller configured RPC chunks", async () => {
+      const sigs = Array.from({ length: 120 }, (_, i) => `sig${i}`);
+      mockConnection.getParsedTransactions.mockResolvedValue([]);
+
+      const fetcher = new BatchRpcFetcher(mockConnection, { chunkSize: 40 });
+      await fetcher.fetchTransactions(sigs);
+
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(3);
+      expect(mockConnection.getParsedTransactions.mock.calls[0][0]).toHaveLength(40);
+      expect(mockConnection.getParsedTransactions.mock.calls[1][0]).toHaveLength(40);
+      expect(mockConnection.getParsedTransactions.mock.calls[2][0]).toHaveLength(40);
     });
 
     it("should fall back to individual fetches on batch failure", async () => {
@@ -205,6 +225,30 @@ describe("BatchRpcFetcher", () => {
 
       // 500 sigs / 100 per chunk = 5 chunks, max 3 parallel
       expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(5);
+    });
+
+    it("should allow lower parallel chunk concurrency", async () => {
+      const sigs = Array.from({ length: 120 }, (_, i) => `sig${i}`);
+      let inFlight = 0;
+      let maxInFlight = 0;
+
+      mockConnection.getParsedTransactions.mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await Promise.resolve();
+        await Promise.resolve();
+        inFlight--;
+        return [];
+      });
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 40,
+        maxParallelChunks: 1,
+      });
+      await fetcher.fetchTransactions(sigs);
+
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(3);
+      expect(maxInFlight).toBe(1);
     });
   });
 
@@ -335,6 +379,108 @@ describe("EventBuffer", () => {
       expect(insertCall).toBeDefined();
       expect(insertCall![0]).toContain("created_at, updated_at, status");
       expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
+    });
+
+    it("replays orphan response and revocation chains when agent registration replays orphan feedback", async () => {
+      const client = mockPool._client;
+      const feedbackHash = "ab".repeat(32);
+      client.query.mockImplementation((sql: string) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 };
+        if (typeof sql === "string" && sql.includes("FROM orphan_feedbacks")) {
+          return {
+            rows: [{
+              id: "ofb-1",
+              asset: "assetKey123456789012345678901234",
+              client_address: "client1",
+              feedback_index: "0",
+              value: "1000",
+              value_decimals: 2,
+              score: 80,
+              tag1: "quality",
+              tag2: "speed",
+              endpoint: "/chat",
+              feedback_uri: "ipfs://feedback",
+              feedback_hash: feedbackHash,
+              running_digest: Buffer.from(new Uint8Array(32).fill(0xab)),
+              atom_enabled: false,
+              new_trust_tier: 0,
+              new_quality_score: 0,
+              new_confidence: 0,
+              new_risk_score: 0,
+              new_diversity_ratio: 0,
+              block_slot: "100",
+              tx_index: 2,
+              event_ordinal: 0,
+              tx_signature: "feedback-sig",
+              created_at: new Date("2026-03-06T00:00:00.000Z").toISOString(),
+            }],
+            rowCount: 1,
+          };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedbacks")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("UPDATE agents SET")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("FROM orphan_responses")) {
+          return {
+            rows: [{
+              id: "orphan-response-1",
+              asset: "assetKey123456789012345678901234",
+              client_address: "client1",
+              feedback_index: "0",
+              responder: "responder1",
+              response_uri: "ipfs://resp",
+              response_hash: feedbackHash,
+              seal_hash: feedbackHash,
+              running_digest: Buffer.from(new Uint8Array(32).fill(0xab)),
+              response_count: "1",
+              block_slot: "101",
+              tx_index: 3,
+              event_ordinal: 0,
+              tx_signature: "response-sig",
+              created_at: new Date("2026-03-06T00:00:01.000Z").toISOString(),
+            }],
+            rowCount: 1,
+          };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedback_responses (id, response_id")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("DELETE FROM orphan_responses")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("FROM revocations")) {
+          return { rows: [{ feedback_hash: feedbackHash, status: "ORPHANED" }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("UPDATE revocations")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("AgentRegistered", {
+          asset: "assetKey123456789012345678901234",
+          owner: "ownerKey123456789012345678901234",
+          collection: "collKey1234567890123456789012345",
+          agentUri: "",
+          atomEnabled: false,
+        })
+      );
+      await buffer.flush();
+
+      expect(client.query.mock.calls.some((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      )).toBe(true);
+      expect(client.query.mock.calls.some((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("UPDATE revocations")
+      )).toBe(true);
+      expect(client.query.mock.calls.some((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("DELETE FROM orphan_feedbacks")
+      )).toBe(true);
     });
 
     it("should queue URI metadata on AgentRegistered with URI", async () => {
