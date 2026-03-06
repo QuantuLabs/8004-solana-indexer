@@ -18,6 +18,7 @@ const logger = createChildLogger("uri-digest");
 /** Allowed URL protocols for metadata fields (image, endpoints, etc.) */
 const ALLOWED_URL_PROTOCOLS = new Set(["https:", "http:", "ipfs:", "ar:"]);
 const ENS_NAME_REGEX = /^(?=.{1,255}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const SNS_NAME_REGEX = /^(?=.{1,255}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+sol$/;
 const DID_URI_REGEX = /^did:[a-z0-9]+:[A-Za-z0-9._:%-]+(?::[A-Za-z0-9._:%-]+)*(?:[/?#][^\s]*)?$/;
 const EIP155_ACCOUNT_REGEX = /^eip155:\d+:0x[a-fA-F0-9]{40}$/;
 
@@ -95,6 +96,11 @@ function sanitizeEnsName(value: string): string {
   return ENS_NAME_REGEX.test(candidate) ? candidate : "";
 }
 
+function sanitizeSnsName(value: string): string {
+  const candidate = sanitizeText(value).toLowerCase();
+  return SNS_NAME_REGEX.test(candidate) ? candidate : "";
+}
+
 function sanitizeDidUri(value: string): string {
   const candidate = sanitizeText(value);
   if (!candidate || /\s/.test(candidate)) return "";
@@ -108,7 +114,7 @@ function sanitizeDidUri(value: string): string {
 function sanitizeServices(arr: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(arr)) return [];
 
-  const validServiceNames = new Set(["mcp", "a2a", "oasf", "ens", "did", "agentwallet", "wallet"]);
+  const validServiceNames = new Set(["mcp", "a2a", "oasf", "ens", "sns", "did", "agentwallet", "wallet"]);
   const slugRegex = /^[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?(?:\/[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?)*$/;
 
   // SLICE FIRST to prevent CPU exhaustion via large arrays
@@ -143,12 +149,15 @@ function sanitizeServices(arr: unknown): Array<Record<string, unknown>> {
         const canonicalServiceName = service.name as string;
         const isWalletService = canonicalServiceName === "agentwallet" || canonicalServiceName === "wallet";
         const isEnsService = canonicalServiceName === "ens";
+        const isSnsService = canonicalServiceName === "sns";
         const isDidService = canonicalServiceName === "did";
         const endpointRef = sanitizeText(item.endpoint);
         const endpoint = isWalletService
           ? (EIP155_ACCOUNT_REGEX.test(endpointRef) ? endpointRef : "")
           : isEnsService
             ? sanitizeEnsName(endpointRef)
+            : isSnsService
+              ? sanitizeSnsName(endpointRef)
             : isDidService
               ? sanitizeDidUri(endpointRef)
               : sanitizeUrl(item.endpoint);

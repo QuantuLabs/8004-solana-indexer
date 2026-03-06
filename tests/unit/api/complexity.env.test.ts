@@ -25,8 +25,8 @@ describe('GraphQL complexity env parsing', () => {
     vi.resetModules();
 
     const mod = await import('../../../src/api/graphql/plugins/complexity.js');
-    expect(mod.MAX_COMPLEXITY).toBe(500);
-    expect(mod.MAX_FIRST_CAP).toBe(250);
+    expect(mod.MAX_COMPLEXITY).toBe(3000);
+    expect(mod.MAX_FIRST_CAP).toBe(400);
 
     const doc = parse(`{
       a1: agents(first: 250) { id feedback(first: 250) { id responses { id } } }

@@ -258,9 +258,7 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
        (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
        (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
        (SELECT COUNT(*)::text
-        FROM collections
-        WHERE status != 'ORPHANED'
-          AND registry_type != 'BASE') AS total_collections,
+        FROM collection_pointers) AS total_collections,
        COALESCE((
          SELECT ARRAY(
            SELECT tag FROM (

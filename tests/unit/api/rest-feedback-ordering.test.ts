@@ -636,9 +636,9 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -667,9 +667,9 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -697,9 +697,9 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -766,9 +766,9 @@ describe("REST feedback deterministic ordering", () => {
             { agentId: "asc" },
             { client: "asc" },
             { feedbackIndex: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -1367,8 +1367,10 @@ describe("REST feedback deterministic ordering", () => {
           orderBy: [
             { responseCount: "desc" },
             { responder: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { slot: "asc" },
+            { txIndex: "asc" },
+            { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -1424,9 +1426,9 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -1461,9 +1463,9 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -1479,7 +1481,7 @@ describe("REST feedback deterministic ordering", () => {
     ["block_slot.asc", "slot", "asc"],
     [undefined, "createdAt", "desc"],
   ])(
-    "keeps canonical response ordering deterministic with txSignature nulls-last for order=%s",
+    "keeps canonical response ordering deterministic with txIndex/eventOrdinal before txSignature for order=%s",
     async (order, primaryField, primaryDir) => {
       const prisma = {
         feedback: {
@@ -1500,14 +1502,17 @@ describe("REST feedback deterministic ordering", () => {
         expect(res.status).toBe(200);
 
         const callArgs = prisma.feedbackResponse.findMany.mock.calls[0]?.[0];
-        expect(callArgs).toBeDefined();
-        expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
-        expect(callArgs.orderBy).toContainEqual({ txSignature: { sort: "asc", nulls: "last" } });
-        expect(callArgs.orderBy).toContainEqual({ txIndex: "asc" });
-        expect(callArgs.orderBy).toContainEqual({ eventOrdinal: "asc" });
-      } finally {
-        await stopServer(server);
-      }
+      expect(callArgs).toBeDefined();
+      expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
+      const txIndexPos = callArgs.orderBy.findIndex((entry: any) => "txIndex" in entry);
+      const eventOrdinalPos = callArgs.orderBy.findIndex((entry: any) => "eventOrdinal" in entry);
+      const txSignaturePos = callArgs.orderBy.findIndex((entry: any) => "txSignature" in entry);
+      expect(txIndexPos).toBeGreaterThan(-1);
+      expect(eventOrdinalPos).toBeGreaterThan(txIndexPos);
+      expect(txSignaturePos).toBeGreaterThan(eventOrdinalPos);
+    } finally {
+      await stopServer(server);
+    }
     }
   );
 
@@ -1531,9 +1536,9 @@ describe("REST feedback deterministic ordering", () => {
             { feedback: { client: "asc" } },
             { feedback: { feedbackIndex: "asc" } },
             { responder: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
             { txIndex: "asc" },
             { eventOrdinal: "asc" },
+            { txSignature: { sort: "asc", nulls: "last" } },
           ],
         })
       );
@@ -1601,7 +1606,7 @@ describe("REST feedback deterministic ordering", () => {
     ["block_slot.desc", "slot", "desc"],
     [undefined, "createdAt", "desc"],
   ])(
-    "keeps orphan response ordering deterministic with txSignature nulls-last for order=%s",
+    "keeps orphan response ordering deterministic with txIndex/eventOrdinal before txSignature for order=%s",
     async (order, primaryField, primaryDir) => {
       const prisma = {
         feedback: {
@@ -1625,13 +1630,18 @@ describe("REST feedback deterministic ordering", () => {
         expect(res.status).toBe(200);
         expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
 
-        const callArgs = prisma.orphanResponse.findMany.mock.calls[0]?.[0];
-        expect(callArgs).toBeDefined();
-        expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
-        expect(callArgs.orderBy).toContainEqual({ txSignature: { sort: "asc", nulls: "last" } });
-      } finally {
-        await stopServer(server);
-      }
+      const callArgs = prisma.orphanResponse.findMany.mock.calls[0]?.[0];
+      expect(callArgs).toBeDefined();
+      expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
+      const txIndexPos = callArgs.orderBy.findIndex((entry: any) => "txIndex" in entry);
+      const eventOrdinalPos = callArgs.orderBy.findIndex((entry: any) => "eventOrdinal" in entry);
+      const txSignaturePos = callArgs.orderBy.findIndex((entry: any) => "txSignature" in entry);
+      expect(txIndexPos).toBeGreaterThan(-1);
+      expect(eventOrdinalPos).toBeGreaterThan(txIndexPos);
+      expect(txSignaturePos).toBeGreaterThan(eventOrdinalPos);
+    } finally {
+      await stopServer(server);
+    }
     }
   );
 

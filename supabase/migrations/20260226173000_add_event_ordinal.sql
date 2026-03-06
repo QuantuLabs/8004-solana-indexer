@@ -1,8 +1,8 @@
 -- =============================================
 -- Add event_ordinal for deterministic intra-transaction ordering
 -- Migration: 2026-02-26
--- Canonical key: block_slot, tx_signature, tx_index NULLS LAST,
---                event_ordinal NULLS LAST, then technical tie-break (id/asset)
+-- Canonical key: block_slot, tx_index NULLS LAST,
+--                event_ordinal NULLS LAST, tx_signature, then technical tie-break (id/asset)
 -- =============================================
 
 -- Add event_ordinal columns for all tx_index-backed entities
@@ -19,24 +19,24 @@ ALTER TABLE revocations ADD COLUMN IF NOT EXISTS tx_index INTEGER;
 -- Canonical ordering indexes
 DROP INDEX IF EXISTS idx_agents_ordering_canonical;
 CREATE INDEX idx_agents_ordering_canonical
-ON agents(block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, asset);
+ON agents(block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, asset);
 
 DROP INDEX IF EXISTS idx_feedbacks_deterministic_order;
 CREATE INDEX idx_feedbacks_deterministic_order
-ON feedbacks(asset, client_address, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedbacks(asset, client_address, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 DROP INDEX IF EXISTS idx_feedbacks_global_order;
 CREATE INDEX idx_feedbacks_global_order
-ON feedbacks(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedbacks(asset, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 DROP INDEX IF EXISTS idx_feedback_responses_canonical_order;
 CREATE INDEX idx_feedback_responses_canonical_order
-ON feedback_responses(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedback_responses(asset, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 DROP INDEX IF EXISTS idx_revocations_canonical_order;
 CREATE INDEX idx_revocations_canonical_order
-ON revocations(asset, slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON revocations(asset, slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 DROP INDEX IF EXISTS idx_validations_canonical_order;
 CREATE INDEX idx_validations_canonical_order
-ON validations(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON validations(asset, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);

@@ -418,6 +418,7 @@ describe("URI Digest Coverage", () => {
         { name: "a2a", endpoint: "https://b.com" },
         { name: "oasf", endpoint: "https://c.com" },
         { name: "ens", endpoint: "dataanalyst.eth" },
+        { name: "sns", endpoint: "agentalpha.sol" },
         { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
         { name: "agentwallet", endpoint: "eip155:1:0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb7" },
         { name: "wallet", endpoint: "eip155:1:0x1234567890abcdef1234567890abcdef12345678" },
@@ -425,7 +426,7 @@ describe("URI Digest Coverage", () => {
       global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ services }));
       const result = await digestUri("https://example.com/agent.json");
       const svc = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
-      expect(svc.length).toBe(7);
+      expect(svc.length).toBe(8);
     });
 
     it("should reject agentwallet endpoint that is not eip155", async () => {
@@ -458,11 +459,12 @@ describe("URI Digest Coverage", () => {
       expect(result.fields!["_uri:services"]).toBeUndefined();
     });
 
-    it("should accept ENS and DID canonical endpoints", async () => {
+    it("should accept ENS, SNS and DID canonical endpoints", async () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockFetchOk({
           services: [
             { name: "ens", endpoint: "DataAnalyst.eth" },
+            { name: "sns", endpoint: "AgentAlpha.sol" },
             { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
           ],
         })
@@ -472,17 +474,29 @@ describe("URI Digest Coverage", () => {
       const services = result.fields!["_uri:services"] as Array<Record<string, unknown>>;
       expect(services).toEqual([
         { name: "ens", endpoint: "dataanalyst.eth" },
+        { name: "sns", endpoint: "agentalpha.sol" },
         { name: "did", endpoint: "did:ethr:0x1234567890abcdef1234567890abcdef12345678" },
       ]);
     });
 
-    it("should reject ENS and DID services with URL endpoints", async () => {
+    it("should reject ENS, SNS and DID services with URL endpoints", async () => {
       global.fetch = vi.fn().mockResolvedValue(
         mockFetchOk({
           services: [
             { name: "ens", endpoint: "https://ens.example.com" },
+            { name: "sns", endpoint: "https://sns.example.com" },
             { name: "did", endpoint: "https://did.example.com" },
           ],
+        })
+      );
+      const result = await digestUri("https://example.com/agent.json");
+      expect(result.fields!["_uri:services"]).toBeUndefined();
+    });
+
+    it("should reject SNS services without a .sol domain endpoint", async () => {
+      global.fetch = vi.fn().mockResolvedValue(
+        mockFetchOk({
+          services: [{ name: "sns", endpoint: "agentalpha.eth" }],
         })
       );
       const result = await digestUri("https://example.com/agent.json");

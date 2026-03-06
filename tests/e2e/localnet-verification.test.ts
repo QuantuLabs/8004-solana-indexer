@@ -335,7 +335,7 @@ describe("E2E: Localnet Verification", () => {
         create: {
           id: registryConfigPda.toBase58(),
           collection: collectionPubkey.toBase58(),
-          registryType: "Base",
+          registryType: "BASE",
           authority: wallet.publicKey.toBase58(),
           status: "PENDING",
           slot: 0n,

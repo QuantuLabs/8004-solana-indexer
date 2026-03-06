@@ -15,13 +15,13 @@ CREATE SEQUENCE IF NOT EXISTS agent_global_id_seq START 1;
 
 -- Backfill existing agents in deterministic order:
 --   1) block_slot
---   2) tx_signature
---   3) tx_index NULLS LAST
---   4) event_ordinal NULLS LAST
+--   2) tx_index NULLS LAST
+--   3) event_ordinal NULLS LAST
+--   4) tx_signature
 --   5) asset (technical tie-breaker)
 WITH ordered_agents AS (
   SELECT asset, ROW_NUMBER() OVER (
-    ORDER BY block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, asset
+    ORDER BY block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, asset
   ) AS rn
   FROM agents
   WHERE status != 'ORPHANED'

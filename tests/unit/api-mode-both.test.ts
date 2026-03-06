@@ -1213,6 +1213,29 @@ describe("API_MODE=both behavior", () => {
       expect(statsUpstreamUrl.pathname).toBe("/rest/v1/global_stats");
       expect(statsUpstreamUrl.searchParams.get("limit")).toBe("1");
 
+      const statsIncludeOrphanedCallStart = fetchSpy.mock.calls.length;
+      const statsIncludeOrphanedRes = await fetch(`${baseUrl}/rest/v1/stats?includeOrphaned=true&limit=2`);
+      expect(statsIncludeOrphanedRes.status).toBe(200);
+      const statsIncludeOrphanedUpstreamCall = fetchSpy.mock.calls.slice(statsIncludeOrphanedCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/global_stats");
+      });
+      expect(statsIncludeOrphanedUpstreamCall).toBeTruthy();
+      const statsIncludeOrphanedUpstreamUrlRaw = typeof statsIncludeOrphanedUpstreamCall?.[0] === "string"
+        ? statsIncludeOrphanedUpstreamCall[0]
+        : statsIncludeOrphanedUpstreamCall?.[0] instanceof URL
+          ? statsIncludeOrphanedUpstreamCall[0].toString()
+          : statsIncludeOrphanedUpstreamCall?.[0]?.url;
+      expect(typeof statsIncludeOrphanedUpstreamUrlRaw).toBe("string");
+      const statsIncludeOrphanedUpstreamUrl = new URL(statsIncludeOrphanedUpstreamUrlRaw as string);
+      expect(statsIncludeOrphanedUpstreamUrl.pathname).toBe("/rest/v1/global_stats");
+      expect(statsIncludeOrphanedUpstreamUrl.searchParams.get("includeOrphaned")).toBeNull();
+      expect(statsIncludeOrphanedUpstreamUrl.searchParams.get("limit")).toBe("2");
+
       const verificationCallStart = fetchSpy.mock.calls.length;
       const verificationPoolCallStart = poolQuery.mock.calls.length;
       const verificationRes = await fetch(`${baseUrl}/rest/v1/stats/verification`);
@@ -1542,6 +1565,149 @@ describe("API_MODE=both behavior", () => {
       expect(forwardedHeaders.get("prefer")).toBe("count=exact");
       expect(forwardedHeaders.get("apikey")).toBe("alias-service-role-key");
       expect(forwardedHeaders.get("authorization")).toBe("Bearer alias-service-role-key");
+
+      await waitForGraphqlMount(baseUrl);
+      const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: "{ stats { totalAgents } }" }),
+      });
+      expect(gqlRes.status).toBe(200);
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("falls back to derived stats when /global_stats relation is missing in REST proxy mode", async () => {
+    process.env.POSTGREST_URL = "https://proxy-test.supabase.co";
+    process.env.POSTGREST_TOKEN = "alias-service-role-key";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+
+      if (typeof url === "string") {
+        const parsed = new URL(url);
+        if (parsed.pathname === "/global_stats") {
+          return new Response(
+            JSON.stringify({ code: "42P01", message: "relation \"public.global_stats\" does not exist" }),
+            { status: 404, headers: { "content-type": "application/json" } }
+          );
+        }
+        if (parsed.pathname === "/agents") {
+          return new Response(
+            JSON.stringify([{ asset: "ProxyAgentFallback11111111111111111111111111" }]),
+            { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/10" } }
+          );
+        }
+        if (parsed.pathname === "/feedbacks") {
+          return new Response(
+            JSON.stringify([{ id: "feedback-1" }]),
+            { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/7" } }
+          );
+        }
+        if (parsed.pathname === "/collections") {
+          return new Response(
+            JSON.stringify([{ collection: "c1:bafy..." }]),
+            { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/3" } }
+          );
+        }
+      }
+
+      return realFetch(input, init);
+    });
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: vi.fn() } as any,
+    });
+
+    try {
+      const restRes = await fetch(`${baseUrl}/rest/v1/stats?limit=1`);
+      expect(restRes.status).toBe(200);
+      expect(await restRes.json()).toEqual([{
+        total_agents: 10,
+        total_feedbacks: 7,
+        total_collections: 3,
+      }]);
+
+      const upstreamGlobalStatsCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/global_stats");
+      });
+      expect(upstreamGlobalStatsCall).toBeTruthy();
+
+      const agentCountCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof url !== "string") return false;
+        const parsed = new URL(url);
+        return parsed.pathname === "/agents" && parsed.searchParams.get("select") === "asset";
+      });
+      expect(agentCountCall).toBeTruthy();
+      const agentCountUrl = new URL(
+        (typeof agentCountCall?.[0] === "string"
+          ? agentCountCall?.[0]
+          : agentCountCall?.[0] instanceof URL
+            ? agentCountCall?.[0].toString()
+            : agentCountCall?.[0]?.url) as string
+      );
+      expect(agentCountUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+      const agentCountInit = agentCountCall?.[1] as RequestInit | undefined;
+      const agentCountHeaders = new Headers(agentCountInit?.headers);
+      expect(agentCountHeaders.get("prefer")).toBe("count=exact");
+      expect(agentCountHeaders.get("range")).toBe("0-0");
+
+      const feedbackCountCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof url !== "string") return false;
+        const parsed = new URL(url);
+        return parsed.pathname === "/feedbacks" && parsed.searchParams.get("select") === "id";
+      });
+      expect(feedbackCountCall).toBeTruthy();
+      const feedbackCountUrl = new URL(
+        (typeof feedbackCountCall?.[0] === "string"
+          ? feedbackCountCall?.[0]
+          : feedbackCountCall?.[0] instanceof URL
+            ? feedbackCountCall?.[0].toString()
+            : feedbackCountCall?.[0]?.url) as string
+      );
+      expect(feedbackCountUrl.searchParams.get("status")).toBe("neq.ORPHANED");
+
+      const collectionCountCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof url !== "string") return false;
+        const parsed = new URL(url);
+        return parsed.pathname === "/collections" && parsed.searchParams.get("select") === "collection";
+      });
+      expect(collectionCountCall).toBeTruthy();
+      const collectionCountUrl = new URL(
+        (typeof collectionCountCall?.[0] === "string"
+          ? collectionCountCall?.[0]
+          : collectionCountCall?.[0] instanceof URL
+            ? collectionCountCall?.[0].toString()
+            : collectionCountCall?.[0]?.url) as string
+      );
+      expect(collectionCountUrl.searchParams.get("registry_type")).toBe("neq.BASE");
+      expect(collectionCountUrl.searchParams.get("status")).toBe("neq.ORPHANED");
 
       await waitForGraphqlMount(baseUrl);
       const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {

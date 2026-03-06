@@ -12,3 +12,8 @@ coverage
 scripts
 Dockerfile*
 docker
+artifacts
+.codex-tmp
+data
+prisma/data/*.db
+prisma/data/*.db-*

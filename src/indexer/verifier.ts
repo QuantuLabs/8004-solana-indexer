@@ -1466,9 +1466,9 @@ export class DataVerifier {
           where: { agentId, runningDigest: { not: null }, status: notOrphaned },
           orderBy: [
             { createdSlot: { sort: 'desc', nulls: 'last' } },
-            { createdTxSignature: { sort: 'desc', nulls: 'last' } },
             { txIndex: { sort: 'desc', nulls: 'last' } },
             { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { createdTxSignature: { sort: 'desc', nulls: 'last' } },
             { id: 'desc' },
           ],
           select: { runningDigest: true, createdTxSignature: true, createdSlot: true },
@@ -1478,9 +1478,9 @@ export class DataVerifier {
           where: { feedback: { agentId }, runningDigest: { not: null }, status: notOrphaned },
           orderBy: [
             { slot: { sort: 'desc', nulls: 'last' } },
-            { txSignature: { sort: 'desc', nulls: 'last' } },
             { txIndex: { sort: 'desc', nulls: 'last' } },
             { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { txSignature: { sort: 'desc', nulls: 'last' } },
             { id: 'desc' },
           ],
           select: { runningDigest: true, txSignature: true, slot: true },
@@ -1514,7 +1514,7 @@ export class DataVerifier {
           `SELECT running_digest, tx_signature, block_slot
            FROM feedbacks
            WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
            LIMIT 1`,
           [agentId]
         ),
@@ -1523,7 +1523,7 @@ export class DataVerifier {
           `SELECT running_digest, tx_signature, block_slot
            FROM feedback_responses
            WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY block_slot DESC NULLS LAST, tx_signature DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, id DESC
+           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
            LIMIT 1`,
           [agentId]
         ),
@@ -1657,6 +1657,7 @@ export class DataVerifier {
         select: {
           id: true,
           createdSlot: true,
+          txIndex: true,
           createdTxSignature: true,
           eventOrdinal: true,
         },
@@ -1668,15 +1669,19 @@ export class DataVerifier {
         const bSlot = b.createdSlot ?? BigInt("9223372036854775807");
         if (aSlot !== bSlot) return aSlot < bSlot ? -1 : 1;
 
+        const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
+        if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
+
+        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
         const aSig = a.createdTxSignature;
         const bSig = b.createdTxSignature;
         if (aSig === null && bSig !== null) return 1;
         if (aSig !== null && bSig === null) return -1;
         if (aSig !== bSig) return (aSig ?? "").localeCompare(bSig ?? "");
-
-        const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
-        const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
-        if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
 
         return a.id.localeCompare(b.id);
       });
@@ -1722,8 +1727,9 @@ export class DataVerifier {
            AND status != 'ORPHANED'
            AND agent_id IS NULL
          ORDER BY block_slot ASC NULLS LAST,
-                  tx_signature ASC NULLS LAST,
+                  tx_index ASC NULLS LAST,
                   event_ordinal ASC NULLS LAST,
+                  tx_signature ASC NULLS LAST,
                   asset ASC`,
         [ids]
       );
@@ -1838,10 +1844,6 @@ export class DataVerifier {
         const bCreatedSlot = b.createdSlot ?? BigInt("9223372036854775807");
         if (aCreatedSlot !== bCreatedSlot) return aCreatedSlot < bCreatedSlot ? -1 : 1;
 
-        const aSig = a.createdTxSignature ?? "";
-        const bSig = b.createdTxSignature ?? "";
-        if (aSig !== bSig) return aSig.localeCompare(bSig);
-
         const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
         if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
@@ -1849,6 +1851,10 @@ export class DataVerifier {
         const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        const aSig = a.createdTxSignature ?? "";
+        const bSig = b.createdTxSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
 
         if (a.client !== b.client) return a.client.localeCompare(b.client);
         if (a.feedbackIndex !== b.feedbackIndex) return a.feedbackIndex < b.feedbackIndex ? -1 : 1;
@@ -1904,7 +1910,7 @@ export class DataVerifier {
            AND status != 'ORPHANED'
            AND feedback_id IS NULL
          ORDER BY asset ASC, block_slot ASC NULLS LAST,
-                  tx_signature ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST,
+                  tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC,
                   client_address ASC, feedback_index ASC, id ASC`,
         [ids]
       );
@@ -1983,10 +1989,6 @@ export class DataVerifier {
         const bSlot = b.slot ?? BigInt("9223372036854775807");
         if (aSlot !== bSlot) return aSlot < bSlot ? -1 : 1;
 
-        const aSig = a.txSignature ?? "";
-        const bSig = b.txSignature ?? "";
-        if (aSig !== bSig) return aSig.localeCompare(bSig);
-
         const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
         if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
@@ -1994,6 +1996,10 @@ export class DataVerifier {
         const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        const aSig = a.txSignature ?? "";
+        const bSig = b.txSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
 
         return a.id.localeCompare(b.id);
       });
@@ -2040,8 +2046,8 @@ export class DataVerifier {
            AND status != 'ORPHANED'
            AND response_id IS NULL
          ORDER BY asset ASC, client_address ASC, feedback_index ASC,
-                  response_count ASC NULLS LAST, block_slot ASC NULLS LAST, tx_signature ASC,
-                  tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, id ASC`,
+                  response_count ASC NULLS LAST, block_slot ASC NULLS LAST, tx_index ASC NULLS LAST,
+                  event_ordinal ASC NULLS LAST, tx_signature ASC, id ASC`,
         [ids]
       );
       if (rows.length === 0) return;
@@ -2106,10 +2112,6 @@ export class DataVerifier {
 
         if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
 
-        const aSig = a.txSignature ?? "";
-        const bSig = b.txSignature ?? "";
-        if (aSig !== bSig) return aSig.localeCompare(bSig);
-
         const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
         if (aTxIndex !== bTxIndex) return aTxIndex - bTxIndex;
@@ -2117,6 +2119,10 @@ export class DataVerifier {
         const aEventOrdinal = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         const bEventOrdinal = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         if (aEventOrdinal !== bEventOrdinal) return aEventOrdinal - bEventOrdinal;
+
+        const aSig = a.txSignature ?? "";
+        const bSig = b.txSignature ?? "";
+        if (aSig !== bSig) return aSig.localeCompare(bSig);
 
         return a.id.localeCompare(b.id);
       });
@@ -2153,8 +2159,8 @@ export class DataVerifier {
          WHERE id = ANY($1::text[])
            AND status != 'ORPHANED'
            AND revocation_id IS NULL
-         ORDER BY asset ASC, revoke_count ASC, block_slot ASC, tx_signature ASC,
-                  tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, id ASC`,
+         ORDER BY asset ASC, revoke_count ASC, slot ASC, tx_index ASC NULLS LAST,
+                  event_ordinal ASC NULLS LAST, tx_signature ASC, id ASC`,
         [ids]
       );
       if (rows.length === 0) return;

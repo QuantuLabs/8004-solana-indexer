@@ -5,21 +5,21 @@
 
 -- =============================================
 -- ISSUE 1: Deterministic Feedback Ordering
--- Use (block_slot, tx_signature) for consistent re-indexing order
+-- Use (block_slot, tx_index NULLS LAST, tx_signature) for consistent re-indexing order
 -- =============================================
 
 -- Index for deterministic feedback ordering
 -- Replaces reliance on feedback_index (client-provided, not guaranteed)
 CREATE INDEX IF NOT EXISTS idx_feedbacks_deterministic_order
-ON feedbacks(asset, client_address, block_slot, tx_signature);
+ON feedbacks(asset, client_address, block_slot, tx_index, tx_signature);
 
 -- Index for global feedback ordering (across all clients)
 CREATE INDEX IF NOT EXISTS idx_feedbacks_global_order
-ON feedbacks(asset, block_slot, tx_signature);
+ON feedbacks(asset, block_slot, tx_index, tx_signature);
 
 -- =============================================
 -- ISSUE 7: Global Agent ID (Cosmetic/Gamification)
--- Sequential ID based on registration order (slot, tx_signature)
+-- Sequential ID based on registration order (slot, tx_index NULLS LAST, tx_signature)
 -- Deterministic: re-indexing produces same global_id
 -- =============================================
 
@@ -27,19 +27,20 @@ ON feedbacks(asset, block_slot, tx_signature);
 DROP MATERIALIZED VIEW IF EXISTS agent_global_ids;
 
 -- Create materialized view for global agent IDs
--- Uses ROW_NUMBER() with deterministic ordering by (block_slot, tx_signature)
+-- Uses ROW_NUMBER() with deterministic ordering by (block_slot, tx_index NULLS LAST, tx_signature)
 CREATE MATERIALIZED VIEW agent_global_ids AS
 SELECT
   asset,
   collection,
   owner,
   nft_name,
-  ROW_NUMBER() OVER (ORDER BY block_slot, tx_signature) AS global_id,
+  ROW_NUMBER() OVER (ORDER BY block_slot, tx_index NULLS LAST, tx_signature) AS global_id,
   block_slot,
+  tx_index,
   tx_signature,
   created_at
 FROM agents
-ORDER BY block_slot, tx_signature;
+ORDER BY block_slot, tx_index NULLS LAST, tx_signature;
 
 -- Indexes for fast lookups
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_global_ids_global_id ON agent_global_ids(global_id);

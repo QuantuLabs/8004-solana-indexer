@@ -155,7 +155,7 @@ function makePrismaStub() {
       ]),
       count: vi.fn().mockResolvedValue(1),
     },
-    registry: {
+    collection: {
       count: vi.fn().mockResolvedValue(1),
     },
   };
@@ -591,11 +591,8 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
           }),
         })
       );
-      expect(prisma.registry.count).toHaveBeenCalledWith({
-        where: {
-          status: { not: "ORPHANED" },
-          registryType: { not: "Base" },
-        },
+      expect(prisma.collection.count).toHaveBeenCalledWith({
+        where: {},
       });
 
       const gqlAgentsCall = (pool.query as any).mock.calls.find(
@@ -629,10 +626,10 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
         (call: unknown[]) =>
           typeof call[0] === "string" &&
           (call[0] as string).includes("total_collections") &&
-          (call[0] as string).includes("FROM collections")
+          (call[0] as string).includes("FROM collection_pointers")
       );
       expect(gqlStatsCall).toBeDefined();
-      expect(gqlStatsCall[0]).toContain("registry_type != 'BASE'");
+      expect(gqlStatsCall[0]).toContain("FROM collection_pointers) AS total_collections");
     } finally {
       await stopServer(server);
     }

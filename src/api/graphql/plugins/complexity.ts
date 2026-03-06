@@ -5,8 +5,8 @@ import {
   visit,
 } from 'graphql';
 
-const DEFAULT_MAX_COMPLEXITY = 500;
-const DEFAULT_MAX_FIRST_CAP = 250;
+const DEFAULT_MAX_COMPLEXITY = 3000;
+const DEFAULT_MAX_FIRST_CAP = 400;
 
 function parsePositiveIntEnv(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? '', 10);

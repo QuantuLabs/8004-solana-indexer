@@ -404,12 +404,14 @@ describe("DataVerifier", () => {
           {
             id: "agent-b",
             createdSlot: 11n,
+            txIndex: 1,
             createdTxSignature: "sig-b",
             eventOrdinal: 0,
           },
           {
             id: "agent-a",
             createdSlot: 10n,
+            txIndex: 0,
             createdTxSignature: "sig-a",
             eventOrdinal: 0,
           },
@@ -444,6 +446,82 @@ describe("DataVerifier", () => {
       await verifier.stop();
     });
 
+    it("orders agent_id backfill by createdSlot, txIndex, eventOrdinal, then signature", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.agent.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.agent.findMany.mockResolvedValueOnce([
+        {
+          id: "sig-b",
+          createdSlot: 11n,
+          txIndex: 1,
+          createdTxSignature: "sig-b",
+          eventOrdinal: 1,
+        },
+        {
+          id: "event-first",
+          createdSlot: 11n,
+          txIndex: 1,
+          createdTxSignature: "sig-z",
+          eventOrdinal: 0,
+        },
+        {
+          id: "txindex-first",
+          createdSlot: 11n,
+          txIndex: 0,
+          createdTxSignature: "sig-z",
+          eventOrdinal: 99,
+        },
+        {
+          id: "slot-first",
+          createdSlot: 10n,
+          txIndex: 99,
+          createdTxSignature: "sig-z",
+          eventOrdinal: 99,
+        },
+        {
+          id: "sig-a",
+          createdSlot: 11n,
+          txIndex: 1,
+          createdTxSignature: "sig-a",
+          eventOrdinal: 1,
+        },
+      ]);
+      mockPrisma.agent.findFirst.mockResolvedValueOnce({ agentId: 100n });
+
+      await (verifier as any).backfillAgentIds(["slot-first", "txindex-first", "event-first", "sig-a", "sig-b"]);
+
+      expect(mockPrisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: expect.objectContaining({
+            createdSlot: true,
+            txIndex: true,
+            eventOrdinal: true,
+            createdTxSignature: true,
+          }),
+        }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ where: expect.objectContaining({ id: "slot-first" }), data: { agentId: 101n } }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ where: expect.objectContaining({ id: "txindex-first" }), data: { agentId: 102n } }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({ where: expect.objectContaining({ id: "event-first" }), data: { agentId: 103n } }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        4,
+        expect.objectContaining({ where: expect.objectContaining({ id: "sig-a" }), data: { agentId: 104n } }),
+      );
+      expect(mockPrisma.agent.updateMany).toHaveBeenNthCalledWith(
+        5,
+        expect.objectContaining({ where: expect.objectContaining({ id: "sig-b" }), data: { agentId: 105n } }),
+      );
+    });
+
     it("orders null signatures last when backfilling agent_id", async () => {
       const verifier = new DataVerifier(mockConnection, mockPrisma, null);
       mockPrisma.agent.updateMany.mockResolvedValue({ count: 1 });
@@ -452,12 +530,14 @@ describe("DataVerifier", () => {
         {
           id: "agent-null-sig",
           createdSlot: 9n,
+          txIndex: 0,
           createdTxSignature: null,
           eventOrdinal: 0,
         },
         {
           id: "agent-with-sig",
           createdSlot: 9n,
+          txIndex: 0,
           createdTxSignature: "sig-a",
           eventOrdinal: 0,
         },
@@ -496,6 +576,7 @@ describe("DataVerifier", () => {
         {
           id: "agent-retry",
           createdSlot: 10n,
+          txIndex: 0,
           createdTxSignature: "sig-a",
           eventOrdinal: 0,
         },
@@ -592,6 +673,31 @@ describe("DataVerifier", () => {
 
       expect(assigned).toEqual(["10", "11"]);
       expect(maxReads).toBe(2);
+    });
+
+    it("uses canonical SQL ordering for pool agent_id backfill", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      let selectSql = "";
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("SELECT asset AS id") && sql.includes("FROM agents")) {
+          selectSql = sql;
+          return { rows: [{ id: "pool-agent" }], rowCount: 1 };
+        }
+        if (sql.includes("SELECT MAX(agent_id)::text AS max_id")) {
+          return { rows: [{ max_id: "9" }], rowCount: 1 };
+        }
+        if (sql.includes("UPDATE agents") && sql.includes("SET agent_id")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      await (verifier as any).backfillAgentIds(["pool-agent"]);
+
+      expect(selectSql).toMatch(
+        /ORDER BY block_slot ASC NULLS LAST,\s*tx_index ASC NULLS LAST,\s*event_ordinal ASC NULLS LAST,\s*tx_signature ASC NULLS LAST,\s*asset ASC/
+      );
     });
   });
 
@@ -1721,6 +1827,23 @@ describe("DataVerifier", () => {
       await verifier.start();
       await verifier.stop();
     });
+
+    it("uses canonical tx_index-before-signature ordering for feedback and response digest heads", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      mockPool.query.mockResolvedValue({ rows: [], rowCount: 0 });
+
+      await (verifier as any).getLastDbDigests(AGENT_KEY.toBase58());
+
+      const feedbackQuery = mockPool.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("FROM feedbacks") && call[0].includes("running_digest")
+      )?.[0];
+      const responseQuery = mockPool.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("FROM feedback_responses") && call[0].includes("running_digest")
+      )?.[0];
+
+      expect(feedbackQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC");
+      expect(responseQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC");
+    });
   });
 
   describe("batchUpdateStatus", () => {
@@ -1833,6 +1956,57 @@ describe("DataVerifier", () => {
         expect.objectContaining({
           where: expect.objectContaining({ id: "uuid-z" }),
           data: { feedbackId: 9n },
+        })
+      );
+    });
+
+    it("orders feedback_id by tx_index before signature within the same slot", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedback.findMany.mockResolvedValueOnce([
+        {
+          id: "fb-sig-low-tx-high",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 20n,
+          createdTxSignature: "sig-a",
+          txIndex: 2,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 2n,
+        },
+        {
+          id: "fb-sig-high-tx-low",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 20n,
+          createdTxSignature: "sig-z",
+          txIndex: 1,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 1n,
+        },
+      ]);
+      mockPrisma.feedback.findFirst.mockResolvedValueOnce({ feedbackId: 10n });
+      mockPrisma.feedback.updateMany.mockResolvedValue({ count: 1 });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-sig-low-tx-high", "fb-sig-high-tx-low"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedback.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "fb-sig-high-tx-low" }),
+          data: { feedbackId: 11n },
+        })
+      );
+      expect(mockPrisma.feedback.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "fb-sig-low-tx-high" }),
+          data: { feedbackId: 12n },
         })
       );
     });
@@ -2029,6 +2203,54 @@ describe("DataVerifier", () => {
         expect.objectContaining({
           where: expect.objectContaining({ id: "uuid-z" }),
           data: { responseId: 9n },
+        })
+      );
+    });
+
+    it("orders response_id by tx_index before signature within the same slot", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedbackResponse.findMany.mockResolvedValueOnce([
+        {
+          id: "resp-sig-low-tx-high",
+          feedbackId: "fb-same-slot",
+          responseCount: 1n,
+          slot: 20n,
+          txSignature: "sig-a",
+          txIndex: 2,
+          eventOrdinal: 0,
+        },
+        {
+          id: "resp-sig-high-tx-low",
+          feedbackId: "fb-same-slot",
+          responseCount: 1n,
+          slot: 20n,
+          txSignature: "sig-z",
+          txIndex: 1,
+          eventOrdinal: 0,
+        },
+      ]);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValueOnce({ responseId: 4n });
+
+      await (verifier as any).batchUpdateStatus(
+        "feedback_responses",
+        "id",
+        ["resp-sig-low-tx-high", "resp-sig-high-tx-low"],
+        "FINALIZED",
+        new Date()
+      );
+
+      expect(mockPrisma.feedbackResponse.updateMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "resp-sig-high-tx-low" }),
+          data: { responseId: 5n },
+        })
+      );
+      expect(mockPrisma.feedbackResponse.updateMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "resp-sig-low-tx-high" }),
+          data: { responseId: 6n },
         })
       );
     });

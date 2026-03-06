@@ -32,13 +32,12 @@ const DEFAULT_MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
 const MAX_DEAD_LETTER = 10000;     // Max diagnostic events retained in dead letter queue
 const DEAD_LETTER_BACKPRESSURE = 0.8; // Warn at 80% diagnostic queue capacity
 
-// Helper to check for all-zero hash (empty hash should be NULL, not "00...00")
-function isAllZeroHash(hash: Uint8Array | undefined | null): boolean {
-  if (!hash) return true;
-  return hash.every(b => b === 0);
-}
-
 const ZERO_HASH_HEX = "0".repeat(64);
+
+function toRequiredHashHex(hash: Uint8Array | undefined | null): string | null {
+  if (!hash) return null;
+  return Buffer.from(hash).toString("hex");
+}
 
 function hashesMatchHex(stored: string | null, event: string | null): boolean {
   const sEmpty = !stored || stored === ZERO_HASH_HEX;
@@ -75,6 +74,29 @@ export interface BatchStats {
   avgFlushTime: number;
   rpcBatchCount: number;
   avgRpcBatchTime: number;
+}
+
+function compareCursorCtx(
+  a: BatchEvent["ctx"] | null | undefined,
+  b: BatchEvent["ctx"] | null | undefined
+): number {
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  if (a.slot !== b.slot) {
+    return a.slot < b.slot ? -1 : 1;
+  }
+
+  const aTxIndex = a.txIndex ?? -1;
+  const bTxIndex = b.txIndex ?? -1;
+  if (aTxIndex !== bTxIndex) {
+    return aTxIndex - bTxIndex;
+  }
+
+  if (a.signature === b.signature) {
+    return 0;
+  }
+  return a.signature < b.signature ? -1 : 1;
 }
 
 interface BatchRpcFetcherOptions {
@@ -278,7 +300,7 @@ export class EventBuffer {
   private activeFlushPromise: Promise<void> | null = null;
   private pool: Pool | null = null;
   private prisma: PrismaClient | null = null;
-  private lastCtx: BatchEvent["ctx"] | null = null;
+  private cursorCtx: BatchEvent["ctx"] | null = null;
   private retryCount = 0;
   private deadLetterQueue: DeadLetterEntry[] = [];
 
@@ -311,7 +333,7 @@ export class EventBuffer {
     }
 
     this.buffer.push(event);
-    this.lastCtx = event.ctx;
+    this.noteCursor(event.ctx);
     this.stats.eventsBuffered++;
 
     // Start flush timer if not already running
@@ -322,6 +344,16 @@ export class EventBuffer {
     // Flush immediately if buffer is full
     if (this.buffer.length >= BATCH_SIZE_DB) {
       await this.flush();
+    }
+  }
+
+  noteCursor(ctx: BatchEvent["ctx"], scheduleFlush: boolean = true): void {
+    if (compareCursorCtx(ctx, this.cursorCtx) > 0) {
+      this.cursorCtx = ctx;
+    }
+
+    if (scheduleFlush && !this.flushTimer) {
+      this.flushTimer = setTimeout(() => this.flush(), FLUSH_INTERVAL_MS);
     }
   }
 
@@ -338,23 +370,23 @@ export class EventBuffer {
       return this.activeFlushPromise ?? Promise.resolve();
     }
 
-    if (this.buffer.length === 0) {
+    if (this.buffer.length === 0 && !this.cursorCtx) {
       return;
     }
 
     this.flushInProgress = true;
     const eventsToFlush = [...this.buffer];
-    const lastCtx = this.lastCtx;
+    const cursorCtx = this.cursorCtx;
     this.buffer = [];
-    this.lastCtx = null;
+    this.cursorCtx = null;
 
     const startTime = Date.now();
     this.activeFlushPromise = (async () => {
       try {
         if (config.dbMode === "supabase" && this.pool) {
-          await this.flushToSupabase(eventsToFlush, lastCtx);
+          await this.flushToSupabase(eventsToFlush, cursorCtx);
         } else if (this.prisma) {
-          await this.flushToPrisma(eventsToFlush, lastCtx);
+          await this.flushToPrisma(eventsToFlush, cursorCtx);
         }
 
         this.stats.eventsFlushed += eventsToFlush.length;
@@ -395,10 +427,16 @@ export class EventBuffer {
           }
 
           this.buffer = [...eventsToFlush, ...this.buffer];
+          if (cursorCtx) {
+            this.noteCursor(cursorCtx, false);
+          }
           this.retryCount = 0;
           throw error;
         } else {
           this.buffer = [...eventsToFlush, ...this.buffer];
+          if (cursorCtx) {
+            this.noteCursor(cursorCtx, false);
+          }
           await new Promise(r => setTimeout(r, RETRY_DELAY_MS * this.retryCount));
           throw error;
         }
@@ -417,7 +455,7 @@ export class EventBuffer {
       this.flushTimer = null;
     }
 
-    while (this.flushInProgress || this.buffer.length > 0) {
+    while (this.flushInProgress || this.buffer.length > 0 || this.cursorCtx) {
       if (this.flushInProgress) {
         await (this.activeFlushPromise ?? Promise.resolve());
         continue;
@@ -438,6 +476,10 @@ export class EventBuffer {
    */
   clearDeadLetterQueue(): void {
     this.deadLetterQueue = [];
+  }
+
+  hasPendingCursor(): boolean {
+    return this.cursorCtx !== null;
   }
 
   /**
@@ -644,9 +686,7 @@ export class EventBuffer {
     const clientAddr = data.clientAddress?.toBase58?.() || data.clientAddress;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
     const id = `${asset}:${clientAddr}:${feedbackIndex}`;
-    const feedbackHash = !isAllZeroHash(data.sealHash)
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
+    const feedbackHash = toRequiredHashHex(data.sealHash);
     const runningDigest = data.newFeedbackDigest
       ? Buffer.from(data.newFeedbackDigest)
       : null;
@@ -799,12 +839,8 @@ export class EventBuffer {
     const responder = data.responder?.toBase58?.() || data.responder;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
     const id = `${asset}:${clientAddr}:${feedbackIndex}:${responder}:${ctx.signature}`;
-    const responseHash = !isAllZeroHash(data.responseHash)
-      ? Buffer.from(data.responseHash).toString("hex")
-      : null;
-    const sealHash = !isAllZeroHash(data.sealHash)
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
+    const responseHash = toRequiredHashHex(data.responseHash);
+    const sealHash = toRequiredHashHex(data.sealHash);
     const runningDigest = data.newResponseDigest
       ? Buffer.from(data.newResponseDigest)
       : null;
@@ -950,10 +986,7 @@ export class EventBuffer {
     }
     const id = `${asset}:${client_addr}:${feedbackIndex}`;
 
-    // Convert all-zero hash to NULL (consistent with supabase.ts)
-    const feedbackHash = !isAllZeroHash(data.sealHash)
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
+    const feedbackHash = toRequiredHashHex(data.sealHash);
     const runningDigest = data.newFeedbackDigest
       ? Buffer.from(data.newFeedbackDigest)
       : null;
@@ -1015,9 +1048,7 @@ export class EventBuffer {
 
     if (!isOrphan) {
       const storedHash = feedbackCheck.rows[0].feedback_hash;
-      const eventHash = !isAllZeroHash(data.sealHash)
-        ? Buffer.from(data.sealHash).toString("hex")
-        : null;
+      const eventHash = toRequiredHashHex(data.sealHash);
       if (!hashesMatchHex(storedHash, eventHash)) {
         logger.warn({ asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
           "seal_hash mismatch: revocation sealHash does not match stored feedbackHash");
@@ -1028,9 +1059,7 @@ export class EventBuffer {
     const revokeDigest = data.newRevokeDigest
       ? Buffer.from(data.newRevokeDigest)
       : null;
-    const revokeSealHash = !isAllZeroHash(data.sealHash)
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
+    const revokeSealHash = toRequiredHashHex(data.sealHash);
     const revokeResult = await client.query(`
       INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
@@ -1095,10 +1124,7 @@ export class EventBuffer {
     const responseCount = BigInt(data.newResponseCount?.toString() || "0");
     const id = `${asset}:${client_addr}:${feedbackIndex}:${responder}:${ctx.signature}`;
 
-    // Convert all-zero hash to NULL (consistent with supabase.ts)
-    const responseHash = !isAllZeroHash(data.responseHash)
-      ? Buffer.from(data.responseHash).toString("hex")
-      : null;
+    const responseHash = toRequiredHashHex(data.responseHash);
     const responseRunningDigest = data.newResponseDigest
       ? Buffer.from(data.newResponseDigest)
       : null;
@@ -1115,9 +1141,7 @@ export class EventBuffer {
     }
 
     const storedHash = feedbackCheck.rows[0].feedback_hash;
-    const eventHash = !isAllZeroHash(data.sealHash)
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
+    const eventHash = toRequiredHashHex(data.sealHash);
     const sealMismatch = !hashesMatchHex(storedHash, eventHash);
     if (sealMismatch) {
       logger.warn({ asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
@@ -1392,6 +1416,7 @@ export class EventBuffer {
         block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
+        tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
       WHERE NOT metadata.immutable
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,

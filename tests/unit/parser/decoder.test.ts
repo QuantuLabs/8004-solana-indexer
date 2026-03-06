@@ -10,6 +10,8 @@ import {
   eventParser,
   IDL_VERSION,
   IDL_PROGRAM_ID,
+  IDL_PATH,
+  resolveRuntimeIdlFilename,
 } from "../../../src/parser/decoder.js";
 import {
   TEST_ASSET,
@@ -53,6 +55,37 @@ describe("Parser Decoder", () => {
     it("should export IDL_PROGRAM_ID from IDL address", () => {
       expect(IDL_PROGRAM_ID).toBeDefined();
       expect(IDL_PROGRAM_ID).toBe("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
+    });
+
+    it("should resolve the default runtime IDL filename for devnet/test environments", () => {
+      expect(resolveRuntimeIdlFilename()).toBe("agent_registry_8004.json");
+      expect(IDL_PATH.endsWith("/idl/agent_registry_8004.json")).toBe(true);
+    });
+
+    it("should resolve the mainnet runtime IDL filename when mainnet-beta is selected", async () => {
+      const prevNetwork = process.env.SOLANA_NETWORK;
+      const prevProgramId = process.env.PROGRAM_ID;
+      process.env.SOLANA_NETWORK = "mainnet-beta";
+      process.env.PROGRAM_ID = "8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ";
+      vi.resetModules();
+
+      const mainnetDecoder = await import("../../../src/parser/decoder.js");
+
+      expect(mainnetDecoder.resolveRuntimeIdlFilename()).toBe("agent_registry_8004.mainnet.json");
+      expect(mainnetDecoder.IDL_PROGRAM_ID).toBe("8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ");
+      expect(mainnetDecoder.IDL_PATH.endsWith("/idl/agent_registry_8004.mainnet.json")).toBe(true);
+
+      if (prevNetwork === undefined) {
+        delete process.env.SOLANA_NETWORK;
+      } else {
+        process.env.SOLANA_NETWORK = prevNetwork;
+      }
+      if (prevProgramId === undefined) {
+        delete process.env.PROGRAM_ID;
+      } else {
+        process.env.PROGRAM_ID = prevProgramId;
+      }
+      vi.resetModules();
     });
 
     it("should fallback IDL_VERSION to 'unknown' when metadata.version is missing", () => {

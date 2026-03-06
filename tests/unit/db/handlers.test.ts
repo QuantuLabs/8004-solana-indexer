@@ -675,7 +675,7 @@ describe("DB Handlers", () => {
             responder: TEST_OWNER,
             responseUri: "ipfs://QmYYY",
             responseHash: TEST_HASH,
-            sealHash: new Uint8Array(32).fill(0), // All-zero = normalized to null
+            sealHash: new Uint8Array(32).fill(0), // hashesMatch treats legacy null and zero as equivalent
             slot: 123456n,
             newResponseDigest: TEST_HASH,
             newResponseCount: 1n,
@@ -686,6 +686,43 @@ describe("DB Handlers", () => {
 
         // Both null → match, no warning
         expect(prisma.feedbackResponse.upsert).toHaveBeenCalled();
+      });
+
+      it("should preserve all-zero responseHash and sealHash bytes on local storage", async () => {
+        const zeroBytes = new Uint8Array(32).fill(0);
+        (prisma.feedback.findUnique as any).mockResolvedValue({
+          id: "feedback-uuid",
+          agentId: TEST_ASSET.toBase58(),
+          feedbackHash: Uint8Array.from(TEST_HASH),
+        });
+
+        const event: ProgramEvent = {
+          type: "ResponseAppended",
+          data: {
+            asset: TEST_ASSET,
+            client: TEST_CLIENT,
+            feedbackIndex: 0n,
+            responder: TEST_OWNER,
+            responseUri: "ipfs://QmZero",
+            responseHash: zeroBytes,
+            sealHash: zeroBytes,
+            slot: 123456n,
+            newResponseDigest: TEST_HASH,
+            newResponseCount: 1n,
+          },
+        };
+
+        await handleEvent(prisma, event, ctx);
+
+        expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({
+              responseHash: zeroBytes,
+            }),
+          })
+        );
+        const upsertArg = (prisma.feedbackResponse.upsert as any).mock.calls.at(-1)?.[0];
+        expect(upsertArg.create.responseHash).toEqual(zeroBytes);
       });
     });
 

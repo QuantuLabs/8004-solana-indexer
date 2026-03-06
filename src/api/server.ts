@@ -810,6 +810,86 @@ function parseContentRangeTotal(contentRange: string | null): number | null {
   return parsed;
 }
 
+async function fetchProxyTableCount(
+  supabaseRestBaseUrl: string,
+  upstreamHeaders: Headers,
+  endpoint: string,
+  params: URLSearchParams,
+): Promise<number> {
+  const query = new URLSearchParams(params.toString());
+  if (!query.has('limit')) query.set('limit', '1');
+
+  const headers = new Headers(upstreamHeaders);
+  headers.set('Prefer', 'count=exact');
+  headers.set('Range', '0-0');
+
+  const upstreamUrl = `${supabaseRestBaseUrl}${endpoint}${query.toString() ? `?${query.toString()}` : ''}`;
+  const response = await fetch(upstreamUrl, { method: 'GET', headers });
+  const payload = Buffer.from(await response.arrayBuffer());
+
+  if (!response.ok) {
+    throw new Error(`Count query failed for ${endpoint}: HTTP ${response.status} ${payload.toString('utf8')}`);
+  }
+
+  const contentRange = response.headers.get('content-range');
+  const total = parseContentRangeTotal(contentRange);
+  if (total !== null) return total;
+
+  try {
+    const parsed: unknown = JSON.parse(payload.toString('utf8'));
+    if (Array.isArray(parsed)) return parsed.length;
+  } catch {
+    // fall through
+  }
+
+  return 0;
+}
+
+async function fetchFallbackGlobalStats(
+  supabaseRestBaseUrl: string,
+  upstreamHeaders: Headers,
+  includeOrphaned: boolean,
+): Promise<Array<Record<string, number>>> {
+  const agentParams = new URLSearchParams({ select: 'asset' });
+  if (!includeOrphaned) agentParams.append('status', 'neq.ORPHANED');
+
+  const feedbackParams = new URLSearchParams({ select: 'id' });
+  if (!includeOrphaned) feedbackParams.append('status', 'neq.ORPHANED');
+
+  const collectionParams = new URLSearchParams({
+    select: 'collection',
+    registry_type: 'neq.BASE',
+  });
+  if (!includeOrphaned) collectionParams.append('status', 'neq.ORPHANED');
+
+  const [totalAgents, totalFeedbacks, totalCollections] = await Promise.all([
+    fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/agents', agentParams),
+    fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/feedbacks', feedbackParams),
+    fetchProxyTableCount(supabaseRestBaseUrl, upstreamHeaders, '/collections', collectionParams),
+  ]);
+
+  return [{
+    total_agents: totalAgents,
+    total_feedbacks: totalFeedbacks,
+    total_collections: totalCollections,
+  }];
+}
+
+function isMissingGlobalStatsRelationError(status: number, payload: Uint8Array, contentType: string | null): boolean {
+  if (status !== 404 || !contentType || !contentType.toLowerCase().includes('application/json')) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload).toString('utf8')) as { message?: string; code?: string };
+    const message = String(parsed?.message ?? '');
+    if (message.includes('global_stats')) return true;
+    return parsed?.code === '42P01' || parsed?.code === 'PGRST205';
+  } catch {
+    return false;
+  }
+}
+
 export function createApiServer(options: ApiServerOptions): Express {
   const wantsRest = config.apiMode !== 'graphql';
   const wantsGraphql = config.apiMode !== 'rest' && config.enableGraphql;
@@ -923,6 +1003,10 @@ export function createApiServer(options: ApiServerOptions): Express {
               ? '/agents'
             : upstreamRawPathname;
         let upstreamQuery = upstreamRawQuery;
+        const isGlobalStatsProxyPath =
+          upstreamRawPathname === '/stats'
+          || upstreamRawPathname === '/global_stats'
+          || upstreamPathname === '/global_stats';
         if (upstreamPathname === '/agents') {
           const params = new URLSearchParams(upstreamRawQuery);
           const hasCanonicalCol = params.has('canonical_col');
@@ -967,6 +1051,12 @@ export function createApiServer(options: ApiServerOptions): Express {
           if (!includeOrphaned && !params.has('status')) {
             params.append('status', 'neq.ORPHANED');
           }
+          upstreamQuery = params.toString();
+        } else if (upstreamPathname === '/global_stats') {
+          const params = new URLSearchParams(upstreamRawQuery);
+          // PostgREST global_stats view has fixed non-orphaned semantics.
+          // Drop compatibility toggle to avoid forwarding unknown column filters.
+          params.delete('includeOrphaned');
           upstreamQuery = params.toString();
         }
 
@@ -1033,6 +1123,23 @@ export function createApiServer(options: ApiServerOptions): Express {
           body: body as BodyInit | undefined,
         });
 
+        let payload: Uint8Array = Buffer.from(await upstreamRes.arrayBuffer());
+        if (isGlobalStatsProxyPath && isMissingGlobalStatsRelationError(
+          upstreamRes.status,
+          payload,
+          upstreamRes.headers.get('content-type'),
+        )) {
+          const params = new URLSearchParams(upstreamRawQuery);
+          const includeOrphaned = params.get('includeOrphaned') === 'true';
+          const fallbackStats = await fetchFallbackGlobalStats(
+            supabaseRestBaseUrl,
+            upstreamHeaders,
+            includeOrphaned,
+          );
+          res.status(200).json(fallbackStats);
+          return;
+        }
+
         for (const header of PROXY_RESPONSE_HEADER_ALLOWLIST) {
           const value = upstreamRes.headers.get(header);
           if (value) {
@@ -1040,7 +1147,6 @@ export function createApiServer(options: ApiServerOptions): Express {
           }
         }
 
-        let payload: Uint8Array = Buffer.from(await upstreamRes.arrayBuffer());
         if (upstreamPathname === '/agents') {
           payload = normalizeAgentsProxyPayload(payload, upstreamRes.headers.get('content-type'));
         }
@@ -1720,33 +1826,43 @@ export function createApiServer(options: ApiServerOptions): Express {
                   ? [
                       { responseCount: 'asc' as const },
                       { responder: 'asc' as const },
-                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       { slot: 'asc' as const },
+                      { txIndex: 'asc' as const },
+                      { eventOrdinal: 'asc' as const },
+                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                     ]
                 : order === 'response_count.desc'
                   ? [
                       { responseCount: 'desc' as const },
                       { responder: 'asc' as const },
-                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       { slot: 'asc' as const },
+                      { txIndex: 'asc' as const },
+                      { eventOrdinal: 'asc' as const },
+                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                     ]
                 : order === 'block_slot.asc'
                   ? [
                       { slot: 'asc' as const },
                       { responder: 'asc' as const },
+                      { txIndex: 'asc' as const },
+                      { eventOrdinal: 'asc' as const },
                       { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                     ]
                   : order === 'block_slot.desc'
                     ? [
                         { slot: 'desc' as const },
                         { responder: 'asc' as const },
+                        { txIndex: 'asc' as const },
+                        { eventOrdinal: 'asc' as const },
                         { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       ]
                     : [
                         { createdAt: 'desc' as const },
                         { responder: 'asc' as const },
-                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                         { slot: 'asc' as const },
+                        { txIndex: 'asc' as const },
+                        { eventOrdinal: 'asc' as const },
+                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
                       ];
 
           const orphanWhere: Prisma.OrphanResponseWhereInput = {
@@ -1796,18 +1912,18 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const orderBy: Prisma.FeedbackResponseOrderByWithRelationInput[] =
         order === 'response_count.asc'
-          ? [{ responseCount: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+          ? [{ responseCount: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
           : order === 'response_count.desc'
-            ? [{ responseCount: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            ? [{ responseCount: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
             : order === 'response_id.asc'
-              ? [{ responseId: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              ? [{ responseId: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
               : order === 'response_id.desc'
-                ? [{ responseId: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                ? [{ responseId: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
                 : order === 'block_slot.asc'
-                  ? [{ slot: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  ? [{ slot: 'asc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
                   : order === 'block_slot.desc'
-                    ? [{ slot: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
-                    : [{ createdAt: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
+                    ? [{ slot: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
+                    : [{ createdAt: 'desc' }, { feedback: { agentId: 'asc' } }, { feedback: { client: 'asc' } }, { feedback: { feedbackIndex: 'asc' } }, { responder: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }];
 
       const needsCount = wantsCount(req);
       const [responses, totalCount] = await Promise.all([
@@ -1983,18 +2099,18 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const orderBy: Prisma.RevocationOrderByWithRelationInput[] =
         order === 'revoke_count.asc'
-          ? [{ revokeCount: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+          ? [{ revokeCount: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
           : order === 'revoke_count.desc'
-            ? [{ revokeCount: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+            ? [{ revokeCount: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
             : order === 'revocation_id.asc'
-              ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+              ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
               : order === 'revocation_id.desc'
-                ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
                 : order === 'block_slot.asc'
-                  ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
+                  ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
                   : order === 'block_slot.desc'
-                    ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }]
-            : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }];
+                    ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
+            : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }];
 
       const needsCount = wantsCount(req);
       const [revocations, totalCount] = await Promise.all([
@@ -2599,14 +2715,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
       const agentWhere: Prisma.AgentWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
       const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
-      const registryWhere: Prisma.RegistryWhereInput = includeOrphaned
-        ? { registryType: { not: 'Base' } }
-        : { status: { not: 'ORPHANED' }, registryType: { not: 'Base' } };
-
       const [totalAgents, totalFeedbacks, totalCollections] = await Promise.all([
         prisma.agent.count({ where: agentWhere }),
         prisma.feedback.count({ where: feedbackWhere }),
-        prisma.registry.count({ where: registryWhere }),
+        prisma.collection.count({ where: {} }),
       ]);
 
       // Return as array for SDK compatibility (PostgREST format)

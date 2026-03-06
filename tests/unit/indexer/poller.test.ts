@@ -176,6 +176,36 @@ describe("Poller", () => {
       });
     });
 
+    it("should not advance cursor when program data logs fail to parse", async () => {
+      const sig = createMockSignatureInfo();
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        "Program data: AAAAAAAAAAAAAAAA",
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ]);
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "previous-sig",
+        lastSlot: 100n,
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
+
+      await poller.start();
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: expect.stringContaining("Failed to parse program events"),
+        }),
+      });
+    });
+
     it("should save state after processing", async () => {
       const sig = createMockSignatureInfo();
       const eventData = {

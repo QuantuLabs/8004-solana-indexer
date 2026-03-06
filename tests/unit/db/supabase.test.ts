@@ -284,6 +284,7 @@ describe("supabase.ts", () => {
         expect(insertCall).toBeDefined();
         expect(insertCall![0]).toContain("created_at, updated_at");
         expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
+        expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
         expect(insertCall![1]).toContain(TEST_ASSET.toBase58());
         expect(insertCall![1]).toContain("ipfs://QmTest");
       });
@@ -306,6 +307,204 @@ describe("supabase.ts", () => {
         );
         expect(insertCall).toBeDefined();
         expect(insertCall![1]).toContain(null); // agentUri is null
+      });
+
+      it("replays orphan responses and revocations after orphan feedback replay on agent registration", async () => {
+        const feedbackHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query.mockImplementation((sql: string) => {
+          if (sql.includes("FROM orphan_feedbacks")) {
+            return Promise.resolve({
+              rows: [{
+                id: "orphan-feedback-1",
+                asset: TEST_ASSET.toBase58(),
+                client_address: TEST_CLIENT.toBase58(),
+                feedback_index: "0",
+                value: "1000",
+                value_decimals: 2,
+                score: 80,
+                tag1: "quality",
+                tag2: "speed",
+                endpoint: "/chat",
+                feedback_uri: "ipfs://feedback",
+                feedback_hash: feedbackHash,
+                running_digest: Buffer.from(TEST_HASH),
+                atom_enabled: false,
+                new_trust_tier: 0,
+                new_quality_score: 0,
+                new_confidence: 0,
+                new_risk_score: 0,
+                new_diversity_ratio: 0,
+                block_slot: "123456",
+                tx_index: 2,
+                event_ordinal: 0,
+                tx_signature: "feedback-sig",
+                created_at: ctx.blockTime.toISOString(),
+              }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedbacks")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("UPDATE agents SET")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM orphan_responses")) {
+            return Promise.resolve({
+              rows: [{
+                id: "orphan-response-1",
+                asset: TEST_ASSET.toBase58(),
+                client_address: TEST_CLIENT.toBase58(),
+                feedback_index: "0",
+                responder: TEST_RESPONDER.toBase58(),
+                response_uri: "ipfs://response",
+                response_hash: feedbackHash,
+                seal_hash: feedbackHash,
+                running_digest: Buffer.from(TEST_HASH),
+                response_count: "1",
+                block_slot: "123457",
+                tx_index: 3,
+                event_ordinal: 0,
+                tx_signature: "response-sig",
+                created_at: ctx.blockTime.toISOString(),
+              }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedback_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("DELETE FROM orphan_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM revocations")) {
+            return Promise.resolve({
+              rows: [{ feedback_hash: feedbackHash, status: "ORPHANED" }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("UPDATE revocations")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        await handleEvent({
+          type: "AgentRegistered",
+          data: {
+            asset: TEST_ASSET,
+            collection: TEST_COLLECTION,
+            owner: TEST_OWNER,
+            atomEnabled: false,
+            agentUri: "",
+          },
+        }, ctx);
+
+        expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        )).toBe(true);
+        expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("DELETE FROM orphan_responses")
+        )).toBe(true);
+        expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("UPDATE revocations")
+        )).toBe(true);
+      });
+
+      it("still cascades orphan response and revocation replay when orphan feedback already exists", async () => {
+        const feedbackHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query.mockImplementation((sql: string) => {
+          if (sql.includes("FROM orphan_feedbacks")) {
+            return Promise.resolve({
+              rows: [{
+                id: "orphan-feedback-2",
+                asset: TEST_ASSET.toBase58(),
+                client_address: TEST_CLIENT.toBase58(),
+                feedback_index: "0",
+                value: "1000",
+                value_decimals: 2,
+                score: 80,
+                tag1: "quality",
+                tag2: "speed",
+                endpoint: "/chat",
+                feedback_uri: "ipfs://feedback",
+                feedback_hash: feedbackHash,
+                running_digest: Buffer.from(TEST_HASH),
+                atom_enabled: false,
+                new_trust_tier: 0,
+                new_quality_score: 0,
+                new_confidence: 0,
+                new_risk_score: 0,
+                new_diversity_ratio: 0,
+                block_slot: "123456",
+                tx_index: 2,
+                event_ordinal: 0,
+                tx_signature: "feedback-sig",
+                created_at: ctx.blockTime.toISOString(),
+              }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedbacks")) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          if (sql.includes("FROM orphan_responses")) {
+            return Promise.resolve({
+              rows: [{
+                id: "orphan-response-2",
+                asset: TEST_ASSET.toBase58(),
+                client_address: TEST_CLIENT.toBase58(),
+                feedback_index: "0",
+                responder: TEST_RESPONDER.toBase58(),
+                response_uri: "ipfs://response",
+                response_hash: feedbackHash,
+                seal_hash: feedbackHash,
+                running_digest: Buffer.from(TEST_HASH),
+                response_count: "1",
+                block_slot: "123457",
+                tx_index: 3,
+                event_ordinal: 0,
+                tx_signature: "response-sig",
+                created_at: ctx.blockTime.toISOString(),
+              }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedback_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("DELETE FROM orphan_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM revocations")) {
+            return Promise.resolve({
+              rows: [{ feedback_hash: feedbackHash, status: "ORPHANED" }],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("UPDATE revocations")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        await handleEvent({
+          type: "AgentRegistered",
+          data: {
+            asset: TEST_ASSET,
+            collection: TEST_COLLECTION,
+            owner: TEST_OWNER,
+            atomEnabled: false,
+            agentUri: "",
+          },
+        }, ctx);
+
+        expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        )).toBe(true);
+        expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("UPDATE revocations")
+        )).toBe(true);
       });
 
       it("should catch and log error on query failure", async () => {
@@ -377,6 +576,7 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner")
         );
         expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
         expect(updateCall![1]).toContain(TEST_NEW_OWNER.toBase58());
       });
 
@@ -410,6 +610,7 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("atom_enabled = true")
         );
         expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
       });
 
       it("should catch query error", async () => {
@@ -437,6 +638,7 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("UPDATE agents SET agent_uri")
         );
         expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
         expect(updateCall![1][0]).toBe("ipfs://QmNewUri");
       });
 
@@ -482,6 +684,7 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
         expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
         expect(updateCall![1][0]).toBe(TEST_WALLET.toBase58());
       });
 
@@ -499,6 +702,7 @@ describe("supabase.ts", () => {
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
+        expect(updateCall![0]).not.toContain("block_slot");
         expect(updateCall![1][0]).toBeNull();
       });
 
@@ -509,6 +713,62 @@ describe("supabase.ts", () => {
           data: { asset: TEST_ASSET, oldWallet: null, newWallet: TEST_WALLET, updatedBy: TEST_OWNER },
         };
         await handleEvent(event, ctx);
+      });
+    });
+
+    describe("agent mutable updates keep creation slot immutable", () => {
+      it("should not rewrite block_slot on WalletResetOnOwnerSync", async () => {
+        const event: any = {
+          type: "WalletResetOnOwnerSync",
+          data: {
+            asset: TEST_ASSET,
+            ownerAfterSync: TEST_NEW_OWNER,
+            newWallet: DEFAULT_PUBKEY_KEY,
+          },
+        };
+        await handleEvent(event, ctx);
+        const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1, agent_wallet = $2")
+        );
+        expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
+      });
+
+      it("should not rewrite block_slot on CollectionPointerSet", async () => {
+        const event: any = {
+          type: "CollectionPointerSet",
+          data: {
+            asset: TEST_ASSET,
+            col: "c1:test-pointer",
+            setBy: TEST_OWNER,
+            lock: true,
+          },
+        };
+        await handleEvent(event, ctx);
+        const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
+        );
+        expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
+      });
+
+      it("should not rewrite block_slot on ParentAssetSet", async () => {
+        const event: any = {
+          type: "ParentAssetSet",
+          data: {
+            asset: TEST_ASSET,
+            parentAsset: TEST_COLLECTION,
+            parentCreator: TEST_OWNER,
+            lock: true,
+          },
+        };
+        await handleEvent(event, ctx);
+        const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
+        );
+        expect(updateCall).toBeDefined();
+        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![1]).toHaveLength(5);
       });
     });
 
@@ -1603,6 +1863,7 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain("tx_signature = EXCLUDED.tx_signature");
       });
 
       it("MetadataSet _uri: prefix key is skipped", async () => {
@@ -2524,7 +2785,8 @@ describe("supabase.ts", () => {
 
   describe("saveIndexerState()", () => {
     it("should upsert state with monotonic guard", async () => {
-      await saveIndexerState("sig456", 100000n);
+      const updatedAt = new Date("2026-03-06T10:33:43.860Z");
+      await saveIndexerState("sig456", 100000n, null, "poller", updatedAt);
       const upsertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("INSERT INTO indexer_state")
       );
@@ -2532,13 +2794,15 @@ describe("supabase.ts", () => {
       expect(upsertCall![0]).toContain("indexer_state.last_slot < EXCLUDED.last_slot");
       expect(upsertCall![0]).toContain("COALESCE(indexer_state.last_signature, '') COLLATE \"C\"");
       expect(upsertCall![0]).toContain("<= EXCLUDED.last_signature COLLATE \"C\"");
+      expect(upsertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
       expect(upsertCall![1]).toContain("sig456");
       expect(upsertCall![1]).toContain("100000");
+      expect(upsertCall![1]).toContain(updatedAt.toISOString());
     });
 
     it("should catch query error", async () => {
       mockPoolInstance.query.mockRejectedValueOnce(new Error("save fail"));
-      await saveIndexerState("sig", 1n);
+      await saveIndexerState("sig", 1n, null, "poller", new Date("2026-03-06T10:31:29.259Z"));
       // Should not throw
     });
   });

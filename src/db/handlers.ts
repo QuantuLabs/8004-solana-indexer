@@ -23,6 +23,7 @@ import {
 import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
+import { trySaveLocalIndexerStateWithSql } from "./indexer-state-local.js";
 import { classifyRevocationStatus } from "./revocation-classification.js";
 import { digestUri, serializeValue, toDeterministicUriStatus } from "../indexer/uriDigest.js";
 import { digestCollectionPointerDoc } from "../indexer/collectionDigest.js";
@@ -32,12 +33,14 @@ import { DEFAULT_PUBKEY, STANDARD_URI_FIELDS } from "../constants.js";
 
 const logger = createChildLogger("db-handlers");
 
-// Global concurrency limiter for URI metadata fetching
-// Prevents OOM from unbounded fire-and-forget digest operations
-const MAX_URI_FETCH_CONCURRENT = 5;
+// Global concurrency limiter for URI metadata fetching.
+// SQLite local mode is effectively single-writer, so derived metadata work stays serialized there.
+const MAX_URI_FETCH_CONCURRENT = config.dbMode === "local" ? 1 : 5;
 const uriDigestQueue = new PQueue({ concurrency: MAX_URI_FETCH_CONCURRENT });
-const MAX_COLLECTION_FETCH_CONCURRENT = 3;
-const collectionDigestQueue = new PQueue({ concurrency: MAX_COLLECTION_FETCH_CONCURRENT });
+const MAX_COLLECTION_FETCH_CONCURRENT = config.dbMode === "local" ? 1 : 3;
+const collectionDigestQueue = config.dbMode === "local"
+  ? uriDigestQueue
+  : new PQueue({ concurrency: MAX_COLLECTION_FETCH_CONCURRENT });
 const pendingUriDigests = new Map<string, { prisma: PrismaClient; uri: string; verifiedAt?: Date }>();
 const inFlightUriDigests = new Set<string>();
 const pendingCollectionDigests = new Map<string, { prisma: PrismaClient; pointer: string }>();
@@ -46,6 +49,8 @@ const LOCAL_RECOVERY_INTERVAL_MS = 60_000;
 const LOCAL_RECOVERY_BATCH_SIZE = 500;
 let localRecoveryInterval: NodeJS.Timeout | null = null;
 let localRecoveryInFlight = false;
+let localDerivedDigestsEnabled = process.env.NODE_ENV === "test";
+let localDerivedDigestsSuspendCount = 0;
 let agentIdAssignmentTail: Promise<void> = Promise.resolve();
 let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
 let responseIdAssignmentTail: Promise<void> = Promise.resolve();
@@ -330,6 +335,7 @@ async function upsertCollectionPointerWithOptionalCollectionId(
 }
 
 function enqueueUriDigestWorker(assetId: string): void {
+  if (!canRunLocalDerivedDigests()) return;
   if (inFlightUriDigests.has(assetId)) return;
   const pending = pendingUriDigests.get(assetId);
   if (!pending) return;
@@ -339,6 +345,7 @@ function enqueueUriDigestWorker(assetId: string): void {
     .add(async () => {
       try {
         while (true) {
+          if (!canRunLocalDerivedDigests()) break;
           const next = pendingUriDigests.get(assetId);
           if (!next) break;
           pendingUriDigests.delete(assetId);
@@ -373,10 +380,12 @@ function scheduleUriDigest(
 ): void {
   if (!uri || config.metadataIndexMode === "off") return;
   pendingUriDigests.set(assetId, { prisma, uri, verifiedAt });
+  if (!canRunLocalDerivedDigests()) return;
   enqueueUriDigestWorker(assetId);
 }
 
 function enqueueCollectionDigestWorker(assetId: string): void {
+  if (!canRunLocalDerivedDigests()) return;
   if (inFlightCollectionDigests.has(assetId)) return;
   const pending = pendingCollectionDigests.get(assetId);
   if (!pending) return;
@@ -386,6 +395,7 @@ function enqueueCollectionDigestWorker(assetId: string): void {
     .add(async () => {
       try {
         while (true) {
+          if (!canRunLocalDerivedDigests()) break;
           const next = pendingCollectionDigests.get(assetId);
           if (!next) break;
           pendingCollectionDigests.delete(assetId);
@@ -415,7 +425,12 @@ function enqueueCollectionDigestWorker(assetId: string): void {
 function scheduleCollectionDigest(prisma: PrismaClient, assetId: string, pointer: string): void {
   if (!pointer || !config.collectionMetadataIndexEnabled) return;
   pendingCollectionDigests.set(assetId, { prisma, pointer });
+  if (!canRunLocalDerivedDigests()) return;
   enqueueCollectionDigestWorker(assetId);
+}
+
+function canRunLocalDerivedDigests(): boolean {
+  return localDerivedDigestsEnabled && localDerivedDigestsSuspendCount === 0;
 }
 
 function decodeRawMetadataValue(value: Uint8Array | Buffer | null | undefined): string | null {
@@ -438,7 +453,7 @@ function shouldRetryUriRecovery(status: string | null | undefined): boolean {
 }
 
 function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
-  if (process.env.NODE_ENV === "test" || localRecoveryInterval) {
+  if (!localDerivedDigestsEnabled || process.env.NODE_ENV === "test" || localRecoveryInterval) {
     return;
   }
 
@@ -538,6 +553,84 @@ function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
   }, LOCAL_RECOVERY_INTERVAL_MS);
 }
 
+function flushPendingLocalDerivedDigests(): void {
+  if (!canRunLocalDerivedDigests()) return;
+  for (const assetId of pendingUriDigests.keys()) {
+    enqueueUriDigestWorker(assetId);
+  }
+  for (const assetId of pendingCollectionDigests.keys()) {
+    enqueueCollectionDigestWorker(assetId);
+  }
+}
+
+export function enableLocalDerivedDigests(prisma: PrismaClient): void {
+  if (localDerivedDigestsEnabled) {
+    startLocalDigestRecoveryLoop(prisma);
+    flushPendingLocalDerivedDigests();
+    return;
+  }
+
+  localDerivedDigestsEnabled = true;
+  startLocalDigestRecoveryLoop(prisma);
+  flushPendingLocalDerivedDigests();
+}
+
+export async function suspendLocalDerivedDigests(): Promise<void> {
+  const shouldPauseQueues = localDerivedDigestsSuspendCount === 0;
+  localDerivedDigestsSuspendCount += 1;
+
+  if (shouldPauseQueues) {
+    uriDigestQueue.pause();
+    if (collectionDigestQueue !== uriDigestQueue) {
+      collectionDigestQueue.pause();
+    }
+  }
+
+  await uriDigestQueue.onPendingZero();
+  if (collectionDigestQueue !== uriDigestQueue) {
+    await collectionDigestQueue.onPendingZero();
+  }
+}
+
+export function resumeLocalDerivedDigests(): void {
+  if (localDerivedDigestsSuspendCount > 0) {
+    localDerivedDigestsSuspendCount -= 1;
+  }
+  if (localDerivedDigestsSuspendCount === 0) {
+    if (uriDigestQueue.isPaused) {
+      uriDigestQueue.start();
+    }
+    if (collectionDigestQueue !== uriDigestQueue && collectionDigestQueue.isPaused) {
+      collectionDigestQueue.start();
+    }
+    flushPendingLocalDerivedDigests();
+  }
+}
+
+export function resetLocalDerivedDigestsForTests(enabled: boolean = process.env.NODE_ENV === "test"): void {
+  if (localRecoveryInterval) {
+    clearInterval(localRecoveryInterval);
+    localRecoveryInterval = null;
+  }
+  localRecoveryInFlight = false;
+  localDerivedDigestsEnabled = enabled;
+  localDerivedDigestsSuspendCount = 0;
+  uriDigestQueue.clear();
+  if (uriDigestQueue.isPaused) {
+    uriDigestQueue.start();
+  }
+  if (collectionDigestQueue !== uriDigestQueue) {
+    collectionDigestQueue.clear();
+    if (collectionDigestQueue.isPaused) {
+      collectionDigestQueue.start();
+    }
+  }
+  pendingUriDigests.clear();
+  inFlightUriDigests.clear();
+  pendingCollectionDigests.clear();
+  inFlightCollectionDigests.clear();
+}
+
 // Default status for new records (will be verified later)
 const DEFAULT_STATUS: ChainStatus = "PENDING";
 
@@ -548,7 +641,8 @@ type PrismaTransactionClient = Omit<PrismaClient, "$connect" | "$disconnect" | "
 type PrismaClientOrTx = PrismaClient | PrismaTransactionClient;
 
 /**
- * Normalize hash: all-zero means "no hash" → NULL (parity with Supabase)
+ * Normalize optional hash fields that use all-zero as an off-chain "absent" placeholder.
+ * Keep this limited to truly optional hash domains.
  */
 function normalizeHash(hash: Uint8Array | number[]): Uint8Array<ArrayBuffer> | null {
   if (!hash) return null;
@@ -557,6 +651,14 @@ function normalizeHash(hash: Uint8Array | number[]): Uint8Array<ArrayBuffer> | n
     if (normalized[i] !== 0) return normalized;
   }
   return null;
+}
+
+/**
+ * Preserve exact hash bytes for protocol-required hash fields, including all-zero payloads.
+ */
+function preserveHash(hash: Uint8Array | number[] | null | undefined): Uint8Array<ArrayBuffer> | null {
+  if (!hash) return null;
+  return Uint8Array.from(hash) as Uint8Array<ArrayBuffer>;
 }
 
 /**
@@ -645,7 +747,7 @@ async function upsertOrphanFeedback(
       tag2: data.tag2,
       endpoint: data.endpoint,
       feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.sealHash),
+      feedbackHash: preserveHash(data.sealHash),
       runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
       atomEnabled: data.atomEnabled,
       newTrustTier: data.newTrustTier,
@@ -667,7 +769,7 @@ async function upsertOrphanFeedback(
       tag2: data.tag2,
       endpoint: data.endpoint,
       feedbackUri: data.feedbackUri,
-      feedbackHash: normalizeHash(data.sealHash),
+      feedbackHash: preserveHash(data.sealHash),
       runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
       atomEnabled: data.atomEnabled,
       newTrustTier: data.newTrustTier,
@@ -832,6 +934,23 @@ export async function handleEventAtomic(
 
   startLocalDigestRecoveryLoop(prisma);
 
+  // Metadata writes are idempotent. Running them inside Prisma's interactive
+  // transaction on large SQLite replays can time out and abort the cursor
+  // advance. Process the metadata write first, then advance the cursor in a
+  // tiny transaction so failures remain fail-closed with respect to the cursor.
+  if (event.type === "MetadataSet" || event.type === "MetadataDeleted") {
+    if (event.type === "MetadataSet") {
+      await handleMetadataSet(prisma, event.data, ctx);
+    } else {
+      await handleMetadataDeleted(prisma, event.data, ctx);
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await updateCursorAtomic(tx, ctx);
+    });
+    return;
+  }
+
   for (let attempt = 0; attempt < ATOMIC_COLLECTION_ID_TX_MAX_RETRIES; attempt++) {
     try {
       await prisma.$transaction(async (tx) => {
@@ -888,9 +1007,9 @@ async function updateCursorAtomic(
       || (
         ctx.slot === current.lastSlot
         && (
-          (current.lastTxIndex ?? Number.MAX_SAFE_INTEGER) > (ctx.txIndex ?? Number.MAX_SAFE_INTEGER)
+          (current.lastTxIndex ?? -1) > (ctx.txIndex ?? -1)
           || (
-            (current.lastTxIndex ?? Number.MAX_SAFE_INTEGER) === (ctx.txIndex ?? Number.MAX_SAFE_INTEGER)
+            (current.lastTxIndex ?? -1) === (ctx.txIndex ?? -1)
             && current.lastSignature !== null
             && ctx.signature < current.lastSignature
           )
@@ -898,6 +1017,16 @@ async function updateCursorAtomic(
       )
     )
   ) {
+    return;
+  }
+
+  if (await trySaveLocalIndexerStateWithSql(tx, {
+    signature: ctx.signature,
+    slot: ctx.slot,
+    txIndex: ctx.txIndex ?? null,
+    source: ctx.source || "poller",
+    updatedAt: ctx.blockTime,
+  })) {
     return;
   }
 
@@ -1852,7 +1981,7 @@ async function handleRegistryInitializedTx(
     create: {
       id: collectionId,
       collection: collectionId,
-      registryType: "Base", // v0.6.0: single-collection, always base
+      registryType: "BASE", // v0.6.0: single-collection, always base
       authority: data.authority.toBase58(),
       txSignature: ctx.signature,
       slot: ctx.slot,
@@ -1875,7 +2004,7 @@ async function handleRegistryInitialized(
     create: {
       id: collectionId,
       collection: collectionId,
-      registryType: "Base", // v0.6.0: single-collection, always base
+      registryType: "BASE", // v0.6.0: single-collection, always base
       authority: data.authority.toBase58(),
       txSignature: ctx.signature,
       slot: ctx.slot,
@@ -1949,7 +2078,7 @@ async function handleNewFeedbackTx(
         tag2: data.tag2,
         endpoint: data.endpoint,
         feedbackUri: data.feedbackUri,
-        feedbackHash: normalizeHash(data.sealHash),
+        feedbackHash: preserveHash(data.sealHash),
         runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
         createdTxSignature: ctx.signature,
         createdSlot: ctx.slot,
@@ -2171,7 +2300,7 @@ async function handleNewFeedback(
         tag2: data.tag2,
         endpoint: data.endpoint,
         feedbackUri: data.feedbackUri,
-        feedbackHash: normalizeHash(data.sealHash),
+        feedbackHash: preserveHash(data.sealHash),
         runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
         createdTxSignature: ctx.signature,
         createdSlot: ctx.slot,
@@ -2348,7 +2477,7 @@ async function handleFeedbackRevokedTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
-  const eventSealHash = normalizeHash(data.sealHash);
+  const eventSealHash = preserveHash(data.sealHash);
 
   const feedback = await tx.feedback.findUnique({
     where: {
@@ -2474,7 +2603,7 @@ async function handleFeedbackRevoked(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
-  const eventSealHash = normalizeHash(data.sealHash);
+  const eventSealHash = preserveHash(data.sealHash);
 
   const feedback = await prisma.feedback.findUnique({
     where: {
@@ -2631,8 +2760,8 @@ async function handleResponseAppendedTx(
         feedbackIndex: data.feedbackIndex,
         responder,
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
-        sealHash: normalizeHash(data.sealHash),
+        responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
@@ -2643,8 +2772,8 @@ async function handleResponseAppendedTx(
       },
       update: {
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
-        sealHash: normalizeHash(data.sealHash),
+        responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         slot: ctx.slot,
@@ -2657,7 +2786,7 @@ async function handleResponseAppendedTx(
     return;
   }
 
-  const eventSealHash = normalizeHash(data.sealHash);
+  const eventSealHash = preserveHash(data.sealHash);
   const sealMismatch = !hashesMatch(eventSealHash, feedback.feedbackHash);
   if (sealMismatch) {
     logger.warn(
@@ -2703,7 +2832,7 @@ async function handleResponseAppendedTx(
         feedbackId: feedback.id,
         responder,
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
+        responseHash: preserveHash(data.responseHash),
         runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
@@ -2767,8 +2896,8 @@ async function handleResponseAppended(
         feedbackIndex: data.feedbackIndex,
         responder,
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
-        sealHash: normalizeHash(data.sealHash),
+        responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
@@ -2779,8 +2908,8 @@ async function handleResponseAppended(
       },
       update: {
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
-        sealHash: normalizeHash(data.sealHash),
+        responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         slot: ctx.slot,
@@ -2797,7 +2926,7 @@ async function handleResponseAppended(
     return;
   }
 
-  const eventSealHash = normalizeHash(data.sealHash);
+  const eventSealHash = preserveHash(data.sealHash);
   const sealMismatch = !hashesMatch(eventSealHash, feedback.feedbackHash);
   if (sealMismatch) {
     logger.warn(
@@ -2843,7 +2972,7 @@ async function handleResponseAppended(
         feedbackId: feedback.id,
         responder,
         responseUri: data.responseUri,
-        responseHash: normalizeHash(data.responseHash),
+        responseHash: preserveHash(data.responseHash),
         runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,

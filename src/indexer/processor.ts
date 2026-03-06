@@ -6,6 +6,7 @@ import { Poller } from "./poller.js";
 import { WebSocketIndexer, testWebSocketConnection } from "./websocket.js";
 import { DataVerifier } from "./verifier.js";
 import { createChildLogger } from "../logger.js";
+import { enableLocalDerivedDigests } from "../db/handlers.js";
 import { setVerifierActive } from "../observability/integrity-metrics.js";
 
 const logger = createChildLogger("processor");
@@ -65,6 +66,11 @@ export class Processor {
 
     // Start background verifier for reorg resilience
     await this.startVerifier();
+
+    if (this.prisma && config.dbMode === "local") {
+      enableLocalDerivedDigests(this.prisma);
+      logger.info("Local derived digest workers enabled after bootstrap");
+    }
   }
 
   private async startVerifier(): Promise<void> {

@@ -81,7 +81,16 @@ vi.mock("../../../src/utils/sanitize.js", () => ({
   stripNullBytes: mockStripNullBytes,
 }));
 
-import { handleEventAtomic, cleanupOrphanResponses, handleEvent, EventContext } from "../../../src/db/handlers.js";
+import {
+  handleEventAtomic,
+  cleanupOrphanResponses,
+  handleEvent,
+  EventContext,
+  enableLocalDerivedDigests,
+  resetLocalDerivedDigestsForTests,
+  suspendLocalDerivedDigests,
+  resumeLocalDerivedDigests,
+} from "../../../src/db/handlers.js";
 import { ProgramEvent } from "../../../src/parser/types.js";
 
 const DEFAULT_PUBKEY_STR = "11111111111111111111111111111111";
@@ -91,6 +100,7 @@ describe("DB Handlers Coverage", () => {
   let ctx: EventContext;
 
   beforeEach(() => {
+    resetLocalDerivedDigestsForTests(true);
     prisma = createMockPrismaClient();
     ctx = {
       signature: TEST_SIGNATURE,
@@ -471,6 +481,27 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
+    it("should allow same-slot cursor advance when persisted tx index is null and next tx index is resolved", async () => {
+      (prisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSlot: 5000n,
+        lastTxIndex: null,
+        lastSignature: "sig-a",
+      });
+
+      const advancedCtx = { ...ctx, slot: 5000n, txIndex: 0, signature: "sig-b" };
+      await handleEventAtomic(prisma, simpleEvent, advancedCtx);
+
+      expect(prisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "sig-b",
+            lastSlot: 5000n,
+            lastTxIndex: 0,
+          }),
+        })
+      );
+    });
+
     it("should default source to 'poller' when ctx.source is undefined", async () => {
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
@@ -696,9 +727,9 @@ describe("DB Handlers Coverage", () => {
   });
 
   // ==========================================================================
-  // 5. handleMetadataSetTx
+  // 5. MetadataSet via handleEventAtomic
   // ==========================================================================
-  describe("handleMetadataSetTx (via handleEventAtomic)", () => {
+  describe("MetadataSet via handleEventAtomic", () => {
     it("should upsert metadata for normal key", async () => {
       const event: ProgramEvent = {
         type: "MetadataSet",
@@ -712,6 +743,10 @@ describe("DB Handlers Coverage", () => {
 
       (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.$transaction as any).mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => {
+        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+        return fn(prisma);
+      });
 
       await handleEventAtomic(prisma, event, ctx);
 
@@ -725,6 +760,7 @@ describe("DB Handlers Coverage", () => {
           }),
         })
       );
+      expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
     it("should skip _uri: prefix keys", async () => {
@@ -785,6 +821,26 @@ describe("DB Handlers Coverage", () => {
           create: expect.objectContaining({ immutable: true }),
         })
       );
+    });
+
+    it("should not advance cursor when metadata write fails", async () => {
+      const event: ProgramEvent = {
+        type: "MetadataSet",
+        data: {
+          asset: TEST_ASSET,
+          key: "description",
+          value: new Uint8Array([72]),
+          immutable: false,
+        },
+      };
+
+      const writeError = new Error("metadata write failed");
+      (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
+      (prisma.agentMetadata.upsert as any).mockRejectedValue(writeError);
+
+      await expect(handleEventAtomic(prisma, event, ctx)).rejects.toThrow("metadata write failed");
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.indexerState.upsert).not.toHaveBeenCalled();
     });
   });
 
@@ -948,6 +1004,29 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.revocation.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
           create: expect.objectContaining({ feedbackIndex: 99n, status: "ORPHANED" }),
+        })
+      );
+    });
+
+    it("should preserve all-zero sealHash bytes for atomic revocations", async () => {
+      const zeroBytes = new Uint8Array(32).fill(0);
+      (prisma.feedback.findUnique as any).mockResolvedValue({
+        feedbackHash: Uint8Array.from(TEST_HASH),
+      });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+
+      const event: ProgramEvent = {
+        type: "FeedbackRevoked",
+        data: { ...revokeEventData, sealHash: zeroBytes },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.revocation.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({
+            feedbackHash: zeroBytes,
+          }),
         })
       );
     });
@@ -1376,6 +1455,235 @@ describe("DB Handlers Coverage", () => {
       await new Promise((r) => setTimeout(r, 300));
     });
 
+    it("should queue URI digest work until local derived digests are enabled", async () => {
+      resetLocalDerivedDigestsForTests(false);
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        uri: "https://example.com/queued.json",
+        nftName: "",
+        updatedAt: ctx.blockTime,
+        createdAt: ctx.blockTime,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      mockDigestUri.mockResolvedValue({
+        status: "ok",
+        bytes: 100,
+        hash: "queuedhash",
+        fields: { "_uri:name": "Queued Agent" },
+        truncatedKeys: false,
+      });
+
+      const event: ProgramEvent = {
+        type: "UriUpdated",
+        data: { asset: TEST_ASSET, newUri: "https://example.com/queued.json", updatedBy: TEST_OWNER },
+      };
+
+      await handleEvent(prisma, event, ctx);
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockDigestUri).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.upsert).not.toHaveBeenCalled();
+
+      enableLocalDerivedDigests(prisma as any);
+
+      await vi.waitFor(() => {
+        expect(mockDigestUri).toHaveBeenCalledTimes(1);
+        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+      }, { timeout: 500 });
+    });
+
+    it("should defer queued URI digest execution while local ingestion is suspended", async () => {
+      const event: ProgramEvent = {
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: false,
+          agentUri: "https://example.com/suspended.json",
+        },
+      };
+
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        uri: "https://example.com/suspended.json",
+        nftName: "",
+        creator: TEST_OWNER.toBase58(),
+        updatedAt: ctx.blockTime,
+        createdAt: ctx.blockTime,
+      });
+
+      suspendLocalDerivedDigests();
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(mockDigestUri).not.toHaveBeenCalled();
+
+      resumeLocalDerivedDigests();
+
+      await vi.waitFor(() => {
+        expect(mockDigestUri).toHaveBeenCalledTimes(1);
+      }, { timeout: 500 });
+    });
+
+    it("should wait for an in-flight local URI digest before suspending", async () => {
+      let releaseDigest: (() => void) | null = null;
+      mockDigestUri.mockImplementationOnce(() => new Promise((resolve) => {
+        releaseDigest = () => resolve({
+          status: "ok",
+          bytes: 100,
+          hash: "inflight",
+          fields: {},
+          truncatedKeys: false,
+        });
+      }));
+
+      const event: ProgramEvent = {
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: false,
+          agentUri: "https://example.com/inflight.json",
+        },
+      };
+
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        uri: "https://example.com/inflight.json",
+        nftName: "",
+        creator: TEST_OWNER.toBase58(),
+        updatedAt: ctx.blockTime,
+        createdAt: ctx.blockTime,
+      });
+
+      await handleEventAtomic(prisma, event, ctx);
+      await new Promise((r) => setTimeout(r, 0));
+
+      const suspendPromise = suspendLocalDerivedDigests();
+      let settled = false;
+      void suspendPromise.then(() => {
+        settled = true;
+      });
+
+      await new Promise((r) => setTimeout(r, 25));
+      expect(settled).toBe(false);
+
+      releaseDigest?.();
+      await suspendPromise;
+
+      expect(mockDigestUri).toHaveBeenCalledTimes(1);
+      resumeLocalDerivedDigests();
+    });
+
+    it("should defer same-asset URI rollover queued during suspension", async () => {
+      let releaseFirstDigest: (() => void) | null = null;
+      let currentUri = "https://example.com/first.json";
+      mockDigestUri
+        .mockImplementationOnce(() => new Promise((resolve) => {
+          releaseFirstDigest = () => resolve({
+            status: "ok",
+            bytes: 100,
+            hash: "first",
+            fields: {},
+            truncatedKeys: false,
+          });
+        }))
+        .mockResolvedValueOnce({
+          status: "ok",
+          bytes: 100,
+          hash: "second",
+          fields: {},
+          truncatedKeys: false,
+        });
+
+      const makeEvent = (uri: string): ProgramEvent => ({
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: false,
+          agentUri: uri,
+        },
+      });
+
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.findUnique as any).mockImplementation(async () => ({
+        uri: currentUri,
+        nftName: "",
+        creator: TEST_OWNER.toBase58(),
+        updatedAt: ctx.blockTime,
+        createdAt: ctx.blockTime,
+      }));
+
+      await handleEventAtomic(prisma, makeEvent(currentUri), ctx);
+      await new Promise((r) => setTimeout(r, 0));
+
+      const suspendPromise = suspendLocalDerivedDigests();
+      let settled = false;
+      void suspendPromise.then(() => {
+        settled = true;
+      });
+
+      await new Promise((r) => setTimeout(r, 25));
+      expect(settled).toBe(false);
+      expect(mockDigestUri).toHaveBeenCalledTimes(1);
+
+      currentUri = "https://example.com/second.json";
+      await handleEventAtomic(prisma, makeEvent(currentUri), ctx);
+
+      releaseFirstDigest?.();
+      await suspendPromise;
+
+      expect(mockDigestUri).toHaveBeenCalledTimes(1);
+
+      resumeLocalDerivedDigests();
+
+      await vi.waitFor(() => {
+        expect(mockDigestUri).toHaveBeenCalledTimes(2);
+      }, { timeout: 500 });
+    });
+
+    it("should keep only the latest queued URI digest per asset until local derived digests are enabled", async () => {
+      resetLocalDerivedDigestsForTests(false);
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        uri: "https://example.com/latest.json",
+        nftName: "",
+        updatedAt: ctx.blockTime,
+        createdAt: ctx.blockTime,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      mockDigestUri.mockResolvedValue({
+        status: "ok",
+        bytes: 101,
+        hash: "latesthash",
+        fields: { "_uri:name": "Latest Agent" },
+        truncatedKeys: false,
+      });
+
+      await handleEvent(prisma, {
+        type: "UriUpdated",
+        data: { asset: TEST_ASSET, newUri: "https://example.com/stale.json", updatedBy: TEST_OWNER },
+      }, ctx);
+      await handleEvent(prisma, {
+        type: "UriUpdated",
+        data: { asset: TEST_ASSET, newUri: "https://example.com/latest.json", updatedBy: TEST_OWNER },
+      }, { ...ctx, signature: "sig-latest" });
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockDigestUri).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.upsert).not.toHaveBeenCalled();
+
+      enableLocalDerivedDigests(prisma as any);
+
+      await vi.waitFor(() => {
+        expect(mockDigestUri).toHaveBeenCalledTimes(1);
+        expect(mockDigestUri).toHaveBeenCalledWith("https://example.com/latest.json");
+        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+      }, { timeout: 500 });
+    });
+
     it("should not overwrite immutable URI-derived metadata entries", async () => {
       (prisma.agent.findUnique as any).mockResolvedValue({
         uri: "https://example.com/immutable.json",
@@ -1605,6 +1913,40 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.feedbackResponse.upsert).toHaveBeenCalled();
     });
 
+    it("should preserve all-zero responseHash bytes for atomic responses", async () => {
+      const zeroBytes = new Uint8Array(32).fill(0);
+      (prisma.feedback.findUnique as any).mockResolvedValue({
+        id: "fb-uuid",
+        feedbackHash: Uint8Array.from(TEST_HASH),
+      });
+
+      const event: ProgramEvent = {
+        type: "ResponseAppended",
+        data: {
+          asset: TEST_ASSET,
+          client: TEST_CLIENT,
+          feedbackIndex: 0n,
+          responder: TEST_OWNER,
+          responseUri: "ipfs://QmResp",
+          responseHash: zeroBytes,
+          sealHash: TEST_HASH,
+          slot: 123456n,
+          newResponseDigest: TEST_HASH,
+          newResponseCount: 1n,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({
+            responseHash: zeroBytes,
+          }),
+        })
+      );
+    });
+
     it("should handle ResponseAppended as orphan when feedback not found (atomic)", async () => {
       (prisma.feedback.findUnique as any).mockResolvedValue(null);
 
@@ -1630,18 +1972,23 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.feedbackResponse.upsert).not.toHaveBeenCalled();
     });
 
-    it("should handle MetadataDeleted atomically", async () => {
+    it("should handle MetadataDeleted before advancing cursor", async () => {
       const event: ProgramEvent = {
         type: "MetadataDeleted",
         data: { asset: TEST_ASSET, key: "test-key" },
       };
 
+      (prisma.$transaction as any).mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => {
+        expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
+          where: { agentId: TEST_ASSET.toBase58(), key: "test-key" },
+        });
+        return fn(prisma);
+      });
+
       await handleEventAtomic(prisma, event, ctx);
 
       expect(prisma.$transaction).toHaveBeenCalled();
-      expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-        where: { agentId: TEST_ASSET.toBase58(), key: "test-key" },
-      });
+      expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
     it("should handle unknown event type without throwing", async () => {
@@ -2029,6 +2376,25 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
+    it("should preserve all-zero sealHash bytes for non-atomic revocations", async () => {
+      const zeroBytes = new Uint8Array(32).fill(0);
+      (prisma.feedback.findUnique as any).mockResolvedValue({
+        feedbackHash: Uint8Array.from(TEST_HASH),
+      });
+
+      const event: ProgramEvent = {
+        type: "FeedbackRevoked",
+        data: { ...revokeData, sealHash: zeroBytes },
+      };
+      await handleEvent(prisma, event, ctx);
+
+      expect(prisma.revocation.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ feedbackHash: zeroBytes }),
+        })
+      );
+    });
+
     it("should handle revocation as orphan when feedback not found (non-atomic)", async () => {
       (prisma.feedback.findUnique as any).mockResolvedValue(null);
 
@@ -2092,6 +2458,26 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
+    it("should preserve all-zero responseHash bytes for non-atomic responses", async () => {
+      const zeroBytes = new Uint8Array(32).fill(0);
+      (prisma.feedback.findUnique as any).mockResolvedValue({
+        id: "fb-found",
+        feedbackHash: Uint8Array.from(TEST_HASH),
+      });
+
+      const event: ProgramEvent = {
+        type: "ResponseAppended",
+        data: { ...responseData, responseHash: zeroBytes },
+      };
+      await handleEvent(prisma, event, ctx);
+
+      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ responseHash: zeroBytes }),
+        })
+      );
+    });
+
     it("should store orphan when feedback not found (non-atomic)", async () => {
       (prisma.feedback.findUnique as any).mockResolvedValue(null);
 
@@ -2139,7 +2525,7 @@ describe("DB Handlers Coverage", () => {
         expect.objectContaining({
           create: expect.objectContaining({
             id: TEST_COLLECTION.toBase58(),
-            registryType: "Base",
+            registryType: "BASE",
           }),
         })
       );

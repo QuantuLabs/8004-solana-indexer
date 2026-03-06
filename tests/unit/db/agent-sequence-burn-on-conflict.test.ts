@@ -14,6 +14,13 @@ const migrationSql = readFileSync(
   ),
   "utf8"
 );
+const deterministicCounterMigrationSql = readFileSync(
+  resolve(
+    __dirname,
+    "../../../supabase/migrations/20260307111500_deterministic_id_counter_timestamps.sql"
+  ),
+  "utf8"
+);
 const supabaseRuntime = readFileSync(resolve(__dirname, "../../../src/db/supabase.ts"), "utf8");
 const batchProcessorRuntime = readFileSync(
   resolve(__dirname, "../../../src/indexer/batch-processor.ts"),
@@ -86,12 +93,16 @@ function assertAgentInsertContract(source: string): void {
 describe("agent_id conflict-safe trigger semantics for ON CONFLICT", () => {
   it("defines lock-guarded BEFORE INSERT assignment in bootstrap schema", () => {
     expect(schemaSql).toContain("CREATE TABLE IF NOT EXISTS id_counters (");
-    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)");
+    expect(schemaSql).toContain(
+      "CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT, p_updated_at TIMESTAMPTZ DEFAULT NULL)"
+    );
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_agent_id()");
     expect(schemaSql).toContain("pg_advisory_xact_lock(hashtextextended('agent:id:' || NEW.asset, 0));");
     expect(schemaSql).toContain("SELECT agent_id, status");
     expect(schemaSql).toContain("IF FOUND THEN");
-    expect(schemaSql).toContain("NEW.agent_id := alloc_gapless_id('agent:global');");
+    expect(schemaSql).toContain(
+      "NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));"
+    );
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_agent_id");
     expect(schemaSql).toContain("BEFORE INSERT OR UPDATE ON agents");
     expect(schemaSql).not.toContain("CREATE SEQUENCE IF NOT EXISTS agent_id_seq START 1;");
@@ -106,8 +117,41 @@ describe("agent_id conflict-safe trigger semantics for ON CONFLICT", () => {
     expect(migrationSql).toContain("pg_advisory_xact_lock(hashtextextended('agent:id:' || NEW.asset, 0));");
     expect(migrationSql).toContain("NEW.agent_id := alloc_gapless_id('agent:global');");
     expect(migrationSql).toContain("ROW_NUMBER() OVER");
+    expect(migrationSql).toContain("WHERE agent_id IS NULL");
+    expect(migrationSql).toContain("WHERE feedback_id IS NULL");
+    expect(migrationSql).toContain("WHERE response_id IS NULL");
+    expect(migrationSql).toContain("WHERE revocation_id IS NULL");
+    expect(migrationSql).not.toContain("SET agent_id = agent_id +");
+    expect(migrationSql).not.toContain("SET feedback_id = feedback_id +");
+    expect(migrationSql).not.toContain("SET response_id = response_id +");
+    expect(migrationSql).not.toContain("SET revocation_id = revocation_id +");
     expect(migrationSql).toContain("DELETE FROM id_counters");
     expect(migrationSql).toContain("DROP SEQUENCE IF EXISTS agent_id_seq;");
+  });
+
+  it("adds a deterministic timestamp migration for id_counters bookkeeping", () => {
+    expect(deterministicCounterMigrationSql).toContain(
+      "IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT, p_updated_at TIMESTAMPTZ DEFAULT NULL)"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset, COALESCE(NEW.created_at, NOW()));"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "COALESCE(NEW.first_seen_at, NEW.last_seen_at, NOW())"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,"
+    );
+    expect(deterministicCounterMigrationSql).toContain(
+      "NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset, COALESCE(NEW.created_at, NOW()));"
+    );
+    expect(deterministicCounterMigrationSql).toContain("DROP FUNCTION IF EXISTS alloc_gapless_id(TEXT);");
   });
 
   it("upserts agents via ON CONFLICT(asset) without mutating agent_id in runtime SQL", () => {

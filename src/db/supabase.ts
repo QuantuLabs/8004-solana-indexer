@@ -379,6 +379,8 @@ async function replayOrphanFeedbacksForAsset(
   }
 
   for (const row of pending.rows) {
+    const feedbackIndex = BigInt(row.feedback_index?.toString?.() ?? row.feedback_index ?? "0");
+    const feedbackHash = row.feedback_hash ?? null;
     const insertResult = await db.query(
       `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
@@ -456,6 +458,20 @@ async function replayOrphanFeedbacksForAsset(
       }
     }
 
+    await replayOrphanResponsesForFeedback(
+      db,
+      row.asset,
+      row.client_address,
+      feedbackIndex,
+      feedbackHash
+    );
+    await reconcileOrphanRevocationForFeedback(
+      db,
+      row.asset,
+      row.client_address,
+      feedbackIndex,
+      feedbackHash
+    );
     await db.query(`DELETE FROM orphan_feedbacks WHERE id = $1`, [row.id]);
   }
 
@@ -682,29 +698,29 @@ async function updateCursorAtomic(
 ): Promise<void> {
   await client.query(
     `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
-     VALUES ('main', $1, $2, $3, $4, NOW())
+     VALUES ('main', $1, $2, $3, $4, $5)
        ON CONFLICT (id) DO UPDATE SET
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
          last_tx_index = EXCLUDED.last_tx_index,
          source = EXCLUDED.source,
-         updated_at = NOW()
+         updated_at = EXCLUDED.updated_at
        WHERE indexer_state.last_slot IS NULL
           OR indexer_state.last_slot < EXCLUDED.last_slot
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
             AND (
-              COALESCE(indexer_state.last_tx_index, 2147483647)
-                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
+              COALESCE(indexer_state.last_tx_index, -1)
+                < COALESCE(EXCLUDED.last_tx_index, -1)
               OR (
-                COALESCE(indexer_state.last_tx_index, 2147483647)
-                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                COALESCE(indexer_state.last_tx_index, -1)
+                  = COALESCE(EXCLUDED.last_tx_index, -1)
                 AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                   <= EXCLUDED.last_signature COLLATE "C"
               )
             )
           )`,
-    [ctx.signature, ctx.slot.toString(), ctx.txIndex ?? null, ctx.source || "poller"]
+    [ctx.signature, ctx.slot.toString(), ctx.txIndex ?? null, ctx.source || "poller", ctx.blockTime.toISOString()]
   );
 }
 
@@ -837,7 +853,6 @@ async function handleAgentRegisteredTx(
        creator = COALESCE(agents.creator, EXCLUDED.creator),
        agent_uri = EXCLUDED.agent_uri,
        atom_enabled = EXCLUDED.atom_enabled,
-       block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
        updated_at = EXCLUDED.updated_at`,
@@ -877,8 +892,8 @@ async function handleAgentOwnerSyncedTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   await client.query(
-    `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-    [data.newOwner.toBase58(), ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    `UPDATE agents SET owner = $1, updated_at = $2 WHERE asset = $3`,
+    [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
 }
@@ -890,8 +905,8 @@ async function handleAtomEnabledTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   await client.query(
-    `UPDATE agents SET atom_enabled = true, block_slot = $1, updated_at = $2 WHERE asset = $3`,
-    [ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    `UPDATE agents SET atom_enabled = true, updated_at = $1 WHERE asset = $2`,
+    [ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
 }
@@ -904,8 +919,8 @@ async function handleUriUpdatedTx(
   const assetId = data.asset.toBase58();
   const newUri = data.newUri || null;
   await client.query(
-    `UPDATE agents SET agent_uri = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-    [newUri, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    `UPDATE agents SET agent_uri = $1, updated_at = $2 WHERE asset = $3`,
+    [newUri, ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, newUri }, "Agent URI updated");
 
@@ -924,8 +939,8 @@ async function handleWalletUpdatedTx(
   const newWalletRaw = data.newWallet.toBase58();
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
   await client.query(
-    `UPDATE agents SET agent_wallet = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-    [newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    `UPDATE agents SET agent_wallet = $1, updated_at = $2 WHERE asset = $3`,
+    [newWallet, ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
 }
@@ -939,8 +954,8 @@ async function handleWalletResetOnOwnerSyncTx(
   const newWalletRaw = data.newWallet.toBase58();
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
   await client.query(
-    `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
-    [data.ownerAfterSync.toBase58(), newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+    `UPDATE agents SET owner = $1, agent_wallet = $2, updated_at = $3 WHERE asset = $4`,
+    [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId]
   );
   logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
 }
@@ -973,13 +988,12 @@ async function handleCollectionPointerSetTx(
        WHERE asset = $1
      ),
      resolved AS (
-       SELECT COALESCE((SELECT prev_creator FROM previous), $3) AS creator_key
+       SELECT COALESCE((SELECT prev_creator FROM previous), $3::text) AS creator_key
      ),
      updated AS (
        UPDATE agents
        SET canonical_col = $2,
            creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
-           block_slot = $4,
            updated_at = $5,
            col_locked = COALESCE($7, col_locked)
        WHERE asset = $1
@@ -1054,14 +1068,12 @@ async function handleParentAssetSetTx(
     `UPDATE agents
      SET parent_asset = $1,
          parent_creator = $2,
-         block_slot = $3,
-         updated_at = $4,
-         parent_locked = COALESCE($6, parent_locked)
-     WHERE asset = $5`,
+         updated_at = $3,
+         parent_locked = COALESCE($5, parent_locked)
+     WHERE asset = $4`,
     [
       data.parentAsset.toBase58(),
       data.parentCreator.toBase58(),
-      ctx.slot.toString(),
       ctx.blockTime.toISOString(),
       assetId,
       lock,
@@ -1097,6 +1109,7 @@ async function handleMetadataSetTx(
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature,
        updated_at = EXCLUDED.updated_at
      WHERE NOT metadata.immutable`,
     [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
@@ -1468,7 +1481,6 @@ async function handleAgentRegistered(
          creator = COALESCE(agents.creator, EXCLUDED.creator),
          agent_uri = EXCLUDED.agent_uri,
          atom_enabled = EXCLUDED.atom_enabled,
-         block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
          updated_at = EXCLUDED.updated_at`,
@@ -1512,8 +1524,8 @@ async function handleAgentOwnerSynced(
 
   try {
     await db.query(
-      `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [data.newOwner.toBase58(), ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET owner = $1, updated_at = $2 WHERE asset = $3`,
+      [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
   } catch (error: any) {
@@ -1530,8 +1542,8 @@ async function handleAtomEnabled(
 
   try {
     await db.query(
-      `UPDATE agents SET atom_enabled = true, block_slot = $1, updated_at = $2 WHERE asset = $3`,
-      [ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET atom_enabled = true, updated_at = $1 WHERE asset = $2`,
+      [ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
   } catch (error: any) {
@@ -1549,8 +1561,8 @@ async function handleUriUpdated(
 
   try {
     await db.query(
-      `UPDATE agents SET agent_uri = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [newUri, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET agent_uri = $1, updated_at = $2 WHERE asset = $3`,
+      [newUri, ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, newUri }, "Agent URI updated");
 
@@ -1575,8 +1587,8 @@ async function handleWalletUpdated(
 
   try {
     await db.query(
-      `UPDATE agents SET agent_wallet = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET agent_wallet = $1, updated_at = $2 WHERE asset = $3`,
+      [newWallet, ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
   } catch (error: any) {
@@ -1595,8 +1607,8 @@ async function handleWalletResetOnOwnerSync(
 
   try {
     await db.query(
-      `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
-      [data.ownerAfterSync.toBase58(), newWallet, ctx.slot.toString(), ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET owner = $1, agent_wallet = $2, updated_at = $3 WHERE asset = $4`,
+      [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId]
     );
     logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
   } catch (error: any) {
@@ -1635,13 +1647,12 @@ async function handleCollectionPointerSet(
          WHERE asset = $1
        ),
        resolved AS (
-         SELECT COALESCE((SELECT prev_creator FROM previous), $3) AS creator_key
+         SELECT COALESCE((SELECT prev_creator FROM previous), $3::text) AS creator_key
        ),
        updated AS (
          UPDATE agents
          SET canonical_col = $2,
              creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
-             block_slot = $4,
              updated_at = $5,
              col_locked = COALESCE($7, col_locked)
          WHERE asset = $1
@@ -1721,14 +1732,12 @@ async function handleParentAssetSet(
       `UPDATE agents
        SET parent_asset = $1,
            parent_creator = $2,
-           block_slot = $3,
-           updated_at = $4,
-           parent_locked = COALESCE($6, parent_locked)
-       WHERE asset = $5`,
+           updated_at = $3,
+           parent_locked = COALESCE($5, parent_locked)
+       WHERE asset = $4`,
       [
         data.parentAsset.toBase58(),
         data.parentCreator.toBase58(),
-        ctx.slot.toString(),
         ctx.blockTime.toISOString(),
         assetId,
         lock,
@@ -1774,6 +1783,7 @@ async function handleMetadataSet(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature,
          updated_at = EXCLUDED.updated_at
        WHERE NOT metadata.immutable`,
       [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]
@@ -2227,35 +2237,36 @@ export async function saveIndexerState(
   signature: string,
   slot: bigint,
   txIndex: number | null,
-  source: "poller" | "websocket" | "substreams" = "poller"
+  source: "poller" | "websocket" | "substreams" = "poller",
+  updatedAt: Date
 ): Promise<void> {
   const db = getPool();
   try {
     await db.query(
       `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
-       VALUES ('main', $1, $2, $3, $4, NOW())
+       VALUES ('main', $1, $2, $3, $4, $5)
        ON CONFLICT (id) DO UPDATE SET
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
          last_tx_index = EXCLUDED.last_tx_index,
          source = EXCLUDED.source,
-         updated_at = NOW()
+         updated_at = EXCLUDED.updated_at
        WHERE indexer_state.last_slot IS NULL
           OR indexer_state.last_slot < EXCLUDED.last_slot
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
             AND (
-              COALESCE(indexer_state.last_tx_index, 2147483647)
-                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
+              COALESCE(indexer_state.last_tx_index, -1)
+                < COALESCE(EXCLUDED.last_tx_index, -1)
               OR (
-                COALESCE(indexer_state.last_tx_index, 2147483647)
-                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                COALESCE(indexer_state.last_tx_index, -1)
+                  = COALESCE(EXCLUDED.last_tx_index, -1)
                 AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                   <= EXCLUDED.last_signature COLLATE "C"
               )
             )
           )`,
-      [signature, slot.toString(), txIndex, source]
+      [signature, slot.toString(), txIndex, source, updatedAt.toISOString()]
     );
   } catch (error: any) {
     logger.error({ error: error.message }, "Failed to save indexer state");

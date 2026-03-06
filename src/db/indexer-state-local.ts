@@ -7,6 +7,7 @@ type LocalIndexerStateUpdate = {
   slot: bigint;
   txIndex?: number | null;
   source?: string | null;
+  updatedAt: Date;
 };
 
 const SQLITE_INDEXER_STATE_UPSERT_SQL = `
@@ -18,13 +19,13 @@ const SQLITE_INDEXER_STATE_UPSERT_SQL = `
     "source",
     "updatedAt"
   )
-  VALUES ('main', ?, CAST(? AS INTEGER), ?, ?, CURRENT_TIMESTAMP)
+  VALUES ('main', ?, CAST(? AS INTEGER), ?, ?, ?)
   ON CONFLICT("id") DO UPDATE SET
     "lastSignature" = excluded."lastSignature",
     "lastSlot" = excluded."lastSlot",
     "lastTxIndex" = excluded."lastTxIndex",
     "source" = excluded."source",
-    "updatedAt" = CURRENT_TIMESTAMP
+    "updatedAt" = excluded."updatedAt"
   WHERE "IndexerState"."lastSlot" IS NULL
      OR "IndexerState"."lastSlot" < excluded."lastSlot"
      OR (
@@ -64,7 +65,8 @@ export async function trySaveLocalIndexerStateWithSql(
     update.signature,
     update.slot.toString(),
     update.txIndex ?? null,
-    update.source ?? "poller"
+    update.source ?? "poller",
+    update.updatedAt.toISOString()
   );
 
   return true;

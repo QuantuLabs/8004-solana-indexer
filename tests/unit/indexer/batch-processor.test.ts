@@ -359,6 +359,30 @@ describe("EventBuffer", () => {
       expect(mockPool.connect).not.toHaveBeenCalled();
     });
 
+    it("should flush cursor-only progress when no events were buffered", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      buffer.noteCursor({
+        signature: "cursor-only-sig",
+        slot: 777n,
+        blockTime: new Date("2026-03-06T12:00:00.000Z"),
+        txIndex: 4,
+      });
+
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const cursorCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
+      );
+      expect(cursorCall).toBeDefined();
+      expect(cursorCall[1]).toEqual([
+        "cursor-only-sig",
+        "777",
+        4,
+        "2026-03-06T12:00:00.000Z",
+      ]);
+    });
+
     it("should not double-flush (flushInProgress guard)", async () => {
       const client = mockPool._client;
       let firstQueryCalled = false;
@@ -688,7 +712,7 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("should handle all-zero sealHash as null", async () => {
+    it("should preserve all-zero sealHash bytes for feedback inserts", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
         makeEvent("NewFeedback", {
@@ -701,6 +725,11 @@ describe("EventBuffer", () => {
       await buffer.flush();
 
       const client = mockPool._client;
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedbacks (id, feedback_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][12]).toBe("0".repeat(64));
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
@@ -874,6 +903,35 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
+    it("should preserve all-zero sealHash bytes for revocation inserts", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          return { rows: [{ id: "f1", feedback_hash: "0".repeat(64) }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0),
+          newRevokeCount: 1,
+        })
+      );
+      await buffer.flush();
+
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO revocations (id, revocation_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][5]).toBe("0".repeat(64));
+      expect(insertCall[1][16]).toBe("PENDING");
+    });
+
     it("should insert ResponseAppended event", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
@@ -893,7 +951,7 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("should handle response with all-zero hash", async () => {
+    it("should preserve all-zero responseHash bytes for orphan response inserts", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
         makeEvent("ResponseAppended", {
@@ -902,12 +960,51 @@ describe("EventBuffer", () => {
           responder: "responder1",
           feedbackIndex: 0n,
           responseHash: new Uint8Array(32).fill(0),
+          sealHash: new Uint8Array(32).fill(0),
         })
       );
       await buffer.flush();
 
       const client = mockPool._client;
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO orphan_responses")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][6]).toBe("0".repeat(64));
+      expect(insertCall[1][7]).toBe("0".repeat(64));
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+    });
+
+    it("should preserve all-zero responseHash and sealHash bytes for response inserts", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          return { rows: [{ id: "f1", feedback_hash: "0".repeat(64) }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder1",
+          feedbackIndex: 0n,
+          responseUri: "https://example.com/zero-response",
+          responseHash: new Uint8Array(32).fill(0),
+          sealHash: new Uint8Array(32).fill(0),
+          newResponseCount: 1n,
+        })
+      );
+      await buffer.flush();
+
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][7]).toBe("0".repeat(64));
+      expect(insertCall[1][15]).toBe("PENDING");
     });
 
     it("should insert ValidationRequested event", async () => {
@@ -1128,7 +1225,29 @@ describe("EventBuffer", () => {
       expect(metadataInsertCall).toBeDefined();
       expect(metadataInsertCall[0]).toContain("created_at, updated_at, status");
       expect(metadataInsertCall[0]).toContain("updated_at = EXCLUDED.updated_at");
+      expect(metadataInsertCall[0]).toContain("tx_signature = EXCLUDED.tx_signature");
       expect(metadataInsertCall[1][10]).toBe(metadataInsertCall[1][11]);
+    });
+
+    it("should flush cursor state even when no events are buffered", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      buffer.noteCursor({
+        signature: "cursor-only-sig",
+        slot: 42n,
+        blockTime: new Date("2026-03-06T12:00:00.000Z"),
+        txIndex: 3,
+      });
+
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const cursorCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
+      );
+      expect(cursorCall).toBeDefined();
+      expect(cursorCall[1][0]).toBe("cursor-only-sig");
+      expect(cursorCall[1][1]).toBe("42");
+      expect(cursorCall[1][2]).toBe(3);
     });
 
     it("should skip _uri: prefixed metadata keys", async () => {

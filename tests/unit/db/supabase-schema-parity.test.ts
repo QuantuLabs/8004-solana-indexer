@@ -41,13 +41,15 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("WHERE revocation_id IS NOT NULL;");
     expect(schemaSql).toContain("CREATE INDEX idx_revocations_asset_revocation_id_lookup");
     expect(schemaSql).toContain("CREATE INDEX idx_revocations_canonical_order");
-    expect(schemaSql).toContain("ON revocations(asset, slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);");
+    expect(schemaSql).toContain("ON revocations(asset, slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);");
   });
 
   it("hardens scoped sequential IDs at DB layer with trigger assignment", () => {
     expect(schemaSql).toContain("CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)");
     expect(schemaSql).toContain("CREATE TABLE IF NOT EXISTS id_counters (");
-    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)");
+    expect(schemaSql).toContain(
+      "CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT, p_updated_at TIMESTAMPTZ DEFAULT NULL)"
+    );
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_feedback_id()");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_response_id()");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
@@ -56,9 +58,25 @@ describe("supabase schema revocations bootstrap parity", () => {
       "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '')"
     );
     expect(schemaSql).toContain("'revocation:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
-    expect(schemaSql).toContain("NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset);");
+    expect(schemaSql).toContain(
+      "NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));"
+    );
+    expect(schemaSql).toContain(
+      "IF NEW.status IS NOT NULL AND NEW.status = 'ORPHANED' THEN"
+    );
+    expect(schemaSql).toContain(
+      "NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset, COALESCE(NEW.created_at, NOW()));"
+    );
+    expect(schemaSql).toContain(
+      "'collection:global',\n    COALESCE(NEW.first_seen_at, NEW.last_seen_at, NOW())"
+    );
     expect(schemaSql).toContain("'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
-    expect(schemaSql).toContain("NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset);");
+    expect(schemaSql).toContain(
+      "COALESCE(NEW.created_at, NOW())"
+    );
+    expect(schemaSql).toContain(
+      "NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset, COALESCE(NEW.created_at, NOW()));"
+    );
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_agent_id");
     expect(schemaSql).toContain("BEFORE INSERT OR UPDATE ON agents");
     expect(schemaSql).toContain("CREATE TRIGGER trg_assign_feedback_id");

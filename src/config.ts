@@ -193,6 +193,23 @@ function parseOptionalStartSlot(value: string | undefined): bigint | null {
   }
 }
 
+function parseOptionalStopSlot(value: string | undefined): bigint | null {
+  if (!value || value.trim() === "") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid INDEXER_STOP_SLOT '${trimmed}'. Must be an unsigned integer.`);
+  }
+
+  try {
+    return BigInt(trimmed);
+  } catch {
+    throw new Error(`Invalid INDEXER_STOP_SLOT '${trimmed}'. Must be an unsigned integer.`);
+  }
+}
+
 function parseIpfsGatewayBase(value: string | undefined): string {
   const raw = (value || DEFAULT_IPFS_GATEWAY_BASE).trim();
   if (!raw) {
@@ -294,9 +311,15 @@ export const config = {
   // Polling config
   pollingInterval: parseInt(process.env.POLLING_INTERVAL || "5000", 10),
   batchSize: parseInt(process.env.BATCH_SIZE || "100", 10),
+  pollerBatchRpcEnabled: parseBoolean(process.env.POLLER_BATCH_RPC_ENABLED, true),
+  // Batch RPC pressure knobs for the classic poller (getParsedTransactions chunking)
+  pollerRpcChunkSize: parsePositiveInt(process.env.POLLER_RPC_CHUNK_SIZE, 100),
+  pollerRpcChunkConcurrency: parsePositiveInt(process.env.POLLER_RPC_CHUNK_CONCURRENCY, 3),
   // Optional bootstrap cursor used only when no persisted indexer state exists.
   indexerStartSignature: parseOptionalString(process.env.INDEXER_START_SIGNATURE),
   indexerStartSlot: parseOptionalStartSlot(process.env.INDEXER_START_SLOT),
+  // Optional inclusive slot cutoff used for parity/integrity runs.
+  indexerStopSlot: parseOptionalStopSlot(process.env.INDEXER_STOP_SLOT),
 
   // WebSocket config
   wsReconnectInterval: parseInt(
@@ -409,5 +432,13 @@ export function validateConfig(): void {
 
   if (config.indexerStartSlot !== null && !config.indexerStartSignature) {
     throw new Error("INDEXER_START_SLOT requires INDEXER_START_SIGNATURE");
+  }
+
+  if (
+    config.indexerStartSlot !== null
+    && config.indexerStopSlot !== null
+    && config.indexerStartSlot > config.indexerStopSlot
+  ) {
+    throw new Error("INDEXER_STOP_SLOT must be greater than or equal to INDEXER_START_SLOT");
   }
 }

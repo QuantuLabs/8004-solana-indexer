@@ -21,7 +21,88 @@ If you are upgrading from `v1.7.7`, read:
 
 - [docs/transition-from-v1.7.7.md](docs/transition-from-v1.7.7.md)
 - Canonical collection identity is `creator + collection_pointer` (collection endpoints enforce this scope).
-- Migration path for this transition is database migrations + restart only; no chain replay/reindex is required for already indexed data.
+
+## Upgrade
+
+### Existing PostgreSQL / Supabase
+
+- Back up the database.
+- Apply the SQL files in `supabase/migrations/` in lexicographic order after the last migration you already applied.
+- If you are upgrading specifically from `v1.7.7`, apply these files in order:
+  - `20260303160000_add_collection_sequential_id.sql`
+  - `20260305220000_align_global_stats_with_graphql_status.sql`
+  - `20260305235500_add_orphan_feedbacks.sql`
+  - `20260306164000_add_indexer_state_last_tx_index.sql`
+  - `20260306210000_add_orphan_responses.sql`
+  - `20260306223000_reorder_canonical_indexes.sql`
+  - `20260307111500_deterministic_id_counter_timestamps.sql`
+  - `20260307123000_backfill_legacy_orphan_responses.sql`
+- Restart the indexer on the same database.
+- Do not run `supabase/schema.sql` on an existing database.
+- Keep an operator record of the last migration filename you applied; the repo does not maintain a PG migration-tracking table for you.
+
+### Existing local SQLite
+
+- Back up the SQLite file.
+- If the file already has a valid Prisma migration baseline (`_prisma_migrations`), run `prisma migrate deploy` against it.
+- If you are upgrading specifically from `v1.7.7`, `prisma migrate deploy` should apply:
+  - `20260303161000_add_collection_sequential_id`
+  - `20260304120000_add_agent_sequential_id`
+  - `20260305113000_backfill_collection_sequential_id`
+  - `20260305143000_add_indexer_state_monotonic_guard`
+  - `20260305235500_add_orphan_feedback`
+  - `20260306164000_add_indexer_state_last_tx_index`
+  - `20260306210000_extend_orphan_response_proof`
+  - `20260306233000_add_missing_agent_runtime_columns_sqlite`
+  - `20260306234500_sqlite_fix_feedback_value_text`
+  - `20260307000500_fix_indexer_state_monotonic_guard_tx_index`
+- If the file comes from the known `v1.7.7` local/Docker `prisma db push` flow without a valid `_prisma_migrations` baseline, do not run a blind `prisma migrate deploy`. Apply this exact proven subset manually with `sqlite3` against the same file, in order:
+  - `20260303161000_add_collection_sequential_id/migration.sql`
+  - `20260305113000_backfill_collection_sequential_id/migration.sql`
+  - `20260305143000_add_indexer_state_monotonic_guard/migration.sql`
+  - `20260305235500_add_orphan_feedback/migration.sql`
+  - `20260306164000_add_indexer_state_last_tx_index/migration.sql`
+  - `20260306210000_extend_orphan_response_proof/migration.sql`
+  - `20260306234500_sqlite_fix_feedback_value_text/migration.sql`
+  - `20260307000500_fix_indexer_state_monotonic_guard_tx_index/migration.sql`
+- For that known legacy shape, skip these two files because the old db-push schema already contains those columns and they fail with duplicate-column errors:
+  - `20260304120000_add_agent_sequential_id/migration.sql`
+  - `20260306233000_add_missing_agent_runtime_columns_sqlite/migration.sql`
+- For older/unknown local SQLite files outside that proven `v1.7.7` db-push shape, the simple supported path is still reindex into a fresh SQLite database unless you deliberately baseline and verify the schema yourself.
+- Restart the indexer with the same database file.
+- Do not use `prisma db push` on an existing indexed SQLite database.
+
+### Docker / Compose
+
+- Upgrading the image alone is not enough for persisted databases.
+- Container startup does not run upgrade migrations automatically.
+- If the container uses PostgreSQL / Supabase, apply the pending `supabase/migrations/*.sql` to that persisted database, then restart the container.
+- If the container uses local SQLite, run `prisma migrate deploy` against the same persisted SQLite file, then restart the container.
+- The runtime image defaults local SQLite to `file:/app/prisma/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
+- If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, use the exact manual `sqlite3` subset listed above against the mounted file, then restart the container.
+- If the file is older/unknown and does not match that proven shape, do not force a blind migrate; reindex into a fresh SQLite file unless you are deliberately doing a manual baseline.
+- Restart the container with the same volume/env after the backend-specific upgrade step completes.
+
+### When Migration + Restart Is Enough
+
+- This is the supported path when you keep the same network/program/history and upgrade an already indexed database through the shipped migrations only.
+- Shipped upgrade migrations are intended to fill missing runtime data needed by the newer runtime without deliberately renumbering existing public sequential IDs.
+- Do not treat an in-place upgrade on a historically drifted database as proof that every public sequential ID will match a fresh rebuild row-for-row.
+- Do not treat an in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
+
+### When Reindex Is Required
+
+- Reindex is required after a destructive reset, when switching to a different network/program/bootstrap window, or when rebuilding a database already known to contain historical holes/inconsistent rows from an older run.
+- For the known `v1.7.7` local/Docker SQLite `db push` shape without `_prisma_migrations`, do not use `prisma migrate deploy`; use the exact manual `sqlite3` subset listed above.
+- For older/unknown SQLite files without `_prisma_migrations`, do not assume `prisma migrate deploy` is safe blindly; reindex into a fresh database unless you deliberately baseline and verify the schema yourself.
+
+### How To Verify After Upgrade
+
+- Check `/health`.
+- Confirm the persisted cursor resumes from the existing state and advances.
+- Verify representative `agents`, `feedbacks`, `responses`, `revocations`, and `collections` still resolve through the API.
+- If you use collection-scoped reads, verify them with `creator + collection`.
+- If you need strict PostgreSQL-vs-SQLite parity validation, treat that as a separate verification exercise, not as the default in-place upgrade contract.
 
 ## Quick Start
 
@@ -225,8 +306,8 @@ Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.7.3 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.7.3
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.0 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.0
 ```
 
 ## GraphQL Example

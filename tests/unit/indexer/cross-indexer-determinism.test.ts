@@ -3,14 +3,14 @@ import { describe, it, expect } from "vitest";
 /**
  * Cross-indexer determinism tests.
  *
- * Proves that canonical ordering (block_slot, tx_signature, tx_index)
+ * Proves that canonical ordering (block_slot, tx_index, tx_signature)
  * produces identical agent_id assignments regardless of which indexer runs:
  *   - RPC Poller (getBlock → enumerate → tx_index)
  *   - Substreams  (block.transactions.iter().enumerate() → tx_index)
  *   - WebSocket   (onLogs → no tx_index, NULL fallback)
  *
  * Also validates that the SQL ordering
- *   ORDER BY block_slot, tx_signature, tx_index NULLS LAST
+ *   ORDER BY block_slot, tx_index NULLS LAST, tx_signature
  * matches the TypeScript in-memory ordering.
  */
 
@@ -22,25 +22,23 @@ function deterministicSort<T extends { block_slot: bigint; tx_index: number | nu
 ): T[] {
   return [...agents].sort((a, b) => {
     if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
-    const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
-    if (sigCmp !== 0) return sigCmp;
     const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
     const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-    return txA - txB;
+    if (txA !== txB) return txA - txB;
+    return a.tx_signature.localeCompare(b.tx_signature);
   });
 }
 
-/** SQL-equivalent sort with signature-first ordering and NULLS LAST tx_index tie-break */
+/** SQL-equivalent sort with tx_index-first ordering and NULLS LAST tx_index tie-break */
 function sqlEquivalentSort<T extends { block_slot: bigint; tx_index: number | null; tx_signature: string }>(
   agents: T[],
 ): T[] {
   return [...agents].sort((a, b) => {
     if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
-    const sigCmp = a.tx_signature.localeCompare(b.tx_signature);
-    if (sigCmp !== 0) return sigCmp;
     const txA = a.tx_index ?? 2147483647;
     const txB = b.tx_index ?? 2147483647;
-    return txA - txB;
+    if (txA !== txB) return txA - txB;
+    return a.tx_signature.localeCompare(b.tx_signature);
   });
 }
 
@@ -209,8 +207,9 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     ]);
   });
 
-  it("WebSocket ordering matches Poller/Substreams under canonical signature ordering", () => {
-    // With canonical (slot, signature) ordering, missing tx_index does not change ordering.
+  it("WebSocket ordering can diverge from Poller/Substreams on multi-tx slots without tx_index", () => {
+    // Once tx_index becomes primary inside a slot, a websocket-only stream can diverge
+    // from getBlock/substreams ordering whenever a slot contains multiple transactions.
     const pollerResult = simulatePollerOutput(BLOCK_DATA);
     const wsResult = simulateWebSocketOutput(BLOCK_DATA);
 
@@ -235,9 +234,9 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
       if (pollerId !== wsId) hasDivergence = true;
     }
 
-    // No divergence expected, even in multi-agent slots.
+    // Divergence is expected because websocket lacks tx_index.
     expect(slotsWithMultiple.size).toBeGreaterThan(0);
-    expect(hasDivergence).toBe(false);
+    expect(hasDivergence).toBe(true);
   });
 });
 
@@ -258,7 +257,7 @@ describe("Cross-indexer determinism: SQL vs TypeScript equivalence", () => {
     expect(jsSorted.map(a => a.asset)).toEqual(["A", "B", "C", "N"]);
   });
 
-  it("canonical signature ordering applies before NULL tx_index handling", () => {
+  it("resolved tx_index applies before NULL tx_index signature fallback", () => {
     const agents: AgentRecord[] = [
       { asset: "Null1", block_slot: 100n, tx_index: null, tx_signature: "aaa" },
       { asset: "Null2", block_slot: 100n, tx_index: null, tx_signature: "zzz" },
@@ -268,9 +267,9 @@ describe("Cross-indexer determinism: SQL vs TypeScript equivalence", () => {
     const jsSorted = deterministicSort(agents);
     const sqlSorted = sqlEquivalentSort(agents);
 
-    // Signature order is primary ("aaa" < "mmm" < "zzz"), tx_index only breaks ties.
-    expect(jsSorted.map(a => a.asset)).toEqual(["Null1", "Known", "Null2"]);
-    expect(sqlSorted.map(a => a.asset)).toEqual(["Null1", "Known", "Null2"]);
+    // Resolved tx_index sorts before NULL tx_index; signatures only break ties after that.
+    expect(jsSorted.map(a => a.asset)).toEqual(["Known", "Null1", "Null2"]);
+    expect(sqlSorted.map(a => a.asset)).toEqual(["Known", "Null1", "Null2"]);
   });
 
   it("tx_signature tiebreaker is lexicographic in both SQL and JS", () => {
@@ -456,8 +455,8 @@ describe("Cross-indexer determinism: migration backfill correctness", () => {
     const ids = assignGlobalIds(agents);
 
     expect(ids.get("First")).toBe(1);     // slot 100
-    expect(ids.get("Middle")).toBe(2);    // slot 300, signature sig_mid
-    expect(ids.get("MidSlot")).toBe(3);   // slot 300, signature sig_midslot
+    expect(ids.get("MidSlot")).toBe(2);   // slot 300, tx_index 0
+    expect(ids.get("Middle")).toBe(3);    // slot 300, tx_index 2
     expect(ids.get("NullIdx")).toBe(4);   // slot 300, signature sig_nullidx
     expect(ids.get("Late")).toBe(5);      // slot 500
   });
@@ -553,7 +552,7 @@ describe("Cross-indexer determinism: edge cases", () => {
     expect(ids.size).toBe(0);
   });
 
-  it("large tx_index values do not override signature-primary ordering", () => {
+  it("large tx_index values preserve tx_index-first ordering", () => {
     const agents: AgentRecord[] = [
       { asset: "Last", block_slot: 100n, tx_index: 1399, tx_signature: "sig_last" },
       { asset: "First", block_slot: 100n, tx_index: 0, tx_signature: "sig_first" },
@@ -561,7 +560,7 @@ describe("Cross-indexer determinism: edge cases", () => {
     ];
 
     const sorted = deterministicSort(agents);
-    expect(sorted.map(a => a.asset)).toEqual(["First", "Last", "Mid"]);
+    expect(sorted.map(a => a.asset)).toEqual(["First", "Mid", "Last"]);
   });
 
   it("bigint block_slot comparison doesn't overflow", () => {

@@ -38,7 +38,8 @@ LABEL org.opencontainers.image.title="8004 Solana Indexer" \
 
 WORKDIR /app
 ENV NODE_ENV=production \
-    API_PORT=3001
+    API_PORT=3001 \
+    DATABASE_URL=file:/app/prisma/data/indexer.db
 
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/dist ./dist

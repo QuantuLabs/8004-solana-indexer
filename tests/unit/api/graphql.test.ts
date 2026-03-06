@@ -1088,7 +1088,7 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     const [sql] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain("(SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents");
-    expect(sql).toMatch(/FROM collections[\s\S]*status != 'ORPHANED'[\s\S]*registry_type != 'BASE'/);
+    expect(sql).toContain('FROM collection_pointers');
     expect(sql).not.toContain('MAX(agent_id)');
     expect(sql).not.toContain('FROM validations');
   });

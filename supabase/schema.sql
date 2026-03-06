@@ -197,16 +197,16 @@ CREATE TABLE IF NOT EXISTS id_counters (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT)
+CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT, p_updated_at TIMESTAMPTZ DEFAULT NULL)
 RETURNS BIGINT AS $$
 DECLARE
   allocated BIGINT;
 BEGIN
   INSERT INTO id_counters (scope, next_value, updated_at)
-  VALUES (p_scope, 2, NOW())
+  VALUES (p_scope, 2, COALESCE(p_updated_at, NOW()))
   ON CONFLICT (scope) DO UPDATE
     SET next_value = id_counters.next_value + 1,
-        updated_at = NOW()
+        updated_at = COALESCE(p_updated_at, NOW())
   RETURNING next_value - 1 INTO allocated;
 
   RETURN allocated;
@@ -249,7 +249,7 @@ BEGIN
     END IF;
 
     IF existing_status IS NULL OR existing_status != 'ORPHANED' THEN
-      NEW.agent_id := alloc_gapless_id('agent:global');
+      NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));
       UPDATE agents
       SET agent_id = NEW.agent_id
       WHERE asset = NEW.asset
@@ -260,7 +260,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  NEW.agent_id := alloc_gapless_id('agent:global');
+  NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -548,7 +548,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset);
+  NEW.feedback_id := alloc_gapless_id('feedback:' || NEW.asset, COALESCE(NEW.created_at, NOW()));
 
   RETURN NEW;
 END;
@@ -589,7 +589,10 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  NEW.collection_id := alloc_gapless_id('collection:global');
+  NEW.collection_id := alloc_gapless_id(
+    'collection:global',
+    COALESCE(NEW.first_seen_at, NEW.last_seen_at, NOW())
+  );
 
   RETURN NEW;
 END;
@@ -638,7 +641,8 @@ BEGIN
   END IF;
 
   NEW.response_id := alloc_gapless_id(
-    'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text
+    'response:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
+    COALESCE(NEW.created_at, NOW())
   );
 
   RETURN NEW;
@@ -685,7 +689,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset);
+  NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset, COALESCE(NEW.created_at, NOW()));
 
   RETURN NEW;
 END;
@@ -1006,28 +1010,28 @@ CREATE POLICY "Public read agent_digest_cache" ON agent_digest_cache FOR SELECT 
 -- =============================================
 -- DETERMINISTIC ORDERING INDEXES
 -- Canonical order uses:
--- (block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, technical tie-breaker)
+-- (block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, technical tie-breaker)
 -- =============================================
 
 -- Agent ordering: deterministic global-id/backfill key
 CREATE INDEX idx_agents_ordering_canonical
-ON agents(block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, asset);
+ON agents(block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, asset);
 
 -- Feedback ordering: deterministic per client
 CREATE INDEX idx_feedbacks_deterministic_order
-ON feedbacks(asset, client_address, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedbacks(asset, client_address, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 -- Feedback ordering: global within agent
 CREATE INDEX idx_feedbacks_global_order
-ON feedbacks(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedbacks(asset, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 -- Feedback response ordering: canonical replay/head resolution
 CREATE INDEX idx_feedback_responses_canonical_order
-ON feedback_responses(asset, block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON feedback_responses(asset, block_slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 -- Revocation ordering: canonical replay/head resolution
 CREATE INDEX idx_revocations_canonical_order
-ON revocations(asset, slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST, id);
+ON revocations(asset, slot, tx_index NULLS LAST, event_ordinal NULLS LAST, tx_signature, id);
 
 -- Grant read access to metadata views
 GRANT SELECT ON metadata_decoded TO anon;

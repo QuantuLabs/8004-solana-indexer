@@ -87,8 +87,13 @@ function parseOptionalHash32(value: unknown, fieldName: string): Uint8Array<Arra
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Keep both IDLs in /idl side-by-side; runtime intentionally uses the existing devnet/default file.
-const idlPath = join(__dirname, "../../idl/agent_registry_8004.json");
+export function resolveRuntimeIdlFilename(): string {
+  return config.solanaNetwork === "mainnet-beta"
+    ? "agent_registry_8004.mainnet.json"
+    : "agent_registry_8004.json";
+}
+
+const idlPath = join(__dirname, "../../idl", resolveRuntimeIdlFilename());
 const idl: Idl = JSON.parse(readFileSync(idlPath, "utf-8"));
 const coder = new BorshCoder(idl);
 const eventParser = new EventParser(new PublicKey(config.programId), coder);
@@ -96,6 +101,7 @@ const eventParser = new EventParser(new PublicKey(config.programId), coder);
 // IDL version info for startup validation
 export const IDL_VERSION = (idl as any).metadata?.version || "unknown";
 export const IDL_PROGRAM_ID = (idl as any).address || config.programId;
+export const IDL_PATH = idlPath;
 
 logger.info({ version: IDL_VERSION, programId: IDL_PROGRAM_ID }, "IDL loaded");
 

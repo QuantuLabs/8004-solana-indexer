@@ -7,7 +7,12 @@ import {
 import { PrismaClient } from "@prisma/client";
 import { config } from "../config.js";
 import { parseTransaction, toTypedEvent } from "../parser/decoder.js";
-import { handleEventAtomic, EventContext } from "../db/handlers.js";
+import {
+  handleEventAtomic,
+  EventContext,
+  suspendLocalDerivedDigests,
+  resumeLocalDerivedDigests,
+} from "../db/handlers.js";
 import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { loadIndexerState, saveIndexerState, getPool } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
@@ -68,6 +73,36 @@ function compareTransactionCursor(
     return aOrderTxIndex - bOrderTxIndex;
   }
   return compareSignatures(aSignature, bSignature);
+}
+
+function hasProgramDataLogsForProgram(
+  tx: ParsedTransactionWithMeta,
+  programId: string
+): boolean {
+  const logs = tx.meta?.logMessages ?? [];
+  const invokeStack: string[] = [];
+
+  for (const log of logs) {
+    const invokeMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[\d+\]$/.exec(log);
+    if (invokeMatch) {
+      invokeStack.push(invokeMatch[1]);
+      continue;
+    }
+
+    const completionMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) (success|failed:.*)$/.exec(log);
+    if (completionMatch) {
+      if (invokeStack[invokeStack.length - 1] === completionMatch[1]) {
+        invokeStack.pop();
+      }
+      continue;
+    }
+
+    if (log.startsWith("Program data:") && invokeStack[invokeStack.length - 1] === programId) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function hasUnresolvedTxIndex(
@@ -454,6 +489,14 @@ export class Poller {
           } else {
             blockTime = await this.processTransaction(sig, txIndex);
           }
+          if (USE_BATCH_DB && this.eventBuffer) {
+            this.eventBuffer.noteCursor({
+              signature: sig.signature,
+              slot: BigInt(sig.slot),
+              blockTime,
+              txIndex,
+            }, false);
+          }
           this.lastSignature = sig.signature;
           this.lastSlot = BigInt(sig.slot);
           this.lastTxIndex = txIndex ?? null;
@@ -566,7 +609,7 @@ export class Poller {
 
     // Flush any remaining events in batch mode
     if (this.eventBuffer) {
-      if (this.eventBuffer.size > 0) {
+      if (this.eventBuffer.size > 0 || this.eventBuffer.hasPendingCursor()) {
         logger.info({ remaining: this.eventBuffer.size }, "Flushing remaining events before shutdown");
       }
       await this.eventBuffer.drain();
@@ -867,120 +910,134 @@ export class Poller {
   }
 
   private async processNewTransactions(): Promise<void> {
-    const signatures = await this.fetchSignatures();
+    const suspendLocalDigests = Boolean(this.prisma && config.dbMode === "local");
+    if (suspendLocalDigests) await suspendLocalDerivedDigests();
+    try {
+      const signatures = await this.fetchSignatures();
 
-    if (this.hadPaginationPartial) {
-      logger.warn(
-        {
-          count: signatures.length,
-          pendingContinuation: this.pendingContinuation,
-          pendingStopSignature: this.pendingStopSignature,
-        },
-        "Skipping partial pagination batch to prevent cursor advance"
-      );
-      return;
-    }
-
-    if (signatures.length === 0) {
-      logger.debug("No new transactions");
-      return;
-    }
-
-    logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
-
-    // Reverse to process oldest first
-    const reversed = signatures.reverse();
-
-    // BATCH RPC: Pre-fetch all transactions in batch (with fallback)
-    let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
-    if (this.useBatchRpc && this.batchFetcher && reversed.length > 1) {
-      const sigList = reversed.map(s => s.signature);
-      txCache = await this.batchFetcher.fetchTransactions(sigList);
-      logger.debug({ requested: sigList.length, fetched: txCache.size }, "Live poll batch RPC fetch");
-    }
-
-    // Group by slot for tx_index resolution
-    const bySlot = new Map<number, ConfirmedSignatureInfo[]>();
-    for (const sig of reversed) {
-      if (!bySlot.has(sig.slot)) {
-        bySlot.set(sig.slot, []);
-      }
-      bySlot.get(sig.slot)!.push(sig);
-    }
-
-    // Process slot by slot
-    const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
-
-    for (const slot of sortedSlots) {
-      if (this.stopBeforeNewerSlot(slot, "polling")) break;
-      const sigs = bySlot.get(slot)!;
-      const txIndexMap = await this.getTxIndexMap(slot, sigs);
-      if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
-        throw new Error(`Deterministic tx_index unavailable for live slot ${slot}`);
+      if (this.hadPaginationPartial) {
+        logger.warn(
+          {
+            count: signatures.length,
+            pendingContinuation: this.pendingContinuation,
+            pendingStopSignature: this.pendingStopSignature,
+          },
+          "Skipping partial pagination batch to prevent cursor advance"
+        );
+        return;
       }
 
-      const sigsWithIndex = sigs.map((sig) => ({
-        sig,
-        txIndex: txIndexMap.get(sig.signature) ?? undefined
-      })).sort((a, b) =>
-        compareTransactionCursor(a.txIndex, a.sig.signature, b.txIndex, b.sig.signature)
-      );
+      if (signatures.length === 0) {
+        logger.debug("No new transactions");
+        return;
+      }
 
-      let batchFailed = false;
-      for (const { sig, txIndex } of sigsWithIndex) {
-        try {
-          // Use cached transaction from batch RPC if available
-          let blockTime: Date;
-          if (this.useBatchRpc && txCache) {
-            blockTime = await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
-          } else {
-            blockTime = await this.processTransaction(sig, txIndex);
-          }
-          this.lastSignature = sig.signature;
-          this.lastSlot = BigInt(sig.slot);
-          this.lastTxIndex = txIndex ?? null;
-          // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
-          if (!USE_BATCH_DB) {
-            await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
-          }
-          this.processedCount++;
-        } catch (error) {
-          this.errorCount++;
-          logger.error(
-            { error: error instanceof Error ? error.message : String(error), signature: sig.signature },
-            "Error processing transaction - stopping batch to prevent event loss"
-          );
+      logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
+
+      // Reverse to process oldest first
+      const reversed = signatures.reverse();
+
+      // BATCH RPC: Pre-fetch all transactions in batch (with fallback)
+      let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
+      if (this.useBatchRpc && this.batchFetcher && reversed.length > 1) {
+        const sigList = reversed.map(s => s.signature);
+        txCache = await this.batchFetcher.fetchTransactions(sigList);
+        logger.debug({ requested: sigList.length, fetched: txCache.size }, "Live poll batch RPC fetch");
+      }
+
+      // Group by slot for tx_index resolution
+      const bySlot = new Map<number, ConfirmedSignatureInfo[]>();
+      for (const sig of reversed) {
+        if (!bySlot.has(sig.slot)) {
+          bySlot.set(sig.slot, []);
+        }
+        bySlot.get(sig.slot)!.push(sig);
+      }
+
+      // Process slot by slot
+      const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
+
+      for (const slot of sortedSlots) {
+        if (this.stopBeforeNewerSlot(slot, "polling")) break;
+        const sigs = bySlot.get(slot)!;
+        const txIndexMap = await this.getTxIndexMap(slot, sigs);
+        if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
+          throw new Error(`Deterministic tx_index unavailable for live slot ${slot}`);
+        }
+
+        const sigsWithIndex = sigs.map((sig) => ({
+          sig,
+          txIndex: txIndexMap.get(sig.signature) ?? undefined
+        })).sort((a, b) =>
+          compareTransactionCursor(a.txIndex, a.sig.signature, b.txIndex, b.sig.signature)
+        );
+
+        let batchFailed = false;
+        for (const { sig, txIndex } of sigsWithIndex) {
           try {
-            await this.logFailedTransaction(sig, error);
-          } catch (logError) {
-            logger.warn(
-              { error: logError instanceof Error ? logError.message : String(logError), signature: sig.signature },
-              "Failed to log failed transaction"
+            // Use cached transaction from batch RPC if available
+            let blockTime: Date;
+            if (this.useBatchRpc && txCache) {
+              blockTime = await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
+            } else {
+              blockTime = await this.processTransaction(sig, txIndex);
+            }
+            if (USE_BATCH_DB && this.eventBuffer) {
+              this.eventBuffer.noteCursor({
+                signature: sig.signature,
+                slot: BigInt(sig.slot),
+                blockTime,
+                txIndex,
+              }, false);
+            }
+            this.lastSignature = sig.signature;
+            this.lastSlot = BigInt(sig.slot);
+            this.lastTxIndex = txIndex ?? null;
+            // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
+            if (!USE_BATCH_DB) {
+              await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
+            }
+            this.processedCount++;
+          } catch (error) {
+            this.errorCount++;
+            logger.error(
+              { error: error instanceof Error ? error.message : String(error), signature: sig.signature },
+              "Error processing transaction - stopping batch to prevent event loss"
             );
+            try {
+              await this.logFailedTransaction(sig, error);
+            } catch (logError) {
+              logger.warn(
+                { error: logError instanceof Error ? logError.message : String(logError), signature: sig.signature },
+                "Failed to log failed transaction"
+              );
+            }
+            batchFailed = true;
+            break;
           }
-          batchFailed = true;
+        }
+        if (batchFailed) {
+          logger.warn(
+            { slot, lastSignature: this.lastSignature },
+            "Batch processing halted - will retry failed tx on next poll cycle"
+          );
           break;
         }
       }
-      if (batchFailed) {
-        logger.warn(
-          { slot, lastSignature: this.lastSignature },
-          "Batch processing halted - will retry failed tx on next poll cycle"
-        );
-        break;
-      }
-    }
 
-    // BATCH DB: Flush events after processing all transactions
-    if (USE_BATCH_DB && this.eventBuffer) {
-      if (!this.isRunning) {
-        await this.eventBuffer.drain();
-      } else if (this.eventBuffer.size > 0) {
-        await this.eventBuffer.flush();
+      // BATCH DB: Flush events after processing all transactions
+      if (USE_BATCH_DB && this.eventBuffer) {
+        if (!this.isRunning) {
+          await this.eventBuffer.drain();
+        } else if (this.eventBuffer.size > 0 || this.eventBuffer.hasPendingCursor()) {
+          await this.eventBuffer.flush();
+        }
       }
-    }
 
-    this.logStatsIfNeeded();
+      this.logStatsIfNeeded();
+    } finally {
+      if (suspendLocalDigests) resumeLocalDerivedDigests();
+    }
   }
 
   /**
@@ -1354,6 +1411,9 @@ export class Poller {
     const blockTime = resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot);
     const parsed = parseTransaction(tx);
     if (!parsed || parsed.events.length === 0) {
+      if (hasProgramDataLogsForProgram(tx, this.programId.toBase58())) {
+        throw new Error(`Failed to parse program events for signature ${sig.signature}`);
+      }
       return blockTime;
     }
 
@@ -1362,9 +1422,15 @@ export class Poller {
       "Parsed transaction"
     );
 
-    for (const [eventOrdinal, event] of parsed.events.entries()) {
-      const typedEvent = toTypedEvent(event);
-      if (!typedEvent) continue;
+    const typedEvents = parsed.events.map((rawEvent, eventOrdinal) => {
+      const typedEvent = toTypedEvent(rawEvent);
+      if (!typedEvent) {
+        throw new Error(`Failed to convert parsed program event ${rawEvent.name} for signature ${sig.signature}`);
+      }
+      return { typedEvent, eventOrdinal, rawEvent };
+    });
+
+    for (const { typedEvent, eventOrdinal, rawEvent } of typedEvents) {
 
       const ctx: EventContext = {
         signature: sig.signature,
@@ -1384,7 +1450,7 @@ export class Poller {
             signature: sig.signature,
             slot: BigInt(sig.slot),
             blockTime: ctx.blockTime,
-            data: event.data as object,
+            data: rawEvent.data as object,
             processed: true,
           },
         });
@@ -1418,6 +1484,9 @@ export class Poller {
     const blockTime = resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot);
     const parsed = parseTransaction(tx);
     if (!parsed || parsed.events.length === 0) {
+      if (hasProgramDataLogsForProgram(tx, this.programId.toBase58())) {
+        throw new Error(`Failed to parse program events for signature ${sig.signature}`);
+      }
       return blockTime;
     }
 
@@ -1426,9 +1495,15 @@ export class Poller {
       "Parsed transaction (batch mode)"
     );
 
-    for (const [eventOrdinal, event] of parsed.events.entries()) {
+    const typedEvents = parsed.events.map((event, eventOrdinal) => {
       const typedEvent = toTypedEvent(event);
-      if (!typedEvent) continue;
+      if (!typedEvent) {
+        throw new Error(`Failed to convert parsed program event ${event.name} for signature ${sig.signature}`);
+      }
+      return { typedEvent, eventOrdinal };
+    });
+
+    for (const { typedEvent, eventOrdinal } of typedEvents) {
 
       const ctx = {
         signature: sig.signature,

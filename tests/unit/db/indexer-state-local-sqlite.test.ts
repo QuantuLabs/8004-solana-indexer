@@ -38,11 +38,13 @@ describe("local sqlite indexer state writes", () => {
       });
 
       try {
+        const firstUpdatedAt = new Date("2026-03-06T10:31:29.259Z");
         await trySaveLocalIndexerStateWithSql(prisma, {
           signature: "sig-z",
           slot: 10n,
           txIndex: 1,
           source: "poller",
+          updatedAt: firstUpdatedAt,
         });
 
         await expect(
@@ -51,6 +53,7 @@ describe("local sqlite indexer state writes", () => {
             slot: 10n,
             txIndex: 1,
             source: "poller",
+            updatedAt: new Date("2026-03-06T10:31:28.000Z"),
           })
         ).resolves.toBe(true);
 
@@ -61,12 +64,15 @@ describe("local sqlite indexer state writes", () => {
         expect(stateAfterStaleWrite?.lastSignature).toBe("sig-z");
         expect(stateAfterStaleWrite?.lastSlot).toBe(10n);
         expect(stateAfterStaleWrite?.lastTxIndex).toBe(1);
+        expect(stateAfterStaleWrite?.updatedAt.toISOString()).toBe(firstUpdatedAt.toISOString());
 
+        const secondUpdatedAt = new Date("2026-03-06T10:33:43.860Z");
         await trySaveLocalIndexerStateWithSql(prisma, {
           signature: "sig-y",
           slot: 10n,
           txIndex: 2,
           source: "websocket",
+          updatedAt: secondUpdatedAt,
         });
 
         const advancedState = await prisma.indexerState.findUnique({
@@ -77,6 +83,7 @@ describe("local sqlite indexer state writes", () => {
         expect(advancedState?.lastSlot).toBe(10n);
         expect(advancedState?.lastTxIndex).toBe(2);
         expect(advancedState?.source).toBe("websocket");
+        expect(advancedState?.updatedAt.toISOString()).toBe(secondUpdatedAt.toISOString());
       } finally {
         await prisma.$disconnect();
       }

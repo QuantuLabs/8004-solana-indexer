@@ -280,7 +280,7 @@ describe("E2E: Real Devnet Verification", () => {
         create: {
           id: registryPda.toBase58(),
           collection: realCollection.toBase58(),
-          registryType: "Base",
+          registryType: "BASE",
           authority: resolvedOwner.toBase58(),
           status: "PENDING",
           slot: 1n,

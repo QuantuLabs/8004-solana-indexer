@@ -46,6 +46,8 @@ vi.mock("../../../src/db/supabase.js", () => ({
 // Mock handlers
 vi.mock("../../../src/db/handlers.js", () => ({
   handleEventAtomic: vi.fn().mockResolvedValue(undefined),
+  suspendLocalDerivedDigests: vi.fn(),
+  resumeLocalDerivedDigests: vi.fn(),
 }));
 
 import * as web3 from "@solana/web3.js";
@@ -66,7 +68,11 @@ import {
   TEST_COLLECTION,
 } from "../../mocks/solana.js";
 import { saveIndexerState } from "../../../src/db/supabase.js";
-import { handleEventAtomic } from "../../../src/db/handlers.js";
+import {
+  handleEventAtomic,
+  suspendLocalDerivedDigests,
+  resumeLocalDerivedDigests,
+} from "../../../src/db/handlers.js";
 
 describe("WebSocketIndexer Coverage", () => {
   let wsIndexer: WebSocketIndexer;
@@ -79,6 +85,10 @@ describe("WebSocketIndexer Coverage", () => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrismaClient();
     logsHandler = null;
+    vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+    vi.mocked(suspendLocalDerivedDigests).mockResolvedValue(undefined as never);
+    vi.mocked(resumeLocalDerivedDigests).mockImplementation(() => undefined);
+    vi.mocked(saveIndexerState).mockResolvedValue(undefined);
 
     // Capture the logs handler on subscribe
     (mockConnection.onLogs as any).mockImplementation(
@@ -549,6 +559,7 @@ describe("WebSocketIndexer Coverage", () => {
         BigInt(TEST_SLOT),
         null,
         "websocket",
+        expect.any(Date),
       );
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
     });
@@ -1301,6 +1312,62 @@ describe("WebSocketIndexer Coverage", () => {
       // Cursor should NOT be updated
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
       expect(saveIndexerState).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("handleLogs - local derived digest suspension", () => {
+    it("should suspend and resume local derived digests around local websocket processing", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTest",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+
+      logsHandler!(
+        { signature: "suspend-ws-sig", err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(suspendLocalDerivedDigests).toHaveBeenCalledTimes(1);
+      expect(resumeLocalDerivedDigests).toHaveBeenCalledTimes(1);
+    });
+
+    it("should resume local derived digests only after local cursor persistence", async () => {
+      createIndexer();
+      await wsIndexer.start();
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValueOnce(null);
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTest",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+
+      logsHandler!(
+        { signature: "resume-after-cursor-sig", err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledTimes(1);
+      expect(resumeLocalDerivedDigests).toHaveBeenCalledTimes(1);
+      expect(
+        (mockPrisma.indexerState.upsert as any).mock.invocationCallOrder[0]
+      ).toBeLessThan(
+        (resumeLocalDerivedDigests as any).mock.invocationCallOrder[0]
+      );
     });
   });
 

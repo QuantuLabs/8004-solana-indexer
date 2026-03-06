@@ -48,12 +48,19 @@ vi.mock("../../../src/db/supabase.js", () => ({
 // Mock handlers
 vi.mock("../../../src/db/handlers.js", () => ({
   handleEventAtomic: vi.fn().mockResolvedValue(undefined),
+  suspendLocalDerivedDigests: vi.fn(),
+  resumeLocalDerivedDigests: vi.fn(),
 }));
 
 import { Poller } from "../../../src/indexer/poller.js";
 import { loadIndexerState, saveIndexerState } from "../../../src/db/supabase.js";
-import { handleEventAtomic } from "../../../src/db/handlers.js";
+import {
+  handleEventAtomic,
+  suspendLocalDerivedDigests,
+  resumeLocalDerivedDigests,
+} from "../../../src/db/handlers.js";
 import { config } from "../../../src/config.js";
+import * as decoder from "../../../src/parser/decoder.js";
 
 /**
  * Safely stop a poller by setting isRunning=false and nullifying batch components.
@@ -121,6 +128,49 @@ describe("Poller Coverage", () => {
     });
   });
 
+  describe("local derived digest suspension", () => {
+    it("should suspend and resume local derived digests around local polling batches", async () => {
+      (config as any).dbMode = "local";
+      (config as any).pollerBatchRpcEnabled = false;
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
+        createMockSignatureInfo({ signature: TEST_SIGNATURE, slot: Number(TEST_SLOT) }),
+      ]);
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(
+        createMockParsedTransaction({
+          signature: TEST_SIGNATURE,
+          slot: Number(TEST_SLOT),
+          logMessages: [],
+        })
+      );
+      vi.spyOn(decoder, "parseTransaction").mockReturnValue({
+        events: [{ name: "AgentRegistered", data: {} }],
+      } as any);
+      vi.spyOn(decoder, "toTypedEvent").mockReturnValue({
+        type: "AgentRegistered",
+        data: {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: false,
+          agentUri: "",
+        },
+      } as any);
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      await (poller as any).processNewTransactions();
+
+      expect(suspendLocalDerivedDigests).toHaveBeenCalledTimes(1);
+      expect(resumeLocalDerivedDigests).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("stop - flush and stats", () => {
     it("should flush eventBuffer and log stats on stop", async () => {
       poller = new Poller({
@@ -146,6 +196,7 @@ describe("Poller Coverage", () => {
         size: 3,
         flush: mockFlush,
         drain: mockDrain,
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         getStats: mockGetBufferStats,
       };
 
@@ -182,6 +233,7 @@ describe("Poller Coverage", () => {
         size: 0,
         flush: mockFlush,
         drain: mockDrain,
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         getStats: vi.fn().mockReturnValue({}),
       };
       (poller as any).batchFetcher = {
@@ -1338,6 +1390,7 @@ describe("Poller Coverage", () => {
       (poller as any).eventBuffer = {
         addEvent: mockAddEvent,
         flush: vi.fn(),
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         size: 0,
         getStats: vi.fn().mockReturnValue({}),
       };
@@ -2551,6 +2604,7 @@ describe("Poller Coverage", () => {
       (poller as any).eventBuffer = {
         addEvent: mockAddEvent,
         flush: vi.fn(),
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         size: 0,
         getStats: vi.fn().mockReturnValue({}),
       };
@@ -2595,6 +2649,7 @@ describe("Poller Coverage", () => {
       (poller as any).eventBuffer = {
         addEvent: mockAddEvent,
         flush: vi.fn(),
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         size: 0,
         getStats: vi.fn().mockReturnValue({}),
       };
@@ -2636,6 +2691,74 @@ describe("Poller Coverage", () => {
       expect(handleEventAtomic).not.toHaveBeenCalled();
       expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
     });
+
+    it("should skip foreign-program data logs without failing closed", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      const sig = createMockSignatureInfo();
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_COLLECTION.toBase58()} invoke [1]`,
+        "Program data: AAAAAAAAAAAAAAAA",
+        `Program ${TEST_COLLECTION.toBase58()} success`,
+      ]);
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
+
+      await expect((poller as any).processTransaction(sig, 0)).resolves.toBeInstanceOf(Date);
+      expect(handleEventAtomic).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
+    });
+
+    it("should fail closed before buffering any event when a later raw event cannot be typed", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      const sig = createMockSignatureInfo();
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        "Program data: AAAAAAAAAAAAAAAA",
+      ]);
+      const mockAddEvent = vi.fn().mockResolvedValue(undefined);
+      (poller as any).eventBuffer = {
+        addEvent: mockAddEvent,
+        flush: vi.fn(),
+        hasPendingCursor: vi.fn().mockReturnValue(false),
+        size: 0,
+        getStats: vi.fn().mockReturnValue({}),
+      };
+      const parseSpy = vi.spyOn(decoder, "parseTransaction").mockReturnValue({
+        signature: TEST_SIGNATURE,
+        slot: Number(TEST_SLOT),
+        blockTime: Number(TEST_SLOT),
+        events: [
+          {
+            name: "MetadataDeleted",
+            data: { asset: TEST_ASSET.toBase58(), key: "foo" },
+          },
+          { name: "UnknownEvent", data: {} },
+        ],
+      });
+
+      await expect((poller as any).processTransactionBatch(sig, 0, tx)).rejects.toThrow(
+        "Failed to convert parsed program event UnknownEvent"
+      );
+      expect(handleEventAtomic).not.toHaveBeenCalled();
+      expect(mockAddEvent).not.toHaveBeenCalled();
+
+      parseSpy.mockRestore();
+      (poller as any).eventBuffer = null;
+    });
+
   });
 
   describe("poll - error catch in polling loop (lines 470-472)", () => {
@@ -2705,6 +2828,7 @@ describe("Poller Coverage", () => {
         size: 3,
         flush: mockFlush,
         addEvent: vi.fn().mockResolvedValue(undefined),
+        hasPendingCursor: vi.fn().mockReturnValue(false),
         getStats: vi.fn().mockReturnValue({}),
       };
       (poller as any).batchFetcher = null;

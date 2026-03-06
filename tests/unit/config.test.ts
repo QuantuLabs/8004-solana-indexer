@@ -39,6 +39,7 @@ describe("Config", () => {
       delete process.env.URI_DIGEST_TRUSTED_HOSTS;
       delete process.env.INDEXER_START_SIGNATURE;
       delete process.env.INDEXER_START_SLOT;
+      delete process.env.INDEXER_STOP_SLOT;
       delete process.env.POSTGREST_URL;
       delete process.env.POSTGREST_TOKEN;
 
@@ -62,6 +63,7 @@ describe("Config", () => {
       expect(config.uriDigestTrustedHosts).toEqual([]);
       expect(config.indexerStartSignature).toBeNull();
       expect(config.indexerStartSlot).toBeNull();
+      expect(config.indexerStopSlot).toBeNull();
     });
 
     it("should use custom env values when set", async () => {
@@ -80,6 +82,7 @@ describe("Config", () => {
       process.env.URI_DIGEST_TRUSTED_HOSTS = " localhost,127.0.0.1 ";
       process.env.INDEXER_START_SIGNATURE = "env-start-signature";
       process.env.INDEXER_START_SLOT = "123456789";
+      process.env.INDEXER_STOP_SLOT = "123456999";
 
       const { config } = await import("../../src/config.js");
 
@@ -100,6 +103,7 @@ describe("Config", () => {
       expect(config.uriDigestTrustedHosts).toEqual(["localhost", "127.0.0.1"]);
       expect(config.indexerStartSignature).toBe("env-start-signature");
       expect(config.indexerStartSlot).toBe(123456789n);
+      expect(config.indexerStopSlot).toBe(123456999n);
     });
 
     it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {
@@ -246,6 +250,14 @@ describe("Config", () => {
 
       await expect(import("../../src/config.js")).rejects.toThrow(
         /Invalid INDEXER_START_SLOT/
+      );
+    });
+
+    it("should throw when INDEXER_STOP_SLOT is invalid", async () => {
+      process.env.INDEXER_STOP_SLOT = "not-a-slot";
+
+      await expect(import("../../src/config.js")).rejects.toThrow(
+        /Invalid INDEXER_STOP_SLOT/
       );
     });
   });
@@ -446,6 +458,18 @@ describe("Config", () => {
 
       expect(() => validateConfig()).toThrow(
         "INDEXER_START_SLOT requires INDEXER_START_SIGNATURE"
+      );
+    });
+
+    it("should throw when INDEXER_STOP_SLOT is below INDEXER_START_SLOT", async () => {
+      process.env.INDEXER_START_SIGNATURE = "bootstrap-sig";
+      process.env.INDEXER_START_SLOT = "500";
+      process.env.INDEXER_STOP_SLOT = "499";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "INDEXER_STOP_SLOT must be greater than or equal to INDEXER_START_SLOT"
       );
     });
   });

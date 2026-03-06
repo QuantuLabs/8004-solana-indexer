@@ -247,129 +247,136 @@ CREATE TRIGGER trg_assign_revocation_id
   FOR EACH ROW
   EXECUTE FUNCTION assign_revocation_id();
 
--- Historical compaction (remove existing gaps).
--- Phase 1: temporary offset to avoid uniqueness conflicts during in-place renumbering.
-WITH mx AS (
-  SELECT GREATEST(COALESCE(MAX(agent_id), 0), 1) + 1000000 AS off
+-- Backfill only rows that are still missing public sequential IDs.
+-- Existing assigned IDs are preserved to avoid renumbering public API data
+-- during in-place upgrades.
+WITH agent_seed AS (
+  SELECT COALESCE(MAX(agent_id), 0) AS max_id
   FROM agents
-)
-UPDATE agents
-SET agent_id = agent_id + (SELECT off FROM mx)
-WHERE agent_id IS NOT NULL;
-
-WITH ordered AS (
+  WHERE agent_id IS NOT NULL
+),
+agent_ranked AS (
   SELECT
     asset,
     ROW_NUMBER() OVER (
       ORDER BY
-        CASE WHEN status = 'ORPHANED' THEN 1 ELSE 0 END,
-        created_at ASC NULLS LAST,
         block_slot ASC NULLS LAST,
-        tx_signature ASC NULLS LAST,
         tx_index ASC NULLS LAST,
         event_ordinal ASC NULLS LAST,
+        tx_signature ASC NULLS LAST,
         asset ASC
-    )::bigint AS dense_id
+    )::bigint AS rn
   FROM agents
+  WHERE agent_id IS NULL
+    AND (status IS NULL OR status != 'ORPHANED')
 )
 UPDATE agents a
-SET agent_id = o.dense_id
-FROM ordered o
-WHERE a.asset = o.asset;
+SET agent_id = (SELECT max_id FROM agent_seed) + r.rn
+FROM agent_ranked r
+WHERE a.asset = r.asset
+  AND a.agent_id IS NULL;
 
-WITH mx AS (
-  SELECT GREATEST(COALESCE(MAX(feedback_id), 0), 1) + 1000000 AS off
+WITH feedback_seed AS (
+  SELECT asset, COALESCE(MAX(feedback_id), 0) AS max_id
   FROM feedbacks
-)
-UPDATE feedbacks
-SET feedback_id = feedback_id + (SELECT off FROM mx)
-WHERE feedback_id IS NOT NULL;
-
-WITH ordered AS (
+  WHERE feedback_id IS NOT NULL
+  GROUP BY asset
+),
+feedback_ranked AS (
   SELECT
     id,
+    asset,
     ROW_NUMBER() OVER (
       PARTITION BY asset
       ORDER BY
-        CASE WHEN status = 'ORPHANED' THEN 1 ELSE 0 END,
-        created_at ASC NULLS LAST,
         block_slot ASC NULLS LAST,
-        tx_signature ASC NULLS LAST,
         tx_index ASC NULLS LAST,
         event_ordinal ASC NULLS LAST,
+        tx_signature ASC NULLS LAST,
         client_address ASC,
         feedback_index ASC,
         id ASC
-    )::bigint AS dense_id
+    )::bigint AS rn
   FROM feedbacks
+  WHERE feedback_id IS NULL
+    AND (status IS NULL OR status != 'ORPHANED')
 )
 UPDATE feedbacks f
-SET feedback_id = o.dense_id
-FROM ordered o
-WHERE f.id = o.id;
+SET feedback_id = COALESCE(s.max_id, 0) + r.rn
+FROM feedback_ranked r
+LEFT JOIN feedback_seed s ON s.asset = r.asset
+WHERE f.id = r.id
+  AND f.feedback_id IS NULL;
 
-WITH mx AS (
-  SELECT GREATEST(COALESCE(MAX(response_id), 0), 1) + 1000000 AS off
+WITH response_seed AS (
+  SELECT asset, client_address, feedback_index, COALESCE(MAX(response_id), 0) AS max_id
   FROM feedback_responses
-)
-UPDATE feedback_responses
-SET response_id = response_id + (SELECT off FROM mx)
-WHERE response_id IS NOT NULL;
-
-WITH ordered AS (
+  WHERE response_id IS NOT NULL
+  GROUP BY asset, client_address, feedback_index
+),
+response_ranked AS (
   SELECT
     id,
+    asset,
+    client_address,
+    feedback_index,
     ROW_NUMBER() OVER (
       PARTITION BY asset, client_address, feedback_index
       ORDER BY
-        CASE WHEN status = 'ORPHANED' THEN 1 ELSE 0 END,
-        created_at ASC NULLS LAST,
         block_slot ASC NULLS LAST,
-        tx_signature ASC NULLS LAST,
         tx_index ASC NULLS LAST,
         event_ordinal ASC NULLS LAST,
+        tx_signature ASC NULLS LAST,
         responder ASC,
         id ASC
-    )::bigint AS dense_id
+    )::bigint AS rn
   FROM feedback_responses
+  WHERE response_id IS NULL
+    AND (status IS NULL OR status != 'ORPHANED')
 )
-UPDATE feedback_responses r
-SET response_id = o.dense_id
-FROM ordered o
-WHERE r.id = o.id;
+UPDATE feedback_responses fr
+SET response_id = COALESCE(s.max_id, 0) + r.rn
+FROM response_ranked r
+LEFT JOIN response_seed s
+  ON s.asset = r.asset
+ AND s.client_address = r.client_address
+ AND s.feedback_index = r.feedback_index
+WHERE fr.id = r.id
+  AND fr.response_id IS NULL;
 
-WITH mx AS (
-  SELECT GREATEST(COALESCE(MAX(revocation_id), 0), 1) + 1000000 AS off
+WITH revocation_seed AS (
+  SELECT asset, COALESCE(MAX(revocation_id), 0) AS max_id
   FROM revocations
-)
-UPDATE revocations
-SET revocation_id = revocation_id + (SELECT off FROM mx)
-WHERE revocation_id IS NOT NULL;
-
-WITH ordered AS (
+  WHERE revocation_id IS NOT NULL
+  GROUP BY asset
+),
+revocation_ranked AS (
   SELECT
     id,
+    asset,
     ROW_NUMBER() OVER (
       PARTITION BY asset
       ORDER BY
-        CASE WHEN status = 'ORPHANED' THEN 1 ELSE 0 END,
-        created_at ASC NULLS LAST,
         slot ASC NULLS LAST,
-        tx_signature ASC NULLS LAST,
         tx_index ASC NULLS LAST,
         event_ordinal ASC NULLS LAST,
+        tx_signature ASC NULLS LAST,
         client_address ASC,
         feedback_index ASC,
         id ASC
-    )::bigint AS dense_id
+    )::bigint AS rn
   FROM revocations
+  WHERE revocation_id IS NULL
+    AND (status IS NULL OR status != 'ORPHANED')
 )
 UPDATE revocations r
-SET revocation_id = o.dense_id
-FROM ordered o
-WHERE r.id = o.id;
+SET revocation_id = COALESCE(s.max_id, 0) + ranked.rn
+FROM revocation_ranked ranked
+LEFT JOIN revocation_seed s ON s.asset = ranked.asset
+WHERE r.id = ranked.id
+  AND r.revocation_id IS NULL;
 
--- Rebuild counter checkpoints from compacted state.
+-- Rebuild counter checkpoints from the preserved public IDs + NULL backfills.
 DELETE FROM id_counters
 WHERE scope = 'agent:global'
    OR scope LIKE 'feedback:%'

@@ -9,7 +9,13 @@ import { PrismaClient } from "@prisma/client";
 import PQueue from "p-queue";
 import { config } from "../config.js";
 import { parseTransaction, parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
-import { handleEventAtomic, EventContext } from "../db/handlers.js";
+import {
+  handleEventAtomic,
+  EventContext,
+  suspendLocalDerivedDigests,
+  resumeLocalDerivedDigests,
+} from "../db/handlers.js";
+import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { saveIndexerState } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
@@ -43,8 +49,8 @@ function shouldAdvanceCursor(
   if (currentSlot === null || currentSlot === undefined) return true;
   if (nextSlot > currentSlot) return true;
   if (nextSlot < currentSlot) return false;
-  const currentOrderTxIndex = currentTxIndex ?? Number.MAX_SAFE_INTEGER;
-  const nextOrderTxIndex = nextTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const currentOrderTxIndex = currentTxIndex ?? -1;
+  const nextOrderTxIndex = nextTxIndex ?? -1;
   if (nextOrderTxIndex > currentOrderTxIndex) return true;
   if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
@@ -380,134 +386,146 @@ export class WebSocketIndexer {
       const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
 
       let allEventsProcessed = true;
-
-      for (const [eventOrdinal, event] of events.entries()) {
-        const typedEvent = toTypedEvent(event);
-        if (!typedEvent) continue;
-
-        const eventCtx: EventContext = {
-          signature: logs.signature,
-          slot: BigInt(ctx.slot),
-          blockTime,
-          txIndex,
-          eventOrdinal,
-          source: "websocket",
-        };
-
-        let eventProcessed = true;
-        let eventErrorMessage: string | undefined;
-
-        try {
-          await handleEventAtomic(this.prisma, typedEvent, eventCtx);
-        } catch (eventError) {
-          eventProcessed = false;
-          allEventsProcessed = false;
-          eventErrorMessage = eventError instanceof Error ? eventError.message : String(eventError);
-          logger.error({
-            error: eventErrorMessage,
-            eventType: typedEvent.type,
-            signature: logs.signature
-          }, "Error handling event — cursor will NOT advance past this tx");
-        }
-
-        // Only log to Prisma if in local mode
-        if (this.prisma) {
-          try {
-            await this.prisma.eventLog.create({
-              data: {
-                eventType: eventProcessed ? typedEvent.type : "PROCESSING_FAILED",
-                signature: logs.signature,
-                slot: BigInt(ctx.slot),
-                blockTime,
-                data: event.data as object,
-                processed: eventProcessed,
-                error: eventErrorMessage,
-              },
-            });
-          } catch (prismaError) {
-            logger.warn({
-              error: prismaError instanceof Error ? prismaError.message : String(prismaError),
-              signature: logs.signature
-            }, "Failed to log event to Prisma");
-          }
-        }
-      }
-
-      // Only advance cursor if ALL events in this tx were processed successfully
-      if (!allEventsProcessed) {
-        this.errorCount++;
-        logger.warn({ signature: logs.signature, slot: ctx.slot },
-          "Skipping cursor update — failed event(s) in this tx will be retried on restart");
-        return;
-      }
-
-      // Update state - both local and Supabase modes (with monotonic guard)
+      const suspendLocalDigests = Boolean(this.prisma && config.dbMode === "local");
+      if (suspendLocalDigests) await suspendLocalDerivedDigests();
       try {
-        const newSlot = BigInt(ctx.slot);
-        if (this.prisma) {
-          const current = await this.prisma.indexerState.findUnique({
-            where: { id: "main" },
-            select: { lastSlot: true, lastTxIndex: true, lastSignature: true },
-          });
-          if (!shouldAdvanceCursor(
-            current?.lastSlot,
-            current?.lastTxIndex,
-            current?.lastSignature,
-            newSlot,
-            txIndex ?? null,
-            logs.signature
-          )) {
-            logger.debug(
-              {
-                slot: ctx.slot,
-                currentSlot: current?.lastSlot?.toString() ?? null,
-                txIndex: txIndex ?? null,
-                currentTxIndex: current?.lastTxIndex ?? null,
-                signature: logs.signature,
-                currentSignature: current?.lastSignature ?? null,
-              },
-              "WS cursor update skipped — monotonic guard"
-            );
-          } else {
-            await this.prisma.indexerState.upsert({
-              where: { id: "main" },
-              create: {
-                id: "main",
-                lastSignature: logs.signature,
-                lastSlot: newSlot,
-                lastTxIndex: txIndex ?? null,
-                source: "websocket",
-              },
-              update: {
-                lastSignature: logs.signature,
-                lastSlot: newSlot,
-                lastTxIndex: txIndex ?? null,
-                source: "websocket",
-              },
-            });
+        for (const [eventOrdinal, event] of events.entries()) {
+          const typedEvent = toTypedEvent(event);
+          if (!typedEvent) continue;
+
+          const eventCtx: EventContext = {
+            signature: logs.signature,
+            slot: BigInt(ctx.slot),
+            blockTime,
+            txIndex,
+            eventOrdinal,
+            source: "websocket",
+          };
+
+          let eventProcessed = true;
+          let eventErrorMessage: string | undefined;
+
+          try {
+            await handleEventAtomic(this.prisma, typedEvent, eventCtx);
+          } catch (eventError) {
+            eventProcessed = false;
+            allEventsProcessed = false;
+            eventErrorMessage = eventError instanceof Error ? eventError.message : String(eventError);
+            logger.error({
+              error: eventErrorMessage,
+              eventType: typedEvent.type,
+              signature: logs.signature
+            }, "Error handling event — cursor will NOT advance past this tx");
           }
-        } else {
-          // Supabase mode — saveIndexerState already has SQL-level monotonic guard
-          await saveIndexerState(logs.signature, newSlot, txIndex ?? null, "websocket");
+
+          // Only log to Prisma if in local mode
+          if (this.prisma) {
+            try {
+              await this.prisma.eventLog.create({
+                data: {
+                  eventType: eventProcessed ? typedEvent.type : "PROCESSING_FAILED",
+                  signature: logs.signature,
+                  slot: BigInt(ctx.slot),
+                  blockTime,
+                  data: event.data as object,
+                  processed: eventProcessed,
+                  error: eventErrorMessage,
+                },
+              });
+            } catch (prismaError) {
+              logger.warn({
+                error: prismaError instanceof Error ? prismaError.message : String(prismaError),
+                signature: logs.signature
+              }, "Failed to log event to Prisma");
+            }
+          }
         }
-      } catch (stateError) {
-        logger.error({
-          error: stateError instanceof Error ? stateError.message : String(stateError),
-          signature: logs.signature
-        }, "Failed to save indexer state");
-      }
+        // Only advance cursor if ALL events in this tx were processed successfully
+        if (!allEventsProcessed) {
+          this.errorCount++;
+          logger.warn({ signature: logs.signature, slot: ctx.slot },
+            "Skipping cursor update — failed event(s) in this tx will be retried on restart");
+          return;
+        }
 
-      this.processedCount++;
-      const duration = Date.now() - startTime;
+        // Update state - both local and Supabase modes (with monotonic guard)
+        try {
+          const newSlot = BigInt(ctx.slot);
+          if (this.prisma) {
+            const current = await this.prisma.indexerState.findUnique({
+              where: { id: "main" },
+              select: { lastSlot: true, lastTxIndex: true, lastSignature: true },
+            });
+            if (!shouldAdvanceCursor(
+              current?.lastSlot,
+              current?.lastTxIndex,
+              current?.lastSignature,
+              newSlot,
+              txIndex ?? null,
+              logs.signature
+            )) {
+              logger.debug(
+                {
+                  slot: ctx.slot,
+                  currentSlot: current?.lastSlot?.toString() ?? null,
+                  txIndex: txIndex ?? null,
+                  currentTxIndex: current?.lastTxIndex ?? null,
+                  signature: logs.signature,
+                  currentSignature: current?.lastSignature ?? null,
+                },
+                "WS cursor update skipped — monotonic guard"
+              );
+            } else {
+              if (!(await trySaveLocalIndexerStateWithSql(this.prisma, {
+                signature: logs.signature,
+                slot: newSlot,
+                txIndex: txIndex ?? null,
+                source: "websocket",
+                updatedAt: blockTime,
+              }))) {
+                await this.prisma.indexerState.upsert({
+                  where: { id: "main" },
+                  create: {
+                    id: "main",
+                    lastSignature: logs.signature,
+                    lastSlot: newSlot,
+                    lastTxIndex: txIndex ?? null,
+                    source: "websocket",
+                  },
+                  update: {
+                    lastSignature: logs.signature,
+                    lastSlot: newSlot,
+                    lastTxIndex: txIndex ?? null,
+                    source: "websocket",
+                  },
+                });
+              }
+            }
+          } else {
+            // Supabase mode — saveIndexerState already has SQL-level monotonic guard
+            await saveIndexerState(logs.signature, newSlot, txIndex ?? null, "websocket", blockTime);
+          }
+        } catch (stateError) {
+          logger.error({
+            error: stateError instanceof Error ? stateError.message : String(stateError),
+            signature: logs.signature
+          }, "Failed to save indexer state");
+        }
 
-      if (this.processedCount % 100 === 0) {
-        logger.info({
-          processedCount: this.processedCount,
-          errorCount: this.errorCount,
-          queueSize: this.logQueue.size,
-          droppedLogs: this.droppedLogs,
-          lastDuration: duration
-        }, "WebSocket processing stats");
+        this.processedCount++;
+        const duration = Date.now() - startTime;
+
+        if (this.processedCount % 100 === 0) {
+          logger.info({
+            processedCount: this.processedCount,
+            errorCount: this.errorCount,
+            queueSize: this.logQueue.size,
+            droppedLogs: this.droppedLogs,
+            lastDuration: duration
+          }, "WebSocket processing stats");
+        }
+      } finally {
+        if (suspendLocalDigests) resumeLocalDerivedDigests();
       }
 
     } catch (error) {

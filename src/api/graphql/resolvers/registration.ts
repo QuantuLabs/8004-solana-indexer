@@ -41,6 +41,7 @@ const CANONICAL_SERVICE_NAMES = new Set([
   'a2a',
   'oasf',
   'ens',
+  'sns',
   'did',
   'agentwallet',
   'wallet',

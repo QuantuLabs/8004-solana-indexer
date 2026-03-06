@@ -4,17 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-03-06
+
 ### Fixed
 - REST `/rest/v1/revocations` now parses/applies `revoke_count` filters for both scalar (`eq.N`) and PostgREST `in.(...)` forms used by SDK spot-check calls.
 - REST eq-only string filters now reject unsupported operators (`neq`, `in`, `not.in`) with explicit `400` errors while preserving plain literal value semantics.
 - Backfill startup now fails fast on repeated scan/window RPC exhaustion instead of continuing with partial historical coverage.
 - Hashchain API head selection now requires `running_digest IS NOT NULL` to stay aligned with verifier digest predicates.
+- GraphQL complexity defaults are now aligned with the documented/env defaults used by local and containerized deployments.
 
 ### Changed
-- Transition docs now explicitly define collection scope as `creator + collection_pointer` and document the migration path as DB migrations + restart (no chain reindex required for already indexed data).
+- Transition docs now explicitly define collection scope as `creator + collection_pointer` and document the backend-specific migration path plus its exact limits for historically drifted databases.
 - Local startup performs explicit `collection_id` schema preflight and exits with migration guidance if schema is outdated.
 - Verifier/API digest-head ordering was aligned on deterministic slot/signature/index/ordinal tie-breakers with explicit null handling.
-- Transition docs now explicitly document backend-specific `collection_id` backfill ranking keys for no-reindex upgrades.
+- Upgrade migrations now preserve already assigned public sequential IDs and only backfill missing values.
+- Added the PostgreSQL orphan-response backfill migration for legacy response-before-feedback rows.
 
 ## [1.7.7] - 2026-03-02
 

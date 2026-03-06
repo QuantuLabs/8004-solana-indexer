@@ -4,7 +4,7 @@
  * Tests run against LOCAL test validator with 8004 programs deployed.
  * Registers multiple agents (same block + cross-block), then validates:
  *   1. tx_index is resolved correctly via getBlock
- *   2. Agents are ordered by composite key (block_slot, tx_signature, tx_index NULLS LAST, event_ordinal NULLS LAST)
+ *   2. Agents are ordered by composite key (block_slot, tx_index NULLS LAST, tx_signature, event_ordinal NULLS LAST)
  *   3. agent_id is assigned deterministically based on insertion order
  *   4. Re-ingesting produces the same ordering
  *   5. Orphaned agents do NOT receive a agent_id
@@ -54,11 +54,10 @@ function sortAgentsDeterministically<T extends { slot: number; txIndex: number |
 ): T[] {
   return [...agents].sort((a, b) => {
     if (a.slot !== b.slot) return a.slot - b.slot;
-    const sigCmp = a.signature.localeCompare(b.signature);
-    if (sigCmp !== 0) return sigCmp;
     const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
     const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-    return txA - txB;
+    if (txA !== txB) return txA - txB;
+    return a.signature.localeCompare(b.signature);
   });
 }
 
@@ -249,25 +248,23 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   // =========================================================================
 
   describe("2. Composite Key Ordering", () => {
-    it("should sort agents by (block_slot, tx_signature, tx_index NULLS LAST)", () => {
+    it("should sort agents by (block_slot, tx_index NULLS LAST, tx_signature)", () => {
       // Sort using the same logic as both indexers
       const sorted = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       // Verify the order is deterministic (sorting again produces same result)
       const reSorted = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       expect(sorted.map((a) => a.assetId)).toEqual(reSorted.map((a) => a.assetId));
@@ -277,21 +274,19 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       // Simulate SQL ordering: signature first, then COALESCE(tx_index, 2147483647)
       const sqlSort = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? 2147483647;
         const txB = b.txIndex ?? 2147483647;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       // JS ordering: MAX_SAFE_INTEGER
       const jsSort = [...registeredAgents].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       expect(sqlSort.map((a) => a.assetId)).toEqual(jsSort.map((a) => a.assetId));
@@ -421,9 +416,9 @@ describe("E2E: Localnet Deterministic Ordering", () => {
         FROM "Agent"
         WHERE id IN (${Prisma.join(ids)})
         ORDER BY "createdSlot" ASC,
-                 "createdTxSignature" ASC,
                  CASE WHEN "txIndex" IS NULL THEN 1 ELSE 0 END ASC,
-                 "txIndex" ASC
+                 "txIndex" ASC,
+                 "createdTxSignature" ASC
       `;
 
       const expected = sortAgentsDeterministically([
@@ -643,11 +638,10 @@ describe("E2E: Localnet Deterministic Ordering", () => {
 
       const sorted = withWs.sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       // For same slot + same signature, NULL tx_index should sort after concrete tx_index.
@@ -683,11 +677,10 @@ describe("E2E: Localnet Deterministic Ordering", () => {
 
       const sorted = [...registeredAgents, wsA, wsB, wsC].sort((a, b) => {
         if (a.slot !== b.slot) return a.slot - b.slot;
-        const sigCmp = a.signature.localeCompare(b.signature);
-        if (sigCmp !== 0) return sigCmp;
         const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
         const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
+        if (txA !== txB) return txA - txB;
+        return a.signature.localeCompare(b.signature);
       });
 
       const nullGroup = sorted
@@ -707,7 +700,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
   // =========================================================================
 
   describe("8. Feedback Deterministic Ordering", () => {
-    it("should order feedbacks by (createdSlot, createdTxSignature, txIndex NULLS LAST)", async () => {
+    it("should order feedbacks by (createdSlot, txIndex NULLS LAST, createdTxSignature)", async () => {
       const base = registeredAgents[0];
       if (!base) return;
 
@@ -789,19 +782,18 @@ describe("E2E: Localnet Deterministic Ordering", () => {
         FROM "Feedback"
         WHERE id IN (${Prisma.join(ids)})
         ORDER BY "createdSlot" ASC,
-                 "createdTxSignature" ASC,
                  CASE WHEN "txIndex" IS NULL THEN 1 ELSE 0 END ASC,
-                 "txIndex" ASC
+                 "txIndex" ASC,
+                 "createdTxSignature" ASC
       `;
 
       const expected = [...rows]
         .sort((a, b) => {
           if (a.createdSlot !== b.createdSlot) return Number(a.createdSlot - b.createdSlot);
-          const sigCmp = a.createdTxSignature.localeCompare(b.createdTxSignature);
-          if (sigCmp !== 0) return sigCmp;
           const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
           const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-          return txA - txB;
+          if (txA !== txB) return txA - txB;
+          return a.createdTxSignature.localeCompare(b.createdTxSignature);
         })
         .map((r) => r.id);
 
