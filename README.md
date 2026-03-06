@@ -56,18 +56,9 @@ If you are upgrading from `v1.7.7`, read:
   - `20260306233000_add_missing_agent_runtime_columns_sqlite`
   - `20260306234500_sqlite_fix_feedback_value_text`
   - `20260307000500_fix_indexer_state_monotonic_guard_tx_index`
-- If the file comes from the known `v1.7.7` local/Docker `prisma db push` flow without a valid `_prisma_migrations` baseline, do not run a blind `prisma migrate deploy`. Apply this exact proven subset manually with `sqlite3` against the same file, in order:
-  - `20260303161000_add_collection_sequential_id/migration.sql`
-  - `20260305113000_backfill_collection_sequential_id/migration.sql`
-  - `20260305143000_add_indexer_state_monotonic_guard/migration.sql`
-  - `20260305235500_add_orphan_feedback/migration.sql`
-  - `20260306164000_add_indexer_state_last_tx_index/migration.sql`
-  - `20260306210000_extend_orphan_response_proof/migration.sql`
-  - `20260306234500_sqlite_fix_feedback_value_text/migration.sql`
-  - `20260307000500_fix_indexer_state_monotonic_guard_tx_index/migration.sql`
-- For that known legacy shape, skip these two files because the old db-push schema already contains those columns and they fail with duplicate-column errors:
-  - `20260304120000_add_agent_sequential_id/migration.sql`
-  - `20260306233000_add_missing_agent_runtime_columns_sqlite/migration.sql`
+- If the file comes from the known `v1.7.7` local/Docker `prisma db push` flow without a valid `_prisma_migrations` baseline, do not run a blind `prisma migrate deploy`. Apply the shipped legacy bundle against that same file:
+  - `sqlite3 /path/to/indexer.db < prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql`
+- That bundle is intentionally scoped to the proven `v1.7.7` db-push shape and already excludes the two duplicate-column migrations that fail on that legacy schema.
 - For older/unknown local SQLite files outside that proven `v1.7.7` db-push shape, the simple supported path is still reindex into a fresh SQLite database unless you deliberately baseline and verify the schema yourself.
 - Restart the indexer with the same database file.
 - Do not use `prisma db push` on an existing indexed SQLite database.
@@ -79,7 +70,7 @@ If you are upgrading from `v1.7.7`, read:
 - If the container uses PostgreSQL / Supabase, apply the pending `supabase/migrations/*.sql` to that persisted database, then restart the container.
 - If the container uses local SQLite, run `prisma migrate deploy` against the same persisted SQLite file, then restart the container.
 - The runtime image defaults local SQLite to `file:/app/prisma/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
-- If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, use the exact manual `sqlite3` subset listed above against the mounted file, then restart the container.
+- If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, apply `prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql` with `sqlite3` against the mounted file, then restart the container.
 - If the file is older/unknown and does not match that proven shape, do not force a blind migrate; reindex into a fresh SQLite file unless you are deliberately doing a manual baseline.
 - Restart the container with the same volume/env after the backend-specific upgrade step completes.
 
