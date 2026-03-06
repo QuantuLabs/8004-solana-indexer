@@ -82,6 +82,7 @@ describe("Poller Coverage", () => {
     (config as any).pollerBatchRpcEnabled = true;
     (config as any).indexerStartSignature = null;
     (config as any).indexerStartSlot = null;
+    (config as any).indexerStopSlot = null;
   });
 
   afterEach(async () => {
@@ -132,6 +133,7 @@ describe("Poller Coverage", () => {
 
       // Inject mock eventBuffer with items to flush
       const mockFlush = vi.fn().mockResolvedValue(undefined);
+      const mockDrain = vi.fn().mockResolvedValue(undefined);
       const mockGetBufferStats = vi.fn().mockReturnValue({
         eventsBuffered: 5,
         eventsFlushed: 3,
@@ -143,6 +145,7 @@ describe("Poller Coverage", () => {
       (poller as any).eventBuffer = {
         size: 3,
         flush: mockFlush,
+        drain: mockDrain,
         getStats: mockGetBufferStats,
       };
 
@@ -155,7 +158,7 @@ describe("Poller Coverage", () => {
       (poller as any).isRunning = true;
       await poller.stop();
 
-      expect(mockFlush).toHaveBeenCalled();
+      expect(mockDrain).toHaveBeenCalled();
       expect(mockGetBatchStats).toHaveBeenCalled();
       expect(mockGetBufferStats).toHaveBeenCalled();
 
@@ -174,9 +177,11 @@ describe("Poller Coverage", () => {
       });
 
       const mockFlush = vi.fn();
+      const mockDrain = vi.fn().mockResolvedValue(undefined);
       (poller as any).eventBuffer = {
         size: 0,
         flush: mockFlush,
+        drain: mockDrain,
         getStats: vi.fn().mockReturnValue({}),
       };
       (poller as any).batchFetcher = {
@@ -187,6 +192,7 @@ describe("Poller Coverage", () => {
       await poller.stop();
 
       expect(mockFlush).not.toHaveBeenCalled();
+      expect(mockDrain).toHaveBeenCalled();
 
       (poller as any).batchFetcher = null;
       (poller as any).eventBuffer = null;
@@ -245,6 +251,9 @@ describe("Poller Coverage", () => {
       } as any);
       (config as any).indexerStartSignature = "env-start-sig";
       (config as any).indexerStartSlot = 123n;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        slot: 123,
+      });
 
       poller = new Poller({
         connection: mockConnection as any,
@@ -261,8 +270,39 @@ describe("Poller Coverage", () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect((poller as any).lastSignature).toBe("env-start-sig");
-      expect(saveIndexerState).toHaveBeenCalledWith("env-start-sig", 123n, null);
+      expect(saveIndexerState).toHaveBeenCalledWith(
+        "env-start-sig",
+        123n,
+        null,
+        "poller",
+        expect.any(Date)
+      );
       expect(backfillSpy).not.toHaveBeenCalled();
+    });
+
+    it("should reject mismatched env bootstrap signature and slot", async () => {
+      vi.mocked(loadIndexerState).mockResolvedValue({
+        lastSignature: null,
+        lastSlot: null,
+      } as any);
+      (config as any).indexerStartSignature = "env-start-sig";
+      (config as any).indexerStartSlot = 123n;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        slot: 999,
+      });
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      await expect(poller.start()).rejects.toThrow(
+        "Configured start cursor mismatch: signature env-start-sig resolves to slot 999, expected 123"
+      );
+      expect(saveIndexerState).not.toHaveBeenCalled();
     });
 
     it("should prefer saved state over env bootstrap cursor", async () => {
@@ -287,7 +327,13 @@ describe("Poller Coverage", () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect((poller as any).lastSignature).toBe("persisted-sig");
-      expect(saveIndexerState).not.toHaveBeenCalledWith("env-start-sig", 123n);
+      expect(saveIndexerState).not.toHaveBeenCalledWith(
+        "env-start-sig",
+        123n,
+        null,
+        "poller",
+        expect.any(Date)
+      );
     });
 
     it("should not call logFailedTransaction when prisma is null", async () => {
@@ -327,7 +373,13 @@ describe("Poller Coverage", () => {
 
       await (poller as any).saveState("test-sig", 500n, undefined);
 
-      expect(saveIndexerState).toHaveBeenCalledWith("test-sig", 500n, undefined);
+      expect(saveIndexerState).toHaveBeenCalledWith(
+        "test-sig",
+        500n,
+        undefined,
+        "poller",
+        expect.any(Date)
+      );
     });
   });
 
@@ -833,6 +885,53 @@ describe("Poller Coverage", () => {
       expect(signatures).not.toContain("sig-old-slot");
     });
 
+    it("should stop at the saved slot boundary when stop signature is missing from RPC pagination", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-stop";
+      (poller as any).lastSlot = 500n;
+      (poller as any).lastTxIndex = null;
+
+      let callNum = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+        callNum++;
+        if (callNum === 1) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-new-slot", 600),
+            createMockSignatureInfo("sig-older-same-slot", 500),
+          ]);
+        }
+        if (callNum === 2) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-newer-same-slot", 500),
+            createMockSignatureInfo("sig-below-stop-slot", 499),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-older-same-slot"] } },
+          { transaction: { signatures: ["sig-stop"] } },
+          { transaction: { signatures: ["sig-newer-same-slot"] } },
+        ],
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toEqual(["sig-new-slot", "sig-newer-same-slot"]);
+      expect(signatures).not.toContain("sig-older-same-slot");
+      expect(signatures).not.toContain("sig-below-stop-slot");
+    });
+
     it("should continue same-slot scan across next pages after stop signature", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -1014,6 +1113,56 @@ describe("Poller Coverage", () => {
       const result = await (poller as any).fetchSignatures();
 
       expect(result.length).toBe(1); // Only "resumed-1"
+      expect((poller as any).pendingContinuation).toBe(null);
+      expect((poller as any).pendingStopSignature).toBe(null);
+    });
+
+    it("should stop at the saved slot boundary when resuming from pendingContinuation without stop signature", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-stop";
+      (poller as any).lastSlot = 500n;
+      (poller as any).lastTxIndex = null;
+      (poller as any).pendingContinuation = "resume-from-here";
+      (poller as any).pendingStopSignature = "sig-stop";
+
+      let callNum = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation((_programId: unknown, options?: { before?: string }) => {
+        callNum++;
+        if (callNum === 1) {
+          expect(options?.before).toBe("resume-from-here");
+          return Promise.resolve([
+            createMockSignatureInfo("sig-new-slot", 600),
+            createMockSignatureInfo("sig-older-same-slot", 500),
+          ]);
+        }
+        if (callNum === 2) {
+          return Promise.resolve([
+            createMockSignatureInfo("sig-newer-same-slot", 500),
+            createMockSignatureInfo("sig-below-stop-slot", 499),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-older-same-slot"] } },
+          { transaction: { signatures: ["sig-stop"] } },
+          { transaction: { signatures: ["sig-newer-same-slot"] } },
+        ],
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toEqual(["sig-new-slot", "sig-newer-same-slot"]);
       expect((poller as any).pendingContinuation).toBe(null);
       expect((poller as any).pendingStopSignature).toBe(null);
     });
@@ -1372,7 +1521,13 @@ describe("Poller Coverage", () => {
 
       await (poller as any).saveState("test-sig-supa", 67890n, undefined);
 
-      expect(saveIndexerState).toHaveBeenCalledWith("test-sig-supa", 67890n, undefined);
+      expect(saveIndexerState).toHaveBeenCalledWith(
+        "test-sig-supa",
+        67890n,
+        undefined,
+        "poller",
+        expect.any(Date)
+      );
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
     });
 
@@ -1485,6 +1640,9 @@ describe("Poller Coverage", () => {
     it("should fast-forward local saved state when configured start slot is newer", async () => {
       (config as any).indexerStartSignature = "configured-start-sig";
       (config as any).indexerStartSlot = 2000n;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        slot: 2000,
+      });
 
       poller = new Poller({
         connection: mockConnection as any,
@@ -1522,6 +1680,9 @@ describe("Poller Coverage", () => {
     it("should fast-forward supabase saved state when configured start slot is newer", async () => {
       (config as any).indexerStartSignature = "configured-supabase-sig";
       (config as any).indexerStartSlot = 3000n;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        slot: 3000,
+      });
       vi.mocked(loadIndexerState).mockResolvedValue({
         lastSignature: "supabase-loaded",
         lastSlot: 888n,
@@ -1538,11 +1699,48 @@ describe("Poller Coverage", () => {
       await (poller as any).loadState();
 
       expect((poller as any).lastSignature).toBe("configured-supabase-sig");
-      expect(saveIndexerState).toHaveBeenCalledWith("configured-supabase-sig", 3000n, null);
+      expect(saveIndexerState).toHaveBeenCalledWith(
+        "configured-supabase-sig",
+        3000n,
+        null,
+        "poller",
+        expect.any(Date)
+      );
     });
   });
 
   describe("backfill - Phase 2 and Phase 3 processing", () => {
+    it("should stop backfill batches before processing slots above INDEXER_STOP_SLOT", async () => {
+      (config as any).pollerBatchRpcEnabled = false;
+      (config as any).indexerStopSlot = 100n;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+
+      const withinStopSlot = createMockSignatureInfo("backfill-stop-100", 100);
+      const aboveStopSlot = createMockSignatureInfo("backfill-stop-101", 101);
+
+      vi.spyOn(poller as any, "getTxIndexMap").mockImplementation(async (_slot: number, sigs: Array<{ signature: string }>) =>
+        new Map(sigs.map((sig) => [sig.signature, 0]))
+      );
+      const processTransactionSpy = vi.spyOn(poller as any, "processTransaction").mockResolvedValue(undefined);
+      const saveStateSpy = vi.spyOn(poller as any, "saveState").mockResolvedValue(undefined);
+
+      const processed = await (poller as any).processSignatureBatch([withinStopSlot, aboveStopSlot], 0, 2);
+
+      expect(processed).toBe(1);
+      expect(processTransactionSpy).toHaveBeenCalledTimes(1);
+      expect(processTransactionSpy).toHaveBeenCalledWith(withinStopSlot, 0);
+      expect(saveStateSpy).toHaveBeenCalledTimes(1);
+      expect((poller as any).isRunning).toBe(false);
+    });
+
     it("should process checkpoints in reverse order (oldest first) during Phase 2", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -1849,6 +2047,39 @@ describe("Poller Coverage", () => {
   });
 
   describe("processNewTransactions - full flow", () => {
+    it("should stop before processing slots above INDEXER_STOP_SLOT", async () => {
+      (config as any).pollerBatchRpcEnabled = false;
+      (config as any).indexerStopSlot = 100n;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "prev-stop-slot";
+
+      const withinStopSlot = createMockSignatureInfo("stop-slot-100", 100);
+      const aboveStopSlot = createMockSignatureInfo("stop-slot-101", 101);
+
+      vi.spyOn(poller as any, "fetchSignatures").mockResolvedValue([aboveStopSlot, withinStopSlot]);
+      vi.spyOn(poller as any, "getTxIndexMap").mockResolvedValue(new Map([
+        ["stop-slot-100", 0],
+        ["stop-slot-101", 0],
+      ]));
+      const processTransactionSpy = vi.spyOn(poller as any, "processTransaction").mockResolvedValue(undefined);
+      const saveStateSpy = vi.spyOn(poller as any, "saveState").mockResolvedValue(undefined);
+
+      await (poller as any).processNewTransactions();
+
+      expect(processTransactionSpy).toHaveBeenCalledTimes(1);
+      expect(processTransactionSpy).toHaveBeenCalledWith(withinStopSlot, 0);
+      expect(saveStateSpy).toHaveBeenCalledTimes(1);
+      expect((poller as any).isRunning).toBe(false);
+    });
+
     it("should process transactions with batch RPC for multi-sig batches", async () => {
       poller = new Poller({
         connection: mockConnection as any,

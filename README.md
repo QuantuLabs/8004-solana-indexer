@@ -63,7 +63,8 @@ WebSocket subscriptions are live notifications, not historical replay.
 
 - For complete bootstrap/sync, use HTTP RPC history first (`getSignaturesForAddress` + transaction fetch).
 - Then run live tail with `INDEXER_MODE=websocket` or `INDEXER_MODE=auto`.
-- If your provider/network keeps limited history (often devnet/testnet), use archival RPC for bootstrap, or set `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`.
+- If your provider/network keeps limited history (often devnet/testnet), use archival RPC for bootstrap, or set `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT` to the same exact tx/slot pair.
+- When both are set, startup validates that the signature resolves to that slot and fails fast on mismatch.
 
 ## Remote API Docs
 
@@ -116,15 +117,17 @@ Notes:
   - `DB_MODE=local` (Prisma), or
   - `DB_MODE=supabase` with PostgREST proxy auth (`SUPABASE_URL` + `SUPABASE_KEY`, or `POSTGREST_URL` + `POSTGREST_TOKEN`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
-- `.env.devnet.example` includes current devnet bootstrap cursor (`INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT`).
-- `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`; set startup signature/slot for first sync.
-- IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/default runtime) and `agent_registry_8004.mainnet.json` (mainnet reference copy).
+- `.env.devnet.example` includes the current devnet bootstrap cursor as an exact validated signature/slot pair.
+- `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`, plus a commented validated bootstrap pair for history-capable RPCs.
+- IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/testnet/localnet runtime) and `agent_registry_8004.mainnet.json` (mainnet runtime).
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `TRUST_PROXY` defaults to `false`; set it explicitly (for example `1`) only when running behind a trusted reverse proxy.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
 - `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
-- Optional startup cursor bootstrap: `INDEXER_START_SIGNATURE` (and optional `INDEXER_START_SLOT`) is applied only when no persisted `indexer_state` exists.
+- Optional startup cursor: `INDEXER_START_SIGNATURE` is applied when no persisted `indexer_state` exists.
+- If `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT` are configured and persisted state exists but is older than that slot, the poller fast-forwards persisted state to the configured cursor.
 - `INDEXER_START_SLOT` requires `INDEXER_START_SIGNATURE`.
+- When both are set, startup validates that `INDEXER_START_SIGNATURE` resolves to `INDEXER_START_SLOT` and aborts on mismatch.
 - If `SOLANA_NETWORK=mainnet-beta`, ensure `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID` match your deployed mainnet programs. Startup validation warns if mainnet is selected but `PROGRAM_ID` is still the default devnet ID.
 - `.env.localnet` is preconfigured for local REST mode.
 - `GRAPHQL_STATS_CACHE_TTL_MS` controls `globalStats`/`protocol` aggregate cache TTL (default `60000` ms).
