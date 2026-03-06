@@ -108,6 +108,13 @@ export function createMockPrismaClient(): PrismaClient {
       delete: vi.fn(),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
+    orphanFeedback: {
+      findMany: vi.fn().mockResolvedValue([]),
+      create: vi.fn(),
+      upsert: vi.fn(),
+      delete: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
     indexerCursor: {
       findUnique: vi.fn(),
       upsert: vi.fn(),

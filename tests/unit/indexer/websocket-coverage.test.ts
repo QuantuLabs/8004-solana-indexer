@@ -547,6 +547,7 @@ describe("WebSocketIndexer Coverage", () => {
       expect(saveIndexerState).toHaveBeenCalledWith(
         TEST_SIGNATURE,
         BigInt(TEST_SLOT),
+        null,
         "websocket",
       );
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();

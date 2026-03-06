@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import PQueue from "p-queue";
+import { PublicKey } from "@solana/web3.js";
 import {
   ProgramEvent,
   AgentRegistered,
@@ -37,7 +38,7 @@ const MAX_URI_FETCH_CONCURRENT = 5;
 const uriDigestQueue = new PQueue({ concurrency: MAX_URI_FETCH_CONCURRENT });
 const MAX_COLLECTION_FETCH_CONCURRENT = 3;
 const collectionDigestQueue = new PQueue({ concurrency: MAX_COLLECTION_FETCH_CONCURRENT });
-const pendingUriDigests = new Map<string, { prisma: PrismaClient; uri: string }>();
+const pendingUriDigests = new Map<string, { prisma: PrismaClient; uri: string; verifiedAt?: Date }>();
 const inFlightUriDigests = new Set<string>();
 const pendingCollectionDigests = new Map<string, { prisma: PrismaClient; pointer: string }>();
 const inFlightCollectionDigests = new Set<string>();
@@ -343,7 +344,7 @@ function enqueueUriDigestWorker(assetId: string): void {
           pendingUriDigests.delete(assetId);
 
           try {
-            await digestAndStoreUriMetadataLocal(next.prisma, assetId, next.uri);
+            await digestAndStoreUriMetadataLocal(next.prisma, assetId, next.uri, next.verifiedAt);
           } catch (err: any) {
             logger.warn({ assetId, uri: next.uri, error: err.message }, "Failed to digest URI metadata");
           }
@@ -364,9 +365,14 @@ function enqueueUriDigestWorker(assetId: string): void {
     });
 }
 
-function scheduleUriDigest(prisma: PrismaClient, assetId: string, uri: string): void {
+function scheduleUriDigest(
+  prisma: PrismaClient,
+  assetId: string,
+  uri: string,
+  verifiedAt?: Date
+): void {
   if (!uri || config.metadataIndexMode === "off") return;
-  pendingUriDigests.set(assetId, { prisma, uri });
+  pendingUriDigests.set(assetId, { prisma, uri, verifiedAt });
   enqueueUriDigestWorker(assetId);
 }
 
@@ -576,9 +582,158 @@ function hashesMatch(a: Uint8Array | Uint8Array<ArrayBuffer> | null | undefined,
   return true;
 }
 
+type OrphanFeedbackRecord = {
+  id: string;
+  agentId: string;
+  client: string;
+  feedbackIndex: bigint;
+  value: string;
+  valueDecimals: number;
+  score: number | null;
+  tag1: string;
+  tag2: string;
+  endpoint: string;
+  feedbackUri: string;
+  feedbackHash: Uint8Array<ArrayBuffer> | null;
+  runningDigest: Uint8Array<ArrayBuffer> | null;
+  atomEnabled: boolean;
+  newTrustTier: number;
+  newQualityScore: number;
+  newConfidence: number;
+  newRiskScore: number;
+  newDiversityRatio: number;
+  createdAt: Date;
+  txSignature: string | null;
+  slot: bigint | null;
+  txIndex: number | null;
+  eventOrdinal: number | null;
+};
+
+function denormalizeHash(hash: Uint8Array<ArrayBuffer> | null): Uint8Array<ArrayBuffer> {
+  if (!hash || hash.length === 0) {
+    return new Uint8Array(32) as Uint8Array<ArrayBuffer>;
+  }
+  return Uint8Array.from(hash) as Uint8Array<ArrayBuffer>;
+}
+
+async function upsertOrphanFeedback(
+  client: PrismaClientOrTx,
+  data: NewFeedback,
+  ctx: EventContext
+): Promise<void> {
+  const orphanFeedback = (client as any).orphanFeedback as {
+    upsert(args: unknown): Promise<unknown>;
+  };
+  const agentId = data.asset.toBase58();
+  const clientAddress = data.clientAddress.toBase58();
+  await orphanFeedback.upsert({
+    where: {
+      agentId_client_feedbackIndex: {
+        agentId,
+        client: clientAddress,
+        feedbackIndex: data.feedbackIndex,
+      },
+    },
+    create: {
+      agentId,
+      client: clientAddress,
+      feedbackIndex: data.feedbackIndex,
+      value: data.value.toString(),
+      valueDecimals: data.valueDecimals,
+      score: data.score,
+      tag1: data.tag1,
+      tag2: data.tag2,
+      endpoint: data.endpoint,
+      feedbackUri: data.feedbackUri,
+      feedbackHash: normalizeHash(data.sealHash),
+      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
+      atomEnabled: data.atomEnabled,
+      newTrustTier: data.newTrustTier,
+      newQualityScore: data.newQualityScore,
+      newConfidence: data.newConfidence,
+      newRiskScore: data.newRiskScore,
+      newDiversityRatio: data.newDiversityRatio,
+      createdAt: ctx.blockTime,
+      txSignature: ctx.signature,
+      slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
+    },
+    update: {
+      value: data.value.toString(),
+      valueDecimals: data.valueDecimals,
+      score: data.score,
+      tag1: data.tag1,
+      tag2: data.tag2,
+      endpoint: data.endpoint,
+      feedbackUri: data.feedbackUri,
+      feedbackHash: normalizeHash(data.sealHash),
+      runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
+      atomEnabled: data.atomEnabled,
+      newTrustTier: data.newTrustTier,
+      newQualityScore: data.newQualityScore,
+      newConfidence: data.newConfidence,
+      newRiskScore: data.newRiskScore,
+      newDiversityRatio: data.newDiversityRatio,
+      createdAt: ctx.blockTime,
+      txSignature: ctx.signature,
+      slot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
+    },
+  });
+}
+
+function orphanFeedbackToEvent(record: OrphanFeedbackRecord): { data: NewFeedback; ctx: EventContext } {
+  const slot = record.slot ?? 0n;
+  const data: NewFeedback = {
+    asset: new PublicKey(record.agentId),
+    clientAddress: new PublicKey(record.client),
+    feedbackIndex: record.feedbackIndex,
+    value: BigInt(record.value),
+    valueDecimals: record.valueDecimals,
+    score: record.score,
+    feedbackFileHash: null,
+    sealHash: denormalizeHash(record.feedbackHash),
+    atomEnabled: record.atomEnabled,
+    newTrustTier: record.newTrustTier,
+    newQualityScore: record.newQualityScore,
+    newConfidence: record.newConfidence,
+    newRiskScore: record.newRiskScore,
+    newDiversityRatio: record.newDiversityRatio,
+    isUniqueClient: false,
+    newFeedbackDigest: record.runningDigest
+      ? Uint8Array.from(record.runningDigest) as Uint8Array<ArrayBuffer>
+      : (new Uint8Array(32) as Uint8Array<ArrayBuffer>),
+    newFeedbackCount: 0n,
+    tag1: record.tag1,
+    tag2: record.tag2,
+    endpoint: record.endpoint,
+    feedbackUri: record.feedbackUri,
+    slot,
+  };
+
+  const ctx: EventContext = {
+    signature: record.txSignature || `orphan-feedback:${record.id}`,
+    slot,
+    blockTime: record.createdAt,
+    txIndex: record.txIndex ?? undefined,
+    eventOrdinal: record.eventOrdinal ?? undefined,
+  };
+
+  return { data, ctx };
+}
+
 function toRoundedScore(avg: number | null | undefined): number {
   if (avg === null || avg === undefined || Number.isNaN(avg)) return 0;
   return Math.round(avg);
+}
+
+function resolveDeterministicMetadataVerifiedAt(
+  updatedAt: Date | null | undefined,
+  createdAt: Date | null | undefined
+): Date {
+  return updatedAt ?? createdAt ?? new Date(0);
 }
 
 interface AgentAtomPatch {
@@ -704,14 +859,14 @@ export async function handleEventAtomic(
 
   // 3. Trigger derived metadata extraction AFTER transaction (fire-and-forget)
   // This is outside the transaction to avoid blocking event processing
-  await triggerDerivedDigestsIfNeeded(prisma, event);
+  await triggerDerivedDigestsIfNeeded(prisma, event, ctx);
 }
 
 /**
  * Update indexer cursor with monotonic guard
  * Advances only when:
  * - new slot is greater than current slot, or
- * - same slot and new signature is lexicographically >= current signature
+ * - same slot and new tx_index/signature are >= current cursor order
  */
 async function updateCursorAtomic(
   tx: PrismaTransactionClient,
@@ -719,7 +874,7 @@ async function updateCursorAtomic(
 ): Promise<void> {
   const current = await tx.indexerState.findUnique({
     where: { id: "main" },
-    select: { lastSlot: true, lastSignature: true },
+    select: { lastSlot: true, lastSignature: true, lastTxIndex: true },
   });
 
   // Monotonic guard:
@@ -732,8 +887,14 @@ async function updateCursorAtomic(
       ctx.slot < current.lastSlot
       || (
         ctx.slot === current.lastSlot
-        && current.lastSignature !== null
-        && ctx.signature < current.lastSignature
+        && (
+          (current.lastTxIndex ?? Number.MAX_SAFE_INTEGER) > (ctx.txIndex ?? Number.MAX_SAFE_INTEGER)
+          || (
+            (current.lastTxIndex ?? Number.MAX_SAFE_INTEGER) === (ctx.txIndex ?? Number.MAX_SAFE_INTEGER)
+            && current.lastSignature !== null
+            && ctx.signature < current.lastSignature
+          )
+        )
       )
     )
   ) {
@@ -746,11 +907,13 @@ async function updateCursorAtomic(
       id: "main",
       lastSignature: ctx.signature,
       lastSlot: ctx.slot,
+      lastTxIndex: ctx.txIndex ?? null,
       source: ctx.source || "poller",
     },
     update: {
       lastSignature: ctx.signature,
       lastSlot: ctx.slot,
+      lastTxIndex: ctx.txIndex ?? null,
       source: ctx.source || "poller",
     },
   });
@@ -762,7 +925,8 @@ async function updateCursorAtomic(
  */
 async function triggerDerivedDigestsIfNeeded(
   prisma: PrismaClient,
-  event: ProgramEvent
+  event: ProgramEvent,
+  ctx: EventContext
 ): Promise<void> {
   let uriAssetId: string | null = null;
   let uri: string | null = null;
@@ -776,7 +940,7 @@ async function triggerDerivedDigestsIfNeeded(
   }
 
   if (uriAssetId && uri && config.metadataIndexMode !== "off") {
-    scheduleUriDigest(prisma, uriAssetId, uri);
+    scheduleUriDigest(prisma, uriAssetId, uri, ctx.blockTime);
   }
 
   if (event.type === "CollectionPointerSet" && config.collectionMetadataIndexEnabled) {
@@ -796,7 +960,7 @@ async function handleEventInner(
 ): Promise<void> {
   switch (event.type) {
     case "AgentRegistered":
-      await handleAgentRegisteredCore(tx, event.data, ctx);
+      await handleAgentRegisteredTx(tx, event.data, ctx);
       break;
     case "AgentOwnerSynced":
       await handleAgentOwnerSyncedTx(tx, event.data, ctx);
@@ -1022,6 +1186,74 @@ async function handleAgentRegisteredCore(
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 }
 
+async function reconcileOrphanFeedbacksTx(
+  tx: PrismaTransactionClient,
+  assetId: string
+): Promise<void> {
+  const orphans = await (tx as any).orphanFeedback.findMany({
+    where: { agentId: assetId },
+    orderBy: [
+      { slot: "asc" },
+      { txIndex: "asc" },
+      { eventOrdinal: "asc" },
+      { createdAt: "asc" },
+      { id: "asc" },
+    ],
+  }) as OrphanFeedbackRecord[];
+  const orphanFeedback = (tx as any).orphanFeedback as {
+    delete(args: unknown): Promise<unknown>;
+  };
+
+  for (const orphan of orphans) {
+    const replay = orphanFeedbackToEvent(orphan);
+    await handleNewFeedbackTx(tx, replay.data, replay.ctx);
+    await orphanFeedback.delete({ where: { id: orphan.id } });
+  }
+
+  if (orphans.length > 0) {
+    logger.info({ assetId, count: orphans.length }, "Reconciled orphan feedbacks");
+  }
+}
+
+async function reconcileOrphanFeedbacks(
+  prisma: PrismaClient,
+  assetId: string
+): Promise<void> {
+  const orphans = await (prisma as any).orphanFeedback.findMany({
+    where: { agentId: assetId },
+    orderBy: [
+      { slot: "asc" },
+      { txIndex: "asc" },
+      { eventOrdinal: "asc" },
+      { createdAt: "asc" },
+      { id: "asc" },
+    ],
+  }) as OrphanFeedbackRecord[];
+  const orphanFeedback = (prisma as any).orphanFeedback as {
+    delete(args: unknown): Promise<unknown>;
+  };
+
+  for (const orphan of orphans) {
+    const replay = orphanFeedbackToEvent(orphan);
+    await handleNewFeedback(prisma, replay.data, replay.ctx);
+    await orphanFeedback.delete({ where: { id: orphan.id } });
+  }
+
+  if (orphans.length > 0) {
+    logger.info({ assetId, count: orphans.length }, "Reconciled orphan feedbacks");
+  }
+}
+
+async function handleAgentRegisteredTx(
+  tx: PrismaTransactionClient,
+  data: AgentRegistered,
+  ctx: EventContext
+): Promise<void> {
+  await handleAgentRegisteredCore(tx, data, ctx);
+  const assetId = data.asset.toBase58();
+  await reconcileOrphanFeedbacksTx(tx, assetId);
+}
+
 // Non-atomic wrapper with URI digest side effect
 async function handleAgentRegistered(
   prisma: PrismaClient,
@@ -1030,11 +1262,12 @@ async function handleAgentRegistered(
 ): Promise<void> {
   await handleAgentRegisteredCore(prisma, data, ctx);
   const assetId = data.asset.toBase58();
+  await reconcileOrphanFeedbacks(prisma, assetId);
   const agentUri = data.agentUri || "";
 
   // Trigger URI metadata extraction if configured and URI is present
   if (agentUri && config.metadataIndexMode !== "off") {
-    scheduleUriDigest(prisma, assetId, agentUri);
+    scheduleUriDigest(prisma, assetId, agentUri, ctx.blockTime);
   }
 }
 
@@ -1171,7 +1404,7 @@ async function handleUriUpdated(
 
   // Trigger URI metadata extraction if configured and URI is present
   if (newUri && config.metadataIndexMode !== "off") {
-    scheduleUriDigest(prisma, assetId, newUri);
+    scheduleUriDigest(prisma, assetId, newUri, ctx.blockTime);
   }
 }
 
@@ -1662,6 +1895,18 @@ async function handleNewFeedbackTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
+  const agent = await tx.agent.findUnique({
+    where: { id: assetId },
+    select: { id: true },
+  });
+  if (agent === null) {
+    await upsertOrphanFeedback(tx, data, ctx);
+    logger.warn(
+      { assetId, clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+      "Agent missing for feedback; stored orphan feedback"
+    );
+    return;
+  }
   const feedback = await withFeedbackIdAssignmentLock(async () => {
     const existingFeedback = await tx.feedback.findUnique({
       where: {
@@ -1722,8 +1967,17 @@ async function handleNewFeedbackTx(
   // Reconcile orphan responses
   const orphans = await tx.orphanResponse.findMany({
     where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+    orderBy: [
+      { slot: "asc" },
+      { txIndex: "asc" },
+      { eventOrdinal: "asc" },
+      { txSignature: "asc" },
+      { id: "asc" },
+    ],
   });
   for (const orphan of orphans) {
+    const orphanSealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
+    const orphanResponseStatus = orphanSealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
     await withResponseIdAssignmentLock(async () => {
       const orphanTxSignature = orphan.txSignature ?? "";
       const existingResponse = await tx.feedbackResponse.findUnique({
@@ -1738,7 +1992,10 @@ async function handleNewFeedbackTx(
       });
 
       let assignedResponseId: bigint | undefined;
-      if (!existingResponse || existingResponse.responseId === null) {
+      if (
+        orphanResponseStatus !== "ORPHANED" &&
+        (!existingResponse || existingResponse.responseId === null)
+      ) {
         const highestAssigned = await tx.feedbackResponse.findMany({
           where: { feedbackId: feedback.id, responseId: { not: null } },
           select: { responseId: true },
@@ -1765,13 +2022,19 @@ async function handleNewFeedbackTx(
           responseCount: orphan.responseCount,
           txSignature: orphan.txSignature,
           slot: orphan.slot,
-          responseId: assignedResponseId ?? null,
-          status: DEFAULT_STATUS,
+          txIndex: orphan.txIndex,
+          eventOrdinal: orphan.eventOrdinal,
+          responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
+          status: orphanResponseStatus,
           createdAt: orphan.createdAt,
         },
         update: {
           responseCount: orphan.responseCount,
-          ...(assignedResponseId !== undefined ? { responseId: assignedResponseId } : {}),
+          ...(orphanResponseStatus === "ORPHANED"
+            ? { status: orphanResponseStatus }
+            : assignedResponseId !== undefined
+              ? { responseId: assignedResponseId, status: orphanResponseStatus }
+              : { status: orphanResponseStatus }),
         },
       });
     });
@@ -1853,6 +2116,18 @@ async function handleNewFeedback(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
+  const agent = await prisma.agent.findUnique({
+    where: { id: assetId },
+    select: { id: true },
+  });
+  if (agent === null) {
+    await upsertOrphanFeedback(prisma, data, ctx);
+    logger.warn(
+      { assetId, clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+      "Agent missing for feedback; stored orphan feedback"
+    );
+    return;
+  }
 
   const feedback = await withFeedbackIdAssignmentLock(async () => {
     const existingFeedback = await prisma.feedback.findUnique({
@@ -1915,9 +2190,18 @@ async function handleNewFeedback(
   // Reconcile orphan responses
   const orphans = await prisma.orphanResponse.findMany({
     where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+    orderBy: [
+      { slot: "asc" },
+      { txIndex: "asc" },
+      { eventOrdinal: "asc" },
+      { txSignature: "asc" },
+      { id: "asc" },
+    ],
   });
 
   for (const orphan of orphans) {
+    const orphanSealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
+    const orphanResponseStatus = orphanSealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
     await withResponseIdAssignmentLock(async () => {
       const orphanTxSignature = orphan.txSignature ?? "";
       const existingResponse = await prisma.feedbackResponse.findUnique({
@@ -1932,7 +2216,10 @@ async function handleNewFeedback(
       });
 
       let assignedResponseId: bigint | undefined;
-      if (!existingResponse || existingResponse.responseId === null) {
+      if (
+        orphanResponseStatus !== "ORPHANED" &&
+        (!existingResponse || existingResponse.responseId === null)
+      ) {
         const highestAssigned = await prisma.feedbackResponse.findMany({
           where: { feedbackId: feedback.id, responseId: { not: null } },
           select: { responseId: true },
@@ -1959,13 +2246,19 @@ async function handleNewFeedback(
           responseCount: orphan.responseCount,
           txSignature: orphan.txSignature,
           slot: orphan.slot,
-          responseId: assignedResponseId ?? null,
-          status: DEFAULT_STATUS,
+          txIndex: orphan.txIndex,
+          eventOrdinal: orphan.eventOrdinal,
+          responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
+          status: orphanResponseStatus,
           createdAt: orphan.createdAt,
         },
         update: {
           responseCount: orphan.responseCount,
-          ...(assignedResponseId !== undefined ? { responseId: assignedResponseId } : {}),
+          ...(orphanResponseStatus === "ORPHANED"
+            ? { status: orphanResponseStatus }
+            : assignedResponseId !== undefined
+              ? { responseId: assignedResponseId, status: orphanResponseStatus }
+              : { status: orphanResponseStatus }),
         },
       });
     });
@@ -2339,14 +2632,25 @@ async function handleResponseAppendedTx(
         responder,
         responseUri: data.responseUri,
         responseHash: normalizeHash(data.responseHash),
+        sealHash: normalizeHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
         createdAt: ctx.blockTime,
       },
       update: {
+        responseUri: data.responseUri,
+        responseHash: normalizeHash(data.responseHash),
+        sealHash: normalizeHash(data.sealHash),
+        runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        createdAt: ctx.blockTime,
       },
     });
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Orphan response stored");
@@ -2464,14 +2768,25 @@ async function handleResponseAppended(
         responder,
         responseUri: data.responseUri,
         responseHash: normalizeHash(data.responseHash),
+        sealHash: normalizeHash(data.sealHash),
         runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
         slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
         createdAt: ctx.blockTime,
       },
       update: {
+        responseUri: data.responseUri,
+        responseHash: normalizeHash(data.responseHash),
+        sealHash: normalizeHash(data.sealHash),
+        runningDigest: data.newResponseDigest ? Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer> : null,
         responseCount: data.newResponseCount,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        createdAt: ctx.blockTime,
       },
     });
 
@@ -2764,7 +3079,8 @@ async function handleValidationResponded(
 async function digestAndStoreUriMetadataLocal(
   prisma: PrismaClient,
   assetId: string,
-  uri: string
+  uri: string,
+  verifiedAt?: Date
 ): Promise<void> {
   if (config.metadataIndexMode === "off") {
     return;
@@ -2774,7 +3090,7 @@ async function digestAndStoreUriMetadataLocal(
   // This prevents stale data from overwriting newer data due to out-of-order completion
   const agent = await prisma.agent.findUnique({
     where: { id: assetId },
-    select: { uri: true },
+    select: { uri: true, updatedAt: true, createdAt: true },
   });
 
   if (!agent) {
@@ -2796,12 +3112,16 @@ async function digestAndStoreUriMetadataLocal(
   // Re-check URI freshness after network fetch (TOCTOU protection)
   const agentRecheck = await prisma.agent.findUnique({
     where: { id: assetId },
-    select: { uri: true },
+    select: { uri: true, updatedAt: true, createdAt: true },
   });
   if (!agentRecheck || agentRecheck.uri !== uri) {
     logger.debug({ assetId, uri }, "URI changed during fetch, discarding stale results");
     return;
   }
+  const metadataVerifiedAt = verifiedAt ?? resolveDeterministicMetadataVerifiedAt(
+    agentRecheck.updatedAt,
+    agentRecheck.createdAt
+  );
 
   // Purge old URI-derived metadata before storing new ones
   try {
@@ -2809,6 +3129,7 @@ async function digestAndStoreUriMetadataLocal(
       where: {
         agentId: assetId,
         key: { startsWith: "_uri:" },
+        NOT: { key: "_uri:_source" },
         immutable: false,
       },
     });
@@ -2818,12 +3139,18 @@ async function digestAndStoreUriMetadataLocal(
   }
 
   // Keep extraction source for restart recovery and URI mismatch detection.
-  await storeUriMetadataLocal(prisma, assetId, "_uri:_source", uri);
+  await storeUriMetadataLocal(prisma, assetId, "_uri:_source", uri, metadataVerifiedAt);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+    await storeUriMetadataLocal(
+      prisma,
+      assetId,
+      "_uri:_status",
+      JSON.stringify(toDeterministicUriStatus(result)),
+      metadataVerifiedAt
+    );
     return;
   }
 
@@ -2834,18 +3161,30 @@ async function digestAndStoreUriMetadataLocal(
 
     if (serialized.oversize) {
       // Store metadata about oversize field
-      await storeUriMetadataLocal(prisma, assetId, `${key}_meta`, JSON.stringify({
-        status: "oversize",
-        bytes: serialized.bytes,
-        sha256: result.hash,
-      }));
+      await storeUriMetadataLocal(
+        prisma,
+        assetId,
+        `${key}_meta`,
+        JSON.stringify({
+          status: "oversize",
+          bytes: serialized.bytes,
+          sha256: result.hash,
+        }),
+        metadataVerifiedAt
+      );
     } else {
-      await storeUriMetadataLocal(prisma, assetId, key, serialized.value);
+      await storeUriMetadataLocal(prisma, assetId, key, serialized.value, metadataVerifiedAt);
     }
   }
 
   // Store success status with truncation info
-  await storeUriMetadataLocal(prisma, assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+  await storeUriMetadataLocal(
+    prisma,
+    assetId,
+    "_uri:_status",
+    JSON.stringify(toDeterministicUriStatus(result)),
+    metadataVerifiedAt
+  );
 
   // Sync nftName from _uri:name if not already set
   const uriName = result.fields["_uri:name"];
@@ -2958,7 +3297,8 @@ async function storeUriMetadataLocal(
   prisma: PrismaClient,
   assetId: string,
   key: string,
-  value: string
+  value: string,
+  verifiedAt: Date
 ): Promise<void> {
   try {
     const existing = await prisma.agentMetadata.findUnique({
@@ -2996,9 +3336,13 @@ async function storeUriMetadataLocal(
         value: storedValue,
         immutable: false,
         slot: 0n,
+        status: "FINALIZED",
+        verifiedAt,
       },
       update: {
         value: storedValue,
+        status: "FINALIZED",
+        verifiedAt,
       },
     });
   } catch (error: any) {

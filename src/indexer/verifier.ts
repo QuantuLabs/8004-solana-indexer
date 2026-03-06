@@ -234,6 +234,50 @@ export class DataVerifier {
     setMismatchCount(this.stats.hashChainMismatches);
   }
 
+  private async loadAgentVerifiedAtMap(agentIds: string[]): Promise<Map<string, Date>> {
+    const uniqueIds = Array.from(new Set(agentIds));
+    if (uniqueIds.length === 0) {
+      return new Map();
+    }
+
+    if (this.prisma) {
+      const rows = await this.prisma.agent.findMany({
+        where: { id: { in: uniqueIds } },
+        select: { id: true, updatedAt: true, createdAt: true },
+      });
+      return new Map(
+        rows.map((row) => [row.id, row.updatedAt ?? row.createdAt ?? new Date(0)])
+      );
+    }
+
+    if (this.pool) {
+      const result = await this.pool.query(
+        `SELECT asset AS id, updated_at, created_at
+         FROM agents
+         WHERE asset = ANY($1::text[])`,
+        [uniqueIds]
+      );
+      return new Map(
+        result.rows.map((row) => [
+          row.id as string,
+          this.toVerifiedAtDate(row.updated_at ?? row.created_at),
+        ])
+      );
+    }
+
+    return new Map();
+  }
+
+  private toVerifiedAtDate(value: Date | string | null | undefined): Date {
+    if (value instanceof Date) {
+      return value;
+    }
+    if (typeof value === "string") {
+      return new Date(value);
+    }
+    return new Date(0);
+  }
+
   // =========================================================================
   // Existence Verification (Agent, Metadata, Registry, Validation)
   // =========================================================================
@@ -462,20 +506,22 @@ export class DataVerifier {
     }
 
     const now = new Date();
+    const uriVerifiedAtMap = await this.loadAgentVerifiedAtMap(uriMetadata.map((m) => m.agentId));
 
     // Auto-finalize URI-derived metadata
     for (const m of uriMetadata) {
       if (!this.isRunning) break;
       try {
+        const verifiedAt = uriVerifiedAtMap.get(m.agentId) ?? new Date(0);
         if (this.prisma) {
           await this.prisma.agentMetadata.update({
             where: { id: m.id },
-            data: { status: "FINALIZED", verifiedAt: now },
+            data: { status: "FINALIZED", verifiedAt },
           });
         } else if (this.pool) {
           await this.pool.query(
             `UPDATE metadata SET status = 'FINALIZED', verified_at = $1 WHERE id = $2`,
-            [now.toISOString(), m.id]
+            [verifiedAt.toISOString(), m.id]
           );
         }
         this.stats.metadataVerified++;
@@ -746,7 +792,7 @@ export class DataVerifier {
     let orphanedResponses: Array<{ id: string; agentId: string; feedbackOrphaned: boolean }> = [];
     if (this.prisma) {
       const rows = await this.prisma.feedbackResponse.findMany({
-        where: { status: "ORPHANED" },
+        where: { status: "ORPHANED", responseId: { not: null } },
         take: batchSize,
         include: { feedback: { select: { agentId: true, status: true } } },
       });
@@ -761,6 +807,7 @@ export class DataVerifier {
          FROM feedback_responses fr
          LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
          WHERE fr.status = 'ORPHANED'
+           AND fr.response_id IS NOT NULL
          LIMIT $1`,
         [batchSize]
       );

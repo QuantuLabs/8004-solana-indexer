@@ -179,10 +179,19 @@ describe("MetadataQueue", () => {
     });
 
     it("should deduplicate same asset + same URI", () => {
-      metadataQueue.add("asset1", "https://example.com/agent.json");
-      metadataQueue.add("asset1", "https://example.com/agent.json");
+      metadataQueue.add("asset1", "https://example.com/agent.json", "2026-03-06T01:02:03.000Z");
+      metadataQueue.add("asset1", "https://example.com/agent.json", "2026-03-06T01:02:03.000Z");
       const stats = metadataQueue.getStats();
       expect(stats.skippedDuplicate).toBe(1);
+    });
+
+    it("should replace pending task when same URI is re-enqueued with newer verifiedAt", () => {
+      metadataQueue.add("asset1", "https://example.com/agent.json", "2026-03-06T01:02:03.000Z");
+      metadataQueue.add("asset1", "https://example.com/agent.json", "2026-03-06T01:03:03.000Z");
+
+      const q = metadataQueue as any;
+      expect(q.pending.get("asset1")?.verifiedAt).toBe("2026-03-06T01:03:03.000Z");
+      expect(metadataQueue.getStats().skippedDuplicate).toBe(0);
     });
 
     it("should update URI for same asset with different URI", () => {
@@ -243,6 +252,35 @@ describe("MetadataQueue", () => {
   });
 
   describe("processTask", () => {
+    it("should store URI metadata with deterministic agent timestamp", async () => {
+      const verifiedAt = "2026-03-06T07:08:09.000Z";
+      mockPool.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT agent_uri")) {
+          return {
+            rows: [{
+              agent_uri: "https://example.com/agent.json",
+              updated_at: verifiedAt,
+              created_at: "2026-03-05T00:00:00.000Z",
+            }],
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      metadataQueue.add("asset1", "https://example.com/agent.json");
+      await runCapturedTasks();
+
+      const insertCalls = mockPool.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO metadata")
+      );
+      expect(insertCalls.length).toBeGreaterThan(0);
+      for (const call of insertCalls) {
+        expect(call[0]).toContain("verified_at");
+        expect(call[0]).not.toContain("created_at = EXCLUDED.created_at");
+        expect(call[1]?.[5]).toBe(verifiedAt);
+      }
+    });
+
     it("should fetch URI and store metadata", async () => {
       mockPool.query.mockImplementation((sql: string) => {
         if (typeof sql === "string" && sql.includes("SELECT agent_uri")) {
@@ -280,6 +318,49 @@ describe("MetadataQueue", () => {
 
       const stats = metadataQueue.getStats();
       expect(stats.skippedStale).toBeGreaterThanOrEqual(1);
+    });
+
+    it("should discard stale results when URI changes during fetch", async () => {
+      let freshnessChecks = 0;
+      mockPool.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT agent_uri")) {
+          freshnessChecks++;
+          if (freshnessChecks === 1) {
+            return {
+              rows: [{
+                agent_uri: "https://example.com/agent.json",
+                updated_at: "2026-03-06T12:00:00.000Z",
+                created_at: "2026-03-06T11:00:00.000Z",
+              }],
+              rowCount: 1,
+            };
+          }
+          return {
+            rows: [{
+              agent_uri: "https://example.com/changed.json",
+              updated_at: "2026-03-06T12:01:00.000Z",
+              created_at: "2026-03-06T11:00:00.000Z",
+            }],
+            rowCount: 1,
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      metadataQueue.add("asset1", "https://example.com/agent.json");
+      await runCapturedTasks();
+
+      const metadataWrites = mockPool.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO metadata")
+      );
+      const metadataPurges = mockPool.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("DELETE FROM metadata")
+      );
+
+      expect(digestUri).toHaveBeenCalledWith("https://example.com/agent.json");
+      expect(metadataWrites).toHaveLength(0);
+      expect(metadataPurges).toHaveLength(0);
+      expect(metadataQueue.getStats().skippedStale).toBeGreaterThanOrEqual(1);
     });
 
     it("should handle digest failure", async () => {
@@ -382,6 +463,44 @@ describe("MetadataQueue", () => {
       expect(deleteCalls.length).toBeGreaterThanOrEqual(1);
     });
 
+    it("should preserve _uri:_source and keep the frozen enqueue timestamp", async () => {
+      const deterministicTs = "2026-03-06T01:02:03.000Z";
+      mockPool.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT agent_uri")) {
+          return {
+            rows: [{
+              agent_uri: "https://example.com/agent.json",
+              updated_at: "2026-03-06T01:10:03.000Z",
+              created_at: "2026-03-05T00:00:00.000Z",
+            }],
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      metadataQueue.add("asset1", "https://example.com/agent.json", deterministicTs);
+      await runCapturedTasks();
+
+      const purgeCall = mockPool.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" &&
+          call[0].includes("DELETE FROM metadata") &&
+          call[0].includes("key != '_uri:_source'")
+      );
+      expect(purgeCall).toBeDefined();
+
+      const insertCalls = mockPool.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO metadata")
+      );
+      const sourceInsert = insertCalls.find((call: any[]) => call[1]?.[2] === "_uri:_source");
+      const statusInsert = insertCalls.find((call: any[]) => call[1]?.[2] === "_uri:_status");
+      expect(sourceInsert?.[0]).toContain("created_at");
+      expect(sourceInsert?.[0]).toContain("status, verified_at");
+      expect(sourceInsert?.[0]).not.toContain("created_at = EXCLUDED.created_at");
+      expect(sourceInsert?.[1]?.[5]).toBe(deterministicTs);
+      expect(statusInsert?.[1]?.[5]).toBe(deterministicTs);
+    });
+
     it("should store truncatedKeys in status", async () => {
       (digestUri as any).mockResolvedValueOnce({
         status: "ok",
@@ -432,7 +551,13 @@ describe("MetadataQueue", () => {
     it("should store standard fields without compression", async () => {
       mockPool.query.mockImplementation((sql: string) => {
         if (typeof sql === "string" && sql.includes("SELECT agent_uri")) {
-          return { rows: [{ agent_uri: "https://example.com/agent.json" }] };
+          return {
+            rows: [{
+              agent_uri: "https://example.com/agent.json",
+              updated_at: "2026-03-06T12:00:00.000Z",
+              created_at: "2026-03-06T11:00:00.000Z",
+            }],
+          };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -444,6 +569,13 @@ describe("MetadataQueue", () => {
         (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO metadata")
       );
       expect(insertCalls.length).toBeGreaterThanOrEqual(1);
+
+      const sourceInsert = insertCalls.find((call: any[]) => call[1]?.[2] === "_uri:_source");
+      expect(sourceInsert).toBeDefined();
+      expect(sourceInsert[0]).toContain("status, verified_at");
+      expect(sourceInsert[1][5]).toBe("2026-03-06T12:00:00.000Z");
+      expect(Buffer.isBuffer(sourceInsert[1][4])).toBe(true);
+      expect((sourceInsert[1][4] as Buffer).subarray(1).toString()).toBe("https://example.com/agent.json");
     });
 
     it("should compress non-standard fields", async () => {

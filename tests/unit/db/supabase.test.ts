@@ -189,8 +189,8 @@ function resetPoolMocks() {
 }
 
 function mockQueueToRunDigestWorker() {
-  mockMetadataQueue.add.mockImplementation((assetId: string, uri: string) => {
-    void digestAndStoreUriMetadata(assetId, uri).catch(() => {
+  mockMetadataQueue.add.mockImplementation((assetId: string, uri: string, verifiedAt?: string) => {
+    void digestAndStoreUriMetadata(assetId, uri, verifiedAt ?? TEST_BLOCK_TIME.toISOString()).catch(() => {
       // Queue worker failures are intentionally swallowed.
     });
   });
@@ -282,6 +282,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO agents")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain("created_at, updated_at");
+        expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
         expect(insertCall![1]).toContain(TEST_ASSET.toBase58());
         expect(insertCall![1]).toContain("ipfs://QmTest");
       });
@@ -671,6 +673,142 @@ describe("supabase.ts", () => {
         expect(atomUpdateCall).toBeDefined();
       });
 
+      it("should replay staged orphan responses when feedback arrives", async () => {
+        const feedbackHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query.mockImplementation((sql: string) => {
+          if (sql.includes("SELECT 1 FROM agents")) {
+            return Promise.resolve({ rows: [{ ok: 1 }], rowCount: 1 });
+          }
+          if (sql.includes("INSERT INTO feedbacks")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("UPDATE agents SET")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM orphan_responses")) {
+            return Promise.resolve({
+              rows: [
+                {
+                  id: "orphan-response-1",
+                  asset: TEST_ASSET.toBase58(),
+                  client_address: TEST_CLIENT.toBase58(),
+                  feedback_index: "0",
+                  responder: TEST_RESPONDER.toBase58(),
+                  response_uri: "ipfs://QmReplay",
+                  response_hash: feedbackHash,
+                  seal_hash: feedbackHash,
+                  running_digest: Buffer.from(TEST_HASH),
+                  response_count: "3",
+                  block_slot: "123456",
+                  tx_index: 4,
+                  event_ordinal: 1,
+                  tx_signature: "replayed-sig",
+                  created_at: ctx.blockTime.toISOString(),
+                },
+              ],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedback_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("DELETE FROM orphan_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM revocations")) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        await handleEvent(
+          {
+            type: "NewFeedback",
+            data: makeFeedbackData(),
+          },
+          ctx
+        );
+
+        const replayInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        );
+        const cleanupCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("DELETE FROM orphan_responses")
+        );
+        expect(replayInsert).toBeDefined();
+        expect(replayInsert![1][1]).toBeNull();
+        expect(replayInsert![1][5]).toBe(TEST_RESPONDER.toBase58());
+        expect(replayInsert![1][10]).toBe("123456");
+        expect(replayInsert![1][11]).toBe(4);
+        expect(replayInsert![1][12]).toBe(1);
+        expect(replayInsert![1][15]).toBe("PENDING");
+        expect(cleanupCall).toBeDefined();
+      });
+
+      it("should keep replayed orphan response ORPHANED when staged seal_hash mismatches", async () => {
+        const feedbackHash = Buffer.from(TEST_HASH).toString("hex");
+        mockPoolInstance.query.mockImplementation((sql: string) => {
+          if (sql.includes("SELECT 1 FROM agents")) {
+            return Promise.resolve({ rows: [{ ok: 1 }], rowCount: 1 });
+          }
+          if (sql.includes("INSERT INTO feedbacks")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("UPDATE agents SET")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM orphan_responses")) {
+            return Promise.resolve({
+              rows: [
+                {
+                  id: "orphan-response-2",
+                  asset: TEST_ASSET.toBase58(),
+                  client_address: TEST_CLIENT.toBase58(),
+                  feedback_index: "0",
+                  responder: TEST_RESPONDER.toBase58(),
+                  response_uri: "ipfs://QmMismatch",
+                  response_hash: feedbackHash,
+                  seal_hash: "ff".repeat(32),
+                  running_digest: Buffer.from(TEST_HASH),
+                  response_count: "4",
+                  block_slot: "123456",
+                  tx_index: 5,
+                  event_ordinal: 2,
+                  tx_signature: "replayed-mismatch-sig",
+                  created_at: ctx.blockTime.toISOString(),
+                },
+              ],
+              rowCount: 1,
+            });
+          }
+          if (sql.includes("INSERT INTO feedback_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("DELETE FROM orphan_responses")) {
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM revocations")) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        await handleEvent(
+          {
+            type: "NewFeedback",
+            data: makeFeedbackData(),
+          },
+          ctx
+        );
+
+        const replayInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+        );
+        expect(replayInsert).toBeDefined();
+        expect(replayInsert![1][1]).toBeNull();
+        expect(replayInsert![1][15]).toBe("ORPHANED");
+      });
+
       it("should insert feedback with atomEnabled=false (no ATOM update)", async () => {
         mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 1 });
         const event = {
@@ -857,6 +995,35 @@ describe("supabase.ts", () => {
         }
       });
 
+      it("should skip revoke side-effects when revocation upsert loses the ordering conflict", async () => {
+        mockPoolInstance.query.mockImplementation((queryText: any) => {
+          if (typeof queryText === "string" && queryText.includes("SELECT id, feedback_hash FROM feedbacks")) {
+            return Promise.resolve({ rows: [{ id: "fb1", feedback_hash: "ab".repeat(32) }], rowCount: 1 });
+          }
+          if (typeof queryText === "string" && queryText.includes("INSERT INTO revocations")) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+
+        const event = {
+          type: "FeedbackRevoked" as const,
+          data: makeRevokeData(),
+        };
+        await handleEvent(event, ctx);
+
+        const feedbackSideEffects = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("UPDATE feedbacks SET")
+        );
+        const agentSideEffects = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string"
+            && c[0].includes("UPDATE agents SET")
+            && c[0].includes("feedback_count = COALESCE")
+        );
+        expect(feedbackSideEffects).toHaveLength(0);
+        expect(agentSideEffects).toHaveLength(0);
+      });
+
       it("should warn on seal_hash mismatch", async () => {
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: "ff".repeat(32) }], rowCount: 1 }) // mismatched hash
@@ -960,10 +1127,10 @@ describe("supabase.ts", () => {
         };
         await handleEvent(event, ctx);
         const insertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+          typeof c[0] === "string" && c[0].includes("INSERT INTO orphan_responses")
         );
         expect(insertCall).toBeDefined();
-        expect(insertCall![1]).toContain("ORPHANED");
+        expect(insertCall![1]).toContain(Buffer.from(TEST_HASH).toString("hex"));
       });
 
       it("should treat nullable rowCount with existing rows as non-orphan response", async () => {
@@ -1287,6 +1454,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO agents")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain("created_at, updated_at");
+        expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
       });
 
       it("AgentRegistered with metadataIndexMode on queues metadata", async () => {
@@ -1305,7 +1474,8 @@ describe("supabase.ts", () => {
           await handleEventAtomic(event, ctx);
           expect(mockMetadataQueue.add).toHaveBeenCalledWith(
             TEST_ASSET.toBase58(),
-            "ipfs://QmTest"
+            "ipfs://QmTest",
+            ctx.blockTime.toISOString()
           );
         } finally {
           (config as any).metadataIndexMode = "off";
@@ -1391,7 +1561,8 @@ describe("supabase.ts", () => {
           await handleEventAtomic(event, ctx);
           expect(mockMetadataQueue.add).toHaveBeenCalledWith(
             TEST_ASSET.toBase58(),
-            "ipfs://updated"
+            "ipfs://updated",
+            ctx.blockTime.toISOString()
           );
         } finally {
           (config as any).metadataIndexMode = "off";
@@ -1781,10 +1952,10 @@ describe("supabase.ts", () => {
         };
         await handleEventAtomic(event, ctx);
         const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
+          typeof c[0] === "string" && c[0].includes("INSERT INTO orphan_responses")
         );
         expect(insertCall).toBeDefined();
-        expect(insertCall![1]).toContain("ORPHANED");
+        expect(insertCall![1]).toContain(Buffer.from(TEST_HASH).toString("hex"));
       });
 
       it("ResponseAppended - treats null rowCount with rows as non-orphan", async () => {
@@ -2438,6 +2609,57 @@ describe("supabase.ts", () => {
       }
     });
 
+    it("should store URI metadata with frozen event verified_at on the queue path", async () => {
+      const agentUpdatedAt = "2026-03-06T10:11:12.000Z";
+      (config as any).metadataIndexMode = "normal";
+      try {
+        mockPoolInstance.query.mockImplementation((text: string) => {
+          if (typeof text === "string" && text.includes("SELECT agent_uri")) {
+            return Promise.resolve({
+              rows: [{
+                agent_uri: "ipfs://QmDeterministic",
+                updated_at: agentUpdatedAt,
+                created_at: "2026-03-05T00:00:00.000Z",
+              }],
+              rowCount: 1,
+            });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+        mockDigestUri.mockResolvedValue({
+          status: "ok",
+          fields: { "_uri:name": "Deterministic" },
+          bytes: 100,
+          hash: "abc",
+        });
+        mockSerializeValue.mockReturnValue({ value: "Deterministic", oversize: false, bytes: 13 });
+
+        const event = {
+          type: "AgentRegistered" as const,
+          data: {
+            asset: TEST_ASSET,
+            collection: new PublicKey(new Uint8Array(32).fill(79)),
+            owner: TEST_OWNER,
+            atomEnabled: false,
+            agentUri: "ipfs://QmDeterministic",
+          },
+        };
+        await handleEvent(event, ctx);
+        await new Promise((r) => setTimeout(r, 100));
+
+        const insertCalls = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
+        );
+        expect(insertCalls.length).toBeGreaterThan(0);
+        for (const call of insertCalls) {
+          expect(call[0]).toContain("verified_at");
+          expect(call[1]?.[5]).toBe(ctx.blockTime.toISOString());
+        }
+      } finally {
+        (config as any).metadataIndexMode = "off";
+      }
+    });
+
     it("should handle agent not found (race condition check)", async () => {
       (config as any).metadataIndexMode = "normal";
       try {
@@ -2490,6 +2712,70 @@ describe("supabase.ts", () => {
         await handleEvent(event, ctx);
         await new Promise((r) => setTimeout(r, 100));
         expect(mockDigestUri).not.toHaveBeenCalled();
+      } finally {
+        (config as any).metadataIndexMode = "off";
+      }
+    });
+
+    it("should discard stale results when URI changes during fetch", async () => {
+      (config as any).metadataIndexMode = "normal";
+      try {
+        let freshnessChecks = 0;
+        mockPoolInstance.query.mockImplementation((text: string) => {
+          if (typeof text === "string" && text.includes("SELECT agent_uri")) {
+            freshnessChecks++;
+            if (freshnessChecks === 1) {
+              return Promise.resolve({
+                rows: [{
+                  agent_uri: "ipfs://QmOriginal",
+                  updated_at: "2026-03-06T12:00:00.000Z",
+                  created_at: "2026-03-06T11:00:00.000Z",
+                }],
+                rowCount: 1,
+              });
+            }
+            return Promise.resolve({
+              rows: [{
+                agent_uri: "ipfs://QmChanged",
+                updated_at: "2026-03-06T12:01:00.000Z",
+                created_at: "2026-03-06T11:00:00.000Z",
+              }],
+              rowCount: 1,
+            });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+        mockDigestUri.mockResolvedValue({
+          status: "ok",
+          fields: { "_uri:name": "Changed" },
+          bytes: 50,
+          hash: "changed",
+        });
+        mockSerializeValue.mockReturnValue({ value: "Changed", oversize: false, bytes: 7 });
+
+        const event = {
+          type: "AgentRegistered" as const,
+          data: {
+            asset: TEST_ASSET,
+            collection: TEST_COLLECTION,
+            owner: TEST_OWNER,
+            atomEnabled: false,
+            agentUri: "ipfs://QmOriginal",
+          },
+        };
+        await handleEvent(event, ctx);
+        await new Promise((r) => setTimeout(r, 100));
+
+        const metadataWrites = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
+        );
+        const metadataPurges = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("DELETE FROM metadata")
+        );
+
+        expect(mockDigestUri).toHaveBeenCalledWith("ipfs://QmOriginal");
+        expect(metadataWrites).toHaveLength(0);
+        expect(metadataPurges).toHaveLength(0);
       } finally {
         (config as any).metadataIndexMode = "off";
       }
@@ -2755,12 +3041,72 @@ describe("supabase.ts", () => {
       }
     });
 
+    it("should preserve _uri:_source and reuse deterministic agent timestamps", async () => {
+      (config as any).metadataIndexMode = "normal";
+      try {
+        const deterministicTs = "2026-03-06T01:02:03.000Z";
+        let freshnessChecks = 0;
+        mockPoolInstance.query.mockImplementation((text: string) => {
+          if (typeof text === "string" && text.includes("SELECT agent_uri")) {
+            freshnessChecks += 1;
+            return Promise.resolve({
+              rows: [{
+                agent_uri: "ipfs://QmDeterministic",
+                updated_at: freshnessChecks === 1
+                  ? "2026-03-06T01:10:03.000Z"
+                  : "2026-03-06T01:20:03.000Z",
+                created_at: "2026-03-05T00:00:00.000Z",
+              }],
+              rowCount: 1,
+            });
+          }
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        });
+        mockDigestUri.mockResolvedValue({
+          status: "ok",
+          fields: { "_uri:name": "Deterministic" },
+          bytes: 10,
+          hash: "det",
+        });
+        mockSerializeValue.mockReturnValue({ value: "Deterministic", oversize: false, bytes: 13 });
+
+        await digestAndStoreUriMetadata(
+          TEST_ASSET.toBase58(),
+          "ipfs://QmDeterministic",
+          deterministicTs
+        );
+
+        const purgeCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" &&
+          c[0].includes("DELETE FROM metadata") &&
+          c[0].includes("key != '_uri:_source'")
+        );
+        expect(purgeCall).toBeDefined();
+
+        const insertCalls = mockPoolInstance.query.mock.calls.filter((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
+        );
+        const sourceInsert = insertCalls.find((c: any[]) => c[1]?.[2] === "_uri:_source");
+        const statusInsert = insertCalls.find((c: any[]) => c[1]?.[2] === "_uri:_status");
+        expect(sourceInsert?.[0]).toContain("created_at");
+        expect(sourceInsert?.[0]).toContain("status, verified_at");
+        expect(sourceInsert?.[0]).not.toContain("created_at = EXCLUDED.created_at");
+        expect(sourceInsert?.[1]?.[5]).toBe(deterministicTs);
+        expect(statusInsert?.[1]?.[5]).toBe(deterministicTs);
+      } finally {
+        (config as any).metadataIndexMode = "off";
+      }
+    });
+
     it("should handle purge failure gracefully and continue", async () => {
       (config as any).metadataIndexMode = "normal";
       try {
         let queryCount = 0;
         mockPoolInstance.query.mockImplementation((text: string) => {
           queryCount++;
+          if (typeof text === "string" && text.includes("FROM orphan_feedbacks")) {
+            return { rows: [], rowCount: 0 };
+          }
           if (typeof text === "string" && text.includes("DELETE FROM metadata") && text.includes("_uri:")) {
             throw new Error("purge fail");
           }
@@ -2808,7 +3154,14 @@ describe("supabase.ts", () => {
       try {
         mockPoolInstance.query.mockImplementation((text: string) => {
           if (typeof text === "string" && text.includes("SELECT agent_uri")) {
-            return Promise.resolve({ rows: [{ agent_uri: "ipfs://QmStandard" }], rowCount: 1 });
+            return Promise.resolve({
+              rows: [{
+                agent_uri: "ipfs://QmStandard",
+                updated_at: "2026-03-06T12:00:00.000Z",
+                created_at: "2026-03-06T11:00:00.000Z",
+              }],
+              rowCount: 1,
+            });
           }
           return Promise.resolve({ rows: [], rowCount: 1 });
         });
@@ -2840,6 +3193,17 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("uri_derived")
         );
         expect(uriInsert).toBeDefined();
+
+        const sourceInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" &&
+          c[0].includes("INSERT INTO metadata") &&
+          c[1]?.[2] === "_uri:_source"
+        );
+        expect(sourceInsert).toBeDefined();
+        expect(sourceInsert[0]).toContain("status, verified_at");
+        expect(sourceInsert[1][5]).toBe(ctx.blockTime.toISOString());
+        expect(Buffer.isBuffer(sourceInsert[1][4])).toBe(true);
+        expect((sourceInsert[1][4] as Buffer).subarray(1).toString()).toBe("ipfs://QmStandard");
       } finally {
         (config as any).metadataIndexMode = "off";
       }
@@ -2995,6 +3359,11 @@ describe("supabase.ts", () => {
         await handleEvent(event, ctx);
         await new Promise((r) => setTimeout(r, 100));
         expect(mockDigestUri).toHaveBeenCalledWith("ipfs://QmUpdated");
+        expect(mockMetadataQueue.add).toHaveBeenCalledWith(
+          TEST_ASSET.toBase58(),
+          "ipfs://QmUpdated",
+          ctx.blockTime.toISOString()
+        );
       } finally {
         (config as any).metadataIndexMode = "off";
       }
@@ -3326,7 +3695,7 @@ describe("supabase.ts", () => {
       const cursorCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("indexer_state")
       );
-      expect(cursorCall![1][2]).toBe("poller");
+      expect(cursorCall![1][3]).toBe("poller");
     });
 
     it("should pass 'websocket' source to cursor when source is websocket", async () => {
@@ -3338,7 +3707,7 @@ describe("supabase.ts", () => {
       const cursorCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("indexer_state")
       );
-      expect(cursorCall![1][2]).toBe("websocket");
+      expect(cursorCall![1][3]).toBe("websocket");
     });
 
     it("should default source to 'poller' when not specified", async () => {
@@ -3350,7 +3719,7 @@ describe("supabase.ts", () => {
       const cursorCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("indexer_state")
       );
-      expect(cursorCall![1][2]).toBe("poller");
+      expect(cursorCall![1][3]).toBe("poller");
     });
   });
 });

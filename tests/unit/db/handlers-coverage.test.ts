@@ -1137,11 +1137,61 @@ describe("DB Handlers Coverage", () => {
 
       // Should have purged old _uri: metadata
       expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-        where: { agentId: TEST_ASSET.toBase58(), key: { startsWith: "_uri:" }, immutable: false },
+        where: {
+          agentId: TEST_ASSET.toBase58(),
+          key: { startsWith: "_uri:" },
+          NOT: { key: "_uri:_source" },
+          immutable: false,
+        },
       });
 
       // Should have stored each field + status
       expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+    });
+
+    it("should keep the frozen event timestamp for URI metadata", async () => {
+      const updatedAt = new Date("2026-03-06T12:00:00.000Z");
+      const createdAt = new Date("2026-03-06T11:00:00.000Z");
+      (prisma.agent.findUnique as any)
+        .mockResolvedValueOnce({
+          uri: "https://example.com/deterministic.json",
+          updatedAt,
+          createdAt,
+        })
+        .mockResolvedValueOnce({
+          uri: "https://example.com/deterministic.json",
+          updatedAt,
+          createdAt,
+        });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      mockDigestUri.mockResolvedValue({
+        status: "ok",
+        bytes: 100,
+        hash: "stablehash",
+        fields: { "_uri:description": "Stable" },
+        truncatedKeys: false,
+      });
+
+      const event: ProgramEvent = {
+        type: "UriUpdated",
+        data: { asset: TEST_ASSET, newUri: "https://example.com/deterministic.json", updatedBy: TEST_OWNER },
+      };
+
+      await handleEvent(prisma, event, ctx);
+      await vi.waitFor(() => {
+        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+      }, { timeout: 500 });
+
+      const upsertCalls = (prisma.agentMetadata.upsert as any).mock.calls;
+      const statusCall = upsertCalls.find(
+        (c: any) => c[0]?.where?.agentId_key?.key === "_uri:_status"
+      );
+      expect(statusCall).toBeDefined();
+      expect(statusCall[0].create.status).toBe("FINALIZED");
+      expect(statusCall[0].create.verifiedAt).toEqual(ctx.blockTime);
+      expect(statusCall[0].update.status).toBe("FINALIZED");
+      expect(statusCall[0].update.verifiedAt).toEqual(ctx.blockTime);
+      expect(prisma.agent.update).not.toHaveBeenCalled();
     });
 
     it("should store oversize fields with _meta suffix", async () => {

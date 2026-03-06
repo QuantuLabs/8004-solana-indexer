@@ -58,13 +58,19 @@ function createMockConnection() {
 }
 
 function createMockPool() {
+  const defaultQuery = vi.fn().mockImplementation((sql: string) => {
+    if (typeof sql === "string" && sql.includes("SELECT 1 FROM agents WHERE asset")) {
+      return Promise.resolve({ rows: [{ exists: 1 }], rowCount: 1 });
+    }
+    return Promise.resolve({ rows: [], rowCount: 0 });
+  });
   const mockClient = {
-    query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    query: defaultQuery,
     release: vi.fn(),
   };
   return {
     connect: vi.fn().mockResolvedValue(mockClient),
-    query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+    query: defaultQuery,
     _client: mockClient,
   } as any;
 }
@@ -323,6 +329,12 @@ describe("EventBuffer", () => {
       // BEGIN, INSERT agents, cursor update, COMMIT
       expect(client.query).toHaveBeenCalledWith("BEGIN");
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const insertCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("INSERT INTO agents")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall![0]).toContain("created_at, updated_at, status");
+      expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
     });
 
     it("should queue URI metadata on AgentRegistered with URI", async () => {
@@ -339,7 +351,10 @@ describe("EventBuffer", () => {
 
       expect(metadataQueue.addBatch).toHaveBeenCalledWith(
         expect.arrayContaining([
-          expect.objectContaining({ uri: "https://example.com/agent.json" }),
+          expect.objectContaining({
+            uri: "https://example.com/agent.json",
+            verifiedAt: expect.any(String),
+          }),
         ])
       );
     });
@@ -571,6 +586,43 @@ describe("EventBuffer", () => {
       expect(revocationInsertCalls).toHaveLength(2);
       expect(revocationInsertCalls[0][1][16]).toBe("PENDING");
       expect(revocationInsertCalls[1][1][16]).toBe("ORPHANED");
+    });
+
+    it("should skip revoke side-effects when revocation upsert loses the ordering conflict", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          return { rows: [{ id: "fb1", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO revocations")) {
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("FeedbackRevoked", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          newRevokeCount: 1,
+        })
+      );
+      await buffer.flush();
+
+      const feedbackSideEffects = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("UPDATE feedbacks SET is_revoked")
+      );
+      const agentSideEffects = client.query.mock.calls.filter(
+        (call: any[]) =>
+          typeof call[0] === "string"
+          && call[0].includes("UPDATE agents SET")
+          && call[0].includes("feedback_count = COALESCE")
+      );
+      expect(feedbackSideEffects).toHaveLength(0);
+      expect(agentSideEffects).toHaveLength(0);
     });
 
     it("should warn on seal_hash mismatch during revocation", async () => {
@@ -1156,7 +1208,11 @@ describe("EventBuffer", () => {
       const responseInsertCalls = client.query.mock.calls.filter(
         (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
       );
-      expect(responseInsertCalls).toHaveLength(6);
+      const orphanInsertCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO orphan_responses")
+      );
+      expect(responseInsertCalls).toHaveLength(5);
+      expect(orphanInsertCalls).toHaveLength(1);
 
       expect(responseInsertCalls[0][1][1]).toBeNull();
       expect(responseInsertCalls[0][1][15]).toBe("PENDING");
@@ -1164,17 +1220,123 @@ describe("EventBuffer", () => {
       expect(responseInsertCalls[1][1][15]).toBe("PENDING");
       expect(responseInsertCalls[2][1][1]).toBeNull();
       expect(responseInsertCalls[2][1][15]).toBe("PENDING");
-
       expect(responseInsertCalls[3][1][1]).toBeNull();
       expect(responseInsertCalls[3][1][15]).toBe("ORPHANED");
-      expect(responseInsertCalls[3][0]).toContain("ON CONFLICT (id) DO NOTHING");
-
       expect(responseInsertCalls[4][1][1]).toBeNull();
-      expect(responseInsertCalls[4][1][15]).toBe("ORPHANED");
-      expect(responseInsertCalls[4][0]).not.toContain("response_id = CASE");
+      expect(responseInsertCalls[4][1][15]).toBe("PENDING");
 
-      expect(responseInsertCalls[5][1][1]).toBeNull();
-      expect(responseInsertCalls[5][1][15]).toBe("PENDING");
+      expect(orphanInsertCalls[0][1]).toContain("ab".repeat(32));
+      expect(orphanInsertCalls[0][0]).toContain("ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE");
+    });
+
+    it("replays staged orphan responses when feedback arrives later in the same flush", async () => {
+      const client = mockPool._client;
+
+      client.query.mockImplementation((sql: string, params?: any[]) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1")) {
+          const feedbackIndex = params?.[2] as string;
+          if (feedbackIndex === "0") {
+            return { rows: [], rowCount: 0 };
+          }
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedbacks")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("UPDATE agents SET")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("FROM orphan_responses")) {
+          return {
+            rows: [
+              {
+                id: "asset1:client1:0:responder1:sig-orphan",
+                asset: "asset1",
+                client_address: "client1",
+                feedback_index: "0",
+                responder: "responder1",
+                response_uri: "ipfs://resp",
+                response_hash: "ab".repeat(32),
+                seal_hash: "ab".repeat(32),
+                running_digest: Buffer.from(new Uint8Array(32).fill(0xab)),
+                response_count: "1",
+                block_slot: "100",
+                tx_index: 2,
+                event_ordinal: 0,
+                tx_signature: "sig-orphan",
+                created_at: new Date("2026-03-06T00:00:00.000Z").toISOString(),
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO feedback_responses (id, response_id")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("DELETE FROM orphan_responses")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (typeof sql === "string" && sql.includes("FROM revocations")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO orphan_responses")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder1",
+          feedbackIndex: 0n,
+          sealHash: new Uint8Array(32).fill(0xab),
+          responseHash: new Uint8Array(32).fill(0xab),
+          responseUri: "ipfs://resp",
+          newResponseDigest: new Uint8Array(32).fill(0xab),
+          newResponseCount: 1n,
+        }, { signature: "sig-orphan", txIndex: 2, eventOrdinal: 0, slot: 100n, blockTime: new Date("2026-03-06T00:00:00.000Z") })
+      );
+      await buffer.addEvent(
+        makeEvent("NewFeedback", {
+          asset: "asset1",
+          clientAddress: "client1",
+          feedbackIndex: 0n,
+          value: 1000n,
+          valueDecimals: 2,
+          score: 80,
+          sealHash: new Uint8Array(32).fill(0xab),
+          atomEnabled: false,
+          newFeedbackDigest: new Uint8Array(32).fill(0xab),
+          newFeedbackCount: 1n,
+          tag1: "quality",
+          tag2: "speed",
+          endpoint: "/chat",
+          feedbackUri: "ipfs://feedback",
+          isUniqueClient: true,
+        }, { signature: "sig-feedback", txIndex: 3, eventOrdinal: 0, slot: 100n, blockTime: new Date("2026-03-06T00:00:01.000Z") })
+      );
+      await buffer.flush();
+
+      const orphanInsertIndex = client.query.mock.calls.findIndex(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO orphan_responses")
+      );
+      const responseInsertIndex = client.query.mock.calls.findIndex(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      );
+      const orphanDeleteIndex = client.query.mock.calls.findIndex(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("DELETE FROM orphan_responses")
+      );
+
+      expect(orphanInsertIndex).toBeGreaterThan(-1);
+      expect(responseInsertIndex).toBeGreaterThan(orphanInsertIndex);
+      expect(orphanDeleteIndex).toBeGreaterThan(responseInsertIndex);
+      expect(client.query.mock.calls[responseInsertIndex][1][15]).toBe("PENDING");
     });
   });
 
@@ -1552,6 +1714,9 @@ describe("EventBuffer", () => {
       const client = mockPool._client;
       let insertCall = 0;
       client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT 1 FROM agents WHERE asset")) {
+          return { rows: [{ exists: 1 }], rowCount: 1 };
+        }
         if (typeof sql === 'string' && sql.includes("INSERT INTO feedbacks")) {
           return { rows: [], rowCount: 1 }; // successful insert
         }
@@ -1586,6 +1751,9 @@ describe("EventBuffer", () => {
     it("should update agent stats without ATOM when atomEnabled is false", async () => {
       const client = mockPool._client;
       client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT 1 FROM agents WHERE asset")) {
+          return { rows: [{ exists: 1 }], rowCount: 1 };
+        }
         if (typeof sql === 'string' && sql.includes("INSERT INTO feedbacks")) {
           return { rows: [], rowCount: 1 }; // successful insert
         }

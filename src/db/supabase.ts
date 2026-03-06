@@ -28,6 +28,7 @@ import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import { DEFAULT_PUBKEY } from "../constants.js";
 import { classifyRevocationStatus } from "./revocation-classification.js";
+import { REVOCATION_CONFLICT_UPDATE_WHERE_SQL } from "./revocation-upsert-order.js";
 import type { PoolClient } from "pg";
 
 const logger = createChildLogger("supabase-handlers");
@@ -103,6 +104,364 @@ function hashesMatchHex(stored: string | null, event: string | null): boolean {
   return stored === event;
 }
 
+async function hasAgentRow(db: SqlQueryClient, assetId: string): Promise<boolean> {
+  const result = await db.query(`SELECT 1 FROM agents WHERE asset = $1 LIMIT 1`, [assetId]);
+  return (result.rowCount ?? result.rows.length) > 0;
+}
+
+async function upsertOrphanFeedbackRow(
+  db: SqlQueryClient,
+  data: NewFeedback,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const clientAddress = data.clientAddress.toBase58();
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
+  const feedbackHash = data.sealHash
+    ? Buffer.from(data.sealHash).toString("hex")
+    : null;
+  const runningDigest = data.newFeedbackDigest
+    ? Buffer.from(data.newFeedbackDigest)
+    : null;
+
+  await db.query(
+    `INSERT INTO orphan_feedbacks (
+       id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint,
+       feedback_uri, feedback_hash, running_digest, atom_enabled, new_trust_tier, new_quality_score,
+       new_confidence, new_risk_score, new_diversity_ratio, block_slot, tx_index, event_ordinal,
+       tx_signature, created_at
+     )
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+       $11, $12, $13, $14, $15, $16,
+       $17, $18, $19, $20, $21, $22,
+       $23, $24
+     )
+     ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
+       value = EXCLUDED.value,
+       value_decimals = EXCLUDED.value_decimals,
+       score = EXCLUDED.score,
+       tag1 = EXCLUDED.tag1,
+       tag2 = EXCLUDED.tag2,
+       endpoint = EXCLUDED.endpoint,
+       feedback_uri = EXCLUDED.feedback_uri,
+       feedback_hash = EXCLUDED.feedback_hash,
+       running_digest = EXCLUDED.running_digest,
+       atom_enabled = EXCLUDED.atom_enabled,
+       new_trust_tier = EXCLUDED.new_trust_tier,
+       new_quality_score = EXCLUDED.new_quality_score,
+       new_confidence = EXCLUDED.new_confidence,
+       new_risk_score = EXCLUDED.new_risk_score,
+       new_diversity_ratio = EXCLUDED.new_diversity_ratio,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature,
+       created_at = EXCLUDED.created_at`,
+    [
+      id,
+      assetId,
+      clientAddress,
+      data.feedbackIndex.toString(),
+      data.value.toString(),
+      data.valueDecimals,
+      data.score,
+      data.tag1 || null,
+      data.tag2 || null,
+      data.endpoint || null,
+      data.feedbackUri ?? null,
+      feedbackHash,
+      runningDigest,
+      data.atomEnabled,
+      data.newTrustTier,
+      data.newQualityScore,
+      data.newConfidence,
+      data.newRiskScore,
+      data.newDiversityRatio,
+      ctx.slot.toString(),
+      ctx.txIndex ?? null,
+      ctx.eventOrdinal ?? null,
+      ctx.signature,
+      ctx.blockTime.toISOString(),
+    ]
+  );
+}
+
+async function upsertOrphanResponseRow(
+  db: SqlQueryClient,
+  data: ResponseAppended,
+  ctx: EventContext
+): Promise<void> {
+  const assetId = data.asset.toBase58();
+  const clientAddress = data.client.toBase58();
+  const responder = data.responder.toBase58();
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}`;
+  const responseHash = data.responseHash
+    ? Buffer.from(data.responseHash).toString("hex")
+    : null;
+  const sealHash = data.sealHash
+    ? Buffer.from(data.sealHash).toString("hex")
+    : null;
+  const runningDigest = data.newResponseDigest
+    ? Buffer.from(data.newResponseDigest)
+    : null;
+
+  await db.query(
+    `INSERT INTO orphan_responses (
+       id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash,
+       running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at
+     )
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8,
+       $9, $10, $11, $12, $13, $14, $15
+     )
+     ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE SET
+       response_uri = EXCLUDED.response_uri,
+       response_hash = EXCLUDED.response_hash,
+       seal_hash = EXCLUDED.seal_hash,
+       running_digest = EXCLUDED.running_digest,
+       response_count = EXCLUDED.response_count,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       created_at = EXCLUDED.created_at`,
+    [
+      id,
+      assetId,
+      clientAddress,
+      data.feedbackIndex.toString(),
+      responder,
+      data.responseUri || null,
+      responseHash,
+      sealHash,
+      runningDigest,
+      data.newResponseCount.toString(),
+      ctx.slot.toString(),
+      ctx.txIndex ?? null,
+      ctx.eventOrdinal ?? null,
+      ctx.signature,
+      ctx.blockTime.toISOString(),
+    ]
+  );
+}
+
+async function replayOrphanResponsesForFeedback(
+  db: SqlQueryClient,
+  assetId: string,
+  clientAddress: string,
+  feedbackIndex: bigint,
+  feedbackHash: string | null
+): Promise<void> {
+  const pending = await db.query(
+    `SELECT id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash,
+            running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at
+     FROM orphan_responses
+     WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
+     ORDER BY COALESCE(block_slot, 0) ASC,
+              COALESCE(tx_index, 2147483647) ASC,
+              COALESCE(event_ordinal, 2147483647) ASC,
+              COALESCE(tx_signature, '') ASC,
+              id ASC`,
+    [assetId, clientAddress, feedbackIndex.toString()]
+  );
+
+  if ((pending.rowCount ?? pending.rows.length) === 0) {
+    return;
+  }
+
+  for (const row of pending.rows) {
+    const responseStatus = hashesMatchHex(row.seal_hash ?? null, feedbackHash)
+      ? DEFAULT_STATUS
+      : "ORPHANED";
+    await db.query(
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       ON CONFLICT (id) DO UPDATE SET
+         response_uri = EXCLUDED.response_uri,
+         response_hash = EXCLUDED.response_hash,
+         running_digest = EXCLUDED.running_digest,
+         response_count = EXCLUDED.response_count,
+         block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature,
+         created_at = EXCLUDED.created_at,
+         status = EXCLUDED.status`,
+      [
+        row.id,
+        null,
+        row.asset,
+        row.client_address,
+        row.feedback_index?.toString?.() ?? row.feedback_index,
+        row.responder,
+        row.response_uri,
+        row.response_hash,
+        row.running_digest,
+        row.response_count?.toString?.() ?? row.response_count ?? "0",
+        row.block_slot?.toString?.() ?? row.block_slot,
+        row.tx_index ?? null,
+        row.event_ordinal ?? null,
+        row.tx_signature,
+        row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+        responseStatus,
+      ]
+    );
+    await db.query(`DELETE FROM orphan_responses WHERE id = $1`, [row.id]);
+  }
+
+  logger.info(
+    { assetId, clientAddress, feedbackIndex: feedbackIndex.toString(), count: pending.rows.length },
+    "Replayed orphan responses"
+  );
+}
+
+async function reconcileOrphanRevocationForFeedback(
+  db: SqlQueryClient,
+  assetId: string,
+  clientAddress: string,
+  feedbackIndex: bigint,
+  feedbackHash: string | null
+): Promise<void> {
+  const existing = await db.query(
+    `SELECT feedback_hash, status
+     FROM revocations
+     WHERE asset = $1 AND client_address = $2 AND feedback_index = $3
+     LIMIT 1`,
+    [assetId, clientAddress, feedbackIndex.toString()]
+  );
+  if ((existing.rowCount ?? existing.rows.length) === 0) {
+    return;
+  }
+
+  const row = existing.rows[0];
+  if (!row) {
+    return;
+  }
+  if (row.status !== "ORPHANED" || !hashesMatchHex(row.feedback_hash ?? null, feedbackHash)) {
+    return;
+  }
+
+  const result = await db.query(
+    `UPDATE revocations
+     SET status = $4
+     WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 AND status = 'ORPHANED'`,
+    [assetId, clientAddress, feedbackIndex.toString(), DEFAULT_STATUS]
+  );
+  if ((result.rowCount ?? 0) > 0) {
+    logger.info(
+      { assetId, clientAddress, feedbackIndex: feedbackIndex.toString() },
+      "Reconciled orphan revocation"
+    );
+  }
+}
+
+async function replayOrphanFeedbacksForAsset(
+  db: SqlQueryClient,
+  assetId: string
+): Promise<void> {
+  const pending = await db.query(
+    `SELECT id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2,
+            endpoint, feedback_uri, feedback_hash, running_digest, atom_enabled, new_trust_tier,
+            new_quality_score, new_confidence, new_risk_score, new_diversity_ratio, block_slot,
+            tx_index, event_ordinal, tx_signature, created_at
+     FROM orphan_feedbacks
+     WHERE asset = $1
+     ORDER BY COALESCE(block_slot, 0) ASC,
+              COALESCE(tx_index, 2147483647) ASC,
+              COALESCE(event_ordinal, 2147483647) ASC,
+              created_at ASC,
+              id ASC`,
+    [assetId]
+  );
+
+  if ((pending.rowCount ?? pending.rows.length) === 0) {
+    return;
+  }
+
+  for (const row of pending.rows) {
+    const insertResult = await db.query(
+      `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
+         running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        row.id,
+        null,
+        row.asset,
+        row.client_address,
+        row.feedback_index,
+        row.value?.toString() ?? "0",
+        row.value_decimals ?? 0,
+        row.score,
+        row.tag1,
+        row.tag2,
+        row.endpoint,
+        row.feedback_uri,
+        row.feedback_hash,
+        row.running_digest,
+        false,
+        row.block_slot,
+        row.tx_index,
+        row.event_ordinal,
+        row.tx_signature,
+        row.created_at,
+        DEFAULT_STATUS,
+      ]
+    );
+
+    if ((insertResult.rowCount ?? 0) > 0) {
+      const baseUpdate = `
+        feedback_count = COALESCE((
+          SELECT COUNT(*)::int
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        raw_avg_score = COALESCE((
+          SELECT ROUND(AVG(score))::smallint
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        updated_at = $1
+      `;
+      const updatedAt = row.created_at instanceof Date
+        ? row.created_at.toISOString()
+        : new Date(row.created_at).toISOString();
+      if (row.atom_enabled) {
+        await db.query(
+          `UPDATE agents SET
+             trust_tier = $3,
+             quality_score = $4,
+             confidence = $5,
+             risk_score = $6,
+             diversity_ratio = $7,
+             ${baseUpdate}
+           WHERE asset = $2`,
+          [
+            updatedAt,
+            row.asset,
+            row.new_trust_tier ?? 0,
+            row.new_quality_score ?? 0,
+            row.new_confidence ?? 0,
+            row.new_risk_score ?? 0,
+            row.new_diversity_ratio ?? 0,
+          ]
+        );
+      } else {
+        await db.query(
+          `UPDATE agents SET
+             ${baseUpdate}
+           WHERE asset = $2`,
+          [updatedAt, row.asset]
+        );
+      }
+    }
+
+    await db.query(`DELETE FROM orphan_feedbacks WHERE id = $1`, [row.id]);
+  }
+
+  logger.info({ assetId, count: pending.rows.length }, "Replayed orphan feedbacks");
+}
+
 function logStatsIfNeeded(): void {
   const now = Date.now();
   // Log stats every 60 seconds
@@ -113,6 +472,31 @@ function logStatsIfNeeded(): void {
     }, "Supabase handler stats (60s)");
     eventStats.lastLogTime = now;
   }
+}
+
+type SqlQueryClient = Pick<Pool, "query"> | Pick<PoolClient, "query">;
+
+async function recomputeCollectionPointerAssetCount(
+  db: SqlQueryClient,
+  col: string,
+  creator: string
+): Promise<void> {
+  if (!col || !creator) return;
+  await db.query(
+    `UPDATE collection_pointers cp
+     SET asset_count = sub.cnt
+     FROM (
+       SELECT $1::text AS col,
+              $2::text AS creator,
+              COUNT(*)::bigint AS cnt
+       FROM agents
+       WHERE canonical_col = $1
+         AND COALESCE(creator, owner) = $2
+     ) sub
+     WHERE cp.col = sub.col
+       AND cp.creator = sub.creator`,
+    [col, creator]
+  );
 }
 
 export function getPool(): Pool {
@@ -290,28 +674,37 @@ export async function handleEventAtomic(
  * Update indexer cursor with monotonic guard
  * Advances only when:
  * - new slot is greater than current slot, or
- * - same slot and new signature is lexicographically >= current signature
+ * - same slot and new tx_index/signature are >= current cursor order
  */
 async function updateCursorAtomic(
   client: PoolClient,
   ctx: EventContext & { source?: string }
 ): Promise<void> {
   await client.query(
-    `INSERT INTO indexer_state (id, last_signature, last_slot, source, updated_at)
-     VALUES ('main', $1, $2, $3, NOW())
+    `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+     VALUES ('main', $1, $2, $3, $4, NOW())
        ON CONFLICT (id) DO UPDATE SET
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
+         last_tx_index = EXCLUDED.last_tx_index,
          source = EXCLUDED.source,
          updated_at = NOW()
        WHERE indexer_state.last_slot IS NULL
           OR indexer_state.last_slot < EXCLUDED.last_slot
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
-            AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
-              <= EXCLUDED.last_signature COLLATE "C"
+            AND (
+              COALESCE(indexer_state.last_tx_index, 2147483647)
+                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
+              OR (
+                COALESCE(indexer_state.last_tx_index, 2147483647)
+                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
+                  <= EXCLUDED.last_signature COLLATE "C"
+              )
+            )
           )`,
-    [ctx.signature, ctx.slot.toString(), ctx.source || "poller"]
+    [ctx.signature, ctx.slot.toString(), ctx.txIndex ?? null, ctx.source || "poller"]
   );
 }
 
@@ -437,8 +830,8 @@ async function handleAgentRegisteredTx(
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection);
   await client.query(
-    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17)
      ON CONFLICT (asset) DO UPDATE SET
        owner = EXCLUDED.owner,
        creator = COALESCE(agents.creator, EXCLUDED.creator),
@@ -447,7 +840,7 @@ async function handleAgentRegisteredTx(
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
-       updated_at = EXCLUDED.created_at`,
+       updated_at = EXCLUDED.updated_at`,
     [
       assetId,
       data.owner.toBase58(),
@@ -468,11 +861,12 @@ async function handleAgentRegisteredTx(
       DEFAULT_STATUS,
     ]
   );
+  await replayOrphanFeedbacksForAsset(client, assetId);
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
   // Queue URI metadata extraction (fire-and-forget, runs after transaction commits)
   if (agentUri && config.metadataIndexMode !== "off") {
-    metadataQueue.add(assetId, agentUri);
+    metadataQueue.add(assetId, agentUri, ctx.blockTime.toISOString());
   }
 }
 
@@ -517,7 +911,7 @@ async function handleUriUpdatedTx(
 
   // Queue URI metadata extraction (fire-and-forget, runs after transaction commits)
   if (newUri && config.metadataIndexMode !== "off") {
-    metadataQueue.add(assetId, newUri);
+    metadataQueue.add(assetId, newUri, ctx.blockTime.toISOString());
   }
 }
 
@@ -560,6 +954,18 @@ async function handleCollectionPointerSetTx(
   const pointer = data.col;
   const setBy = data.setBy.toBase58();
   const lock = typeof data.lock === "boolean" ? data.lock : null;
+  const previousResult = await client.query(
+    `SELECT canonical_col AS prev_col, creator AS prev_creator
+     FROM agents
+     WHERE asset = $1
+     LIMIT 1`,
+    [assetId]
+  );
+  const previous = previousResult.rows[0] as
+    | { prev_col?: string | null; prev_creator?: string | null }
+    | undefined;
+  const prevCol = previous?.prev_col ?? "";
+  const prevCreator = previous?.prev_creator ?? setBy;
   await client.query(
     `WITH previous AS (
        SELECT canonical_col AS prev_col, creator AS prev_creator
@@ -611,6 +1017,25 @@ async function handleCollectionPointerSetTx(
        AND EXISTS (SELECT 1 FROM updated)`,
      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
    );
+
+  const currentResult = await client.query(
+    `SELECT canonical_col AS col, COALESCE(creator, owner) AS creator
+     FROM agents
+     WHERE asset = $1
+     LIMIT 1`,
+    [assetId]
+  );
+  const current = currentResult.rows[0] as { col?: string | null; creator?: string | null } | undefined;
+  const currentCol = current?.col ?? "";
+  const currentCreator = current?.creator ?? setBy;
+
+  if (currentCol) {
+    await recomputeCollectionPointerAssetCount(client, currentCol, currentCreator);
+  }
+  if (prevCol && (prevCol !== currentCol || prevCreator !== currentCreator)) {
+    await recomputeCollectionPointerAssetCount(client, prevCol, prevCreator);
+  }
+
   logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
   if (config.collectionMetadataIndexEnabled) {
@@ -714,6 +1139,14 @@ async function handleNewFeedbackTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
+  if (!(await hasAgentRow(client, assetId))) {
+    await upsertOrphanFeedbackRow(client, data, ctx);
+    logger.warn(
+      { assetId, clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+      "Agent missing for feedback; stored orphan feedback"
+    );
+    return;
+  }
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
   // SEAL v1: sealHash is computed on-chain, stored in feedback_hash column
   const feedbackHash = data.sealHash
@@ -738,49 +1171,51 @@ async function handleNewFeedbackTx(
   );
   if (insertResult.rowCount === 0) {
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
-    return;
-  }
-  const baseUpdate = `
-    feedback_count = COALESCE((
-      SELECT COUNT(*)::int
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    raw_avg_score = COALESCE((
-      SELECT ROUND(AVG(score))::smallint
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    updated_at = $1
-  `;
-  if (data.atomEnabled) {
-    await client.query(
-      `UPDATE agents SET
-         trust_tier = $3,
-         quality_score = $4,
-         confidence = $5,
-         risk_score = $6,
-         diversity_ratio = $7,
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [
-        ctx.blockTime.toISOString(),
-        assetId,
-        data.newTrustTier,
-        data.newQualityScore,
-        data.newConfidence,
-        data.newRiskScore,
-        data.newDiversityRatio,
-      ]
-    );
   } else {
-    await client.query(
-      `UPDATE agents SET
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId]
-    );
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
+    if (data.atomEnabled) {
+      await client.query(
+        `UPDATE agents SET
+           trust_tier = $3,
+           quality_score = $4,
+           confidence = $5,
+           risk_score = $6,
+           diversity_ratio = $7,
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [
+          ctx.blockTime.toISOString(),
+          assetId,
+          data.newTrustTier,
+          data.newQualityScore,
+          data.newConfidence,
+          data.newRiskScore,
+          data.newDiversityRatio,
+        ]
+      );
+    } else {
+      await client.query(
+        `UPDATE agents SET
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId]
+      );
+    }
   }
+  await replayOrphanResponsesForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
+  await reconcileOrphanRevocationForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
 }
 
@@ -821,15 +1256,6 @@ async function handleFeedbackRevokedTx(
 
   const revokeStatus = classifyRevocationStatus(hasFeedback);
   const isOrphan = revokeStatus === "ORPHANED";
-  if (!isOrphan) {
-    await client.query(
-      `UPDATE feedbacks SET
-         is_revoked = true,
-         revoked_at = $1
-       WHERE id = $2`,
-      [ctx.blockTime.toISOString(), id]
-    );
-  }
   const revokeDigest = data.newRevokeDigest
     ? Buffer.from(data.newRevokeDigest)
     : null;
@@ -837,7 +1263,7 @@ async function handleFeedbackRevokedTx(
     ? Buffer.from(data.sealHash).toString("hex")
     : null;
   const revokeId = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
-  await client.query(
+  const revokeResult = await client.query(
     `INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
@@ -851,14 +1277,23 @@ async function handleFeedbackRevokedTx(
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
        tx_signature = EXCLUDED.tx_signature,
-       status = EXCLUDED.status`,
+       created_at = EXCLUDED.created_at,
+       status = EXCLUDED.status
+     ${REVOCATION_CONFLICT_UPDATE_WHERE_SQL}`,
     [revokeId, null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
      data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
      revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
      revokeStatus]
   );
 
-  if (!isOrphan) {
+  if (!isOrphan && (revokeResult.rowCount ?? 0) > 0) {
+    await client.query(
+      `UPDATE feedbacks SET
+         is_revoked = true,
+         revoked_at = $1
+       WHERE id = $2`,
+      [ctx.blockTime.toISOString(), id]
+    );
     const baseUpdate = `
       feedback_count = COALESCE((
         SELECT COUNT(*)::int
@@ -918,14 +1353,7 @@ async function handleResponseAppendedTx(
   if (!hasFeedback) {
     logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for response - storing as orphan");
-    await client.query(
-      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-       ON CONFLICT (id) DO NOTHING`,
-      [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash, responseRunningDigest, data.newResponseCount.toString(),
-       ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
-    );
+    await upsertOrphanResponseRow(client, data, ctx);
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
     return;
   }
@@ -1033,8 +1461,8 @@ async function handleAgentRegistered(
 
   try {
     await db.query(
-      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
        ON CONFLICT (asset) DO UPDATE SET
          owner = EXCLUDED.owner,
          creator = COALESCE(agents.creator, EXCLUDED.creator),
@@ -1043,7 +1471,7 @@ async function handleAgentRegistered(
          block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
-         updated_at = EXCLUDED.created_at`,
+         updated_at = EXCLUDED.updated_at`,
       [
         assetId,
         data.owner.toBase58(),
@@ -1063,11 +1491,12 @@ async function handleAgentRegistered(
         ctx.blockTime.toISOString(),
       ]
     );
+    await replayOrphanFeedbacksForAsset(db, assetId);
     logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 
     // Trigger URI metadata extraction if configured and URI is present
     if (agentUri && config.metadataIndexMode !== "off") {
-      metadataQueue.add(assetId, agentUri);
+      metadataQueue.add(assetId, agentUri, ctx.blockTime.toISOString());
     }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to register agent");
@@ -1127,7 +1556,7 @@ async function handleUriUpdated(
 
     // Trigger URI metadata extraction if configured and URI is present
     if (newUri && config.metadataIndexMode !== "off") {
-      metadataQueue.add(assetId, newUri);
+      metadataQueue.add(assetId, newUri, ctx.blockTime.toISOString());
     }
   } catch (error: any) {
     logger.error({ error: error.message, assetId }, "Failed to update URI");
@@ -1186,6 +1615,19 @@ async function handleCollectionPointerSet(
   const lock = typeof data.lock === "boolean" ? data.lock : null;
 
   try {
+    const previousResult = await db.query(
+      `SELECT canonical_col AS prev_col, creator AS prev_creator
+       FROM agents
+       WHERE asset = $1
+       LIMIT 1`,
+      [assetId]
+    );
+    const previous = previousResult.rows[0] as
+      | { prev_col?: string | null; prev_creator?: string | null }
+      | undefined;
+    const prevCol = previous?.prev_col ?? "";
+    const prevCreator = previous?.prev_creator ?? setBy;
+
     await db.query(
       `WITH previous AS (
          SELECT canonical_col AS prev_col, creator AS prev_creator
@@ -1237,6 +1679,25 @@ async function handleCollectionPointerSet(
          AND EXISTS (SELECT 1 FROM updated)`,
       [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
     );
+
+    const currentResult = await db.query(
+      `SELECT canonical_col AS col, COALESCE(creator, owner) AS creator
+       FROM agents
+       WHERE asset = $1
+       LIMIT 1`,
+      [assetId]
+    );
+    const current = currentResult.rows[0] as { col?: string | null; creator?: string | null } | undefined;
+    const currentCol = current?.col ?? "";
+    const currentCreator = current?.creator ?? setBy;
+
+    if (currentCol) {
+      await recomputeCollectionPointerAssetCount(db, currentCol, currentCreator);
+    }
+    if (prevCol && (prevCol !== currentCol || prevCreator !== currentCreator)) {
+      await recomputeCollectionPointerAssetCount(db, prevCol, prevCreator);
+    }
+
     logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
     if (config.collectionMetadataIndexEnabled) {
@@ -1368,9 +1829,18 @@ async function handleNewFeedback(
   const db = getPool();
   const assetId = data.asset.toBase58();
   const clientAddress = data.clientAddress.toBase58();
-  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
+    if (!(await hasAgentRow(db, assetId))) {
+      await upsertOrphanFeedbackRow(db, data, ctx);
+      logger.warn(
+        { assetId, clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+        "Agent missing for feedback; stored orphan feedback"
+      );
+      return;
+    }
+    const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
+
     const feedbackHash = data.sealHash
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
@@ -1395,52 +1865,52 @@ async function handleNewFeedback(
 
     if (insertResult.rowCount === 0) {
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
-      return;
-    }
-
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
-
-    if (data.atomEnabled) {
-      await db.query(
-        `UPDATE agents SET
-           trust_tier = $3,
-           quality_score = $4,
-           confidence = $5,
-           risk_score = $6,
-           diversity_ratio = $7,
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [
-          ctx.blockTime.toISOString(),
-          assetId,
-          data.newTrustTier,
-          data.newQualityScore,
-          data.newConfidence,
-          data.newRiskScore,
-          data.newDiversityRatio,
-        ]
-      );
     } else {
-      await db.query(
-        `UPDATE agents SET
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId]
-      );
-    }
+      const baseUpdate = `
+        feedback_count = COALESCE((
+          SELECT COUNT(*)::int
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        raw_avg_score = COALESCE((
+          SELECT ROUND(AVG(score))::smallint
+          FROM feedbacks
+          WHERE asset = $2 AND NOT is_revoked
+        ), 0),
+        updated_at = $1
+      `;
 
+      if (data.atomEnabled) {
+        await db.query(
+          `UPDATE agents SET
+             trust_tier = $3,
+             quality_score = $4,
+             confidence = $5,
+             risk_score = $6,
+             diversity_ratio = $7,
+             ${baseUpdate}
+           WHERE asset = $2`,
+          [
+            ctx.blockTime.toISOString(),
+            assetId,
+            data.newTrustTier,
+            data.newQualityScore,
+            data.newConfidence,
+            data.newRiskScore,
+            data.newDiversityRatio,
+          ]
+        );
+      } else {
+        await db.query(
+          `UPDATE agents SET
+             ${baseUpdate}
+           WHERE asset = $2`,
+          [ctx.blockTime.toISOString(), assetId]
+        );
+      }
+    }
+    await replayOrphanResponsesForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
+    await reconcileOrphanRevocationForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to save feedback");
@@ -1485,22 +1955,13 @@ async function handleFeedbackRevoked(
 
     const revokeStatus = classifyRevocationStatus(hasFeedback);
     const isOrphan = revokeStatus === "ORPHANED";
-    if (!isOrphan) {
-      await db.query(
-        `UPDATE feedbacks SET
-           is_revoked = true,
-           revoked_at = $1
-         WHERE id = $2`,
-        [ctx.blockTime.toISOString(), id]
-      );
-    }
     const revokeDigest = data.newRevokeDigest
       ? Buffer.from(data.newRevokeDigest)
       : null;
     const revokeSealHash = data.sealHash
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
-    await db.query(
+    const revokeResult = await db.query(
       `INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (asset, client_address, feedback_index) DO UPDATE SET
@@ -1514,14 +1975,23 @@ async function handleFeedbackRevoked(
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
-         status = EXCLUDED.status`,
+         created_at = EXCLUDED.created_at,
+         status = EXCLUDED.status
+       ${REVOCATION_CONFLICT_UPDATE_WHERE_SQL}`,
       [id, null, assetId, clientAddress, data.feedbackIndex.toString(), revokeSealHash,
        data.slot.toString(), data.originalScore, data.atomEnabled, data.hadImpact,
        revokeDigest, data.newRevokeCount.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
        revokeStatus]
     );
 
-    if (!isOrphan) {
+    if (!isOrphan && (revokeResult.rowCount ?? 0) > 0) {
+      await db.query(
+        `UPDATE feedbacks SET
+           is_revoked = true,
+           revoked_at = $1
+         WHERE id = $2`,
+        [ctx.blockTime.toISOString(), id]
+      );
       const baseUpdate = `
         feedback_count = COALESCE((
           SELECT COUNT(*)::int
@@ -1589,14 +2059,7 @@ async function handleResponseAppended(
     if (!hasFeedback) {
       logger.warn({ assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for response - storing as orphan");
-      await db.query(
-        `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-         ON CONFLICT (id) DO NOTHING`,
-        [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-         responseHash, responseRunningDigest, data.newResponseCount.toString(),
-         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), "ORPHANED"]
-      );
+      await upsertOrphanResponseRow(db, data, ctx);
       logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Orphan response stored");
       return;
     }
@@ -1712,6 +2175,7 @@ async function handleValidationResponded(
 export interface IndexerState {
   lastSignature: string | null;
   lastSlot: bigint | null;
+  lastTxIndex: number | null;
 }
 
 // Fallback: first transaction signature of the new program deployment
@@ -1727,19 +2191,25 @@ export async function loadIndexerState(): Promise<IndexerState> {
   try {
     const db = getPool();
     const result = await db.query(
-      `SELECT last_signature, last_slot FROM indexer_state WHERE id = 'main'`
+      `SELECT last_signature, last_slot, last_tx_index FROM indexer_state WHERE id = 'main'`
     );
     if (result.rows.length > 0) {
       const row = result.rows[0];
       // If signature is null in DB, use deployment fallback
       if (!row.last_signature) {
         logger.info("DB has null signature, using deployment fallback");
-        return { lastSignature: null, lastSlot: null };
+        return { lastSignature: null, lastSlot: null, lastTxIndex: null };
       }
-      logger.info({ lastSignature: row.last_signature, lastSlot: row.last_slot }, "Loaded indexer state");
+      logger.info(
+        { lastSignature: row.last_signature, lastSlot: row.last_slot, lastTxIndex: row.last_tx_index },
+        "Loaded indexer state"
+      );
       return {
         lastSignature: row.last_signature,
         lastSlot: row.last_slot ? BigInt(row.last_slot) : null,
+        lastTxIndex: row.last_tx_index === null || row.last_tx_index === undefined
+          ? null
+          : Number(row.last_tx_index),
       };
     }
     logger.info("No saved indexer state found, will start from beginning");
@@ -1747,7 +2217,7 @@ export async function loadIndexerState(): Promise<IndexerState> {
     logger.warn({ error: error.message }, "Failed to load indexer state, using deployment fallback");
   }
   // Fallback: return null to start from beginning (fetches all transactions)
-  return { lastSignature: null, lastSlot: null };
+  return { lastSignature: null, lastSlot: null, lastTxIndex: null };
 }
 
 /**
@@ -1756,26 +2226,36 @@ export async function loadIndexerState(): Promise<IndexerState> {
 export async function saveIndexerState(
   signature: string,
   slot: bigint,
+  txIndex: number | null,
   source: "poller" | "websocket" | "substreams" = "poller"
 ): Promise<void> {
   const db = getPool();
   try {
     await db.query(
-      `INSERT INTO indexer_state (id, last_signature, last_slot, source, updated_at)
-       VALUES ('main', $1, $2, $3, NOW())
+      `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+       VALUES ('main', $1, $2, $3, $4, NOW())
        ON CONFLICT (id) DO UPDATE SET
          last_signature = EXCLUDED.last_signature,
          last_slot = EXCLUDED.last_slot,
+         last_tx_index = EXCLUDED.last_tx_index,
          source = EXCLUDED.source,
          updated_at = NOW()
        WHERE indexer_state.last_slot IS NULL
           OR indexer_state.last_slot < EXCLUDED.last_slot
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
-            AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
-              <= EXCLUDED.last_signature COLLATE "C"
+            AND (
+              COALESCE(indexer_state.last_tx_index, 2147483647)
+                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
+              OR (
+                COALESCE(indexer_state.last_tx_index, 2147483647)
+                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
+                AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
+                  <= EXCLUDED.last_signature COLLATE "C"
+              )
+            )
           )`,
-      [signature, slot.toString(), source]
+      [signature, slot.toString(), txIndex, source]
     );
   } catch (error: any) {
     logger.error({ error: error.message }, "Failed to save indexer state");
@@ -1792,6 +2272,14 @@ import { stripNullBytes } from "../utils/sanitize.js";
 import { metadataQueue } from "../indexer/metadata-queue.js";
 import { collectionMetadataQueue } from "../indexer/collection-metadata-queue.js";
 
+function resolveDeterministicMetadataVerifiedAt(
+  updatedAt: Date | string | null | undefined,
+  createdAt: Date | string | null | undefined
+): string {
+  const resolved = updatedAt ?? createdAt ?? new Date(0);
+  return resolved instanceof Date ? resolved.toISOString() : new Date(resolved).toISOString();
+}
+
 /**
  * Fetch, digest, and store URI metadata for an agent
  * Called asynchronously after agent registration or URI update
@@ -1800,18 +2288,23 @@ import { collectionMetadataQueue } from "../indexer/collection-metadata-queue.js
  * two consecutive URI updates (block N and N+1) might complete out of order.
  * We check if the agent's current URI matches before writing to prevent stale overwrites.
  */
-export async function digestAndStoreUriMetadata(assetId: string, uri: string): Promise<void> {
+export async function digestAndStoreUriMetadata(
+  assetId: string,
+  uri: string,
+  verifiedAt?: string
+): Promise<void> {
   if (config.metadataIndexMode === "off") {
     return;
   }
 
   const db = getPool();
+  let metadataVerifiedAt = verifiedAt ?? new Date(0).toISOString();
 
   // RACE CONDITION CHECK: Verify URI hasn't changed while we were queued/fetching
   // This prevents stale data from overwriting newer data due to out-of-order completion
   try {
     const agentResult = await db.query(
-      `SELECT agent_uri FROM agents WHERE asset = $1`,
+      `SELECT agent_uri, updated_at, created_at FROM agents WHERE asset = $1`,
       [assetId]
     );
     if (agentResult.rows.length === 0) {
@@ -1826,18 +2319,54 @@ export async function digestAndStoreUriMetadata(assetId: string, uri: string): P
       }, "Agent URI changed while processing, skipping stale write");
       return;
     }
+    if (!verifiedAt) {
+      metadataVerifiedAt = resolveDeterministicMetadataVerifiedAt(
+        agentResult.rows[0].updated_at,
+        agentResult.rows[0].created_at
+      );
+    }
   } catch (error: any) {
     logger.warn({ assetId, error: error.message }, "Failed to check agent URI freshness, aborting to prevent stale overwrite");
     return;
   }
 
-  // Purge old URI-derived metadata before storing new ones
-  // Uses "_uri:" prefix to avoid collision with user's on-chain metadata
+  const result = await digestUri(uri);
+
+  try {
+    const agentResult = await db.query(
+      `SELECT agent_uri, updated_at, created_at FROM agents WHERE asset = $1`,
+      [assetId]
+    );
+    if (agentResult.rows.length === 0) {
+      logger.debug({ assetId, uri }, "Agent removed during URI fetch, discarding stale results");
+      return;
+    }
+    if (agentResult.rows[0].agent_uri !== uri) {
+      logger.debug({
+        assetId,
+        expectedUri: uri,
+        currentUri: agentResult.rows[0].agent_uri
+      }, "Agent URI changed during fetch, discarding stale results");
+      return;
+    }
+    if (!verifiedAt) {
+      metadataVerifiedAt = resolveDeterministicMetadataVerifiedAt(
+        agentResult.rows[0].updated_at,
+        agentResult.rows[0].created_at
+      );
+    }
+  } catch (error: any) {
+    logger.warn({ assetId, error: error.message }, "Failed to re-check agent URI freshness after fetch, aborting stale write");
+    return;
+  }
+
+  // Purge old URI-derived metadata only after the post-fetch freshness recheck.
   try {
     await db.query(
       `DELETE FROM metadata
        WHERE asset = $1
          AND key LIKE '\\_uri:%' ESCAPE '\\'
+         AND key != '_uri:_source'
          AND NOT immutable`,
       [assetId]
     );
@@ -1846,12 +2375,18 @@ export async function digestAndStoreUriMetadata(assetId: string, uri: string): P
     logger.warn({ assetId, error: error.message }, "Failed to purge old URI metadata");
   }
 
-  const result = await digestUri(uri);
+  // Track the exact URI used for this extraction so recovery can detect mismatches after restarts.
+  await storeUriMetadata(assetId, "_uri:_source", uri, metadataVerifiedAt);
 
   if (result.status !== "ok" || !result.fields) {
     logger.debug({ assetId, uri, status: result.status, error: result.error }, "URI digest failed or empty");
     // Store error status as metadata
-    await storeUriMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+    await storeUriMetadata(
+      assetId,
+      "_uri:_status",
+      JSON.stringify(toDeterministicUriStatus(result)),
+      metadataVerifiedAt
+    );
     return;
   }
 
@@ -1862,18 +2397,28 @@ export async function digestAndStoreUriMetadata(assetId: string, uri: string): P
 
     if (serialized.oversize) {
       // Store metadata about oversize field
-      await storeUriMetadata(assetId, `${key}_meta`, JSON.stringify({
-        status: "oversize",
-        bytes: serialized.bytes,
-        sha256: result.hash,
-      }));
+      await storeUriMetadata(
+        assetId,
+        `${key}_meta`,
+        JSON.stringify({
+          status: "oversize",
+          bytes: serialized.bytes,
+          sha256: result.hash,
+        }),
+        metadataVerifiedAt
+      );
     } else {
-      await storeUriMetadata(assetId, key, serialized.value);
+      await storeUriMetadata(assetId, key, serialized.value, metadataVerifiedAt);
     }
   }
 
   // Store success status with truncation info
-  await storeUriMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+  await storeUriMetadata(
+    assetId,
+    "_uri:_status",
+    JSON.stringify(toDeterministicUriStatus(result)),
+    metadataVerifiedAt
+  );
 
   // Sync nft_name from _uri:name if not already set
   const uriName = result.fields["_uri:name"];
@@ -1900,7 +2445,12 @@ import { STANDARD_URI_FIELDS } from "../constants.js";
  * Standard fields are stored raw (no compression) for fast reads
  * Extra/custom fields are compressed with ZSTD if > 256 bytes
  */
-async function storeUriMetadata(assetId: string, key: string, value: string): Promise<void> {
+async function storeUriMetadata(
+  assetId: string,
+  key: string,
+  value: string,
+  verifiedAt: string
+): Promise<void> {
   const db = getPool();
   const keyHash = createHash("sha256").update(key).digest().slice(0, 16).toString("hex");
   const id = `${assetId}:${keyHash}`;
@@ -1908,19 +2458,21 @@ async function storeUriMetadata(assetId: string, key: string, value: string): Pr
   try {
     // Only compress non-standard fields (custom/extra data)
     // Standard fields are read frequently and shouldn't incur decompression cost
-    const shouldCompress = !STANDARD_URI_FIELDS.has(key);
+    const shouldCompress = !STANDARD_URI_FIELDS.has(key) && key !== "_uri:_source";
     const storedValue = shouldCompress
       ? await compressForStorage(Buffer.from(value))
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
 
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
-       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', NOW())
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, created_at, updated_at, status, verified_at)
+       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
-         updated_at = NOW()
+         updated_at = EXCLUDED.updated_at,
+         status = EXCLUDED.status,
+         verified_at = EXCLUDED.verified_at
        WHERE NOT metadata.immutable`,
-      [id, assetId, key, keyHash, storedValue]
+      [id, assetId, key, keyHash, storedValue, verifiedAt]
     );
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");

@@ -309,6 +309,22 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
+        expect(prisma.orphanResponse.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              agentId: TEST_ASSET.toBase58(),
+              client: TEST_CLIENT.toBase58(),
+              feedbackIndex: 0n,
+            },
+            orderBy: [
+              { slot: "asc" },
+              { txIndex: "asc" },
+              { eventOrdinal: "asc" },
+              { txSignature: "asc" },
+              { id: "asc" },
+            ],
+          })
+        );
         expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
           expect.objectContaining({
             create: expect.objectContaining({
@@ -319,6 +335,78 @@ describe("DB Handlers", () => {
             update: expect.objectContaining({
               responseCount: 3n,
               responseId: 3n,
+            }),
+          })
+        );
+      });
+
+      it("should keep delayed orphan response ORPHANED when stored sealHash mismatches feedback", async () => {
+        const feedbackId = "feedback-uuid-mismatch";
+        const differentHash = new Uint8Array(32).fill(0xcd);
+        (prisma.feedback.upsert as any).mockResolvedValue({
+          id: feedbackId,
+          feedbackHash: Uint8Array.from(TEST_HASH),
+        });
+        (prisma.orphanResponse.findMany as any).mockResolvedValue([
+          {
+            id: "orphan-mismatch",
+            responder: TEST_OWNER.toBase58(),
+            responseUri: "ipfs://QmMismatch",
+            responseHash: Uint8Array.from(TEST_HASH),
+            sealHash: Uint8Array.from(differentHash),
+            runningDigest: Uint8Array.from(TEST_HASH),
+            responseCount: 4n,
+            txSignature: "orphan-mismatch-sig",
+            slot: 123457n,
+            txIndex: 9,
+            eventOrdinal: 1,
+            createdAt: TEST_BLOCK_TIME,
+          },
+        ]);
+        (prisma.feedbackResponse.findUnique as any).mockResolvedValue(null);
+
+        const event: ProgramEvent = {
+          type: "NewFeedback",
+          data: {
+            asset: TEST_ASSET,
+            clientAddress: TEST_CLIENT,
+            feedbackIndex: 0n,
+            value: 9500n,
+            valueDecimals: 2,
+            score: 85,
+            tag1: "quality",
+            tag2: "speed",
+            endpoint: "/api/chat",
+            feedbackUri: "ipfs://QmXXX",
+            feedbackFileHash: null,
+            sealHash: TEST_HASH,
+            slot: 123456n,
+            atomEnabled: true,
+            newFeedbackDigest: TEST_HASH,
+            newFeedbackCount: 1n,
+            newTrustTier: 0,
+            newQualityScore: 0,
+            newConfidence: 0,
+            newRiskScore: 0,
+            newDiversityRatio: 0,
+            isUniqueClient: true,
+          },
+        };
+
+        await handleEvent(prisma, event, ctx);
+
+        expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
+        expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({
+              feedbackId,
+              status: "ORPHANED",
+              responseId: null,
+              txIndex: 9,
+              eventOrdinal: 1,
+            }),
+            update: expect.objectContaining({
+              status: "ORPHANED",
             }),
           })
         );

@@ -37,7 +37,7 @@ model Agent {
   feedbackCount Int   @default(0)
   rawAvgScore Int     @default(0)
   createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  updatedAt  DateTime
 
   // Transaction reference
   createdTxSignature String?
@@ -171,6 +171,37 @@ model Feedback {
   @@index([status])
 }
 
+model OrphanFeedback {
+  id               String   @id @default(uuid())
+  agentId          String
+  client           String
+  feedbackIndex    BigInt
+  value            String   @default("0")
+  valueDecimals    Int      @default(0)
+  score            Int?
+  tag1             String
+  tag2             String
+  endpoint         String
+  feedbackUri      String
+  feedbackHash     Bytes?
+  runningDigest    Bytes?
+  atomEnabled      Boolean  @default(false)
+  newTrustTier     Int      @default(0)
+  newQualityScore  Int      @default(0)
+  newConfidence    Int      @default(0)
+  newRiskScore     Int      @default(0)
+  newDiversityRatio Int     @default(0)
+  createdAt        DateTime @default(now())
+  txSignature      String?
+  slot             BigInt?
+  txIndex          Int?
+  eventOrdinal     Int?
+
+  @@unique([agentId, client, feedbackIndex])
+  @@index([agentId])
+  @@index([agentId, client, feedbackIndex])
+}
+
 model FeedbackResponse {
   id            String   @id @default(uuid())
   responseId    BigInt?  @map("response_id") // Sequential response ID (auto-assigned, permanent)
@@ -234,11 +265,14 @@ model OrphanResponse {
   responder      String
   responseUri    String
   responseHash   Bytes?
+  sealHash       Bytes?
   runningDigest  Bytes?
   responseCount  BigInt?
   createdAt      DateTime @default(now())
   txSignature    String?
   slot           BigInt?
+  txIndex        Int?
+  eventOrdinal   Int?
 
   @@unique([agentId, client, feedbackIndex, responder, txSignature])
   @@index([agentId])
@@ -311,6 +345,7 @@ model IndexerState {
   id            String   @id @default("main")
   lastSignature String?  // last processed transaction signature
   lastSlot      BigInt?  // last processed slot
+  lastTxIndex   Int?     // last processed tx index within the slot
   source        String   @default("poller") // "websocket" | "poller"
   updatedAt     DateTime @updatedAt
 }

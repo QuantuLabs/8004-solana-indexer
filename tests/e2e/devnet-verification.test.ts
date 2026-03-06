@@ -51,6 +51,7 @@ const FAKE_PUBKEYS = {
   agent: new PublicKey("6fTq22mjTBLTH4LCgbF4VXQJ1v8AU9tQZiwmeck3Y2h1"),
   collection: new PublicKey("6C8dzSp7JZjx11e73TJUwEQiSnZphu42v14sa95d39b1"),
 };
+const E2E_UPDATED_AT = new Date("2026-03-06T00:00:00.000Z");
 
 describe("E2E: Real Devnet Verification", () => {
   let connection: Connection;
@@ -174,6 +175,7 @@ describe("E2E: Real Devnet Verification", () => {
           registry: "test-registry",
           status: "PENDING",
           createdSlot: 1n, // Old slot so it passes cutoff
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {
           status: "PENDING",
@@ -221,6 +223,7 @@ describe("E2E: Real Devnet Verification", () => {
           registry: "fake-registry",
           status: "PENDING",
           createdSlot: 1n,
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {
           status: "PENDING",
@@ -386,6 +389,7 @@ describe("E2E: Real Devnet Verification", () => {
           registry: "test-registry",
           status: "PENDING",
           createdSlot: 1n,
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {
           status: "PENDING",
@@ -406,6 +410,7 @@ describe("E2E: Real Devnet Verification", () => {
           registry: "fake-registry",
           status: "PENDING",
           createdSlot: 1n,
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {
           status: "PENDING",

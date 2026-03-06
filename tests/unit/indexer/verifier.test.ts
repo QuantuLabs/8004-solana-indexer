@@ -691,11 +691,19 @@ describe("DataVerifier", () => {
 
   describe("verifyMetadata (Prisma)", () => {
     it("should auto-finalize URI-derived metadata", async () => {
+      const verifiedAt = new Date("2026-03-06T01:02:03.000Z");
       mockPrisma.agentMetadata.findMany.mockResolvedValue([
         {
           id: "m1",
           agentId: AGENT_KEY.toBase58(),
           key: "_uri:name",
+        },
+      ]);
+      mockPrisma.agent.findMany.mockResolvedValue([
+        {
+          id: AGENT_KEY.toBase58(),
+          updatedAt: verifiedAt,
+          createdAt: new Date("2026-03-05T00:00:00.000Z"),
         },
       ]);
 
@@ -704,7 +712,7 @@ describe("DataVerifier", () => {
 
       expect(mockPrisma.agentMetadata.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ status: "FINALIZED" }),
+          data: expect.objectContaining({ status: "FINALIZED", verifiedAt }),
         })
       );
       expect(verifier.getStats().metadataVerified).toBe(1);
@@ -750,9 +758,16 @@ describe("DataVerifier", () => {
 
   describe("verifyMetadata (Pool)", () => {
     it("should auto-finalize URI metadata via pool", async () => {
+      const verifiedAt = "2026-03-06T04:05:06.000Z";
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM metadata")) {
           return { rows: [{ id: "m1", agentId: AGENT_KEY.toBase58(), key: "_uri:name" }] };
+        }
+        if (sql.includes("FROM agents")) {
+          return {
+            rows: [{ id: AGENT_KEY.toBase58(), updated_at: verifiedAt, created_at: "2026-03-05T00:00:00.000Z" }],
+            rowCount: 1,
+          };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -760,6 +775,10 @@ describe("DataVerifier", () => {
       const verifier = new DataVerifier(mockConnection, null, mockPool);
       await verifier.start();
 
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining("UPDATE metadata SET status = 'FINALIZED', verified_at = $1 WHERE id = $2"),
+        [verifiedAt, "m1"]
+      );
       expect(verifier.getStats().metadataVerified).toBe(1);
       await verifier.stop();
     });
@@ -1255,6 +1274,37 @@ describe("DataVerifier", () => {
       const verifier = new DataVerifier(mockConnection, mockPrisma, null);
       await verifier.start();
 
+      expect(verifier.getStats().orphansRecovered).toBe(0);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should not recover orphaned responses without responseId even when parent feedback is active", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPrisma.agent.findMany.mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([]);
+      mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // verifyFeedbackResponses
+        .mockResolvedValueOnce([]); // recovery now filters responseId != null
+      mockPrisma.revocation.findMany.mockResolvedValue([]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(mockPrisma.feedbackResponse.findMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: { status: "ORPHANED", responseId: { not: null } },
+        })
+      );
       expect(verifier.getStats().orphansRecovered).toBe(0);
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
@@ -2585,6 +2635,30 @@ describe("DataVerifier", () => {
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM feedback_responses fr")) {
           return { rows: [{ id: "resp1", agentId, feedbackStatus: "ORPHANED" }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(0);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should only query recoverable pool orphaned responses with response_id", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedback_responses fr")) {
+          expect(sql).toContain("fr.response_id IS NOT NULL");
+          return { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 0 };
       });

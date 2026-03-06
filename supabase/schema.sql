@@ -28,6 +28,8 @@ BEGIN
       'agents',
       'metadata',
       'feedbacks',
+      'orphan_feedbacks',
+      'orphan_responses',
       'feedback_responses',
       'revocations',
       'validations',
@@ -64,8 +66,10 @@ DROP TABLE IF EXISTS agent_digest_cache CASCADE;
 DROP TABLE IF EXISTS indexer_state CASCADE;
 DROP TABLE IF EXISTS id_counters CASCADE;
 DROP TABLE IF EXISTS validations CASCADE;
+DROP TABLE IF EXISTS orphan_responses CASCADE;
 DROP TABLE IF EXISTS feedback_responses CASCADE;
 DROP TABLE IF EXISTS revocations CASCADE;
+DROP TABLE IF EXISTS orphan_feedbacks CASCADE;
 DROP TABLE IF EXISTS feedbacks CASCADE;
 DROP TABLE IF EXISTS metadata CASCADE;
 DROP TABLE IF EXISTS agents CASCADE;
@@ -371,6 +375,63 @@ CREATE INDEX idx_feedbacks_graphql_created_asset ON feedbacks(created_at DESC, a
 CREATE INDEX idx_feedbacks_graphql_value_asset ON feedbacks(value DESC, asset DESC) WHERE status != 'ORPHANED';
 CREATE UNIQUE INDEX idx_feedbacks_asset_feedback_id_unique ON feedbacks(asset, feedback_id);
 CREATE INDEX idx_feedbacks_asset_feedback_id ON feedbacks(asset, feedback_id);
+
+-- =============================================
+-- ORPHAN_FEEDBACKS (feedback seen before parent agent row exists)
+-- =============================================
+CREATE TABLE orphan_feedbacks (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  client_address TEXT NOT NULL,
+  feedback_index BIGINT NOT NULL,
+  value NUMERIC(39,0) DEFAULT 0,
+  value_decimals SMALLINT DEFAULT 0 CHECK (value_decimals >= 0 AND value_decimals <= 18),
+  score SMALLINT CHECK (score >= 0 AND score <= 100),
+  tag1 TEXT,
+  tag2 TEXT,
+  endpoint TEXT,
+  feedback_uri TEXT,
+  feedback_hash TEXT,
+  running_digest BYTEA,
+  atom_enabled BOOLEAN DEFAULT FALSE,
+  new_trust_tier SMALLINT DEFAULT 0,
+  new_quality_score SMALLINT DEFAULT 0,
+  new_confidence SMALLINT DEFAULT 0,
+  new_risk_score SMALLINT DEFAULT 0,
+  new_diversity_ratio SMALLINT DEFAULT 0,
+  block_slot BIGINT,
+  tx_index INTEGER,
+  event_ordinal INTEGER,
+  tx_signature TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(asset, client_address, feedback_index)
+);
+
+CREATE INDEX idx_orphan_feedbacks_asset ON orphan_feedbacks(asset);
+CREATE INDEX idx_orphan_feedbacks_lookup ON orphan_feedbacks(asset, client_address, feedback_index);
+
+CREATE TABLE orphan_responses (
+  id TEXT PRIMARY KEY,
+  asset TEXT NOT NULL,
+  client_address TEXT NOT NULL,
+  feedback_index BIGINT NOT NULL,
+  responder TEXT NOT NULL,
+  response_uri TEXT,
+  response_hash TEXT,
+  seal_hash TEXT,
+  running_digest BYTEA,
+  response_count BIGINT NOT NULL DEFAULT 0,
+  block_slot BIGINT,
+  tx_index INTEGER,
+  event_ordinal INTEGER,
+  tx_signature TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
+);
+
+CREATE INDEX idx_orphan_responses_asset ON orphan_responses(asset);
+CREATE INDEX idx_orphan_responses_lookup
+ON orphan_responses(asset, client_address, feedback_index);
 
 -- =============================================
 -- FEEDBACK_RESPONSES
@@ -705,6 +766,7 @@ CREATE TABLE indexer_state (
   id TEXT PRIMARY KEY DEFAULT 'main',
   last_signature TEXT,
   last_slot BIGINT,
+  last_tx_index INTEGER,
   source TEXT DEFAULT 'poller',
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -793,9 +855,9 @@ GROUP BY c.collection, c.registry_type, c.authority;
 CREATE OR REPLACE VIEW global_stats
 WITH (security_invoker = true) AS
 SELECT
-  (SELECT COUNT(*) FROM agents) AS total_agents,
+  (SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED') AS total_agents,
   (SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections,
-  (SELECT COUNT(*) FROM feedbacks WHERE NOT is_revoked) AS total_feedbacks,
+  (SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
   (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,
   (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE feedback_count > 0) AS avg_quality;

@@ -25,6 +25,7 @@ const TEST_COLLECTION = new PublicKey("EnhL4ezhwEmCdfD9pAKkwWDARTiK3Gh8p4qoSGDwz
 const TEST_REGISTRY = new PublicKey("H8H8MB6x7N1yniUsEUkDS3fDFqmjjUUHvVSAbkpWF7ZN");
 const TEST_CLIENT = new PublicKey("J7iPcZnFVyHs7ipu7YVgzacYz4MMLhD7p57B8jRjmtqk");
 const TEST_VALIDATOR = new PublicKey("EvpsgCGoqhMUjxFaYouj9KKhqQ4RoknmPjnvsrRUU2ND");
+const E2E_UPDATED_AT = new Date("2026-03-06T00:00:00.000Z");
 
 describe("E2E: Reorg Resilience", () => {
   // =========================================================================
@@ -358,6 +359,7 @@ describe("E2E: Reorg Resilience", () => {
           uri: "https://example.com/orphan.json",
           status: "PENDING",
           createdSlot: 1000n,
+          updatedAt: E2E_UPDATED_AT,
         },
         update: { status: "PENDING", createdSlot: 1000n },
       });
@@ -395,6 +397,7 @@ describe("E2E: Reorg Resilience", () => {
           uri: "https://example.com/new.json",
           status: "PENDING",
           createdSlot: 295000n, // After cutoff (290000)
+          updatedAt: E2E_UPDATED_AT,
         },
         update: { status: "PENDING", createdSlot: 295000n },
       });
@@ -487,6 +490,7 @@ describe("E2E: Reorg Resilience", () => {
           uri: "https://example.com/stats.json",
           status: "PENDING",
           createdSlot: 1000n,
+          updatedAt: E2E_UPDATED_AT,
         },
         update: { status: "PENDING", createdSlot: 1000n },
       });
@@ -622,6 +626,7 @@ describe("E2E: Reorg Resilience", () => {
           registry: TEST_COLLECTION.toBase58(),
           atomEnabled: true,
           status: "PENDING",
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {},
       });
@@ -686,6 +691,7 @@ describe("E2E: Reorg Resilience", () => {
           registry: TEST_COLLECTION.toBase58(),
           atomEnabled: true,
           status: "PENDING",
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {},
       });
@@ -762,6 +768,7 @@ describe("E2E: Reorg Resilience", () => {
           registry: TEST_COLLECTION.toBase58(),
           atomEnabled: true,
           status: "PENDING",
+          updatedAt: E2E_UPDATED_AT,
         },
         update: {},
       });

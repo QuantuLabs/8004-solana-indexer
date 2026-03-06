@@ -246,7 +246,7 @@ describe("Poller Coverage", () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect((poller as any).lastSignature).toBe("env-start-sig");
-      expect(saveIndexerState).toHaveBeenCalledWith("env-start-sig", 123n);
+      expect(saveIndexerState).toHaveBeenCalledWith("env-start-sig", 123n, null);
       expect(backfillSpy).not.toHaveBeenCalled();
     });
 
@@ -310,9 +310,9 @@ describe("Poller Coverage", () => {
         batchSize: 10,
       });
 
-      await (poller as any).saveState("test-sig", 500n);
+      await (poller as any).saveState("test-sig", 500n, undefined);
 
-      expect(saveIndexerState).toHaveBeenCalledWith("test-sig", 500n);
+      expect(saveIndexerState).toHaveBeenCalledWith("test-sig", 500n, undefined);
     });
   });
 
@@ -744,6 +744,38 @@ describe("Poller Coverage", () => {
       expect(signatures).toContain("sig-z");
       expect(signatures).toContain("sig-y");
       expect(signatures).not.toContain("sig-a");
+      expect(signatures).not.toContain("sig-old-slot");
+    });
+
+    it("should include same-slot signatures with higher tx_index even when the signature sorts lower", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-z";
+      (poller as any).lastTxIndex = 0;
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
+        createMockSignatureInfo("sig-z", 500),
+        createMockSignatureInfo("sig-a", 500),
+        createMockSignatureInfo("sig-old-slot", 499),
+      ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-z"] } },
+          { transaction: { signatures: ["sig-a"] } },
+        ],
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toContain("sig-a");
       expect(signatures).not.toContain("sig-old-slot");
     });
 
@@ -1269,9 +1301,9 @@ describe("Poller Coverage", () => {
         batchSize: 10,
       });
 
-      await (poller as any).saveState("test-sig-supa", 67890n);
+      await (poller as any).saveState("test-sig-supa", 67890n, undefined);
 
-      expect(saveIndexerState).toHaveBeenCalledWith("test-sig-supa", 67890n);
+      expect(saveIndexerState).toHaveBeenCalledWith("test-sig-supa", 67890n, undefined);
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
     });
 
@@ -1408,10 +1440,12 @@ describe("Poller Coverage", () => {
           id: "main",
           lastSignature: "configured-start-sig",
           lastSlot: 2000n,
+          lastTxIndex: null,
         },
         update: {
           lastSignature: "configured-start-sig",
           lastSlot: 2000n,
+          lastTxIndex: null,
         },
       });
     });
@@ -1435,7 +1469,7 @@ describe("Poller Coverage", () => {
       await (poller as any).loadState();
 
       expect((poller as any).lastSignature).toBe("configured-supabase-sig");
-      expect(saveIndexerState).toHaveBeenCalledWith("configured-supabase-sig", 3000n);
+      expect(saveIndexerState).toHaveBeenCalledWith("configured-supabase-sig", 3000n, null);
     });
   });
 
@@ -1901,6 +1935,47 @@ describe("Poller Coverage", () => {
       await (poller as any).processNewTransactions();
 
       expect((poller as any).errorCount).toBe(1);
+    });
+
+    it("should not process or advance cursor when pagination ends with retry-exhausted partial results", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-before-partial";
+
+      const sigNewA = createMockSignatureInfo("partial-new-a", 1300);
+      const sigNewB = createMockSignatureInfo("partial-new-b", 1299);
+
+      let sigCallCount = 0;
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+        sigCallCount++;
+        if (sigCallCount === 1) {
+          // Full page without stop signature -> enters pagination loop
+          return Promise.resolve([sigNewA, sigNewB]);
+        }
+        // Exhaust retries on subsequent pagination calls
+        return Promise.reject(new Error("pagination rpc error"));
+      });
+
+      (poller as any).batchFetcher = null;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(createMockParsedTransaction(TEST_SIGNATURE, []));
+
+      await (poller as any).processNewTransactions();
+
+      // No tx should be processed from a partial pagination result set
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("cursor-before-partial");
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
+
+      // Continuation markers remain available for next cycle
+      expect((poller as any).pendingContinuation).toBeTruthy();
+      expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
     });
   });
 

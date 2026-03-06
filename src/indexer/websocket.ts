@@ -34,13 +34,19 @@ export interface WebSocketIndexerOptions {
 
 function shouldAdvanceCursor(
   currentSlot: bigint | null | undefined,
+  currentTxIndex: number | null | undefined,
   currentSignature: string | null | undefined,
   nextSlot: bigint,
+  nextTxIndex: number | null | undefined,
   nextSignature: string
 ): boolean {
   if (currentSlot === null || currentSlot === undefined) return true;
   if (nextSlot > currentSlot) return true;
   if (nextSlot < currentSlot) return false;
+  const currentOrderTxIndex = currentTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const nextOrderTxIndex = nextTxIndex ?? Number.MAX_SAFE_INTEGER;
+  if (nextOrderTxIndex > currentOrderTxIndex) return true;
+  if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
   return nextSignature >= currentSignature;
 }
@@ -441,13 +447,22 @@ export class WebSocketIndexer {
         if (this.prisma) {
           const current = await this.prisma.indexerState.findUnique({
             where: { id: "main" },
-            select: { lastSlot: true, lastSignature: true },
+            select: { lastSlot: true, lastTxIndex: true, lastSignature: true },
           });
-          if (!shouldAdvanceCursor(current?.lastSlot, current?.lastSignature, newSlot, logs.signature)) {
+          if (!shouldAdvanceCursor(
+            current?.lastSlot,
+            current?.lastTxIndex,
+            current?.lastSignature,
+            newSlot,
+            txIndex ?? null,
+            logs.signature
+          )) {
             logger.debug(
               {
                 slot: ctx.slot,
                 currentSlot: current?.lastSlot?.toString() ?? null,
+                txIndex: txIndex ?? null,
+                currentTxIndex: current?.lastTxIndex ?? null,
                 signature: logs.signature,
                 currentSignature: current?.lastSignature ?? null,
               },
@@ -460,18 +475,20 @@ export class WebSocketIndexer {
                 id: "main",
                 lastSignature: logs.signature,
                 lastSlot: newSlot,
+                lastTxIndex: txIndex ?? null,
                 source: "websocket",
               },
               update: {
                 lastSignature: logs.signature,
                 lastSlot: newSlot,
+                lastTxIndex: txIndex ?? null,
                 source: "websocket",
               },
             });
           }
         } else {
           // Supabase mode — saveIndexerState already has SQL-level monotonic guard
-          await saveIndexerState(logs.signature, newSlot, "websocket");
+          await saveIndexerState(logs.signature, newSlot, txIndex ?? null, "websocket");
         }
       } catch (stateError) {
         logger.error({

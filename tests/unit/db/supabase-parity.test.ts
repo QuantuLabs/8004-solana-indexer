@@ -71,6 +71,9 @@ describe("Supabase Handler Parity", () => {
     mockPoolInstance.query.mockReset();
     mockPoolInstance.query.mockImplementation((text: string, values?: any[]) => {
       executedQueries.push({ text, values: values || [] });
+      if (text.includes("FROM agents")) {
+        return { rows: [{ asset: TEST_ASSET.toBase58() }], rowCount: 1 };
+      }
       if (text.includes("SELECT") && text.includes("feedbacks")) {
         if (feedbackExistsOverride) {
           return {
@@ -210,17 +213,16 @@ describe("Supabase Handler Parity", () => {
       expect(insertQuery!.values[1]).toBeNull();
     });
 
-    it("should include running_digest and ORPHANED in orphan response INSERT", async () => {
+    it("should include running_digest and seal_hash in orphan response staging INSERT", async () => {
       feedbackExistsOverride = false;
       await handleEvent(makeResponseEvent(), ctx);
 
       const insertQuery = executedQueries.find(
         (q) =>
-          q.text.includes("INSERT INTO feedback_responses") && q.text.includes("running_digest")
+          q.text.includes("INSERT INTO orphan_responses") && q.text.includes("running_digest")
       );
       expect(insertQuery).toBeDefined();
-      expect(insertQuery!.values).toContain("ORPHANED");
-      expect(insertQuery!.values[1]).toBeNull();
+      expect(insertQuery!.values).toContain(Buffer.from(TEST_HASH).toString("hex"));
     });
   });
 });

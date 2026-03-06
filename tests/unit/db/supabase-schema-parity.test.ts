@@ -23,6 +23,17 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("UNIQUE(asset, client_address, feedback_index)");
   });
 
+  it("defines orphan_responses staging table used for delayed response replay", () => {
+    expect(schemaSql).toContain("DROP TABLE IF EXISTS orphan_responses CASCADE;");
+    expect(schemaSql).toContain("CREATE TABLE orphan_responses (");
+    expect(schemaSql).toContain("seal_hash TEXT");
+    expect(schemaSql).toContain("running_digest BYTEA");
+    expect(schemaSql).toContain("response_count BIGINT NOT NULL DEFAULT 0");
+    expect(schemaSql).toContain("UNIQUE(asset, client_address, feedback_index, responder, tx_signature)");
+    expect(schemaSql).toContain("CREATE INDEX idx_orphan_responses_asset ON orphan_responses(asset);");
+    expect(schemaSql).toContain("CREATE INDEX idx_orphan_responses_lookup");
+  });
+
   it("defines revocation indexes for id assignment and canonical ordering", () => {
     expect(schemaSql).toContain("CREATE INDEX idx_revocations_asset ON revocations(asset);");
     expect(schemaSql).toContain("CREATE INDEX idx_revocations_status ON revocations(status) WHERE status = 'PENDING';");
@@ -73,7 +84,13 @@ describe("supabase schema revocations bootstrap parity", () => {
   it("excludes BASE registry rows from global_stats total_collections", () => {
     expect(schemaSql).toContain("CREATE OR REPLACE VIEW global_stats");
     expect(schemaSql).toContain(
+      "(SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED') AS total_agents"
+    );
+    expect(schemaSql).toContain(
       "(SELECT COUNT(*) FROM collections WHERE status != 'ORPHANED' AND registry_type != 'BASE') AS total_collections"
+    );
+    expect(schemaSql).toContain(
+      "(SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks"
     );
   });
 });

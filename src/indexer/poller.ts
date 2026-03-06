@@ -34,13 +34,19 @@ export interface PollerOptions {
 
 function shouldAdvanceCursor(
   currentSlot: bigint | null | undefined,
+  currentTxIndex: number | null | undefined,
   currentSignature: string | null | undefined,
   nextSlot: bigint,
+  nextTxIndex: number | null | undefined,
   nextSignature: string
 ): boolean {
   if (currentSlot === null || currentSlot === undefined) return true;
   if (nextSlot > currentSlot) return true;
   if (nextSlot < currentSlot) return false;
+  const currentOrderTxIndex = currentTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const nextOrderTxIndex = nextTxIndex ?? Number.MAX_SAFE_INTEGER;
+  if (nextOrderTxIndex > currentOrderTxIndex) return true;
+  if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
   return nextSignature >= currentSignature;
 }
@@ -48,6 +54,62 @@ function shouldAdvanceCursor(
 function compareSignatures(a: string, b: string): number {
   if (a === b) return 0;
   return a < b ? -1 : 1;
+}
+
+function compareTransactionCursor(
+  aTxIndex: number | null | undefined,
+  aSignature: string,
+  bTxIndex: number | null | undefined,
+  bSignature: string
+): number {
+  const aOrderTxIndex = aTxIndex ?? Number.MAX_SAFE_INTEGER;
+  const bOrderTxIndex = bTxIndex ?? Number.MAX_SAFE_INTEGER;
+  if (aOrderTxIndex !== bOrderTxIndex) {
+    return aOrderTxIndex - bOrderTxIndex;
+  }
+  return compareSignatures(aSignature, bSignature);
+}
+
+function toErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message || String(error);
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function toErrorDetails(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const rpcLike = error as Error & {
+      code?: unknown;
+      status?: unknown;
+      data?: unknown;
+      details?: unknown;
+      cause?: unknown;
+    };
+    return {
+      name: error.name,
+      message: error.message || String(error),
+      code: rpcLike.code ?? null,
+      status: rpcLike.status ?? null,
+      details: rpcLike.details ?? null,
+      data: rpcLike.data ?? null,
+      cause: rpcLike.cause instanceof Error ? rpcLike.cause.message : rpcLike.cause ?? null,
+    };
+  }
+  if (typeof error === "object" && error !== null) {
+    const objectError = error as Record<string, unknown>;
+    return {
+      message: toErrorMessage(error),
+      code: objectError.code ?? null,
+      status: objectError.status ?? null,
+      details: objectError.details ?? null,
+      data: objectError.data ?? null,
+    };
+  }
+  return { message: toErrorMessage(error) };
 }
 
 function isMissingCollectionIdSchemaError(error: unknown): boolean {
@@ -72,6 +134,7 @@ export class Poller {
   private batchSize: number;
   private isRunning = false;
   private lastSignature: string | null = null;
+  private lastTxIndex: number | null = null;
   private processedCount = 0;
   private errorCount = 0;
   private lastStatsLog = Date.now();
@@ -80,6 +143,9 @@ export class Poller {
   // pendingStopSignature: where to STOP (original lastSignature when we hit the limit)
   private pendingContinuation: string | null = null;
   private pendingStopSignature: string | null = null;
+  // True when fetchSignatures returned a retry-exhausted partial page set.
+  // In that case we skip processing this cycle to avoid cursor/state advance.
+  private hadPaginationPartial = false;
 
   // Batch processing components (Supabase mode only)
   private batchFetcher: BatchRpcFetcher | null = null;
@@ -328,18 +394,12 @@ export class Poller {
         txIndexMap = new Map(sigs.map((s) => [s.signature, null]));
       }
 
-      // Canonical within-slot order must match SQL deterministic key:
-      // (tx_signature, tx_index NULLS LAST). event_ordinal is handled per event in parser.
-      const sigsWithIndex = sigs.map(sig => ({
+      const sigsWithIndex = sigs.map((sig) => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
-      })).sort((a, b) => {
-        const sigCmp = compareSignatures(a.sig.signature, b.sig.signature);
-        if (sigCmp !== 0) return sigCmp;
-        const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
-        const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
-      });
+      })).sort((a, b) =>
+        compareTransactionCursor(a.txIndex, a.sig.signature, b.txIndex, b.sig.signature)
+      );
 
       for (const { sig, txIndex } of sigsWithIndex) {
         if (!this.isRunning) break;
@@ -352,9 +412,10 @@ export class Poller {
             await this.processTransaction(sig, txIndex);
           }
           this.lastSignature = sig.signature;
+          this.lastTxIndex = txIndex ?? null;
           // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
           if (!USE_BATCH_DB) {
-            await this.saveState(sig.signature, BigInt(sig.slot));
+            await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null);
           }
           processed++;
           this.processedCount++;
@@ -497,6 +558,7 @@ export class Poller {
     }
 
     this.lastSignature = config.indexerStartSignature;
+    this.lastTxIndex = null;
     logger.info(
       {
         source,
@@ -507,7 +569,7 @@ export class Poller {
     );
 
     if (config.indexerStartSlot !== null) {
-      await this.saveState(config.indexerStartSignature, config.indexerStartSlot);
+      await this.saveState(config.indexerStartSignature, config.indexerStartSlot, null);
       logger.info(
         {
           source,
@@ -539,7 +601,8 @@ export class Poller {
     }
 
     this.lastSignature = config.indexerStartSignature;
-    await this.saveState(config.indexerStartSignature, config.indexerStartSlot);
+    this.lastTxIndex = null;
+    await this.saveState(config.indexerStartSignature, config.indexerStartSlot, null);
     logger.warn(
       {
         source,
@@ -559,7 +622,15 @@ export class Poller {
       const state = await loadIndexerState();
       if (state.lastSignature) {
         this.lastSignature = state.lastSignature;
-        logger.info({ lastSignature: this.lastSignature, lastSlot: state.lastSlot?.toString() }, "Supabase mode: resuming from signature");
+        this.lastTxIndex = state.lastTxIndex;
+        logger.info(
+          {
+            lastSignature: this.lastSignature,
+            lastSlot: state.lastSlot?.toString(),
+            lastTxIndex: state.lastTxIndex,
+          },
+          "Supabase mode: resuming from signature"
+        );
         const fastForwarded = await this.tryPreferConfiguredStartCursor(
           "supabase",
           state.lastSignature,
@@ -595,7 +666,15 @@ export class Poller {
 
     if (state?.lastSignature) {
       this.lastSignature = state.lastSignature;
-      logger.info({ lastSignature: this.lastSignature }, "Resuming from signature");
+      this.lastTxIndex = state.lastTxIndex ?? null;
+      logger.info(
+        {
+          lastSignature: this.lastSignature,
+          lastSlot: state.lastSlot?.toString() ?? null,
+          lastTxIndex: state.lastTxIndex ?? null,
+        },
+        "Resuming from signature"
+      );
       const fastForwarded = await this.tryPreferConfiguredStartCursor(
         "local",
         state.lastSignature,
@@ -623,18 +702,25 @@ export class Poller {
     }
   }
 
-  private async saveState(signature: string, slot: bigint): Promise<void> {
+  private async saveState(signature: string, slot: bigint, txIndex: number | null): Promise<void> {
     // Supabase mode - save to Supabase
     if (!this.prisma) {
-      await saveIndexerState(signature, slot);
+      await saveIndexerState(signature, slot, txIndex);
       return;
     }
 
     const current = await this.prisma.indexerState.findUnique({
       where: { id: "main" },
-      select: { lastSlot: true, lastSignature: true },
+      select: { lastSlot: true, lastTxIndex: true, lastSignature: true },
     });
-    if (!shouldAdvanceCursor(current?.lastSlot, current?.lastSignature, slot, signature)) {
+    if (!shouldAdvanceCursor(
+      current?.lastSlot,
+      current?.lastTxIndex ?? null,
+      current?.lastSignature,
+      slot,
+      txIndex,
+      signature
+    )) {
       return;
     }
 
@@ -645,10 +731,12 @@ export class Poller {
         id: "main",
         lastSignature: signature,
         lastSlot: slot,
+        lastTxIndex: txIndex,
       },
       update: {
         lastSignature: signature,
         lastSlot: slot,
+        lastTxIndex: txIndex,
       },
     });
   }
@@ -669,6 +757,18 @@ export class Poller {
 
   private async processNewTransactions(): Promise<void> {
     const signatures = await this.fetchSignatures();
+
+    if (this.hadPaginationPartial) {
+      logger.warn(
+        {
+          count: signatures.length,
+          pendingContinuation: this.pendingContinuation,
+          pendingStopSignature: this.pendingStopSignature,
+        },
+        "Skipping partial pagination batch to prevent cursor advance"
+      );
+      return;
+    }
 
     if (signatures.length === 0) {
       logger.debug("No new transactions");
@@ -704,18 +804,12 @@ export class Poller {
       const sigs = bySlot.get(slot)!;
       const txIndexMap = await this.getTxIndexMap(slot, sigs);
 
-      // Canonical within-slot order must match SQL deterministic key:
-      // (tx_signature, tx_index NULLS LAST). event_ordinal is handled per event in parser.
-      const sigsWithIndex = sigs.map(sig => ({
+      const sigsWithIndex = sigs.map((sig) => ({
         sig,
         txIndex: txIndexMap.get(sig.signature) ?? undefined
-      })).sort((a, b) => {
-        const sigCmp = compareSignatures(a.sig.signature, b.sig.signature);
-        if (sigCmp !== 0) return sigCmp;
-        const txA = a.txIndex ?? Number.MAX_SAFE_INTEGER;
-        const txB = b.txIndex ?? Number.MAX_SAFE_INTEGER;
-        return txA - txB;
-      });
+      })).sort((a, b) =>
+        compareTransactionCursor(a.txIndex, a.sig.signature, b.txIndex, b.sig.signature)
+      );
 
       let batchFailed = false;
       for (const { sig, txIndex } of sigsWithIndex) {
@@ -727,9 +821,10 @@ export class Poller {
             await this.processTransaction(sig, txIndex);
           }
           this.lastSignature = sig.signature;
+          this.lastTxIndex = txIndex ?? null;
           // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
           if (!USE_BATCH_DB) {
-            await this.saveState(sig.signature, BigInt(sig.slot));
+            await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null);
           }
           this.processedCount++;
         } catch (error) {
@@ -773,6 +868,7 @@ export class Poller {
    * Returns signatures in newest-first order (caller should reverse for processing)
    */
   private async fetchSignatures(): Promise<ConfirmedSignatureInfo[]> {
+    this.hadPaginationPartial = false;
     try {
       if (!this.lastSignature) {
         // No last signature - just get the latest batch
@@ -792,6 +888,8 @@ export class Poller {
       // Use pendingStopSignature if resuming, otherwise use lastSignature
       const stopSignature = this.pendingStopSignature || this.lastSignature;
       let retryCount = 0;
+      let pageLimit = this.batchSize;
+      const minPageLimit = Math.max(1, Math.min(25, this.batchSize));
 
       const pushUniqueSignature = (entry: ConfirmedSignatureInfo): void => {
         if (entry.err !== null) return;
@@ -813,7 +911,7 @@ export class Poller {
       while (true) {
         try {
           const options: { limit: number; before?: string } = {
-            limit: this.batchSize,
+            limit: pageLimit,
           };
           if (beforeSignature) {
             options.before = beforeSignature;
@@ -834,26 +932,18 @@ export class Poller {
           for (let i = 0; i < batch.length; i++) {
             const sig = batch[i];
             if (sig.signature === stopSignature) {
-              // Reached our checkpoint. To avoid same-slot misses when RPC order drifts,
-              // keep scanning the current page and include only same-slot signatures that
-              // are lexicographically newer than the stop signature.
               const stopSlot = sig.slot;
-              const filtered = allSignatures.filter(
-                (existing) =>
-                  existing.slot !== stopSlot
-                  || existing.signature > stopSignature
-              );
-              allSignatures.length = 0;
-              seenSignatures.clear();
-              allSignatures.push(...filtered);
-              for (const entry of allSignatures) {
-                seenSignatures.add(entry.signature);
-              }
+              const priorSameSlot = allSignatures.filter((existing) => existing.slot === stopSlot);
+              const keepDifferentSlot = allSignatures.filter((existing) => existing.slot !== stopSlot);
+              const sameSlotCandidates = [...priorSameSlot];
+              const seenSameSlot = new Set(sameSlotCandidates.map((entry) => entry.signature));
               const pushSameSlotCandidate = (candidate: ConfirmedSignatureInfo): void => {
                 if (candidate.slot !== stopSlot) return;
                 if (candidate.err !== null) return;
-                if (candidate.signature <= stopSignature) return;
-                pushUniqueSignature(candidate);
+                if (candidate.signature === stopSignature) return;
+                if (seenSameSlot.has(candidate.signature)) return;
+                seenSameSlot.add(candidate.signature);
+                sameSlotCandidates.push(candidate);
               };
               for (let j = i + 1; j < batch.length; j++) {
                 pushSameSlotCandidate(batch[j]);
@@ -864,7 +954,7 @@ export class Poller {
               while (sameSlotBefore && this.isRunning) {
                 const sameSlotBatch = await this.connection.getSignaturesForAddress(
                   this.programId,
-                  { limit: this.batchSize, before: sameSlotBefore }
+                  { limit: pageLimit, before: sameSlotBefore }
                 );
                 if (sameSlotBatch.length === 0) break;
                 let sawStopSlot = false;
@@ -875,10 +965,62 @@ export class Poller {
                 }
                 const nextBefore = sameSlotBatch[sameSlotBatch.length - 1].signature;
                 if (!sawStopSlot) break;
-                if (sameSlotBatch.length < this.batchSize) break;
+                if (sameSlotBatch.length < pageLimit) break;
                 if (nextBefore === sameSlotBefore) break;
                 sameSlotBefore = nextBefore;
                 await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+              let stopTxIndex = this.lastTxIndex ?? null;
+              const sameSlotCursorEntries = [sig, ...sameSlotCandidates];
+              try {
+                const sameSlotTxIndexMap = await this.getTxIndexMap(stopSlot, sameSlotCursorEntries);
+                if (sameSlotTxIndexMap.has(stopSignature)) {
+                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
+                }
+                sameSlotCandidates.sort((a, b) =>
+                  compareTransactionCursor(
+                    sameSlotTxIndexMap.get(a.signature) ?? null,
+                    a.signature,
+                    sameSlotTxIndexMap.get(b.signature) ?? null,
+                    b.signature
+                  )
+                );
+                allSignatures.length = 0;
+                seenSignatures.clear();
+                for (const entry of keepDifferentSlot) {
+                  pushUniqueSignature(entry);
+                }
+                for (const candidate of sameSlotCandidates) {
+                  if (
+                    compareTransactionCursor(
+                      stopTxIndex,
+                      stopSignature,
+                      sameSlotTxIndexMap.get(candidate.signature) ?? null,
+                      candidate.signature
+                    ) < 0
+                  ) {
+                    pushUniqueSignature(candidate);
+                  }
+                }
+              } catch (error) {
+                logger.warn(
+                  {
+                    stopSlot,
+                    stopSignature,
+                    error: error instanceof Error ? error.message : String(error),
+                  },
+                  "Failed to resolve same-slot tx_index map during pagination stop handling"
+                );
+                allSignatures.length = 0;
+                seenSignatures.clear();
+                for (const entry of keepDifferentSlot) {
+                  pushUniqueSignature(entry);
+                }
+                for (const candidate of sameSlotCandidates) {
+                  if (compareTransactionCursor(stopTxIndex, stopSignature, null, candidate.signature) < 0) {
+                    pushUniqueSignature(candidate);
+                  }
+                }
               }
               this.pendingStopSignature = null;
               return allSignatures;
@@ -911,7 +1053,7 @@ export class Poller {
           }
 
           // Small delay to avoid rate limiting during pagination
-          if (batch.length >= this.batchSize) {
+          if (batch.length >= pageLimit) {
             await new Promise((resolve) => setTimeout(resolve, 100));
           } else {
             // Got fewer than requested, no more signatures
@@ -920,12 +1062,45 @@ export class Poller {
           }
 
           retryCount = 0; // Reset on success
+          pageLimit = this.batchSize;
         } catch (innerError) {
           retryCount++;
-          logger.warn({ error: innerError, retryCount }, "Error during signature pagination");
+          pageLimit = Math.max(minPageLimit, Math.floor(pageLimit / 2));
+          logger.warn(
+            {
+              retryCount,
+              pageLimit,
+              beforeSignature,
+              stopSignature,
+              collectedSignatures: allSignatures.length,
+              err: innerError instanceof Error ? innerError : undefined,
+              error: toErrorDetails(innerError),
+            },
+            "Error during signature pagination"
+          );
 
           if (retryCount >= 3) {
-            logger.error("Too many pagination errors, returning partial results");
+            this.hadPaginationPartial = allSignatures.length > 0;
+            if (beforeSignature && !this.pendingContinuation) {
+              this.pendingContinuation = beforeSignature;
+              if (!this.pendingStopSignature) {
+                this.pendingStopSignature = stopSignature;
+              }
+            }
+            logger.error(
+              {
+                retryCount,
+                pageLimit,
+                beforeSignature,
+                stopSignature,
+                collectedSignatures: allSignatures.length,
+                pendingContinuation: this.pendingContinuation,
+                pendingStopSignature: this.pendingStopSignature,
+                err: innerError instanceof Error ? innerError : undefined,
+                error: toErrorDetails(innerError),
+              },
+              "Too many pagination errors, returning partial results"
+            );
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, 500 * retryCount));

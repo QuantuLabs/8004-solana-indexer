@@ -62,6 +62,7 @@ import { STANDARD_URI_FIELDS } from "../constants.js";
 export interface MetadataTask {
   assetId: string;
   uri: string;
+  verifiedAt?: string;
   addedAt: number;
 }
 
@@ -69,6 +70,14 @@ type RecoveryRetryEntry = {
   uri: string;
   retryAt: number;
 };
+
+function resolveDeterministicMetadataVerifiedAt(
+  updatedAt: Date | string | null | undefined,
+  createdAt: Date | string | null | undefined
+): string {
+  const resolved = updatedAt ?? createdAt ?? new Date(0);
+  return resolved instanceof Date ? resolved.toISOString() : new Date(resolved).toISOString();
+}
 
 /**
  * Singleton metadata extraction queue
@@ -118,7 +127,7 @@ class MetadataQueue {
    * Add a URI extraction task to the queue
    * Deduplicates by keeping only the latest URI per asset
    */
-  add(assetId: string, uri: string): void {
+  add(assetId: string, uri: string, verifiedAt?: string): void {
     if (!uri || config.metadataIndexMode === "off") {
       return;
     }
@@ -127,7 +136,7 @@ class MetadataQueue {
 
     // Check for duplicate (same asset, same URI already pending)
     const existing = this.pending.get(assetId);
-    if (existing && existing.uri === uri) {
+    if (existing && existing.uri === uri && existing.verifiedAt === verifiedAt) {
       this.stats.skippedDuplicate++;
       logger.debug({ assetId }, "Skipped duplicate metadata task");
       return;
@@ -137,6 +146,7 @@ class MetadataQueue {
     const task: MetadataTask = {
       assetId,
       uri,
+      verifiedAt,
       addedAt: Date.now(),
     };
     this.pending.set(assetId, task);
@@ -146,9 +156,9 @@ class MetadataQueue {
   /**
    * Add multiple tasks at once (used after batch commit)
    */
-  addBatch(tasks: Array<{ assetId: string; uri: string }>): void {
+  addBatch(tasks: Array<{ assetId: string; uri: string; verifiedAt?: string }>): void {
     for (const task of tasks) {
-      this.add(task.assetId, task.uri);
+      this.add(task.assetId, task.uri, task.verifiedAt);
     }
     logger.info({ count: tasks.length, queueSize: this.queue.size }, "Added batch to metadata queue");
   }
@@ -158,10 +168,16 @@ class MetadataQueue {
    */
   private async processTask(task: MetadataTask): Promise<void> {
     const { assetId, uri } = task;
+    let metadataVerifiedAt = task.verifiedAt ?? new Date(0).toISOString();
 
     try {
       // Remove from pending map
       const current = this.pending.get(assetId);
+      if (current && current !== task) {
+        this.stats.skippedStale++;
+        logger.debug({ assetId, uri }, "Skipping superseded metadata task");
+        return;
+      }
       if (current === task) {
         this.pending.delete(assetId);
       }
@@ -169,7 +185,7 @@ class MetadataQueue {
       // Freshness check: verify URI hasn't changed in DB
       if (this.pool) {
         const freshCheck = await this.pool.query(
-          `SELECT agent_uri FROM agents WHERE asset = $1`,
+          `SELECT agent_uri, updated_at, created_at FROM agents WHERE asset = $1`,
           [assetId]
         );
 
@@ -187,28 +203,68 @@ class MetadataQueue {
           this.stats.skippedStale++;
           return;
         }
+
+        if (!task.verifiedAt) {
+          metadataVerifiedAt = resolveDeterministicMetadataVerifiedAt(
+            freshCheck.rows[0].updated_at,
+            freshCheck.rows[0].created_at
+          );
+        }
       }
 
-      // Purge old URI metadata before writing new
+      // Fetch and digest URI
+      const result = await digestUri(uri);
+
       if (this.pool) {
+        const freshCheck = await this.pool.query(
+          `SELECT agent_uri, updated_at, created_at FROM agents WHERE asset = $1`,
+          [assetId]
+        );
+
+        if (freshCheck.rows.length === 0) {
+          logger.debug({ assetId }, "Agent removed during URI fetch, discarding stale results");
+          this.recoveryRetryAt.delete(assetId);
+          this.stats.skippedStale++;
+          return;
+        }
+
+        if (freshCheck.rows[0].agent_uri !== uri) {
+          logger.debug({ assetId, expected: uri, current: freshCheck.rows[0].agent_uri },
+            "URI changed during fetch, discarding stale results");
+          this.recoveryRetryAt.delete(assetId);
+          this.stats.skippedStale++;
+          return;
+        }
+
+        if (!task.verifiedAt) {
+          metadataVerifiedAt = resolveDeterministicMetadataVerifiedAt(
+            freshCheck.rows[0].updated_at,
+            freshCheck.rows[0].created_at
+          );
+        }
+
+        // Purge old URI metadata only after the post-fetch freshness recheck.
         await this.pool.query(
           `DELETE FROM metadata
            WHERE asset = $1
              AND key LIKE '\\_uri:%' ESCAPE '\\'
+             AND key != '_uri:_source'
              AND NOT immutable`,
           [assetId]
         );
       }
 
       // Track the exact URI used for this extraction so recovery can detect mismatches after restarts.
-      await this.storeMetadata(assetId, "_uri:_source", uri);
-
-      // Fetch and digest URI
-      const result = await digestUri(uri);
+      await this.storeMetadata(assetId, "_uri:_source", uri, metadataVerifiedAt);
 
       if (result.status !== "ok" || !result.fields) {
         // Store error status
-        await this.storeMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+        await this.storeMetadata(
+          assetId,
+          "_uri:_status",
+          JSON.stringify(toDeterministicUriStatus(result)),
+          metadataVerifiedAt
+        );
         this.setRecoveryRetry(assetId, uri, Date.now() + RECOVERY_RETRY_MS);
         logger.debug({ assetId, uri, status: result.status }, "URI digest failed");
         this.stats.processed++;
@@ -221,18 +277,28 @@ class MetadataQueue {
         const serialized = serializeValue(value, maxValueBytes);
 
         if (serialized.oversize) {
-          await this.storeMetadata(assetId, `${key}_meta`, JSON.stringify({
-            status: "oversize",
-            bytes: serialized.bytes,
-            sha256: result.hash,
-          }));
+          await this.storeMetadata(
+            assetId,
+            `${key}_meta`,
+            JSON.stringify({
+              status: "oversize",
+              bytes: serialized.bytes,
+              sha256: result.hash,
+            }),
+            metadataVerifiedAt
+          );
         } else {
-          await this.storeMetadata(assetId, key, serialized.value);
+          await this.storeMetadata(assetId, key, serialized.value, metadataVerifiedAt);
         }
       }
 
       // Store success status
-      await this.storeMetadata(assetId, "_uri:_status", JSON.stringify(toDeterministicUriStatus(result)));
+      await this.storeMetadata(
+        assetId,
+        "_uri:_status",
+        JSON.stringify(toDeterministicUriStatus(result)),
+        metadataVerifiedAt
+      );
 
       // Sync nft_name from _uri:name if present
       const uriName = result.fields["_uri:name"];
@@ -343,7 +409,12 @@ class MetadataQueue {
   /**
    * Store a single URI metadata entry
    */
-  private async storeMetadata(assetId: string, key: string, value: string): Promise<void> {
+  private async storeMetadata(
+    assetId: string,
+    key: string,
+    value: string,
+    verifiedAt: string
+  ): Promise<void> {
     if (!this.pool) return;
 
     const keyHash = createHash("sha256").update(key).digest().slice(0, 16).toString("hex");
@@ -356,13 +427,15 @@ class MetadataQueue {
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
 
     await this.pool.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, updated_at)
-       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', NOW())
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, created_at, updated_at, status, verified_at)
+       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
-         updated_at = NOW()
+         updated_at = EXCLUDED.updated_at,
+         status = EXCLUDED.status,
+         verified_at = EXCLUDED.verified_at
        WHERE NOT metadata.immutable`,
-      [id, assetId, key, keyHash, storedValue]
+      [id, assetId, key, keyHash, storedValue, verifiedAt]
     );
   }
 

@@ -6,7 +6,6 @@ import { config, validateConfig, runtimeConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { Processor } from "./indexer/processor.js";
 import { startApiServer } from "./api/server.js";
-import { cleanupOrphanResponses } from "./db/handlers.js";
 import { getPool } from "./db/supabase.js";
 import { IDL_VERSION, IDL_PROGRAM_ID } from "./parser/decoder.js";
 import { metadataQueue } from "./indexer/metadata-queue.js";
@@ -94,8 +93,6 @@ async function main() {
       await prisma.$connect();
       logger.info("Database connected (SQLite via Prisma)");
       await assertLocalCollectionIdSchema(prisma);
-      // Cleanup old orphan responses at startup (> 30 min)
-      await cleanupOrphanResponses(prisma);
     } catch (error) {
       if (isMissingCollectionIdSchemaError(error)) {
         logger.fatal({ error }, MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE);
