@@ -250,6 +250,38 @@ describe("BatchRpcFetcher", () => {
       expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(3);
       expect(maxInFlight).toBe(1);
     });
+
+    it("should reduce chunk size and retry subchunks on repeated 429s", async () => {
+      const sigs = ["sig1", "sig2", "sig3", "sig4"];
+      const txs = new Map(
+        sigs.map((sig) => [sig, { slot: 1, transaction: { signatures: [sig] } }])
+      );
+
+      mockConnection.getParsedTransactions.mockImplementation(async (chunk: string[]) => {
+        if (chunk.length === 4) {
+          throw new Error("429 Too Many Requests");
+        }
+        return chunk.map((sig) => txs.get(sig));
+      });
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 4,
+        maxParallelChunks: 1,
+      });
+      const result = await fetcher.fetchTransactions(sigs);
+
+      expect(result.size).toBe(4);
+      expect(Array.from(result.keys())).toEqual(sigs);
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(3);
+      expect(mockConnection.getParsedTransactions.mock.calls[0][0]).toHaveLength(4);
+      expect(mockConnection.getParsedTransactions.mock.calls[1][0]).toHaveLength(2);
+      expect(mockConnection.getParsedTransactions.mock.calls[2][0]).toHaveLength(2);
+
+      await fetcher.fetchTransactions(sigs);
+      expect(mockConnection.getParsedTransactions.mock.calls[3][0]).toHaveLength(2);
+      expect(mockConnection.getParsedTransactions.mock.calls[4][0]).toHaveLength(2);
+      expect(fetcher.getStats().chunkSize).toBe(2);
+    });
   });
 
   describe("getStats", () => {
@@ -346,12 +378,50 @@ describe("EventBuffer", () => {
 
       // Start first flush (will block on BEGIN)
       const flush1 = buffer.flush();
-      // Try second flush immediately - should return immediately (flushInProgress)
-      await buffer.flush();
+      // Try second flush immediately - should join the in-flight flush
+      const flush2 = buffer.flush();
+      await Promise.resolve();
 
       // Resolve all blocked queries to let first flush complete
       resolvers.forEach(r => r());
-      await flush1;
+      await Promise.all([flush1, flush2]);
+      expect(client.query.mock.calls.filter((call: any[]) => call[0] === "BEGIN")).toHaveLength(1);
+      expect(client.query.mock.calls.filter((call: any[]) => call[0] === "COMMIT")).toHaveLength(1);
+    });
+
+    it("should drain tail events added while a flush is already in progress", async () => {
+      const client = mockPool._client;
+      let beginCalls = 0;
+      let releaseFirstBegin!: () => void;
+
+      client.query.mockImplementation((sql: string) => {
+        if (sql === "BEGIN") {
+          beginCalls++;
+          if (beginCalls === 1) {
+            return new Promise((resolve) => {
+              releaseFirstBegin = () => resolve({ rows: [], rowCount: 0 });
+            });
+          }
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(makeEvent("AgentRegistered", { asset: "asset-a", owner: "owner-a", collection: "col-a" }));
+
+      const firstFlush = buffer.flush();
+      await Promise.resolve();
+
+      await buffer.addEvent(makeEvent("AgentRegistered", { asset: "asset-b", owner: "owner-b", collection: "col-b" }));
+      const drainPromise = buffer.drain();
+
+      releaseFirstBegin();
+      await firstFlush;
+      await drainPromise;
+
+      expect(buffer.size).toBe(0);
+      expect(client.query.mock.calls.filter((call: any[]) => call[0] === "BEGIN")).toHaveLength(2);
+      expect(client.query.mock.calls.filter((call: any[]) => call[0] === "COMMIT")).toHaveLength(2);
     });
   });
 
@@ -379,6 +449,16 @@ describe("EventBuffer", () => {
       expect(insertCall).toBeDefined();
       expect(insertCall![0]).toContain("created_at, updated_at, status");
       expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
+      expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
+
+      const collectionCallIndex = client.query.mock.calls.findIndex((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("INSERT INTO collections")
+      );
+      const agentCallIndex = client.query.mock.calls.findIndex((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("INSERT INTO agents")
+      );
+      expect(collectionCallIndex).toBeGreaterThanOrEqual(0);
+      expect(agentCallIndex).toBeGreaterThan(collectionCallIndex);
     });
 
     it("replays orphan response and revocation chains when agent registration replays orphan feedback", async () => {
@@ -947,6 +1027,11 @@ describe("EventBuffer", () => {
       await buffer.flush();
 
       const client = mockPool._client;
+      const insertCall = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("INSERT INTO collections")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall![0]).toContain("authority = EXCLUDED.authority");
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
@@ -1041,6 +1126,9 @@ describe("EventBuffer", () => {
           call[0].includes("WHERE NOT metadata.immutable")
       );
       expect(metadataInsertCall).toBeDefined();
+      expect(metadataInsertCall[0]).toContain("created_at, updated_at, status");
+      expect(metadataInsertCall[0]).toContain("updated_at = EXCLUDED.updated_at");
+      expect(metadataInsertCall[1][10]).toBe(metadataInsertCall[1][11]);
     });
 
     it("should skip _uri: prefixed metadata keys", async () => {
@@ -2086,6 +2174,65 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+    });
+  });
+
+  describe("agent mutable updates preserve creation slot semantics in PG batch mode", () => {
+    it("does not rewrite block_slot on owner, wallet reset, collection pointer, or parent updates", async () => {
+      const client = mockPool._client;
+      const buffer = new EventBuffer(mockPool, null) as any;
+      const ctx = {
+        signature: "sig-mut",
+        slot: 999n,
+        txIndex: 3,
+        eventOrdinal: 1,
+        blockTime: new Date("2026-03-06T00:00:00.000Z"),
+      };
+
+      client.query.mockClear();
+      await buffer.updateAgentOwnerSupabase(client, { asset: "asset1", newOwner: "owner1" }, ctx);
+      const ownerCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1")
+      );
+      expect(ownerCall).toBeDefined();
+      expect(ownerCall![0]).not.toContain("block_slot");
+
+      client.query.mockClear();
+      await buffer.updateWalletResetOnOwnerSyncSupabase(
+        client,
+        { asset: "asset1", ownerAfterSync: "owner2", newWallet: "wallet2" },
+        ctx
+      );
+      const walletResetCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1, agent_wallet = $2")
+      );
+      expect(walletResetCall).toBeDefined();
+      expect(walletResetCall![0]).not.toContain("block_slot");
+
+      client.query.mockClear();
+      await buffer.updateCollectionPointerSupabase(
+        client,
+        { asset: "asset1", col: "c1:test-pointer", setBy: "owner1", lock: true },
+        ctx
+      );
+      const collectionCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
+      );
+      expect(collectionCall).toBeDefined();
+      expect(collectionCall![0]).not.toContain("block_slot");
+
+      client.query.mockClear();
+      await buffer.updateParentAssetSupabase(
+        client,
+        { asset: "asset1", parentAsset: "parent1", parentCreator: "creator1", lock: true },
+        ctx
+      );
+      const parentCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
+      );
+      expect(parentCall).toBeDefined();
+      expect(parentCall![0]).not.toContain("block_slot");
+      expect(parentCall![1]).toHaveLength(5);
     });
   });
 });

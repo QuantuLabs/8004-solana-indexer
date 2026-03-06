@@ -82,18 +82,44 @@ interface BatchRpcFetcherOptions {
   maxParallelChunks?: number;
 }
 
+function isRateLimitError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const maybeError = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    response?: { status?: unknown };
+  };
+
+  if (maybeError.code === 429 || maybeError.status === 429 || maybeError.response?.status === 429) {
+    return true;
+  }
+
+  if (typeof maybeError.message !== "string") {
+    return false;
+  }
+
+  const message = maybeError.message.toLowerCase();
+  return message.includes("429") || message.includes("too many requests") || message.includes("rate limit");
+}
+
 /**
  * Batch RPC Fetcher - Fetches multiple transactions in parallel
  */
 export class BatchRpcFetcher {
   private connection: Connection;
   private chunkSize: number;
+  private currentChunkSize: number;
   private maxParallelChunks: number;
   private stats = { batchCount: 0, totalTime: 0 };
 
   constructor(connection: Connection, options: BatchRpcFetcherOptions = {}) {
     this.connection = connection;
     this.chunkSize = options.chunkSize ?? config.pollerRpcChunkSize ?? DEFAULT_BATCH_SIZE_RPC;
+    this.currentChunkSize = this.chunkSize;
     this.maxParallelChunks = options.maxParallelChunks ?? config.pollerRpcChunkConcurrency ?? DEFAULT_MAX_PARALLEL_RPC;
   }
 
@@ -108,8 +134,8 @@ export class BatchRpcFetcher {
 
     // Split into chunks of configured getParsedTransactions size
     const chunks: string[][] = [];
-    for (let i = 0; i < signatures.length; i += this.chunkSize) {
-      chunks.push(signatures.slice(i, i + this.chunkSize));
+    for (let i = 0; i < signatures.length; i += this.currentChunkSize) {
+      chunks.push(signatures.slice(i, i + this.currentChunkSize));
     }
 
     const startTime = Date.now();
@@ -165,6 +191,31 @@ export class BatchRpcFetcher {
         }
       }
     } catch (error) {
+      if (isRateLimitError(error) && signatures.length > 1) {
+        const nextChunkSize = Math.max(1, Math.floor(signatures.length / 2));
+        if (nextChunkSize < this.currentChunkSize) {
+          this.currentChunkSize = nextChunkSize;
+        }
+        logger.warn(
+          {
+            count: signatures.length,
+            nextChunkSize: this.currentChunkSize,
+            error,
+          },
+          "Batch RPC fetch rate-limited, reducing chunk size and retrying"
+        );
+
+        const splitResults = new Map<string, ParsedTransactionWithMeta>();
+        for (let i = 0; i < signatures.length; i += this.currentChunkSize) {
+          const chunk = signatures.slice(i, i + this.currentChunkSize);
+          const chunkResults = await this.fetchChunk(chunk);
+          for (const [sig, tx] of chunkResults) {
+            splitResults.set(sig, tx);
+          }
+        }
+        return splitResults;
+      }
+
       logger.warn({ error, count: signatures.length }, "Batch RPC fetch failed, falling back to individual");
 
       // Fallback to individual fetches
@@ -205,6 +256,7 @@ export class BatchRpcFetcher {
   getStats() {
     return {
       batchCount: this.stats.batchCount,
+      chunkSize: this.currentChunkSize,
       avgTime: this.stats.batchCount > 0
         ? Math.round(this.stats.totalTime / this.stats.batchCount)
         : 0
@@ -223,6 +275,7 @@ export class EventBuffer {
   private buffer: BatchEvent[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private flushInProgress = false;
+  private activeFlushPromise: Promise<void> | null = null;
   private pool: Pool | null = null;
   private prisma: PrismaClient | null = null;
   private lastCtx: BatchEvent["ctx"] | null = null;
@@ -281,7 +334,11 @@ export class EventBuffer {
       this.flushTimer = null;
     }
 
-    if (this.buffer.length === 0 || this.flushInProgress) {
+    if (this.flushInProgress) {
+      return this.activeFlushPromise ?? Promise.resolve();
+    }
+
+    if (this.buffer.length === 0) {
       return;
     }
 
@@ -292,67 +349,80 @@ export class EventBuffer {
     this.lastCtx = null;
 
     const startTime = Date.now();
-
-    try {
-      if (config.dbMode === "supabase" && this.pool) {
-        await this.flushToSupabase(eventsToFlush, lastCtx);
-      } else if (this.prisma) {
-        await this.flushToPrisma(eventsToFlush, lastCtx);
-      }
-
-      this.stats.eventsFlushed += eventsToFlush.length;
-      this.stats.flushCount++;
-      this.stats.totalFlushTime += Date.now() - startTime;
-
-      logger.debug({
-        events: eventsToFlush.length,
-        elapsed: Date.now() - startTime,
-        avgFlushTime: Math.round(this.stats.totalFlushTime / this.stats.flushCount)
-      }, "Batch flush complete");
-
-    } catch (error) {
-      this.retryCount++;
-      logger.error({ error, eventCount: eventsToFlush.length, retryCount: this.retryCount }, "Batch flush failed");
-
-      if (this.retryCount >= MAX_FLUSH_RETRIES) {
-        // High integrity mode: never continue after unrecoverable flush failure.
-        // Keep events in memory for retry and optionally copy to DLQ for diagnostics.
-        logger.error({
-          eventCount: eventsToFlush.length,
-          retryCount: this.retryCount
-        }, "Max retries exceeded, failing stop-safe flush (events re-queued)");
-
-        // Keep a bounded diagnostic snapshot without dropping source events.
-        const spaceAvailable = Math.max(0, MAX_DEAD_LETTER - this.deadLetterQueue.length);
-        const toCopy = Math.min(spaceAvailable, eventsToFlush.length);
-        if (toCopy > 0) {
-          const now = Date.now();
-          this.deadLetterQueue.push(...eventsToFlush
-            .slice(0, toCopy)
-            .map(event => ({ event, addedAt: now })));
-          this.stats.deadLettered += toCopy;
-        }
-        if (toCopy < eventsToFlush.length) {
-          logger.warn({
-            copiedToDeadLetter: toCopy,
-            skippedDiagnosticCopies: eventsToFlush.length - toCopy,
-            deadLetterSize: this.deadLetterQueue.length,
-          }, "Dead letter queue at capacity; skipped excess diagnostic copies");
+    this.activeFlushPromise = (async () => {
+      try {
+        if (config.dbMode === "supabase" && this.pool) {
+          await this.flushToSupabase(eventsToFlush, lastCtx);
+        } else if (this.prisma) {
+          await this.flushToPrisma(eventsToFlush, lastCtx);
         }
 
-        // Critical: requeue all source events and propagate error so caller halts/retries.
-        this.buffer = [...eventsToFlush, ...this.buffer];
-        this.retryCount = 0;
-        throw error;
-      } else {
-        // Re-add events to buffer for retry (limited retries)
-        this.buffer = [...eventsToFlush, ...this.buffer];
-        // Wait before next retry
-        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * this.retryCount));
-        throw error;
+        this.stats.eventsFlushed += eventsToFlush.length;
+        this.stats.flushCount++;
+        this.stats.totalFlushTime += Date.now() - startTime;
+
+        logger.debug({
+          events: eventsToFlush.length,
+          elapsed: Date.now() - startTime,
+          avgFlushTime: Math.round(this.stats.totalFlushTime / this.stats.flushCount)
+        }, "Batch flush complete");
+
+      } catch (error) {
+        this.retryCount++;
+        logger.error({ error, eventCount: eventsToFlush.length, retryCount: this.retryCount }, "Batch flush failed");
+
+        if (this.retryCount >= MAX_FLUSH_RETRIES) {
+          logger.error({
+            eventCount: eventsToFlush.length,
+            retryCount: this.retryCount
+          }, "Max retries exceeded, failing stop-safe flush (events re-queued)");
+
+          const spaceAvailable = Math.max(0, MAX_DEAD_LETTER - this.deadLetterQueue.length);
+          const toCopy = Math.min(spaceAvailable, eventsToFlush.length);
+          if (toCopy > 0) {
+            const now = Date.now();
+            this.deadLetterQueue.push(...eventsToFlush
+              .slice(0, toCopy)
+              .map(event => ({ event, addedAt: now })));
+            this.stats.deadLettered += toCopy;
+          }
+          if (toCopy < eventsToFlush.length) {
+            logger.warn({
+              copiedToDeadLetter: toCopy,
+              skippedDiagnosticCopies: eventsToFlush.length - toCopy,
+              deadLetterSize: this.deadLetterQueue.length,
+            }, "Dead letter queue at capacity; skipped excess diagnostic copies");
+          }
+
+          this.buffer = [...eventsToFlush, ...this.buffer];
+          this.retryCount = 0;
+          throw error;
+        } else {
+          this.buffer = [...eventsToFlush, ...this.buffer];
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * this.retryCount));
+          throw error;
+        }
+      } finally {
+        this.flushInProgress = false;
+        this.activeFlushPromise = null;
       }
-    } finally {
-      this.flushInProgress = false;
+    })();
+
+    return this.activeFlushPromise;
+  }
+
+  async drain(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    while (this.flushInProgress || this.buffer.length > 0) {
+      if (this.flushInProgress) {
+        await (this.activeFlushPromise ?? Promise.resolve());
+        continue;
+      }
+      await this.flush();
     }
   }
 
@@ -413,13 +483,13 @@ export class EventBuffer {
       if (lastCtx) {
         await client.query(`
           INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
-          VALUES ('main', $1, $2, $3, 'poller', NOW())
+          VALUES ('main', $1, $2, $3, 'poller', $4)
           ON CONFLICT (id) DO UPDATE SET
             last_signature = EXCLUDED.last_signature,
             last_slot = EXCLUDED.last_slot,
             last_tx_index = EXCLUDED.last_tx_index,
             source = EXCLUDED.source,
-            updated_at = NOW()
+            updated_at = EXCLUDED.updated_at
           WHERE indexer_state.last_slot IS NULL
              OR indexer_state.last_slot < EXCLUDED.last_slot
              OR (
@@ -435,7 +505,7 @@ export class EventBuffer {
                  )
                )
              )
-        `, [lastCtx.signature, lastCtx.slot.toString(), lastCtx.txIndex ?? null]);
+        `, [lastCtx.signature, lastCtx.slot.toString(), lastCtx.txIndex ?? null, lastCtx.blockTime.toISOString()]);
       }
 
       await client.query("COMMIT");
@@ -526,6 +596,12 @@ export class EventBuffer {
     const collection = data.collection?.toBase58?.() || data.collection;
 
     await client.query(`
+      INSERT INTO collections (collection, registry_type, created_at, status)
+      VALUES ($1, $2, $3, 'PENDING')
+      ON CONFLICT (collection) DO NOTHING
+    `, [collection, "BASE", ctx.blockTime.toISOString()]);
+
+    await client.query(`
       INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'PENDING')
       ON CONFLICT (asset) DO UPDATE SET
@@ -533,7 +609,6 @@ export class EventBuffer {
         creator = COALESCE(agents.creator, EXCLUDED.creator),
         agent_uri = EXCLUDED.agent_uri,
         atom_enabled = EXCLUDED.atom_enabled,
-        block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
         updated_at = EXCLUDED.updated_at
@@ -1126,7 +1201,9 @@ export class EventBuffer {
     await client.query(`
       INSERT INTO collections (collection, registry_type, authority, created_at, status)
       VALUES ($1, $2, $3, $4, 'PENDING')
-      ON CONFLICT (collection) DO NOTHING
+      ON CONFLICT (collection) DO UPDATE SET
+        registry_type = EXCLUDED.registry_type,
+        authority = EXCLUDED.authority
     `, [collection, "BASE", authority, ctx.blockTime.toISOString()]);
   }
 
@@ -1152,8 +1229,8 @@ export class EventBuffer {
     const wallet = walletRaw === DEFAULT_PUBKEY ? null : walletRaw;
     const ownerAfterSync = data.ownerAfterSync?.toBase58?.() || data.ownerAfterSync;
     await client.query(
-      `UPDATE agents SET owner = $1, agent_wallet = $2, block_slot = $3, updated_at = $4 WHERE asset = $5`,
-      [ownerAfterSync, wallet, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+      `UPDATE agents SET owner = $1, agent_wallet = $2, updated_at = $3 WHERE asset = $4`,
+      [ownerAfterSync, wallet, ctx.blockTime.toISOString(), asset]
     );
   }
 
@@ -1182,13 +1259,12 @@ export class EventBuffer {
          WHERE asset = $1
        ),
        resolved AS (
-         SELECT COALESCE((SELECT prev_creator FROM previous), $3) AS creator_key
+         SELECT COALESCE((SELECT prev_creator FROM previous), $3::text) AS creator_key
        ),
        updated AS (
          UPDATE agents
          SET canonical_col = $2,
              creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
-             block_slot = $4,
              updated_at = $5,
              col_locked = COALESCE($7, col_locked)
          WHERE asset = $1
@@ -1275,11 +1351,10 @@ export class EventBuffer {
       `UPDATE agents
        SET parent_asset = $1,
            parent_creator = $2,
-           block_slot = $3,
-           updated_at = $4,
-           parent_locked = COALESCE($6, parent_locked)
-       WHERE asset = $5`,
-      [parentAsset, parentCreator, ctx.slot.toString(), ctx.blockTime.toISOString(), asset, lock]
+           updated_at = $3,
+           parent_locked = COALESCE($5, parent_locked)
+       WHERE asset = $4`,
+      [parentAsset, parentCreator, ctx.blockTime.toISOString(), asset, lock]
     );
   }
 
@@ -1309,15 +1384,15 @@ export class EventBuffer {
     const id = `${asset}:${keyHash}`;
 
     await client.query(`
-      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING')
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
       ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
         immutable = metadata.immutable OR EXCLUDED.immutable,
         block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
-        updated_at = $12
+        updated_at = EXCLUDED.updated_at
       WHERE NOT metadata.immutable
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
@@ -1334,8 +1409,8 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     const newOwner = data.newOwner?.toBase58?.() || data.newOwner;
     await client.query(
-      `UPDATE agents SET owner = $1, block_slot = $2, updated_at = $3 WHERE asset = $4`,
-      [newOwner, ctx.slot.toString(), ctx.blockTime.toISOString(), asset]
+      `UPDATE agents SET owner = $1, updated_at = $2 WHERE asset = $3`,
+      [newOwner, ctx.blockTime.toISOString(), asset]
     );
   }
 
@@ -1356,6 +1431,7 @@ export class EventBuffer {
           slot: lastCtx.slot,
           txIndex: lastCtx.txIndex ?? null,
           source: "poller",
+          updatedAt: lastCtx.blockTime,
         })) {
           return;
         }
