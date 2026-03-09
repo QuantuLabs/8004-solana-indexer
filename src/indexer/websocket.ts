@@ -146,8 +146,9 @@ export class WebSocketIndexer {
     }
 
     // Drain remaining queue items before shutdown.
-    if (this.logQueue.size > 0) {
-      logger.info({ queueSize: this.logQueue.size }, "Draining log queue before shutdown");
+    const queueDepth = this.logQueue.size + this.logQueue.pending;
+    if (queueDepth > 0) {
+      logger.info({ queueSize: this.logQueue.size, pending: this.logQueue.pending }, "Draining log queue before shutdown");
       await this.logQueue.onIdle();
     }
   }

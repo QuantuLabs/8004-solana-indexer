@@ -34,7 +34,9 @@ import * as fs from "fs";
 import * as path from "path";
 
 const LOCALNET_RPC = "http://localhost:8899";
-const PROGRAM_ID = new PublicKey("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
+const PROGRAM_ID = new PublicKey(
+  process.env.PROGRAM_ID || "8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ"
+);
 const MPL_CORE_PROGRAM_ID = new PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
 
 function loadIdl(): any {

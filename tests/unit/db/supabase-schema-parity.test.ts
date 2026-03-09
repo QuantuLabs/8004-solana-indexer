@@ -111,4 +111,27 @@ describe("supabase schema revocations bootstrap parity", () => {
       "(SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks"
     );
   });
+
+  it("defines proxy schema objects used by agent0 REST clients", () => {
+    expect(schemaSql).toContain("DROP VIEW IF EXISTS agent_reputation CASCADE;");
+    expect(schemaSql).toContain("CREATE OR REPLACE VIEW agent_reputation");
+    expect(schemaSql).toContain("LEFT JOIN feedback_stats fs");
+    expect(schemaSql).toContain("THEN COALESCE(fs.avg_score, a.raw_avg_score::numeric)");
+    expect(schemaSql).toContain("LEFT JOIN validation_stats vs");
+    expect(schemaSql).toContain("COALESCE(vs.validation_count, 0) AS validation_count");
+    expect(schemaSql).toContain("GRANT SELECT ON agent_reputation TO anon;");
+    expect(schemaSql).toContain("GRANT SELECT ON agent_reputation TO authenticated;");
+
+    expect(schemaSql).toContain("DROP FUNCTION IF EXISTS get_collection_agents CASCADE;");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION get_collection_agents(");
+    expect(schemaSql).toContain("RETURNS TABLE (");
+    expect(schemaSql).toContain("feedback_count INTEGER");
+    expect(schemaSql).toContain("FROM collection_pointers cp");
+    expect(schemaSql).toContain("JOIN agents a");
+    expect(schemaSql).toContain("a.canonical_col = cp.col");
+    expect(schemaSql).toContain("a.creator = cp.creator");
+    expect(schemaSql).toContain("WHERE cp.collection_id = $1");
+    expect(schemaSql).toContain("GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO anon;");
+    expect(schemaSql).toContain("GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO authenticated;");
+  });
 });

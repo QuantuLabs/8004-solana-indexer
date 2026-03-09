@@ -1326,7 +1326,7 @@ describe("REST feedback deterministic ordering", () => {
     }
   });
 
-  it("maps orphan responses with digest/count fields and response_count ordering", async () => {
+  it("does not expose orphan response staging rows from canonical responses endpoint", async () => {
     const prisma = {
       feedback: {
         findFirst: vi.fn().mockResolvedValue(null),
@@ -1360,41 +1360,10 @@ describe("REST feedback deterministic ordering", () => {
         `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0&order=response_count.desc`
       );
       expect(res.status).toBe(200);
-
-      expect(prisma.orphanResponse.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { agentId: "asset-1", client: "client-1", feedbackIndex: 0n },
-          orderBy: [
-            { responseCount: "desc" },
-            { responder: "asc" },
-            { slot: "asc" },
-            { txIndex: "asc" },
-            { eventOrdinal: "asc" },
-            { txSignature: { sort: "asc", nulls: "last" } },
-          ],
-        })
-      );
+      expect(await res.json()).toEqual([]);
+      expect(prisma.feedback.findFirst).toHaveBeenCalledTimes(1);
       expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
-
-      const body = await res.json() as Array<Record<string, unknown>>;
-      expect(body).toHaveLength(1);
-      expect(body[0]).toMatchObject({
-        id: null,
-        feedback_id: null,
-        response_id: null,
-        asset: "asset-1",
-        client_address: "client-1",
-        feedback_index: "0",
-        responder: "responder-1",
-        response_uri: "ipfs://resp",
-        response_hash: "ab",
-        running_digest: "cd",
-        response_count: "7",
-        status: "PENDING",
-        verified_at: null,
-        block_slot: 42,
-        tx_signature: "tx-1",
-      });
+      expect(prisma.orphanResponse.findMany).not.toHaveBeenCalled();
     } finally {
       await stopServer(server);
     }
@@ -1601,13 +1570,13 @@ describe("REST feedback deterministic ordering", () => {
   });
 
   it.each([
-    ["response_count.asc", "responseCount", "asc"],
-    ["block_slot.asc", "slot", "asc"],
-    ["block_slot.desc", "slot", "desc"],
-    [undefined, "createdAt", "desc"],
+    ["response_count.asc"],
+    ["block_slot.asc"],
+    ["block_slot.desc"],
+    [undefined],
   ])(
-    "keeps orphan response ordering deterministic with txIndex/eventOrdinal before txSignature for order=%s",
-    async (order, primaryField, primaryDir) => {
+    "does not surface orphan response staging rows for order=%s",
+    async (order) => {
       const prisma = {
         feedback: {
           findFirst: vi.fn().mockResolvedValue(null),
@@ -1628,24 +1597,16 @@ describe("REST feedback deterministic ordering", () => {
           `${baseUrl}/rest/v1/responses?asset=asset-1&client_address=client-1&feedback_index=eq.0${orderParam}`
         );
         expect(res.status).toBe(200);
+        expect(await res.json()).toEqual([]);
         expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
-
-      const callArgs = prisma.orphanResponse.findMany.mock.calls[0]?.[0];
-      expect(callArgs).toBeDefined();
-      expect(callArgs.orderBy[0]).toEqual({ [primaryField]: primaryDir });
-      const txIndexPos = callArgs.orderBy.findIndex((entry: any) => "txIndex" in entry);
-      const eventOrdinalPos = callArgs.orderBy.findIndex((entry: any) => "eventOrdinal" in entry);
-      const txSignaturePos = callArgs.orderBy.findIndex((entry: any) => "txSignature" in entry);
-      expect(txIndexPos).toBeGreaterThan(-1);
-      expect(eventOrdinalPos).toBeGreaterThan(txIndexPos);
-      expect(txSignaturePos).toBeGreaterThan(eventOrdinalPos);
+        expect(prisma.orphanResponse.findMany).not.toHaveBeenCalled();
     } finally {
       await stopServer(server);
     }
     }
   );
 
-  it("treats empty status comparison as no status filter for orphan responses", async () => {
+  it("treats empty status comparison as no status filter while still excluding orphan staging rows", async () => {
     const prisma = {
       feedback: {
         findFirst: vi.fn().mockResolvedValue(null),
@@ -1680,8 +1641,8 @@ describe("REST feedback deterministic ordering", () => {
       );
       expect(res.status).toBe(200);
       const body = await res.json() as Array<Record<string, unknown>>;
-      expect(body).toHaveLength(1);
-      expect(prisma.orphanResponse.findMany).toHaveBeenCalledTimes(1);
+      expect(body).toEqual([]);
+      expect(prisma.orphanResponse.findMany).not.toHaveBeenCalled();
       expect(prisma.feedbackResponse.findMany).not.toHaveBeenCalled();
     } finally {
       await stopServer(server);

@@ -241,6 +241,17 @@ describe("Processor", () => {
     });
 
     it("should start in websocket mode", async () => {
+      const bootstrapPollerA = createPollerMock();
+      const bootstrapPollerB = createPollerMock();
+      bootstrapPollerA.bootstrap.mockResolvedValue(undefined);
+      bootstrapPollerB.bootstrap.mockResolvedValue(undefined);
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerA() {
+        return bootstrapPollerA as any;
+      });
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerB() {
+        return bootstrapPollerB as any;
+      });
+
       const processor = new Processor(mockPrisma, null, { mode: "websocket" });
       await processor.start();
 
@@ -253,7 +264,10 @@ describe("Processor", () => {
       expect(WebSocketIndexer).toHaveBeenCalled();
       expect(mockWsIndexerInstance.start).toHaveBeenCalled();
       expect(mockVerifierInstance.start).toHaveBeenCalled();
-      expect(Poller).not.toHaveBeenCalled();
+      expect(Poller).toHaveBeenCalledTimes(2);
+      expect(bootstrapPollerA.bootstrap).toHaveBeenCalledTimes(1);
+      expect(bootstrapPollerB.bootstrap).toHaveBeenCalledTimes(1);
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
       expect((processor as any).wsMonitorInterval).not.toBeNull();
     });
 
@@ -705,11 +719,21 @@ describe("Processor", () => {
     });
 
     it("should clean up websocket startup state when verifier start fails", async () => {
+      const bootstrapPollerA = createPollerMock();
+      const bootstrapPollerB = createPollerMock();
       const wsInstance = createWsIndexerMock();
+      bootstrapPollerA.bootstrap.mockResolvedValue(undefined);
+      bootstrapPollerB.bootstrap.mockResolvedValue(undefined);
       wsInstance.start.mockResolvedValue(undefined);
       wsInstance.stop.mockResolvedValue(undefined);
       wsInstance.isActive.mockReturnValue(true);
       wsInstance.isRecovering.mockReturnValue(false);
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerA() {
+        return bootstrapPollerA as any;
+      });
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerB() {
+        return bootstrapPollerB as any;
+      });
       vi.mocked(WebSocketIndexer).mockImplementationOnce(function MockWsIndexer() {
         return wsInstance as any;
       });
@@ -719,6 +743,8 @@ describe("Processor", () => {
 
       await expect(processor.start()).rejects.toThrow("verifier boom");
 
+      expect(bootstrapPollerA.bootstrap).toHaveBeenCalledTimes(1);
+      expect(bootstrapPollerB.bootstrap).toHaveBeenCalledTimes(1);
       expect(wsInstance.start).toHaveBeenCalledTimes(1);
       expect(wsInstance.stop).toHaveBeenCalledTimes(1);
       expect(mockVerifierInstance.stop).toHaveBeenCalledTimes(1);

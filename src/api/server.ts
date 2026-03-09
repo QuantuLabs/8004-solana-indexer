@@ -11,7 +11,14 @@ import { Server } from 'http';
 import { PrismaClient, Prisma, Agent as PrismaAgent, Collection as PrismaCollection } from '@prisma/client';
 import { logger } from '../logger.js';
 import { decompressFromStorage } from '../utils/compression.js';
-import { ReplayVerifier } from '../services/replay-verifier.js';
+import {
+  fetchReplayDataFromPool,
+  getLatestCheckpointsFromPool,
+  listCheckpointsFromPool,
+  PoolReplayVerifier,
+  ReplayChainType,
+  ReplayVerifier,
+} from '../services/replay-verifier.js';
 import cors from 'cors';
 import type { Pool } from 'pg';
 import { config } from '../config.js';
@@ -49,6 +56,7 @@ export interface ApiServerOptions {
   prisma?: PrismaClient | null;
   pool?: Pool | null;
   port?: number;
+  isReady?: () => boolean;
 }
 
 // LRU cache for leaderboard (prevents unbounded memory growth + repeated queries)
@@ -716,6 +724,12 @@ const REST_PROXY_LOCAL_COMPAT_PATHS = [
   '/collections',
   '/collection_asset_count',
   '/collection_assets',
+  '/checkpoints',
+  '/events',
+  '/verify/replay',
+  '/agents/children',
+  '/agents/tree',
+  '/agents/lineage',
 ] as const;
 
 const REST_PROXY_STATUS_DEFAULT_PATHS = new Set([
@@ -735,6 +749,10 @@ function isAllowedRestProxyPath(pathname: string): boolean {
 
 function isLocalRestCompatPath(pathname: string): boolean {
   return REST_PROXY_LOCAL_COMPAT_PATHS.some((allowed) => pathname === allowed || pathname.startsWith(`${allowed}/`));
+}
+
+function isReplayChainType(value: string | undefined): value is ReplayChainType {
+  return value === 'feedback' || value === 'response' || value === 'revoke';
 }
 
 function hasUnsafeRestProxyPath(pathname: string): boolean {
@@ -921,6 +939,7 @@ export function createApiServer(options: ApiServerOptions): Express {
 
   const prisma = options.prisma as PrismaClient;
   const app = express();
+  const isReady = options.isReady ?? (() => true);
 
   const trustProxyRaw = process.env.TRUST_PROXY;
   let trustProxy: string | number | boolean = false;
@@ -935,7 +954,13 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.use(express.json({ limit: '100kb' }));
 
   // CORS - allow configurable origins
-  const allowedOrigins = process.env.CORS_ORIGINS?.split(',').map(s => s.trim()) || ['*'];
+  const parsedAllowedOrigins = process.env.CORS_ORIGINS
+    ?.split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const allowedOrigins = parsedAllowedOrigins && parsedAllowedOrigins.length > 0
+    ? parsedAllowedOrigins
+    : ['*'];
   if (allowedOrigins.includes('*')) {
     logger.warn('CORS_ORIGINS not set, defaulting to wildcard (*). Set CORS_ORIGINS env var for production.');
   }
@@ -962,12 +987,35 @@ export function createApiServer(options: ApiServerOptions): Express {
     res.json({ status: 'ok' });
   });
 
+  app.get('/ready', (_req: Request, res: Response) => {
+    if (!isReady()) {
+      res.status(503).json({ status: 'starting' });
+      return;
+    }
+    res.json({ status: 'ready' });
+  });
+
   if (config.metricsEndpointEnabled) {
     app.get('/metrics', (_req: Request, res: Response) => {
       res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
       res.send(renderIntegrityMetrics());
     });
   }
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (isReady()) {
+      next();
+      return;
+    }
+
+    if (req.path === '/health' || req.path === '/ready' || req.path === '/metrics') {
+      next();
+      return;
+    }
+
+    res.setHeader('Retry-After', '5');
+    res.status(503).json({ error: 'Indexer bootstrap in progress. Retry shortly.' });
+  });
 
   // Global rate limiting
   const limiter = rateLimit({
@@ -1268,6 +1316,11 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/agents/children - Direct children for a given parent asset
   app.get('/rest/v1/agents/children', async (req: Request, res: Response) => {
     try {
+      if (!prisma) {
+        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        return;
+      }
+
       const parentAsset = parsePostgRESTValue(req.query.parent_asset) ?? parsePostgRESTValue(req.query.parent);
       if (!parentAsset) {
         res.status(400).json({ error: 'Missing required query param: parent_asset' });
@@ -1304,6 +1357,11 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/agents/tree - Reconstruct parent/children tree (bounded depth)
   app.get('/rest/v1/agents/tree', async (req: Request, res: Response) => {
     try {
+      if (!prisma) {
+        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        return;
+      }
+
       const rootAsset = parsePostgRESTValue(req.query.root_asset)
         ?? parsePostgRESTValue(req.query.root)
         ?? parsePostgRESTValue(req.query.parent_asset);
@@ -1387,6 +1445,11 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/agents/lineage - Parent chain for a given asset
   app.get('/rest/v1/agents/lineage', async (req: Request, res: Response) => {
     try {
+      if (!prisma) {
+        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        return;
+      }
+
       const asset = parsePostgRESTValue(req.query.asset);
       if (!asset) {
         res.status(400).json({ error: 'Missing required query param: asset' });
@@ -1580,8 +1643,10 @@ export function createApiServer(options: ApiServerOptions): Express {
                 { id: 'asc' },
               ];
 
-      // If Prefer: count=exact, also get total count
+      // If Prefer: count=exact, also get total count.
+      // Also count when feedback_id is queried without asset because feedback_id is only agent-scoped.
       const needsCount = wantsCount(req);
+      const needsAmbiguityCount = feedback_id !== undefined && !asset;
       const [feedbacks, totalCount] = await Promise.all([
         prisma.feedback.findMany({
           where,
@@ -1589,10 +1654,10 @@ export function createApiServer(options: ApiServerOptions): Express {
           take: limit,
           skip: offset,
         }),
-        needsCount ? prisma.feedback.count({ where }) : Promise.resolve(0),
+        needsCount || needsAmbiguityCount ? prisma.feedback.count({ where }) : Promise.resolve(0),
       ]);
 
-      if (feedback_id !== undefined && !asset && feedbacks.length > 1) {
+      if (feedback_id !== undefined && !asset && totalCount > 1) {
         res.status(400).json({ error: 'feedback_id is scoped by agent. Provide asset filter when ambiguous.' });
         return;
       }
@@ -1679,8 +1744,8 @@ export function createApiServer(options: ApiServerOptions): Express {
     }
   });
 
-  // GET /rest/v1/responses and /rest/v1/feedback_responses - List responses with filters (PostgREST format)
-  // Both routes supported for SDK compatibility
+  // GET /rest/v1/responses and /rest/v1/feedback_responses - List canonical feedback responses
+  // Both routes are aliases for SDK compatibility and intentionally exclude orphan-response staging rows.
   const responsesHandler = async (req: Request, res: Response) => {
     try {
       const feedback_id = parsePostgRESTValue(req.query.feedback_id);
@@ -1714,15 +1779,6 @@ export function createApiServer(options: ApiServerOptions): Express {
         });
         return;
       }
-      const parsedStatusComparison = parsePostgRESTComparison(req.query.status);
-      const statusComparison = parsedStatusComparison?.value ? parsedStatusComparison : null;
-      const orphanStatusAllowed = !statusComparison
-        ? true
-        : (
-          statusComparison.op === 'neq'
-            ? 'PENDING' !== statusComparison.value
-            : 'PENDING' === statusComparison.value
-        );
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
       if (txSignatureFilter !== undefined) {
         where.txSignature = txSignatureFilter;
@@ -1822,89 +1878,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         if (feedback) {
           where.feedbackId = feedback.id;
         } else {
-          // Check orphan responses (feedback not yet indexed)
-          if (parsedResponseId !== undefined || !orphanStatusAllowed) {
-            res.json([]);
-            return;
-          }
-
-          const orphanOrderBy =
-            order === 'response_count.asc'
-                  ? [
-                      { responseCount: 'asc' as const },
-                      { responder: 'asc' as const },
-                      { slot: 'asc' as const },
-                      { txIndex: 'asc' as const },
-                      { eventOrdinal: 'asc' as const },
-                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
-                    ]
-                : order === 'response_count.desc'
-                  ? [
-                      { responseCount: 'desc' as const },
-                      { responder: 'asc' as const },
-                      { slot: 'asc' as const },
-                      { txIndex: 'asc' as const },
-                      { eventOrdinal: 'asc' as const },
-                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
-                    ]
-                : order === 'block_slot.asc'
-                  ? [
-                      { slot: 'asc' as const },
-                      { responder: 'asc' as const },
-                      { txIndex: 'asc' as const },
-                      { eventOrdinal: 'asc' as const },
-                      { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
-                    ]
-                  : order === 'block_slot.desc'
-                    ? [
-                        { slot: 'desc' as const },
-                        { responder: 'asc' as const },
-                        { txIndex: 'asc' as const },
-                        { eventOrdinal: 'asc' as const },
-                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
-                      ]
-                    : [
-                        { createdAt: 'desc' as const },
-                        { responder: 'asc' as const },
-                        { slot: 'asc' as const },
-                        { txIndex: 'asc' as const },
-                        { eventOrdinal: 'asc' as const },
-                        { txSignature: { sort: 'asc' as const, nulls: 'last' as const } },
-                      ];
-
-          const orphanWhere: Prisma.OrphanResponseWhereInput = {
-            agentId: asset,
-            client: client_address,
-            feedbackIndex: parsedFeedbackIndex,
-          };
-          if (txSignatureFilter !== undefined) {
-            orphanWhere.txSignature = txSignatureFilter;
-          }
-          const orphans = await prisma.orphanResponse.findMany({
-            where: orphanWhere,
-            orderBy: orphanOrderBy,
-            take: limit,
-            skip: offset,
-          });
-          const mapped = orphans.map(o => ({
-            id: null,
-            feedback_id: null,
-            response_id: null,
-            asset: o.agentId,
-            client_address: o.client,
-            feedback_index: o.feedbackIndex.toString(),
-            responder: o.responder,
-            response_uri: o.responseUri,
-            response_hash: o.responseHash ? Buffer.from(o.responseHash).toString('hex') : null,
-            running_digest: o.runningDigest ? Buffer.from(o.runningDigest).toString('hex') : null,
-            response_count: o.responseCount ? o.responseCount.toString() : null,
-            status: 'PENDING',
-            verified_at: null,
-            block_slot: o.slot ? Number(o.slot) : 0,
-            tx_signature: o.txSignature || '',
-            created_at: o.createdAt.toISOString(),
-          }));
-          res.json(mapped);
+          res.json([]);
           return;
         }
       } else {
@@ -3044,9 +3018,34 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = safeQueryString(req.params.asset);
       if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
       if (!BASE58_REGEX.test(asset)) { res.status(400).json({ error: 'Invalid asset: must be a base58-encoded public key (32-44 chars)' }); return; }
-      const chainType = safeQueryString(req.query.chainType);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+      const chainTypeRaw = safeQueryString(req.query.chainType);
+      const chainType = isReplayChainType(chainTypeRaw) ? chainTypeRaw : undefined;
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Checkpoint endpoints unavailable without supported database backend' });
+          return;
+        }
+
+        if (chainTypeRaw && !chainType) {
+          res.json([]);
+          return;
+        }
+
+        const checkpoints = await listCheckpointsFromPool(options.pool, asset, chainType);
+        res.json(
+          checkpoints.slice(offset, offset + limit).map((cp) => ({
+            agent_id: asset,
+            chain_type: cp.chainType,
+            event_count: cp.eventCount,
+            digest: cp.digest,
+            created_at: cp.createdAt,
+          }))
+        );
+        return;
+      }
 
       const where: Prisma.HashChainCheckpointWhereInput = { agentId: asset };
       if (chainType) where.chainType = chainType;
@@ -3077,6 +3076,27 @@ export function createApiServer(options: ApiServerOptions): Express {
       const asset = safeQueryString(req.params.asset);
       if (!asset) { res.status(400).json({ error: 'asset parameter required' }); return; }
       if (!BASE58_REGEX.test(asset)) { res.status(400).json({ error: 'Invalid asset: must be a base58-encoded public key (32-44 chars)' }); return; }
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Checkpoint endpoints unavailable without supported database backend' });
+          return;
+        }
+
+        const checkpoints = await getLatestCheckpointsFromPool(options.pool, asset);
+        const fmt = (cp: typeof checkpoints.feedback) => cp ? {
+          event_count: cp.eventCount,
+          digest: cp.digest,
+          created_at: cp.createdAt,
+        } : null;
+
+        res.json({
+          feedback: fmt(checkpoints.feedback),
+          response: fmt(checkpoints.response),
+          revoke: fmt(checkpoints.revoke),
+        });
+        return;
+      }
 
       const [feedback, response, revoke] = await Promise.all(
         ['feedback', 'response', 'revoke'].map(ct =>
@@ -3110,7 +3130,12 @@ export function createApiServer(options: ApiServerOptions): Express {
       const cached = replayCache.get(asset);
       if (cached) { res.json(cached); return; }
 
-      const verifier = new ReplayVerifier(prisma);
+      if (!prisma && !options.pool) {
+        res.status(503).json({ error: 'Replay verification unavailable without supported database backend' });
+        return;
+      }
+
+      const verifier = prisma ? new ReplayVerifier(prisma) : new PoolReplayVerifier(options.pool!);
       const result = await verifier.incrementalVerify(asset);
       replayCache.set(asset, result);
       res.json(result);
@@ -3142,9 +3167,28 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
 
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Replay data unavailable without supported database backend' });
+          return;
+        }
+
+        const replayData = await fetchReplayDataFromPool(
+          options.pool,
+          asset,
+          chainType as ReplayChainType,
+          fromCount,
+          toCount,
+          limit,
+        );
+        res.json(replayData);
+        return;
+      }
+
       if (chainType === 'feedback') {
         const where: Prisma.FeedbackWhereInput = {
           agentId: asset,
+          status: { not: 'ORPHANED' },
           feedbackIndex: { gte: BigInt(fromCount) },
         };
         if (toCount !== undefined) {
@@ -3173,7 +3217,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         });
       } else if (chainType === 'response') {
         const where: Prisma.FeedbackResponseWhereInput = {
-          feedback: { agentId: asset },
+          status: { not: 'ORPHANED' },
+          feedback: {
+            agentId: asset,
+            status: { not: 'ORPHANED' },
+          },
         };
         const rcFilter: { gte: bigint; lt?: bigint } = { gte: BigInt(fromCount) };
         if (toCount !== undefined) rcFilter.lt = BigInt(toCount);
@@ -3210,6 +3258,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       } else {
         const where: Prisma.RevocationWhereInput = {
           agentId: asset,
+          status: { not: 'ORPHANED' },
           revokeCount: { gte: BigInt(fromCount) },
         };
         if (toCount !== undefined) {

@@ -110,6 +110,7 @@ async function main() {
 
   const pool = config.dbMode === "supabase" ? getPool() : null;
   const processor = new Processor(prisma, pool);
+  let apiReady = false;
 
   const wantsRest = config.apiMode !== "graphql";
   const wantsGraphql = config.apiMode !== "rest" && config.enableGraphql;
@@ -165,34 +166,54 @@ async function main() {
   }
 
   let apiServer: Server | null = null;
-  const startProcessorBeforeApi = config.dbMode === "local";
 
-  // In local mode, wait for initial verifier/backfill before exposing REST reads
-  // so sequential agent_id lookups do not race fresh ingests.
-  if (startProcessorBeforeApi) {
-    await processor.start();
-  }
-
-  if (canServeRest || canServeGraphql) {
-    const apiPort = parseInt(process.env.API_PORT || "3001");
-    apiServer = await startApiServer({ prisma, pool, port: apiPort });
-    logger.info(
-      {
-        apiPort,
-        apiMode: config.apiMode,
-        restEnabled: canServeRest,
-        restProxyEnabled,
-        graphqlEnabled: canServeGraphql,
-      },
-      "API available"
-    );
-    if (canServeGraphql) {
-      logger.info({ apiPort }, `GraphQL endpoint: http://localhost:${apiPort}/v2/graphql`);
+  try {
+    if (canServeRest || canServeGraphql) {
+      const apiPort = parseInt(process.env.API_PORT || "3001");
+      apiServer = await startApiServer({
+        prisma,
+        pool,
+        port: apiPort,
+        isReady: () => apiReady,
+      });
+      logger.info(
+        {
+          apiPort,
+          apiMode: config.apiMode,
+          restEnabled: canServeRest,
+          restProxyEnabled,
+          graphqlEnabled: canServeGraphql,
+        },
+        "API available"
+      );
+      if (canServeGraphql) {
+        logger.info({ apiPort }, `GraphQL endpoint: http://localhost:${apiPort}/v2/graphql`);
+      }
     }
-  }
 
-  if (!startProcessorBeforeApi) {
     await processor.start();
+    apiReady = true;
+  } catch (error) {
+    if (apiServer) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          apiServer!.close((err) => err ? reject(err) : resolve());
+        });
+      } catch (closeError) {
+        logger.error({ error: closeError }, "Failed to close API server after startup error");
+      }
+      apiServer = null;
+    }
+
+    if (prisma) {
+      try {
+        await prisma.$disconnect();
+      } catch (disconnectError) {
+        logger.error({ error: disconnectError }, "Failed to disconnect Prisma after startup error");
+      }
+    }
+
+    throw error;
   }
 
   const shutdown = async (signal: string) => {

@@ -12,6 +12,8 @@ describe("Docker Stack Config", () => {
       "DB_MODE: ${DB_MODE:?set DB_MODE}",
       "API_MODE: ${API_MODE:?set API_MODE}",
       "API_PORT: ${API_PORT:-3001}",
+      "RPC_URL: ${RPC_URL:-}",
+      "WS_URL: ${WS_URL:-}",
       "MAX_SUPPORTED_TRANSACTION_VERSION: ${MAX_SUPPORTED_TRANSACTION_VERSION:-0}",
       "GRAPHQL_RATE_LIMIT_MAX_REQUESTS: ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS:-30}",
       "RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}",
@@ -34,6 +36,7 @@ describe("Docker Stack Config", () => {
       "IPFS_GATEWAY_BASE: ${IPFS_GATEWAY_BASE:-https://ipfs.io}",
       "URI_DIGEST_TRUSTED_HOSTS: ${URI_DIGEST_TRUSTED_HOSTS:-}",
       "ALLOW_INSECURE_URI: ${ALLOW_INSECURE_URI:-false}",
+      "SUPABASE_DSN: ${SUPABASE_DSN:-}",
     ]) {
       expect(stackContent).toContain(pattern);
     }

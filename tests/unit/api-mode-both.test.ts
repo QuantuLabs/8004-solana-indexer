@@ -1552,6 +1552,309 @@ describe("API_MODE=both behavior", () => {
     }
   });
 
+  it("serves replay-data locally in REST proxy mode without forwarding upstream", async () => {
+    process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
+    process.env.SUPABASE_KEY = "service-role-key";
+    const asset = "11111111111111111111111111111111";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
+        return new Response(JSON.stringify({ error: "should-not-be-called" }), { status: 500 });
+      }
+      return realFetch(input, init);
+    });
+    const poolQuery = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM feedbacks") && sql.includes("feedback_index >= $2::bigint")) {
+        return {
+          rows: [{
+            client: "Client111111111111111111111111111111111",
+            feedback_index: "0",
+            feedback_hash: "aa".repeat(32),
+            slot: "123",
+            running_digest: "bb".repeat(32),
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: poolQuery } as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/events/${asset}/replay-data?chainType=feedback&fromCount=0&limit=5`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        events: [{
+          asset,
+          client: "Client111111111111111111111111111111111",
+          feedback_index: "0",
+          feedback_hash: "aa".repeat(32),
+          slot: 123,
+          running_digest: "bb".repeat(32),
+        }],
+        hasMore: false,
+        nextFromCount: 1,
+      });
+
+      const upstreamReplayCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
+      });
+      expect(upstreamReplayCall).toBeUndefined();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("serves checkpoint endpoints locally in REST proxy mode without forwarding upstream", async () => {
+    process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
+    process.env.SUPABASE_KEY = "service-role-key";
+    const asset = "11111111111111111111111111111111";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
+        return new Response(JSON.stringify({ error: "should-not-be-called" }), { status: 500 });
+      }
+      return realFetch(input, init);
+    });
+    const poolQuery = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM feedbacks") && sql.includes("ORDER BY feedback_index ASC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "11".repeat(32), created_at: new Date("2026-03-09T10:00:00.000Z") }],
+        };
+      }
+      if (sql.includes("FROM feedback_responses") && sql.includes("ORDER BY response_count ASC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "22".repeat(32), created_at: new Date("2026-03-09T10:01:00.000Z") }],
+        };
+      }
+      if (sql.includes("FROM revocations") && sql.includes("ORDER BY revoke_count ASC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "33".repeat(32), created_at: new Date("2026-03-09T10:02:00.000Z") }],
+        };
+      }
+      if (sql.includes("FROM feedbacks") && sql.includes("ORDER BY feedback_index DESC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "11".repeat(32) }],
+        };
+      }
+      if (sql.includes("FROM feedback_responses") && sql.includes("ORDER BY response_count DESC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "22".repeat(32) }],
+        };
+      }
+      if (sql.includes("FROM revocations") && sql.includes("ORDER BY revoke_count DESC")) {
+        return {
+          rows: [{ event_count: "1000", digest: "33".repeat(32) }],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: poolQuery } as any,
+    });
+
+    try {
+      const listRes = await fetch(`${baseUrl}/rest/v1/checkpoints/${asset}?limit=10`);
+      expect(listRes.status).toBe(200);
+      expect(await listRes.json()).toEqual([
+        {
+          agent_id: asset,
+          chain_type: "feedback",
+          event_count: 1000,
+          digest: "11".repeat(32),
+          created_at: "2026-03-09T10:00:00.000Z",
+        },
+        {
+          agent_id: asset,
+          chain_type: "response",
+          event_count: 1000,
+          digest: "22".repeat(32),
+          created_at: "2026-03-09T10:01:00.000Z",
+        },
+        {
+          agent_id: asset,
+          chain_type: "revoke",
+          event_count: 1000,
+          digest: "33".repeat(32),
+          created_at: "2026-03-09T10:02:00.000Z",
+        },
+      ]);
+
+      const latestRes = await fetch(`${baseUrl}/rest/v1/checkpoints/${asset}/latest`);
+      expect(latestRes.status).toBe(200);
+      expect(await latestRes.json()).toEqual({
+        feedback: {
+          event_count: 1000,
+          digest: "11".repeat(32),
+          created_at: "2026-03-09T10:00:00.000Z",
+        },
+        response: {
+          event_count: 1000,
+          digest: "22".repeat(32),
+          created_at: "2026-03-09T10:01:00.000Z",
+        },
+        revoke: {
+          event_count: 1000,
+          digest: "33".repeat(32),
+          created_at: "2026-03-09T10:02:00.000Z",
+        },
+      });
+
+      const upstreamCheckpointCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
+      });
+      expect(upstreamCheckpointCall).toBeUndefined();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("runs replay verification locally in REST proxy mode without forwarding upstream", async () => {
+    process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
+    process.env.SUPABASE_KEY = "service-role-key";
+    const asset = "11111111111111111111111111111111";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
+        return new Response(JSON.stringify({ error: "should-not-be-called" }), { status: 500 });
+      }
+      return realFetch(input, init);
+    });
+    const poolQuery = vi.fn(async () => ({ rows: [] }));
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: poolQuery } as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/verify/replay/${asset}`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        agentId: asset,
+        feedback: {
+          chainType: "feedback",
+          finalDigest: "00".repeat(32),
+          count: 0,
+          valid: true,
+          checkpointsStored: 0,
+        },
+        response: {
+          chainType: "response",
+          finalDigest: "00".repeat(32),
+          count: 0,
+          valid: true,
+          checkpointsStored: 0,
+        },
+        revoke: {
+          chainType: "revoke",
+          finalDigest: "00".repeat(32),
+          count: 0,
+          valid: true,
+          checkpointsStored: 0,
+        },
+        valid: true,
+        duration: expect.any(Number),
+      });
+
+      const upstreamVerifyCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
+      });
+      expect(upstreamVerifyCall).toBeUndefined();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("returns explicit 503s for agent hierarchy helpers in pool-only proxy mode instead of proxying them", async () => {
+    process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
+    process.env.SUPABASE_KEY = "service-role-key";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
+        return new Response(JSON.stringify({ error: "should-not-be-called" }), { status: 500 });
+      }
+      return realFetch(input, init);
+    });
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: vi.fn() } as any,
+    });
+
+    try {
+      const childrenRes = await fetch(`${baseUrl}/rest/v1/agents/children?parent_asset=11111111111111111111111111111111`);
+      expect(childrenRes.status).toBe(503);
+      expect(await childrenRes.json()).toEqual({
+        error: "Agent hierarchy endpoints require local Prisma backend",
+      });
+
+      const treeRes = await fetch(`${baseUrl}/rest/v1/agents/tree?root_asset=11111111111111111111111111111111`);
+      expect(treeRes.status).toBe(503);
+      expect(await treeRes.json()).toEqual({
+        error: "Agent hierarchy endpoints require local Prisma backend",
+      });
+
+      const lineageRes = await fetch(`${baseUrl}/rest/v1/agents/lineage?asset=11111111111111111111111111111111`);
+      expect(lineageRes.status).toBe(503);
+      expect(await lineageRes.json()).toEqual({
+        error: "Agent hierarchy endpoints require local Prisma backend",
+      });
+
+      const upstreamAgentHelperCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
+      });
+      expect(upstreamAgentHelperCall).toBeUndefined();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("serves GraphQL and proxies REST when only aliases POSTGREST_URL + POSTGREST_TOKEN are set", async () => {
     process.env.POSTGREST_URL = "https://proxy-test.supabase.co";
     process.env.POSTGREST_TOKEN = "alias-service-role-key";

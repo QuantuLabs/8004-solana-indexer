@@ -27,6 +27,7 @@ export class Processor {
   private isRunning = false;
   private wsMonitorInterval: ReturnType<typeof setInterval> | null = null;
   private wsMonitorInProgress = false; // Reentrancy guard for async interval
+  private activeBootstrapPollers = new Set<Poller>();
 
   constructor(prisma: PrismaClient | null, pool: Pool | null = null, options?: ProcessorOptions) {
     this.prisma = prisma;
@@ -51,8 +52,7 @@ export class Processor {
     try {
       switch (this.mode) {
         case "websocket":
-          await this.startWebSocket();
-          this.monitorWebSocket();
+          await this.startWebSocketPipeline();
           break;
 
         case "polling":
@@ -113,6 +113,12 @@ export class Processor {
     }
     setVerifierActive(false);
 
+    if (this.activeBootstrapPollers.size > 0) {
+      const bootstrapPollers = [...this.activeBootstrapPollers];
+      this.activeBootstrapPollers.clear();
+      await Promise.allSettled(bootstrapPollers.map((poller) => poller.stop()));
+    }
+
     if (this.poller) {
       await this.poller.stop();
       this.poller = null;
@@ -151,14 +157,23 @@ export class Processor {
 
   private async bootstrapAutoCatchUp(): Promise<void> {
     const bootstrapPoller = this.createPoller();
-    await bootstrapPoller.bootstrap();
+    this.activeBootstrapPollers.add(bootstrapPoller);
+    try {
+      await bootstrapPoller.bootstrap();
+    } finally {
+      this.activeBootstrapPollers.delete(bootstrapPoller);
+    }
   }
 
-  private async startAutoWebSocketPipeline(): Promise<void> {
+  private async startWebSocketPipeline(): Promise<void> {
     await this.bootstrapAutoCatchUp();
     await this.startWebSocket();
     this.monitorWebSocket();
     await this.bootstrapAutoCatchUp();
+  }
+
+  private async startAutoWebSocketPipeline(): Promise<void> {
+    await this.startWebSocketPipeline();
   }
 
   private async startAuto(): Promise<void> {
@@ -215,9 +230,10 @@ export class Processor {
       return;
     }
 
-    if (this.wsIndexer && !this.wsIndexer.isActive()) {
+    const shouldRetryAutoFailover = this.mode === "auto" && !this.wsIndexer && !this.poller;
+    if (shouldRetryAutoFailover || (this.wsIndexer && !this.wsIndexer.isActive())) {
       // Check if WS is in self-healing mode (reconnecting/health-checking)
-      if (this.wsIndexer.isRecovering()) {
+      if (this.wsIndexer?.isRecovering()) {
         logger.debug("WebSocket in recovery mode, waiting for self-heal");
         this.scheduleNextWsCheck();
         return;
@@ -239,7 +255,7 @@ export class Processor {
       }
     }
 
-    if (this.mode === "websocket" || this.wsIndexer) {
+    if (this.mode === "websocket" || this.wsIndexer || (this.mode === "auto" && !this.poller)) {
       this.scheduleNextWsCheck();
     }
   }
@@ -265,12 +281,6 @@ export class Processor {
   }
 
   private async failOverToPolling(): Promise<void> {
-    if (!this.poller) {
-      const nextPoller = this.createPoller(config.pollingInterval);
-      await nextPoller.start();
-      this.poller = nextPoller;
-    }
-
     if (this.wsIndexer) {
       try {
         await this.wsIndexer.stop();
@@ -283,6 +293,12 @@ export class Processor {
     if (this.wsMonitorInterval) {
       clearTimeout(this.wsMonitorInterval);
       this.wsMonitorInterval = null;
+    }
+
+    if (!this.poller) {
+      const nextPoller = this.createPoller(config.pollingInterval);
+      await nextPoller.start();
+      this.poller = nextPoller;
     }
   }
 

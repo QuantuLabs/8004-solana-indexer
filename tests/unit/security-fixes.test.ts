@@ -340,6 +340,17 @@ describe("CORS and Body Size Limit", () => {
     expect(allowedOrigins).toEqual(["*"]);
   });
 
+  it("should treat empty CORS_ORIGINS as wildcard", () => {
+    const envValue = "";
+    const parsedAllowedOrigins = envValue
+      .split(",")
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0);
+    const allowedOrigins = parsedAllowedOrigins.length > 0 ? parsedAllowedOrigins : ["*"];
+
+    expect(allowedOrigins).toEqual(["*"]);
+  });
+
   it("should detect wildcard origin in allowedOrigins", () => {
     const allowedOrigins = ["*"];
     const corsOrigin = allowedOrigins.includes("*") ? "*" : allowedOrigins;

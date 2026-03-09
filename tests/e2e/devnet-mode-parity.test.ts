@@ -14,8 +14,9 @@ import {
 } from "@solana/web3.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { resetLocalDerivedDigestsForTests } from "../../src/db/handlers.js";
+import { Processor } from "../../src/indexer/processor.js";
 import { Poller } from "../../src/indexer/poller.js";
-import { WebSocketIndexer } from "../../src/indexer/websocket.js";
+import { WebSocketIndexer, testWebSocketConnection } from "../../src/indexer/websocket.js";
 import { parseTransaction } from "../../src/parser/decoder.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -60,6 +61,28 @@ type ReplayResult = {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor<T>(
+  label: string,
+  fn: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 30000,
+  intervalMs = 250
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastValue: T | null = null;
+
+  while (Date.now() < deadline) {
+    const value = await fn();
+    lastValue = value;
+    if (predicate(value)) {
+      return value;
+    }
+    await sleep(intervalMs);
+  }
+
+  throw new Error(`[${label}] timed out after ${timeoutMs}ms with last value ${JSON.stringify(normalize(lastValue))}`);
 }
 
 function isRetryableRpcError(error: unknown): boolean {
@@ -255,6 +278,78 @@ async function snapshotCore(prisma: PrismaClient): Promise<unknown> {
       : null,
     agentDigestCache,
     hashChainCheckpoints,
+  });
+}
+
+async function seedCursor(prisma: PrismaClient, entry: ReplayEntry): Promise<void> {
+  await prisma.indexerState.upsert({
+    where: { id: "main" },
+    update: {
+      lastSignature: entry.signatureInfo.signature,
+      lastSlot: BigInt(entry.signatureInfo.slot),
+      lastTxIndex: entry.txIndex,
+      source: "poller",
+    },
+    create: {
+      id: "main",
+      lastSignature: entry.signatureInfo.signature,
+      lastSlot: BigInt(entry.signatureInfo.slot),
+      lastTxIndex: entry.txIndex,
+      source: "poller",
+    },
+  });
+}
+
+async function countIndexedRows(prisma: PrismaClient): Promise<number> {
+  const [agents, feedbacks, responses, revocations, validations, registries] = await Promise.all([
+    prisma.agent.count(),
+    prisma.feedback.count(),
+    prisma.feedbackResponse.count(),
+    prisma.revocation.count(),
+    prisma.validation.count(),
+    prisma.registry.count(),
+  ]);
+
+  return agents + feedbacks + responses + revocations + validations + registries;
+}
+
+async function runProcessorModeSmoke(mode: "polling" | "websocket" | "auto", entries: ReplayEntry[]) {
+  const seedEntry = entries[0];
+
+  return withTempPrisma(`idx-mode-processor-${mode}`, async (prisma) => {
+    await seedCursor(prisma, seedEntry);
+
+    const processor = new Processor(prisma, null, { mode });
+
+    try {
+      await processor.start();
+
+      await waitFor(
+        `processor-${mode}-progress`,
+        async () => {
+          const [state, totalRows] = await Promise.all([
+            prisma.indexerState.findUnique({ where: { id: "main" } }),
+            countIndexedRows(prisma),
+          ]);
+          return {
+            status: processor.getStatus(),
+            state,
+            totalRows,
+          };
+        },
+        ({ state, totalRows }) =>
+          Boolean(state?.lastSignature && state.lastSignature !== seedEntry.signatureInfo.signature && totalRows > 0),
+        40000,
+      );
+
+      return {
+        status: processor.getStatus(),
+        totalRows: await countIndexedRows(prisma),
+        state: await prisma.indexerState.findUnique({ where: { id: "main" } }),
+      };
+    } finally {
+      await processor.stop();
+    }
   });
 }
 
@@ -472,6 +567,7 @@ async function replayAutoOverlap(entries: ReplayEntry[]): Promise<ReplayResult> 
 describe.sequential("E2E: Devnet mode parity", () => {
   let replayEntries: ReplayEntry[] = [];
   let multiSlotCount = 0;
+  let wsProbeAvailable = false;
 
   beforeAll(async () => {
     const connection = new Connection(rpcUrl, "confirmed");
@@ -481,6 +577,7 @@ describe.sequential("E2E: Devnet mode parity", () => {
     const replayWindow = await fetchReplayWindow();
     replayEntries = replayWindow.entries;
     multiSlotCount = replayWindow.multiSlotCount;
+    wsProbeAvailable = await testWebSocketConnection(rpcUrl, wsUrl, programId.toBase58());
 
     console.log("[devnet-mode-parity] replay window", {
       entries: replayEntries.length,
@@ -500,6 +597,67 @@ describe.sequential("E2E: Devnet mode parity", () => {
     expect(replayEntries.every((entry) => entry.eventCount > 0)).toBe(true);
     expect(replayEntries.every((entry) => entry.parsedTx.meta?.logMessages?.length)).toBe(true);
   });
+
+  it("probes a live websocket logs subscription against devnet", async () => {
+    expect(wsProbeAvailable).toBe(true);
+  }, 30000);
+
+  it("starts and stops a live websocket indexer subscription against devnet", async () => {
+    await withTempPrisma("idx-mode-websocket-live", async (prisma) => {
+      const connection = new Connection(rpcUrl, {
+        wsEndpoint: wsUrl,
+        commitment: "confirmed",
+      });
+      const wsIndexer = new WebSocketIndexer({
+        connection,
+        prisma,
+        programId,
+      });
+
+      await wsIndexer.start();
+      expect(wsIndexer.isActive()).toBe(true);
+
+      await wsIndexer.stop();
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+  }, 30000);
+
+  it("processor polling mode catches up from a recent saved cursor on devnet", async () => {
+    const result = await runProcessorModeSmoke("polling", replayEntries);
+
+    expect(result.status.configuredMode).toBe("polling");
+    expect(result.status.mode).toBe("polling");
+    expect(result.status.pollerActive).toBe(true);
+    expect(result.status.wsActive).toBe(false);
+    expect(result.totalRows).toBeGreaterThan(0);
+    expect(result.state?.lastSignature).not.toBe(replayEntries[0].signatureInfo.signature);
+  }, 60000);
+
+  it("processor websocket mode performs catch-up and keeps a live websocket transport on devnet", async () => {
+    expect(wsProbeAvailable).toBe(true);
+
+    const result = await runProcessorModeSmoke("websocket", replayEntries);
+
+    expect(result.status.configuredMode).toBe("websocket");
+    expect(result.status.mode).toBe("websocket");
+    expect(result.status.wsActive).toBe(true);
+    expect(result.status.pollerActive).toBe(false);
+    expect(result.totalRows).toBeGreaterThan(0);
+    expect(result.state?.lastSignature).not.toBe(replayEntries[0].signatureInfo.signature);
+  }, 60000);
+
+  it("processor auto mode prefers websocket on devnet after catch-up", async () => {
+    expect(wsProbeAvailable).toBe(true);
+
+    const result = await runProcessorModeSmoke("auto", replayEntries);
+
+    expect(result.status.configuredMode).toBe("auto");
+    expect(result.status.mode).toBe("websocket");
+    expect(result.status.wsActive).toBe(true);
+    expect(result.status.pollerActive).toBe(false);
+    expect(result.totalRows).toBeGreaterThan(0);
+    expect(result.state?.lastSignature).not.toBe(replayEntries[0].signatureInfo.signature);
+  }, 60000);
 
   it("polling and websocket produce identical core snapshots on the same devnet window", async () => {
     const polling = await replayPolling(replayEntries);
