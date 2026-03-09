@@ -27,6 +27,19 @@ const {
   },
 }));
 
+const createPollerMock = () => ({
+  bootstrap: vi.fn(),
+  start: vi.fn(),
+  stop: vi.fn(),
+});
+
+const createWsIndexerMock = () => ({
+  start: vi.fn(),
+  stop: vi.fn(),
+  isActive: vi.fn(),
+  isRecovering: vi.fn(),
+});
+
 // Mock the modules BEFORE importing Processor
 vi.mock("@solana/web3.js", () => {
   class MockConnection {
@@ -93,7 +106,6 @@ vi.mock("../../../src/config.js", () => ({
     pollingInterval: 5000,
     wsReconnectInterval: 1000,
     wsMaxRetries: 5,
-    verificationEnabled: false, // Disable verifier in tests
     verifyIntervalMs: 60000,
   },
   IndexerMode: {
@@ -225,6 +237,7 @@ describe("Processor", () => {
       expect(status.pollerActive).toBe(true);
       expect(Poller).toHaveBeenCalled();
       expect(mockPollerInstance.start).toHaveBeenCalled();
+      expect(mockVerifierInstance.start).toHaveBeenCalled();
     });
 
     it("should start in websocket mode", async () => {
@@ -239,11 +252,23 @@ describe("Processor", () => {
       expect(status.configuredMode).toBe("websocket");
       expect(WebSocketIndexer).toHaveBeenCalled();
       expect(mockWsIndexerInstance.start).toHaveBeenCalled();
+      expect(mockVerifierInstance.start).toHaveBeenCalled();
       expect(Poller).not.toHaveBeenCalled();
       expect((processor as any).wsMonitorInterval).not.toBeNull();
     });
 
     it("should start in auto mode with WebSocket available", async () => {
+      const bootstrapPollerA = createPollerMock();
+      const bootstrapPollerB = createPollerMock();
+      bootstrapPollerA.bootstrap.mockResolvedValue(undefined);
+      bootstrapPollerB.bootstrap.mockResolvedValue(undefined);
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerA() {
+        return bootstrapPollerA as any;
+      });
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerB() {
+        return bootstrapPollerB as any;
+      });
+
       const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
 
@@ -258,8 +283,10 @@ describe("Processor", () => {
       expect(status.pollerActive).toBe(false);
       expect(status.mode).toBe("websocket");
       expect(status.configuredMode).toBe("auto");
+      expect(mockVerifierInstance.start).toHaveBeenCalled();
       expect(Poller).toHaveBeenCalledTimes(2);
-      expect(mockPollerInstance.bootstrap).toHaveBeenCalledTimes(2);
+      expect(bootstrapPollerA.bootstrap).toHaveBeenCalledTimes(1);
+      expect(bootstrapPollerB.bootstrap).toHaveBeenCalledTimes(1);
       expect(mockPollerInstance.start).not.toHaveBeenCalled();
     });
 
@@ -612,9 +639,7 @@ describe("Processor", () => {
   });
 
   describe("verifier lifecycle", () => {
-    it("should start verifier when verificationEnabled is true", async () => {
-      (config as any).verificationEnabled = true;
-
+    it("should start verifier", async () => {
       const processor = new Processor(mockPrisma, null, { mode: "polling" });
       await processor.start();
 
@@ -631,14 +656,9 @@ describe("Processor", () => {
       expect(status.verifierStats).toEqual({});
 
       await processor.stop();
-
-      // Restore
-      (config as any).verificationEnabled = false;
     });
 
     it("should stop verifier on processor stop", async () => {
-      (config as any).verificationEnabled = true;
-
       const processor = new Processor(mockPrisma, null, { mode: "polling" });
       await processor.start();
 
@@ -648,13 +668,9 @@ describe("Processor", () => {
 
       expect(mockVerifierInstance.stop).toHaveBeenCalled();
       expect(processor.getStatus().verifierActive).toBe(false);
-
-      // Restore
-      (config as any).verificationEnabled = false;
     });
 
     it("should return verifierStats in getStatus when verifier is active", async () => {
-      (config as any).verificationEnabled = true;
       const fakeStats = { checked: 10, mismatches: 0 };
       mockVerifierInstance.getStats.mockReturnValue(fakeStats);
 
@@ -665,9 +681,100 @@ describe("Processor", () => {
       expect(status.verifierStats).toEqual(fakeStats);
 
       await processor.stop();
+    });
 
-      // Restore
-      (config as any).verificationEnabled = false;
+    it("should clean up partial startup state when verifier start fails", async () => {
+      mockVerifierInstance.start.mockRejectedValueOnce(new Error("verifier boom"));
+
+      const processor = new Processor(mockPrisma, null, { mode: "polling" });
+
+      await expect(processor.start()).rejects.toThrow("verifier boom");
+
+      expect(mockPollerInstance.start).toHaveBeenCalled();
+      expect(mockPollerInstance.stop).toHaveBeenCalled();
+      expect(mockVerifierInstance.stop).toHaveBeenCalled();
+      expect(processor.getStatus()).toEqual({
+        running: false,
+        mode: "polling",
+        configuredMode: "polling",
+        pollerActive: false,
+        wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
+      });
+    });
+
+    it("should clean up websocket startup state when verifier start fails", async () => {
+      const wsInstance = createWsIndexerMock();
+      wsInstance.start.mockResolvedValue(undefined);
+      wsInstance.stop.mockResolvedValue(undefined);
+      wsInstance.isActive.mockReturnValue(true);
+      wsInstance.isRecovering.mockReturnValue(false);
+      vi.mocked(WebSocketIndexer).mockImplementationOnce(function MockWsIndexer() {
+        return wsInstance as any;
+      });
+      mockVerifierInstance.start.mockRejectedValueOnce(new Error("verifier boom"));
+
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
+
+      await expect(processor.start()).rejects.toThrow("verifier boom");
+
+      expect(wsInstance.start).toHaveBeenCalledTimes(1);
+      expect(wsInstance.stop).toHaveBeenCalledTimes(1);
+      expect(mockVerifierInstance.stop).toHaveBeenCalledTimes(1);
+      expect((processor as any).wsMonitorInterval).toBeNull();
+      expect(processor.getStatus()).toEqual({
+        running: false,
+        mode: "websocket",
+        configuredMode: "websocket",
+        pollerActive: false,
+        wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
+      });
+    });
+
+    it("should clean up auto websocket startup state when verifier start fails", async () => {
+      const bootstrapPollerA = createPollerMock();
+      const bootstrapPollerB = createPollerMock();
+      const wsInstance = createWsIndexerMock();
+      bootstrapPollerA.bootstrap.mockResolvedValue(undefined);
+      bootstrapPollerB.bootstrap.mockResolvedValue(undefined);
+      wsInstance.start.mockResolvedValue(undefined);
+      wsInstance.stop.mockResolvedValue(undefined);
+      wsInstance.isActive.mockReturnValue(true);
+      wsInstance.isRecovering.mockReturnValue(false);
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerA() {
+        return bootstrapPollerA as any;
+      });
+      vi.mocked(Poller).mockImplementationOnce(function MockPollerB() {
+        return bootstrapPollerB as any;
+      });
+      vi.mocked(WebSocketIndexer).mockImplementationOnce(function MockWsIndexer() {
+        return wsInstance as any;
+      });
+      mockVerifierInstance.start.mockRejectedValueOnce(new Error("verifier boom"));
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+
+      await expect(processor.start()).rejects.toThrow("verifier boom");
+
+      expect(testWebSocketConnection).toHaveBeenCalledTimes(1);
+      expect(bootstrapPollerA.bootstrap).toHaveBeenCalledTimes(1);
+      expect(bootstrapPollerB.bootstrap).toHaveBeenCalledTimes(1);
+      expect(wsInstance.start).toHaveBeenCalledTimes(1);
+      expect(wsInstance.stop).toHaveBeenCalledTimes(1);
+      expect(mockVerifierInstance.stop).toHaveBeenCalledTimes(1);
+      expect((processor as any).wsMonitorInterval).toBeNull();
+      expect(processor.getStatus()).toEqual({
+        running: false,
+        mode: "auto",
+        configuredMode: "auto",
+        pollerActive: false,
+        wsActive: false,
+        verifierActive: false,
+        verifierStats: undefined,
+      });
     });
   });
 });

@@ -121,11 +121,6 @@ export class DataVerifier {
   ) {}
 
   async start(): Promise<void> {
-    if (!config.verificationEnabled) {
-      logger.info("Verification disabled via config");
-      return;
-    }
-
     this.isRunning = true;
     logger.info({ intervalMs: this.verifyIntervalMs }, "Starting data verifier");
 

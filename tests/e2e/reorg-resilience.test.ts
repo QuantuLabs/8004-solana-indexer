@@ -1309,28 +1309,6 @@ describe("E2E: Reorg Resilience", () => {
   // =========================================================================
 
   describe("13. Verifier Lifecycle", () => {
-    it("should not start when verificationEnabled is false", async () => {
-      const originalConfig = (await import("../../src/config.js")).config;
-      const originalEnabled = originalConfig.verificationEnabled;
-
-      // Temporarily disable verification
-      (originalConfig as any).verificationEnabled = false;
-
-      const mockConnection = {
-        getSlot: vi.fn().mockResolvedValue(500000),
-        getAccountInfo: vi.fn().mockResolvedValue(null),
-      } as unknown as Connection;
-
-      const verifier = new DataVerifier(mockConnection, prisma, null, 60000);
-      await verifier.start();
-
-      // isRunning should still be false
-      expect((verifier as any).isRunning).toBe(false);
-
-      // Restore
-      (originalConfig as any).verificationEnabled = originalEnabled;
-    });
-
     it("should stop and clear interval", async () => {
       const mockConnection = {
         getSlot: vi.fn().mockResolvedValue(500000),

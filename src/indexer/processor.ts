@@ -48,38 +48,42 @@ export class Processor {
     this.isRunning = true;
     logger.info({ mode: this.mode }, "Starting processor");
 
-    switch (this.mode) {
-      case "websocket":
-        await this.startWebSocket();
-        this.monitorWebSocket();
-        break;
+    try {
+      switch (this.mode) {
+        case "websocket":
+          await this.startWebSocket();
+          this.monitorWebSocket();
+          break;
 
-      case "polling":
-        await this.startPolling();
-        break;
+        case "polling":
+          await this.startPolling();
+          break;
 
-      case "auto":
-      default:
-        await this.startAuto();
-        break;
-    }
+        case "auto":
+        default:
+          await this.startAuto();
+          break;
+      }
 
-    // Start background verifier for reorg resilience
-    await this.startVerifier();
+      // Start background verifier for reorg resilience
+      await this.startVerifier();
 
-    if (this.prisma && config.dbMode === "local") {
-      enableLocalDerivedDigests(this.prisma);
-      logger.info("Local derived digest workers enabled after bootstrap");
+      if (this.prisma && config.dbMode === "local") {
+        enableLocalDerivedDigests(this.prisma);
+        logger.info("Local derived digest workers enabled after bootstrap");
+      }
+    } catch (error) {
+      logger.error({ error }, "Processor startup failed, cleaning up partial state");
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        logger.error({ error: cleanupError }, "Processor startup cleanup failed");
+      }
+      throw error;
     }
   }
 
   private async startVerifier(): Promise<void> {
-    if (!config.verificationEnabled) {
-      setVerifierActive(false);
-      logger.info("Verification disabled via config");
-      return;
-    }
-
     setVerifierActive(false);
     this.verifier = new DataVerifier(
       this.connection,

@@ -164,8 +164,15 @@ async function main() {
     );
   }
 
-  // Start API server before processor (available during backfill)
   let apiServer: Server | null = null;
+  const startProcessorBeforeApi = config.dbMode === "local";
+
+  // In local mode, wait for initial verifier/backfill before exposing REST reads
+  // so sequential agent_id lookups do not race fresh ingests.
+  if (startProcessorBeforeApi) {
+    await processor.start();
+  }
+
   if (canServeRest || canServeGraphql) {
     const apiPort = parseInt(process.env.API_PORT || "3001");
     apiServer = await startApiServer({ prisma, pool, port: apiPort });
@@ -184,7 +191,9 @@ async function main() {
     }
   }
 
-  await processor.start();
+  if (!startProcessorBeforeApi) {
+    await processor.start();
+  }
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutdown signal received");

@@ -380,8 +380,7 @@ describe("Config", () => {
       warnSpy.mockRestore();
     });
 
-    it("should warn when local mode disables verification-based deterministic id backfill", async () => {
-      process.env.DB_MODE = "local";
+    it("should warn when legacy VERIFICATION_ENABLED is still set", async () => {
       process.env.VERIFICATION_ENABLED = "false";
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -389,7 +388,7 @@ describe("Config", () => {
       validateConfig();
 
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("DB_MODE=local with VERIFICATION_ENABLED=false")
+        expect.stringContaining("VERIFICATION_ENABLED is deprecated and ignored")
       );
       warnSpy.mockRestore();
     });

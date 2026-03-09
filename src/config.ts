@@ -352,8 +352,6 @@ export const config = {
   uriDigestTrustedHosts: resolvedUriDigestTrustedHosts,
 
   // Verification config (reorg resilience)
-  // Enable/disable background verification worker
-  verificationEnabled: process.env.VERIFICATION_ENABLED !== "false",
   // Expose Prometheus /metrics endpoint for integrity observability
   metricsEndpointEnabled: parseBoolean(process.env.METRICS_ENDPOINT_ENABLED, false),
   // Interval between verification cycles (ms)
@@ -372,6 +370,12 @@ export const config = {
 
 export function validateConfig(): void {
   // Mode validations already done at parse time (parseDbMode, parseIndexerMode, parseMetadataMode)
+
+  if (process.env.VERIFICATION_ENABLED !== undefined) {
+    console.warn(
+      "[CONFIG WARNING] VERIFICATION_ENABLED is deprecated and ignored. Remove it from your environment; verification is always enabled."
+    );
+  }
 
   if (config.apiMode === "graphql" && !config.enableGraphql) {
     throw new Error("API_MODE=graphql requires ENABLE_GRAPHQL=true");
@@ -395,12 +399,6 @@ export function validateConfig(): void {
   ) {
     console.warn(
       `[CONFIG WARNING] INDEXER_MODE=${config.indexerMode} with no INDEXER_START_SIGNATURE and a public/non-HTTP RPC_URL may run as realtime-only ingestion when historical RPC backfill is unavailable. Use a reliable archival RPC and/or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT).`
-    );
-  }
-
-  if (config.dbMode === "local" && !config.verificationEnabled) {
-    console.warn(
-      "[CONFIG WARNING] DB_MODE=local with VERIFICATION_ENABLED=false leaves deterministic agent_id/feedback_id/response_id/revocation_id backfill disabled. Sequential IDs may remain null until verification is re-enabled."
     );
   }
 

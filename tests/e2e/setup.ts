@@ -24,7 +24,7 @@ process.env.PROGRAM_ID =
 process.env.ATOM_ENGINE_PROGRAM_ID =
   process.env.ATOM_ENGINE_PROGRAM_ID || "AToMufS4QD6hEXvcvBDg9m1AHeCLpmZQsyfYa5h9MwAF";
 process.env.LOG_LEVEL = "silent";
-process.env.INDEXER_MODE = "polling";
+process.env.INDEXER_MODE = process.env.INDEXER_MODE || "polling";
 process.env.DB_MODE = "local";
 
 // Now import dependencies

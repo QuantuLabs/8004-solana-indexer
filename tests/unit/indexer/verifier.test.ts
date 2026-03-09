@@ -4,7 +4,6 @@ import { PublicKey } from "@solana/web3.js";
 // Mock config before import
 vi.mock("../../../src/config.js", () => ({
   config: {
-    verificationEnabled: true,
     verifyIntervalMs: 1000,
     verifyBatchSize: 100,
     verifySafetyMarginSlots: 32,
@@ -211,19 +210,6 @@ describe("DataVerifier", () => {
   });
 
   describe("start/stop", () => {
-    it("should not start when verification is disabled", async () => {
-      const { config } = await import("../../../src/config.js");
-      const origEnabled = config.verificationEnabled;
-      (config as any).verificationEnabled = false;
-
-      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
-      await verifier.start();
-      // Should not call getSlot
-      expect(mockConnection.getSlot).not.toHaveBeenCalled();
-
-      (config as any).verificationEnabled = origEnabled;
-    });
-
     it("should run initial verification on start", async () => {
       const verifier = new DataVerifier(mockConnection, mockPrisma, null);
       await verifier.start();
