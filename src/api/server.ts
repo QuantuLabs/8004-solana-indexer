@@ -3250,7 +3250,9 @@ export function createApiServer(options: ApiServerOptions): Express {
       const graphqlLimiter = rateLimit({
         windowMs: GRAPHQL_RATE_LIMIT_WINDOW_MS,
         max: GRAPHQL_RATE_LIMIT_MAX_REQUESTS,
-        message: { error: 'GraphQL rate limited. Max 30 requests per minute.' },
+        message: {
+          error: `GraphQL rate limited. Max ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS} requests per minute.`,
+        },
         standardHeaders: true,
         legacyHeaders: false,
       });

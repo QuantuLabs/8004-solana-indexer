@@ -599,7 +599,7 @@ describe("Poller Coverage", () => {
         .rejects.toThrow("Deterministic tx_index unavailable for slot 300");
     });
 
-    it("should skip getBlock for single signature in slot (returns index 0)", async () => {
+    it("should resolve absolute tx_index from getBlock even for a single signature in slot", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -611,14 +611,24 @@ describe("Poller Coverage", () => {
 
       const sig1 = createMockSignatureInfo("sig-single", 400);
 
-      (mockConnection as any).getBlock = vi.fn();
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["sig-other-1"] } },
+          { transaction: { signatures: ["sig-other-2"] } },
+          { transaction: { signatures: ["sig-single"] } },
+        ],
+      });
 
-      const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
+      const tx = createMockParsedTransaction("sig-single", []);
       (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
 
       await (poller as any).processSignatureBatch([sig1], 0, 1);
 
-      expect((mockConnection as any).getBlock).not.toHaveBeenCalled();
+      expect((mockConnection as any).getBlock).toHaveBeenCalledWith(400, {
+        maxSupportedTransactionVersion: 0,
+        transactionDetails: "full",
+      });
+      expect(handleEventAtomic).not.toHaveBeenCalled();
     });
 
     it("should use batch RPC cache when available", async () => {
@@ -661,6 +671,11 @@ describe("Poller Coverage", () => {
       });
 
       const sig = createMockSignatureInfo("single-sig", 100);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["single-sig"] } },
+        ],
+      });
       const result = await (poller as any).getTxIndexMap(100, [sig]);
 
       expect(result.get("single-sig")).toBe(0);
@@ -1161,6 +1176,12 @@ describe("Poller Coverage", () => {
         createMockSignatureInfo("resumed-1", 200),
         createMockSignatureInfo("original-last", 100), // Found stop signature
       ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["resumed-1"] } },
+          { transaction: { signatures: ["original-last"] } },
+        ],
+      });
 
       const result = await (poller as any).fetchSignatures();
 
@@ -1555,10 +1576,14 @@ describe("Poller Coverage", () => {
           id: "main",
           lastSignature: "test-sig-local",
           lastSlot: 12345n,
+          lastTxIndex: undefined,
+          source: "poller",
         },
         update: {
           lastSignature: "test-sig-local",
           lastSlot: 12345n,
+          lastTxIndex: undefined,
+          source: "poller",
         },
       });
     });
@@ -1625,10 +1650,14 @@ describe("Poller Coverage", () => {
           id: "main",
           lastSignature: "sig-z",
           lastSlot: 5000n,
+          lastTxIndex: undefined,
+          source: "poller",
         },
         update: {
           lastSignature: "sig-z",
           lastSlot: 5000n,
+          lastTxIndex: undefined,
+          source: "poller",
         },
       });
     });
@@ -1721,11 +1750,13 @@ describe("Poller Coverage", () => {
           lastSignature: "configured-start-sig",
           lastSlot: 2000n,
           lastTxIndex: null,
+          source: "poller",
         },
         update: {
           lastSignature: "configured-start-sig",
           lastSlot: 2000n,
           lastTxIndex: null,
+          source: "poller",
         },
       });
     });
@@ -2054,6 +2085,11 @@ describe("Poller Coverage", () => {
       const sigs = Array.from({ length: 100 }, (_, i) =>
         createMockSignatureInfo(`progress-sig-${i}`, 700 + i)
       );
+      (mockConnection as any).getBlock = vi.fn().mockImplementation(async (slot: number) => ({
+        transactions: [
+          { transaction: { signatures: [`progress-sig-${slot - 700}`] } },
+        ],
+      }));
 
       const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
       (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
@@ -2562,6 +2598,12 @@ describe("Poller Coverage", () => {
         createMockSignatureInfo("new-sig", 300),
         createMockSignatureInfo("older-stop-sig", 200),
       ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["new-sig"] } },
+          { transaction: { signatures: ["older-stop-sig"] } },
+        ],
+      });
 
       const result = await (poller as any).fetchSignatures();
 

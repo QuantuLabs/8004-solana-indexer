@@ -189,9 +189,10 @@ Notes:
   - `DB_MODE=local` (Prisma), or
   - `DB_MODE=supabase` with PostgREST proxy auth (`SUPABASE_URL` + `SUPABASE_KEY`, or `POSTGREST_URL` + `POSTGREST_TOKEN`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
+- The deployment stack expects explicit `DB_MODE` and `API_MODE` from your env file instead of silently defaulting them inside Docker.
 - `.env.devnet.example` includes the current devnet bootstrap cursor as an exact validated signature/slot pair.
 - `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`, plus a commented validated bootstrap pair for history-capable RPCs.
-- IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/testnet/localnet runtime) and `agent_registry_8004.mainnet.json` (mainnet runtime).
+- IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/testnet companion) and `agent_registry_8004.mainnet.json` (mainnet/localnet companion). Runtime selection follows the effective `PROGRAM_ID`.
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `TRUST_PROXY` defaults to `false`; set it explicitly (for example `1`) only when running behind a trusted reverse proxy.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.

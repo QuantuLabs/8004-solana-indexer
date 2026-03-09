@@ -102,7 +102,7 @@ function parseDbMode(value: string | undefined): DbMode {
 }
 
 function parseIndexerMode(value: string | undefined): IndexerMode {
-  const mode = value || "auto";
+  const mode = value || "polling";
   if (!VALID_INDEXER_MODES.includes(mode as IndexerMode)) {
     throw new Error(`Invalid INDEXER_MODE '${mode}'. Must be one of: ${VALID_INDEXER_MODES.join(", ")}`);
   }
@@ -304,8 +304,8 @@ export const config = {
   // Cache TTL for expensive GraphQL aggregated stats queries
   graphqlStatsCacheTtlMs: parsePositiveInt(process.env.GRAPHQL_STATS_CACHE_TTL_MS, 60000),
 
-  // Indexer mode: "auto" | "polling" | "websocket"
-  // auto = tries WebSocket first, falls back to polling if unavailable
+  // Indexer mode: "polling" | "auto" | "websocket"
+  // polling = default baseline, auto = prefers WebSocket and falls back to polling
   indexerMode: parseIndexerMode(process.env.INDEXER_MODE),
 
   // Polling config
@@ -373,6 +373,10 @@ export const config = {
 export function validateConfig(): void {
   // Mode validations already done at parse time (parseDbMode, parseIndexerMode, parseMetadataMode)
 
+  if (config.apiMode === "graphql" && !config.enableGraphql) {
+    throw new Error("API_MODE=graphql requires ENABLE_GRAPHQL=true");
+  }
+
   // Warn about disabled SSL verification
   if (!config.supabaseSslVerify) {
     console.warn('[SECURITY WARNING] SUPABASE_SSL_VERIFY=false — TLS certificate verification is disabled for database connections. This is vulnerable to MITM attacks. Do NOT use in production.');
@@ -385,12 +389,18 @@ export function validateConfig(): void {
   }
 
   if (
-    config.indexerMode === "websocket"
+    (config.indexerMode === "websocket" || config.indexerMode === "auto")
     && !config.indexerStartSignature
     && isLikelyUnreliableHistoricalRpc(config.rpcUrl)
   ) {
     console.warn(
-      "[CONFIG WARNING] INDEXER_MODE=websocket with no INDEXER_START_SIGNATURE and a public/non-HTTP RPC_URL may run as realtime-only ingestion when historical RPC backfill is unavailable. Use a reliable archival RPC and/or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT)."
+      `[CONFIG WARNING] INDEXER_MODE=${config.indexerMode} with no INDEXER_START_SIGNATURE and a public/non-HTTP RPC_URL may run as realtime-only ingestion when historical RPC backfill is unavailable. Use a reliable archival RPC and/or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT).`
+    );
+  }
+
+  if (config.dbMode === "local" && !config.verificationEnabled) {
+    console.warn(
+      "[CONFIG WARNING] DB_MODE=local with VERIFICATION_ENABLED=false leaves deterministic agent_id/feedback_id/response_id/revocation_id backfill disabled. Sequential IDs may remain null until verification is re-enabled."
     );
   }
 

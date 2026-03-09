@@ -42,6 +42,17 @@ describe("Config", () => {
       delete process.env.INDEXER_STOP_SLOT;
       delete process.env.POSTGREST_URL;
       delete process.env.POSTGREST_TOKEN;
+      delete process.env.MAX_SUPPORTED_TRANSACTION_VERSION;
+      delete process.env.POLLER_BATCH_RPC_ENABLED;
+      delete process.env.POLLER_RPC_CHUNK_SIZE;
+      delete process.env.POLLER_RPC_CHUNK_CONCURRENCY;
+      delete process.env.METRICS_ENDPOINT_ENABLED;
+      delete process.env.VERIFY_MAX_RETRIES;
+      delete process.env.INDEX_COLLECTION_METADATA;
+      delete process.env.INDEX_VALIDATIONS;
+      delete process.env.METADATA_MAX_BYTES;
+      delete process.env.METADATA_MAX_VALUE_BYTES;
+      delete process.env.ALLOW_INSECURE_URI;
 
       const { config } = await import("../../src/config.js");
 
@@ -51,7 +62,7 @@ describe("Config", () => {
       expect(config.wsUrl).toBe("wss://api.devnet.solana.com");
       // programId comes from SDK (PROGRAM_ID.toBase58()), not env var
       expect(config.programId).toBe("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
-      expect(config.indexerMode).toBe("auto");
+      expect(config.indexerMode).toBe("polling");
       expect(config.pollingInterval).toBe(5000);
       expect(config.batchSize).toBe(100);
       expect(config.wsReconnectInterval).toBe(3000);
@@ -64,6 +75,16 @@ describe("Config", () => {
       expect(config.indexerStartSignature).toBeNull();
       expect(config.indexerStartSlot).toBeNull();
       expect(config.indexerStopSlot).toBeNull();
+      expect(config.maxSupportedTransactionVersion).toBe(0);
+      expect(config.pollerBatchRpcEnabled).toBe(true);
+      expect(config.pollerRpcChunkSize).toBe(100);
+      expect(config.pollerRpcChunkConcurrency).toBe(3);
+      expect(config.metricsEndpointEnabled).toBe(false);
+      expect(config.verifyMaxRetries).toBe(3);
+      expect(config.collectionMetadataIndexEnabled).toBe(true);
+      expect(config.validationIndexEnabled).toBe(true);
+      expect(config.metadataMaxBytes).toBe(262144);
+      expect(config.metadataMaxValueBytes).toBe(10000);
     });
 
     it("should use custom env values when set", async () => {
@@ -83,6 +104,16 @@ describe("Config", () => {
       process.env.INDEXER_START_SIGNATURE = "env-start-signature";
       process.env.INDEXER_START_SLOT = "123456789";
       process.env.INDEXER_STOP_SLOT = "123456999";
+      process.env.MAX_SUPPORTED_TRANSACTION_VERSION = "1";
+      process.env.POLLER_BATCH_RPC_ENABLED = "false";
+      process.env.POLLER_RPC_CHUNK_SIZE = "42";
+      process.env.POLLER_RPC_CHUNK_CONCURRENCY = "7";
+      process.env.METRICS_ENDPOINT_ENABLED = "true";
+      process.env.VERIFY_MAX_RETRIES = "5";
+      process.env.INDEX_COLLECTION_METADATA = "false";
+      process.env.INDEX_VALIDATIONS = "true";
+      process.env.METADATA_MAX_BYTES = "123456";
+      process.env.METADATA_MAX_VALUE_BYTES = "2048";
 
       const { config } = await import("../../src/config.js");
 
@@ -104,6 +135,16 @@ describe("Config", () => {
       expect(config.indexerStartSignature).toBe("env-start-signature");
       expect(config.indexerStartSlot).toBe(123456789n);
       expect(config.indexerStopSlot).toBe(123456999n);
+      expect(config.maxSupportedTransactionVersion).toBe(1);
+      expect(config.pollerBatchRpcEnabled).toBe(false);
+      expect(config.pollerRpcChunkSize).toBe(42);
+      expect(config.pollerRpcChunkConcurrency).toBe(7);
+      expect(config.metricsEndpointEnabled).toBe(true);
+      expect(config.verifyMaxRetries).toBe(5);
+      expect(config.collectionMetadataIndexEnabled).toBe(false);
+      expect(config.validationIndexEnabled).toBe(true);
+      expect(config.metadataMaxBytes).toBe(123456);
+      expect(config.metadataMaxValueBytes).toBe(2048);
     });
 
     it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {
@@ -267,7 +308,7 @@ describe("Config", () => {
       process.env.DATABASE_URL = "file:./data/test.db";
       process.env.RPC_URL = "https://api.devnet.solana.com";
       process.env.PROGRAM_ID = "TestProgramId";
-      process.env.INDEXER_MODE = "auto";
+      process.env.INDEXER_MODE = "polling";
 
       const { validateConfig } = await import("../../src/config.js");
 
@@ -301,6 +342,25 @@ describe("Config", () => {
       warnSpy.mockRestore();
     });
 
+    it("should warn when auto mode has no bootstrap cursor on likely non-archival RPC", async () => {
+      process.env.DB_MODE = "local";
+      process.env.INDEXER_MODE = "auto";
+      process.env.RPC_URL = "https://api.mainnet-beta.solana.com";
+      process.env.SUPABASE_SSL_VERIFY = "true";
+      process.env.SOLANA_NETWORK = "devnet";
+      delete process.env.INDEXER_START_SIGNATURE;
+      delete process.env.INDEXER_START_SLOT;
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const { validateConfig } = await import("../../src/config.js");
+      validateConfig();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("INDEXER_MODE=auto")
+      );
+      warnSpy.mockRestore();
+    });
+
     it("should warn when websocket mode has no bootstrap cursor on likely non-archival RPC", async () => {
       process.env.DB_MODE = "local";
       process.env.INDEXER_MODE = "websocket";
@@ -316,6 +376,20 @@ describe("Config", () => {
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining("INDEXER_MODE=websocket")
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("should warn when local mode disables verification-based deterministic id backfill", async () => {
+      process.env.DB_MODE = "local";
+      process.env.VERIFICATION_ENABLED = "false";
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const { validateConfig } = await import("../../src/config.js");
+      validateConfig();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("DB_MODE=local with VERIFICATION_ENABLED=false")
       );
       warnSpy.mockRestore();
     });
@@ -338,6 +412,17 @@ describe("Config", () => {
       const { validateConfig } = await import("../../src/config.js");
 
       expect(() => validateConfig()).not.toThrow();
+    });
+
+    it("should throw when API_MODE=graphql but ENABLE_GRAPHQL=false", async () => {
+      process.env.API_MODE = "graphql";
+      process.env.ENABLE_GRAPHQL = "false";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "API_MODE=graphql requires ENABLE_GRAPHQL=true"
+      );
     });
 
     it("should throw when VERIFY_INTERVAL_MS is below 5000", async () => {

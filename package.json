@@ -18,6 +18,7 @@
     "test:watch": "bunx vitest",
     "test:coverage": "bunx vitest run --coverage",
     "test:e2e": "bun run test:e2e:major",
+    "test:e2e:modes:devnet": "DEVNET_RPC_URL=https://api.devnet.solana.com RPC_URL=https://api.devnet.solana.com WS_URL=wss://api.devnet.solana.com bunx vitest run --config vitest.e2e.config.ts tests/e2e/devnet-mode-parity.test.ts",
     "test:e2e:major": "DEVNET_RPC_URL=https://api.devnet.solana.com RPC_URL=https://api.devnet.solana.com WS_URL=wss://api.devnet.solana.com bunx vitest run --config vitest.e2e.config.ts tests/e2e/reorg-resilience.test.ts tests/e2e/devnet-verification.test.ts",
     "test:e2e:coverage": "bun run test:e2e:coverage:major",
     "test:e2e:coverage:major": "DEVNET_RPC_URL=https://api.devnet.solana.com RPC_URL=https://api.devnet.solana.com WS_URL=wss://api.devnet.solana.com bunx vitest run --config vitest.e2e.config.ts --coverage tests/e2e/reorg-resilience.test.ts tests/e2e/devnet-verification.test.ts",

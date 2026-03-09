@@ -127,7 +127,8 @@ type Agent {
   cursor: String!
   chainId: Int!
   # Sequential DB registration id from agents.agent_id (not asset-derived).
-  agentId: BigInt!
+  # Can be null in local mode until verifier/backfill assigns canonical IDs.
+  agentId: BigInt
   agentURI: String
   agentURIType: URIType
   owner: String!

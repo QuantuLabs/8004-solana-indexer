@@ -24,6 +24,11 @@ describe("Poller", () => {
   beforeEach(() => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrismaClient();
+    (mockConnection.getBlock as any).mockResolvedValue({
+      transactions: [
+        { transaction: { signatures: [TEST_SIGNATURE] } },
+      ],
+    });
 
     poller = new Poller({
       connection: mockConnection as any,
@@ -88,6 +93,47 @@ describe("Poller", () => {
       await poller.start();
 
       expect(mockPrisma.indexerState.findUnique).toHaveBeenCalled();
+    });
+  });
+
+  describe("bootstrap", () => {
+    it("should load state and drain catch-up batches without staying in polling mode", async () => {
+      const loadStateSpy = vi.spyOn(poller as any, "loadState").mockResolvedValue(undefined);
+      const processSpy = vi
+        .spyOn(poller as any, "processNewTransactions")
+        .mockResolvedValueOnce({ fetchedCount: 2, haltedOnError: false })
+        .mockResolvedValueOnce({ fetchedCount: 0, haltedOnError: false });
+
+      await poller.bootstrap();
+
+      expect(loadStateSpy).toHaveBeenCalledTimes(1);
+      expect(processSpy).toHaveBeenCalledTimes(2);
+      expect((poller as any).isRunning).toBe(false);
+    });
+
+    it("should back off after a halted frontier batch instead of hot-looping", async () => {
+      vi.useFakeTimers();
+
+      const loadStateSpy = vi.spyOn(poller as any, "loadState").mockResolvedValue(undefined);
+      const processSpy = vi
+        .spyOn(poller as any, "processNewTransactions")
+        .mockResolvedValueOnce({ fetchedCount: 1, haltedOnError: true })
+        .mockResolvedValueOnce({ fetchedCount: 0, haltedOnError: false });
+
+      const bootstrapPromise = poller.bootstrap({ retryDelayMs: 5000 });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(loadStateSpy).toHaveBeenCalledTimes(1);
+      expect(processSpy).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(processSpy).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(4000);
+      await bootstrapPromise;
+
+      expect(processSpy).toHaveBeenCalledTimes(2);
+      vi.useRealTimers();
     });
   });
 

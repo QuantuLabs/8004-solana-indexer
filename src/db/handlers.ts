@@ -51,7 +51,6 @@ let localRecoveryInterval: NodeJS.Timeout | null = null;
 let localRecoveryInFlight = false;
 let localDerivedDigestsEnabled = process.env.NODE_ENV === "test";
 let localDerivedDigestsSuspendCount = 0;
-let agentIdAssignmentTail: Promise<void> = Promise.resolve();
 let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
 let responseIdAssignmentTail: Promise<void> = Promise.resolve();
 let revocationIdAssignmentTail: Promise<void> = Promise.resolve();
@@ -73,14 +72,6 @@ async function withAssignmentLock<T>(
   } finally {
     release();
   }
-}
-
-async function withAgentIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
-  return withAssignmentLock(
-    () => agentIdAssignmentTail,
-    (tail) => { agentIdAssignmentTail = tail; },
-    task
-  );
 }
 
 async function withFeedbackIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
@@ -122,7 +113,11 @@ function asBigInt(value: bigint | number | null | undefined): bigint {
 }
 
 type CollectionDelegate = {
-  findUnique(args: unknown): Promise<{ collectionId: bigint | null } | null>;
+  findUnique(args: unknown): Promise<{
+    collectionId: bigint | null;
+    lastSeenSlot?: bigint | null;
+    lastSeenTxSignature?: string | null;
+  } | null>;
   findMany(args: unknown): Promise<Array<{ collectionId: bigint | null }>>;
   upsert(args: unknown): Promise<unknown>;
 };
@@ -153,9 +148,36 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
   WHERE "collection_id" IS NOT NULL
 ))
 ON CONFLICT("col", "creator") DO UPDATE SET
-  "lastSeenAt" = excluded."lastSeenAt",
-  "lastSeenSlot" = excluded."lastSeenSlot",
-  "lastSeenTxSignature" = excluded."lastSeenTxSignature",
+  "lastSeenAt" = CASE
+    WHEN "CollectionPointer"."lastSeenSlot" IS NULL
+      OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
+      OR (
+        excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
+        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+      )
+    THEN excluded."lastSeenAt"
+    ELSE "CollectionPointer"."lastSeenAt"
+  END,
+  "lastSeenSlot" = CASE
+    WHEN "CollectionPointer"."lastSeenSlot" IS NULL
+      OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
+      OR (
+        excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
+        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+      )
+    THEN excluded."lastSeenSlot"
+    ELSE "CollectionPointer"."lastSeenSlot"
+  END,
+  "lastSeenTxSignature" = CASE
+    WHEN "CollectionPointer"."lastSeenSlot" IS NULL
+      OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
+      OR (
+        excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
+        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+      )
+    THEN excluded."lastSeenTxSignature"
+    ELSE "CollectionPointer"."lastSeenTxSignature"
+  END,
   "collection_id" = COALESCE(
     "CollectionPointer"."collection_id",
     (
@@ -197,6 +219,27 @@ function isCollectionIdUniqueConstraintError(error: unknown): boolean {
     return /collection_id|collectionId/i.test(target);
   }
   return false;
+}
+
+function shouldAdvanceCollectionPointerLastSeen(
+  current:
+    | {
+        lastSeenSlot?: bigint | null;
+        lastSeenTxSignature?: string | null;
+      }
+    | null,
+  next: Pick<EventContext, "slot" | "signature">
+): boolean {
+  if (!current || current.lastSeenSlot === null || current.lastSeenSlot === undefined) {
+    return true;
+  }
+  if (next.slot > current.lastSeenSlot) {
+    return true;
+  }
+  if (next.slot < current.lastSeenSlot) {
+    return false;
+  }
+  return (current.lastSeenTxSignature ?? "") <= next.signature;
 }
 
 async function tryDbSideCollectionIdUpsert(
@@ -282,8 +325,20 @@ async function upsertCollectionPointerWithOptionalCollectionId(
       try {
         const existingCollection = await collection.findUnique({
           where,
-          select: { collectionId: true },
+          select: {
+            collectionId: true,
+            lastSeenSlot: true,
+            lastSeenTxSignature: true,
+          },
         });
+        const shouldUpdateLastSeen = shouldAdvanceCollectionPointerLastSeen(existingCollection, ctx);
+        const monotonicUpdateBase = shouldUpdateLastSeen
+          ? {
+              lastSeenAt: ctx.blockTime,
+              lastSeenSlot: ctx.slot,
+              lastSeenTxSignature: ctx.signature,
+            }
+          : {};
         let assignedCollectionId: bigint | undefined;
         if (!existingCollection || existingCollection.collectionId === null) {
           const highestAssigned = await collection.findMany({
@@ -302,7 +357,7 @@ async function upsertCollectionPointerWithOptionalCollectionId(
             collectionId: assignedCollectionId ?? null,
           },
           update: {
-            ...updateBase,
+            ...monotonicUpdateBase,
             ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
           },
         });
@@ -1248,68 +1303,53 @@ async function handleAgentRegisteredCore(
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
   const collectionId = data.collection.toBase58();
-  await withAgentIdAssignmentLock(async () => {
-    const existingAgent = await client.agent.findUnique({
-      where: { id: assetId },
-      select: { agentId: true, creator: true },
-    });
-    const ownerBase58 = data.owner.toBase58();
-    const canonicalCreator = existingAgent
-      ? (() => {
-          if (!existingAgent.creator) {
-            throw new Error(`Invariant violation: missing creator for existing agent ${assetId}`);
-          }
-          return existingAgent.creator;
-        })()
-      : ownerBase58;
+  const existingAgent = await client.agent.findUnique({
+    where: { id: assetId },
+    select: { creator: true },
+  });
+  const ownerBase58 = data.owner.toBase58();
+  const canonicalCreator = existingAgent
+    ? (() => {
+        if (!existingAgent.creator) {
+          throw new Error(`Invariant violation: missing creator for existing agent ${assetId}`);
+        }
+        return existingAgent.creator;
+      })()
+    : ownerBase58;
 
-    let assignedAgentId: bigint | undefined;
-    if (!existingAgent || existingAgent.agentId === null) {
-      const highestAssigned = await client.agent.findMany({
-        where: { agentId: { not: null } },
-        select: { agentId: true },
-        orderBy: { agentId: "desc" },
-        take: 1,
-      });
-      const maxAssigned = highestAssigned[0]?.agentId;
-      assignedAgentId = asBigInt(maxAssigned) + 1n;
-    }
-
-    await client.agent.upsert({
-      where: { id: assetId },
-      create: {
-        id: assetId,
-        owner: data.owner.toBase58(),
-        creator: canonicalCreator,
-        uri: agentUri,
-        nftName: "",
-        collection: collectionId,
-        collectionPointer: "",
-        colLocked: false,
-        parentLocked: false,
-        registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
-        atomEnabled: data.atomEnabled,
-        createdTxSignature: ctx.signature,
-        createdSlot: ctx.slot,
-        txIndex: ctx.txIndex ?? null,
-        eventOrdinal: ctx.eventOrdinal ?? null,
-        agentId: assignedAgentId ?? null,
-        status: DEFAULT_STATUS,
-        createdAt: ctx.blockTime,
-        updatedAt: ctx.blockTime,
-      },
-      update: {
-        collection: collectionId,
-        registry: collectionId, // v0.6.0: registry = collection
-        atomEnabled: data.atomEnabled,
-        uri: agentUri,
-        creator: canonicalCreator,
-        txIndex: ctx.txIndex ?? null,
-        eventOrdinal: ctx.eventOrdinal ?? null,
-        updatedAt: ctx.blockTime,
-        ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
-      },
-    });
+  await client.agent.upsert({
+    where: { id: assetId },
+    create: {
+      id: assetId,
+      owner: data.owner.toBase58(),
+      creator: canonicalCreator,
+      uri: agentUri,
+      nftName: "",
+      collection: collectionId,
+      collectionPointer: "",
+      colLocked: false,
+      parentLocked: false,
+      registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
+      atomEnabled: data.atomEnabled,
+      createdTxSignature: ctx.signature,
+      createdSlot: ctx.slot,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
+      agentId: null,
+      status: DEFAULT_STATUS,
+      createdAt: ctx.blockTime,
+      updatedAt: ctx.blockTime,
+    },
+    update: {
+      collection: collectionId,
+      registry: collectionId, // v0.6.0: registry = collection
+      atomEnabled: data.atomEnabled,
+      uri: agentUri,
+      creator: canonicalCreator,
+      txIndex: ctx.txIndex ?? null,
+      eventOrdinal: ctx.eventOrdinal ?? null,
+      updatedAt: ctx.blockTime,
+    },
   });
 
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");

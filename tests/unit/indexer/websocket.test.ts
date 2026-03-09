@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("@solana/web3.js", async () => {
   const actual = await vi.importActual<any>("@solana/web3.js");
   let getSlotMock: (() => Promise<number>) | null = null;
+  let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
+  let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
 
   class MockConnection {
     constructor(_endpoint: string, _config?: unknown) {}
@@ -13,6 +15,20 @@ vi.mock("@solana/web3.js", async () => {
       }
       return await getSlotMock();
     }
+
+    onLogs(filter: unknown, callback: () => void, commitment?: unknown): number {
+      if (!onLogsMock) {
+        throw new Error("onLogs mock not set");
+      }
+      return onLogsMock(filter, callback, commitment);
+    }
+
+    async removeOnLogsListener(subscriptionId: number): Promise<void> {
+      if (!removeOnLogsListenerMock) {
+        return;
+      }
+      await removeOnLogsListenerMock(subscriptionId);
+    }
   }
 
   return {
@@ -20,6 +36,12 @@ vi.mock("@solana/web3.js", async () => {
     Connection: MockConnection,
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => {
       getSlotMock = fn;
+    },
+    __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => {
+      onLogsMock = fn;
+    },
+    __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => {
+      removeOnLogsListenerMock = fn;
     },
   };
 });
@@ -421,10 +443,14 @@ describe("WebSocketIndexer", () => {
 describe("testWebSocketConnection", () => {
   const web3Mock = web3 as typeof web3 & {
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
+    __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
+    __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
   };
 
   afterEach(() => {
     web3Mock.__setGetSlotMock(null);
+    web3Mock.__setOnLogsMock(null);
+    web3Mock.__setRemoveOnLogsListenerMock(null);
     vi.restoreAllMocks();
   });
 
@@ -433,15 +459,56 @@ describe("testWebSocketConnection", () => {
       Promise.reject(new Error("Connection failed"))
     );
 
-    const result = await testWebSocketConnection("wss://invalid.nonexistent.local");
+    const result = await testWebSocketConnection(
+      "https://invalid.rpc.local",
+      "wss://invalid.nonexistent.local"
+    );
 
     expect(result).toBe(false);
   });
 
-  it("should return true when connection succeeds", async () => {
+  it("should return false when websocket subscription cannot be established", async () => {
     web3Mock.__setGetSlotMock(() => Promise.resolve(123));
+    web3Mock.__setOnLogsMock(() => {
+      throw new Error("log subscription failed");
+    });
 
-    const result = await testWebSocketConnection("wss://api.devnet.solana.com");
+    const result = await testWebSocketConnection(
+      "https://api.devnet.solana.com",
+      "wss://api.devnet.solana.com"
+    );
+    expect(result).toBe(false);
+  });
+
+  it("should return true when http and websocket probes succeed", async () => {
+    web3Mock.__setGetSlotMock(() => Promise.resolve(123));
+    web3Mock.__setOnLogsMock((_filter, callback) => {
+      callback();
+      return 7;
+    });
+    const removeSpy = vi.fn().mockResolvedValue(undefined);
+    web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
+
+    const result = await testWebSocketConnection(
+      "https://api.devnet.solana.com",
+      "wss://api.devnet.solana.com"
+    );
     expect(result).toBe(true);
+    expect(removeSpy).toHaveBeenCalledWith(7);
+  });
+
+  it("should return true when onLogs subscribe/remove succeeds without waiting for activity", async () => {
+    web3Mock.__setGetSlotMock(() => Promise.resolve(123));
+    web3Mock.__setOnLogsMock(() => 9);
+    const removeSpy = vi.fn().mockResolvedValue(undefined);
+    web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
+
+    const result = await testWebSocketConnection(
+      "https://api.devnet.solana.com",
+      "wss://api.devnet.solana.com"
+    );
+
+    expect(result).toBe(true);
+    expect(removeSpy).toHaveBeenCalledWith(9);
   });
 });

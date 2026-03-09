@@ -38,6 +38,28 @@ export interface WebSocketIndexerOptions {
   maxRetries?: number;
 }
 
+async function probeTemporaryLogsSubscription(
+  connection: Pick<Connection, "onLogs" | "removeOnLogsListener">,
+  programId: PublicKey
+): Promise<boolean> {
+  let subscriptionId: number | null = null;
+  try {
+    subscriptionId = connection.onLogs(programId, () => undefined, "confirmed");
+    return true;
+  } catch (error) {
+    logger.debug({ error }, "WebSocket log subscription probe failed");
+    return false;
+  } finally {
+    if (subscriptionId !== null) {
+      try {
+        await connection.removeOnLogsListener(subscriptionId);
+      } catch (error) {
+        logger.debug({ error, subscriptionId }, "Failed to remove temporary log subscription");
+      }
+    }
+  }
+}
+
 function shouldAdvanceCursor(
   currentSlot: bigint | null | undefined,
   currentTxIndex: number | null | undefined,
@@ -134,7 +156,9 @@ export class WebSocketIndexer {
     this.stopHealthCheck();
 
     this.healthCheckTimer = setInterval(() => {
-      this.checkHealth();
+      void this.checkHealth().catch((error) => {
+        logger.error({ error }, "Unhandled WebSocket health check error");
+      });
     }, HEALTH_CHECK_INTERVAL);
 
     logger.debug("Health check timer started");
@@ -170,26 +194,21 @@ export class WebSocketIndexer {
 
       // Check if connection is stale (no activity for too long)
       if (timeSinceActivity > STALE_THRESHOLD) {
-        // Ping RPC before reconnecting - connection may be healthy with no program activity
-        try {
-          const slot = await this.connection.getSlot();
+        const wsHealthy = await probeTemporaryLogsSubscription(this.connection, this.programId);
+        if (wsHealthy) {
           logger.info({
             timeSinceActivity,
-            slot
-          }, "No WebSocket events but RPC is healthy - program may have low activity");
-          // RPC is alive, just reset the activity timer instead of reconnecting
+          }, "No WebSocket events but onLogs heartbeat probe is healthy - program may have low activity");
           this.lastActivityTime = Date.now();
           return;
-        } catch (error) {
-          // RPC is down, reconnect
-          logger.warn({
-            timeSinceActivity,
-            threshold: STALE_THRESHOLD,
-            error: error instanceof Error ? error.message : String(error)
-          }, "WebSocket stale AND RPC ping failed, reconnecting...");
-          await this.forceReconnect();
-          return;
         }
+
+        logger.warn({
+          timeSinceActivity,
+          threshold: STALE_THRESHOLD,
+        }, "WebSocket stale and onLogs heartbeat probe failed, reconnecting...");
+        await this.forceReconnect();
+        return;
       }
 
       // Regular connectivity check (not stale, just verify RPC is up)
@@ -622,19 +641,21 @@ export class WebSocketIndexer {
  * @param rpcUrl - HTTP RPC endpoint for connection test
  * @param wsUrl - WebSocket endpoint to configure
  */
-export async function testWebSocketConnection(rpcUrl: string, wsUrl: string): Promise<boolean> {
+export async function testWebSocketConnection(rpcUrl: string, wsUrl: string, programId = config.programId): Promise<boolean> {
   try {
     logger.debug({ rpcUrl, wsUrl }, "Testing WebSocket connection");
 
-    // Use HTTP endpoint for getSlot, but configure WS endpoint
     const connection = new Connection(rpcUrl, {
       wsEndpoint: wsUrl,
       commitment: "confirmed",
     });
-    // Test HTTP connectivity first
+
     const slot = await connection.getSlot();
-    logger.debug({ slot }, "WebSocket connection test successful");
-    return true;
+
+    const wsReady = await probeTemporaryLogsSubscription(connection, new PublicKey(programId));
+
+    logger.debug({ slot, wsReady }, "WebSocket connection test complete");
+    return wsReady;
   } catch (error) {
     logger.debug({ error }, "WebSocket connection test failed");
     return false;

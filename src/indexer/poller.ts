@@ -37,6 +37,15 @@ export interface PollerOptions {
   batchSize?: number;
 }
 
+export interface PollerBootstrapOptions {
+  retryDelayMs?: number;
+}
+
+interface ProcessNewTransactionsResult {
+  fetchedCount: number;
+  haltedOnError: boolean;
+}
+
 function shouldAdvanceCursor(
   currentSlot: bigint | null | undefined,
   currentTxIndex: number | null | undefined,
@@ -266,6 +275,49 @@ export class Poller {
     this.isRunning = true;
     logger.info({ programId: this.programId.toBase58() }, "Starting poller");
 
+    try {
+      await this.initializeCursor();
+      this.poll();
+    } catch (error) {
+      this.isRunning = false;
+      throw error;
+    }
+  }
+
+  async bootstrap(options?: PollerBootstrapOptions): Promise<void> {
+    if (this.isRunning) {
+      logger.warn("Poller already running");
+      return;
+    }
+
+    this.isRunning = true;
+    logger.info({ programId: this.programId.toBase58() }, "Bootstrapping poller catch-up");
+
+    try {
+      await this.initializeCursor();
+
+      while (this.isRunning) {
+        const result = await this.processNewTransactions();
+        if (result.haltedOnError) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, options?.retryDelayMs ?? this.pollingInterval)
+          );
+          continue;
+        }
+
+        if (result.fetchedCount === 0 && !this.pendingContinuation) {
+          break;
+        }
+      }
+    } finally {
+      this.isRunning = false;
+      this.pendingContinuation = null;
+      this.pendingStopSignature = null;
+      this.hadPaginationPartial = false;
+    }
+  }
+
+  private async initializeCursor(): Promise<void> {
     await this.loadState();
 
     // If no saved state, do backfill first
@@ -273,8 +325,6 @@ export class Poller {
       logger.info("No saved state - starting backfill from beginning");
       await this.backfill();
     }
-
-    this.poll();
   }
 
   /**
@@ -554,18 +604,12 @@ export class Poller {
   }
 
   /**
-   * Get transaction index within a block for multiple signatures
-   * Fetches block once and maps signature -> index
-   * Only called when multiple txs exist in the same slot (rare case)
+   * Get transaction index within a block for the provided signatures.
+   * Fetches the full block and maps signature -> absolute block index.
+   * This keeps poller ordering aligned with websocket/substreams ordering.
    */
   private async getTxIndexMap(slot: number, sigs: ConfirmedSignatureInfo[]): Promise<Map<string, number | null>> {
     const txIndexMap = new Map<string, number | null>();
-
-    // If only one transaction in slot, index is 0 - no need to fetch block
-    if (sigs.length === 1) {
-      txIndexMap.set(sigs[0].signature, 0);
-      return txIndexMap;
-    }
 
     const MAX_RETRIES = 3;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -886,11 +930,13 @@ export class Poller {
         lastSignature: signature,
         lastSlot: slot,
         lastTxIndex: txIndex,
+        source: "poller",
       },
       update: {
         lastSignature: signature,
         lastSlot: slot,
         lastTxIndex: txIndex,
+        source: "poller",
       },
     });
   }
@@ -909,7 +955,7 @@ export class Poller {
     }
   }
 
-  private async processNewTransactions(): Promise<void> {
+  private async processNewTransactions(): Promise<ProcessNewTransactionsResult> {
     const suspendLocalDigests = Boolean(this.prisma && config.dbMode === "local");
     if (suspendLocalDigests) await suspendLocalDerivedDigests();
     try {
@@ -924,12 +970,12 @@ export class Poller {
           },
           "Skipping partial pagination batch to prevent cursor advance"
         );
-        return;
+        return { fetchedCount: signatures.length, haltedOnError: true };
       }
 
       if (signatures.length === 0) {
         logger.debug("No new transactions");
-        return;
+        return { fetchedCount: 0, haltedOnError: false };
       }
 
       logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
@@ -957,6 +1003,7 @@ export class Poller {
       // Process slot by slot
       const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
 
+      let haltedOnError = false;
       for (const slot of sortedSlots) {
         if (this.stopBeforeNewerSlot(slot, "polling")) break;
         const sigs = bySlot.get(slot)!;
@@ -1017,6 +1064,7 @@ export class Poller {
           }
         }
         if (batchFailed) {
+          haltedOnError = true;
           logger.warn(
             { slot, lastSignature: this.lastSignature },
             "Batch processing halted - will retry failed tx on next poll cycle"
@@ -1035,6 +1083,7 @@ export class Poller {
       }
 
       this.logStatsIfNeeded();
+      return { fetchedCount: signatures.length, haltedOnError };
     } finally {
       if (suspendLocalDigests) resumeLocalDerivedDigests();
     }

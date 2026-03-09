@@ -9,6 +9,7 @@ const {
   mockVerifierInstance,
 } = vi.hoisted(() => ({
   mockPollerInstance: {
+    bootstrap: vi.fn(),
     start: vi.fn(),
     stop: vi.fn(),
   },
@@ -88,7 +89,7 @@ vi.mock("../../../src/config.js", () => ({
     rpcUrl: "http://localhost:8899",
     wsUrl: "ws://localhost:8900",
     programId: "11111111111111111111111111111111",
-    indexerMode: "auto",
+    indexerMode: "polling",
     pollingInterval: 5000,
     wsReconnectInterval: 1000,
     wsMaxRetries: 5,
@@ -117,6 +118,7 @@ describe("Processor", () => {
     mockPrisma = createMockPrismaClient();
 
     // Reset mock return values
+    mockPollerInstance.bootstrap.mockResolvedValue(undefined);
     mockPollerInstance.start.mockResolvedValue(undefined);
     mockPollerInstance.stop.mockResolvedValue(undefined);
     mockWsIndexerInstance.start.mockResolvedValue(undefined);
@@ -143,6 +145,7 @@ describe("Processor", () => {
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("polling");
+      expect(status.configuredMode).toBe("polling");
     });
 
     it("should create processor with websocket mode", () => {
@@ -150,6 +153,7 @@ describe("Processor", () => {
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("websocket");
+      expect(status.configuredMode).toBe("websocket");
     });
 
     it("should create processor with auto mode", () => {
@@ -157,6 +161,7 @@ describe("Processor", () => {
       expect(processor).toBeDefined();
       const status = processor.getStatus();
       expect(status.mode).toBe("auto");
+      expect(status.configuredMode).toBe("auto");
     });
   });
 
@@ -169,6 +174,7 @@ describe("Processor", () => {
       expect(status).toEqual({
         running: false,
         mode: "polling",
+        configuredMode: "polling",
         pollerActive: false,
         wsActive: false,
         verifierActive: false,
@@ -184,6 +190,7 @@ describe("Processor", () => {
       expect(status).toEqual({
         running: false,
         mode: "websocket",
+        configuredMode: "websocket",
         pollerActive: false,
         wsActive: false,
         verifierActive: false,
@@ -199,6 +206,7 @@ describe("Processor", () => {
       expect(status).toEqual({
         running: false,
         mode: "auto",
+        configuredMode: "auto",
         pollerActive: false,
         wsActive: false,
         verifierActive: false,
@@ -226,11 +234,13 @@ describe("Processor", () => {
       const status = processor.getStatus();
       expect(status.running).toBe(true);
       expect(status.wsActive).toBe(true);
-      expect(status.pollerActive).toBe(true);
+      expect(status.pollerActive).toBe(false);
+      expect(status.mode).toBe("websocket");
+      expect(status.configuredMode).toBe("websocket");
       expect(WebSocketIndexer).toHaveBeenCalled();
-      expect(Poller).toHaveBeenCalled();
       expect(mockWsIndexerInstance.start).toHaveBeenCalled();
-      expect(mockPollerInstance.start).toHaveBeenCalled();
+      expect(Poller).not.toHaveBeenCalled();
+      expect((processor as any).wsMonitorInterval).not.toBeNull();
     });
 
     it("should start in auto mode with WebSocket available", async () => {
@@ -244,8 +254,13 @@ describe("Processor", () => {
       expect(status.running).toBe(true);
       expect(testWebSocketConnection).toHaveBeenCalled();
       expect(WebSocketIndexer).toHaveBeenCalled();
-      // In auto mode with WS available, both are started
-      expect(Poller).toHaveBeenCalled();
+      expect(status.wsActive).toBe(true);
+      expect(status.pollerActive).toBe(false);
+      expect(status.mode).toBe("websocket");
+      expect(status.configuredMode).toBe("auto");
+      expect(Poller).toHaveBeenCalledTimes(2);
+      expect(mockPollerInstance.bootstrap).toHaveBeenCalledTimes(2);
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
     });
 
     it("should fallback to polling in auto mode when WebSocket unavailable", async () => {
@@ -257,7 +272,27 @@ describe("Processor", () => {
       const status = processor.getStatus();
       expect(status.running).toBe(true);
       expect(status.pollerActive).toBe(true);
+      expect(status.mode).toBe("polling");
+      expect(status.configuredMode).toBe("auto");
       expect(testWebSocketConnection).toHaveBeenCalled();
+    });
+
+    it("should cleanup websocket startup state and fallback to polling when auto websocket pipeline throws", async () => {
+      mockPollerInstance.bootstrap.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("gap catch-up failed"));
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+
+      const status = processor.getStatus();
+      expect(status.running).toBe(true);
+      expect(status.pollerActive).toBe(true);
+      expect(status.wsActive).toBe(false);
+      expect(status.mode).toBe("polling");
+      expect(status.configuredMode).toBe("auto");
+      expect(mockWsIndexerInstance.start).toHaveBeenCalledTimes(1);
+      expect(mockWsIndexerInstance.stop).toHaveBeenCalledTimes(1);
+      expect(mockPollerInstance.start).toHaveBeenCalledTimes(1);
+      expect((processor as any).wsMonitorInterval).toBeNull();
     });
 
     it("should not start twice", async () => {
@@ -305,7 +340,7 @@ describe("Processor", () => {
       const status = processor.getStatus();
       expect(status.running).toBe(false);
       expect(mockWsIndexerInstance.stop).toHaveBeenCalled();
-      expect(mockPollerInstance.stop).toHaveBeenCalled();
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
     });
 
     it("should stop auto mode", async () => {
@@ -328,16 +363,22 @@ describe("Processor", () => {
 
       const processor = new Processor(mockPrisma, null, { mode: "websocket" });
       await processor.start();
+      vi.clearAllMocks();
 
-      // Simulate WebSocket becoming inactive
-      mockWsIndexerInstance.isActive.mockReturnValue(false);
+      mockWsIndexerInstance.isActive.mockReturnValueOnce(false).mockReturnValue(true);
+      mockWsIndexerInstance.isRecovering.mockReturnValue(false);
 
-      // Advance timer to trigger monitor check
       await vi.advanceTimersByTimeAsync(10000);
 
-      // Poller should be restarted with faster interval
-      expect(mockPollerInstance.stop).toHaveBeenCalled();
+      expect(WebSocketIndexer).toHaveBeenCalledTimes(1);
+      expect(Poller).toHaveBeenCalledTimes(2);
+      expect(mockPollerInstance.bootstrap).toHaveBeenCalledTimes(2);
+      expect(mockWsIndexerInstance.stop).toHaveBeenCalledTimes(1);
+      expect(mockWsIndexerInstance.start).toHaveBeenCalledTimes(1);
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
+      expect((processor as any).wsMonitorInterval).not.toBeNull();
 
+      await processor.stop();
       vi.useRealTimers();
     });
 
@@ -346,6 +387,7 @@ describe("Processor", () => {
 
       const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
+      vi.clearAllMocks();
 
       // Simulate WebSocket becoming inactive
       mockWsIndexerInstance.isActive.mockReturnValue(false);
@@ -353,9 +395,38 @@ describe("Processor", () => {
       // Advance timer to trigger monitor check
       await vi.advanceTimersByTimeAsync(10000);
 
-      // Poller should be restarted with faster interval
-      expect(mockPollerInstance.stop).toHaveBeenCalled();
+      expect(Poller).toHaveBeenCalledTimes(1);
+      expect(mockPollerInstance.start).toHaveBeenCalledTimes(1);
+      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      expect(mockWsIndexerInstance.stop).toHaveBeenCalled();
+      expect(processor.getStatus().pollerActive).toBe(true);
+      expect(processor.getStatus().wsActive).toBe(false);
+      expect(processor.getStatus().mode).toBe("polling");
+      expect(processor.getStatus().configuredMode).toBe("auto");
 
+      vi.useRealTimers();
+    });
+
+    it("should fail over to polling only once in auto mode", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+      vi.clearAllMocks();
+
+      mockWsIndexerInstance.isActive.mockReturnValue(false);
+
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(Poller).toHaveBeenCalledTimes(1);
+
+      vi.clearAllMocks();
+      await vi.advanceTimersByTimeAsync(30000);
+
+      expect(Poller).not.toHaveBeenCalled();
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
+      expect(mockWsIndexerInstance.stop).not.toHaveBeenCalled();
+
+      await processor.stop();
       vi.useRealTimers();
     });
 
@@ -413,8 +484,8 @@ describe("Processor", () => {
       // Directly invoke runWebSocketCheck
       await (processor as any).runWebSocketCheck();
 
-      // Poller should NOT be restarted since isRunning is false
-      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      // Poller should NOT be started since isRunning is false
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
 
       // Clean up: restore isRunning so stop() works, then clear intervals manually
       (processor as any).isRunning = true;
@@ -437,8 +508,8 @@ describe("Processor", () => {
       // Advance to trigger monitor check
       await vi.advanceTimersByTimeAsync(10000);
 
-      // Poller should NOT be restarted since wsMonitorInProgress blocks entry
-      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      // Poller should NOT be started since wsMonitorInProgress blocks entry
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
 
       // Reset the guard so stop() works cleanly
       (processor as any).wsMonitorInProgress = false;
@@ -459,8 +530,8 @@ describe("Processor", () => {
       // Advance to trigger check
       await vi.advanceTimersByTimeAsync(10000);
 
-      // Poller should NOT be restarted since WS is recovering
-      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      // Poller should NOT be started since WS is recovering
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
 
       await processor.stop();
       vi.useRealTimers();
@@ -471,19 +542,28 @@ describe("Processor", () => {
 
       const processor = new Processor(mockPrisma, null, { mode: "auto" });
       await processor.start();
+      vi.clearAllMocks();
 
       // WS inactive and not recovering
       mockWsIndexerInstance.isActive.mockReturnValue(false);
       mockWsIndexerInstance.isRecovering.mockReturnValue(false);
 
-      // Make poller.stop throw
-      mockPollerInstance.stop.mockRejectedValueOnce(new Error("poller stop failed"));
+      mockPollerInstance.start
+        .mockRejectedValueOnce(new Error("poller start failed"))
+        .mockResolvedValueOnce(undefined);
 
-      // Advance to trigger check -- should not throw
       await vi.advanceTimersByTimeAsync(10000);
+      expect(mockPollerInstance.start).toHaveBeenCalledTimes(1);
+      expect(processor.getStatus().pollerActive).toBe(false);
+      expect(processor.getStatus().mode).toBe("auto");
+      expect(processor.getStatus().configuredMode).toBe("auto");
 
-      // Processor should still be running (error was caught)
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(mockPollerInstance.start).toHaveBeenCalledTimes(2);
+      expect(processor.getStatus().pollerActive).toBe(true);
       expect(processor.getStatus().running).toBe(true);
+      expect(processor.getStatus().mode).toBe("polling");
+      expect(processor.getStatus().configuredMode).toBe("auto");
 
       await processor.stop();
       vi.useRealTimers();
@@ -509,7 +589,7 @@ describe("Processor", () => {
 
       // Advance further -- no more checks should fire
       await vi.advanceTimersByTimeAsync(30000);
-      expect(mockPollerInstance.stop).not.toHaveBeenCalled();
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
       expect(mockWsIndexerInstance.isActive).not.toHaveBeenCalled();
 
       vi.useRealTimers();

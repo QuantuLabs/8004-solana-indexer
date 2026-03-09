@@ -3,7 +3,7 @@
  *
  * Targets uncovered lines:
  * - Lines 77-111: stop() with queue drain, timeout, clear
- * - Lines 131-186: checkHealth - reentrancy guard, stale connection with RPC ping, regular fail
+ * - Lines 131-186: checkHealth - reentrancy guard, stale onLogs probing, regular fail
  * - Lines 188-214: forceReconnect - concurrency guard, cleanup old subscription
  * - Lines 277-431: handleLogs - failed event processing, cursor skip, supabase mode, prisma failures
  * - Lines 433-463: reconnect - not running, max retries, stop during wait
@@ -17,6 +17,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("@solana/web3.js", async () => {
   const actual = await vi.importActual<any>("@solana/web3.js");
   let getSlotMock: (() => Promise<number>) | null = null;
+  let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
+  let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
 
   class MockConnection {
     constructor(_endpoint: string, _config?: unknown) {}
@@ -27,6 +29,20 @@ vi.mock("@solana/web3.js", async () => {
       }
       return await getSlotMock();
     }
+
+    onLogs(filter: unknown, callback: () => void, commitment?: unknown): number {
+      if (!onLogsMock) {
+        throw new Error("onLogs mock not set");
+      }
+      return onLogsMock(filter, callback, commitment);
+    }
+
+    async removeOnLogsListener(subscriptionId: number): Promise<void> {
+      if (!removeOnLogsListenerMock) {
+        return;
+      }
+      await removeOnLogsListenerMock(subscriptionId);
+    }
   }
 
   return {
@@ -34,6 +50,12 @@ vi.mock("@solana/web3.js", async () => {
     Connection: MockConnection,
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => {
       getSlotMock = fn;
+    },
+    __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => {
+      onLogsMock = fn;
+    },
+    __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => {
+      removeOnLogsListenerMock = fn;
     },
   };
 });
@@ -216,29 +238,34 @@ describe("WebSocketIndexer Coverage", () => {
       expect(mockConnection.getSlot).not.toHaveBeenCalled();
     });
 
-    it("should reset activity timer when stale but RPC is healthy", async () => {
+    it("should reset activity timer when stale but onLogs heartbeat probe succeeds", async () => {
       createIndexer();
       await wsIndexer.start();
 
       // Make connection stale (no activity for > STALE_THRESHOLD)
       (wsIndexer as any).lastActivityTime = Date.now() - 130_000; // 130s ago
 
-      (mockConnection.getSlot as any).mockResolvedValue(12345);
+      (mockConnection.onLogs as any).mockImplementationOnce((_programId: unknown, _callback: () => void) => {
+        return 77;
+      });
 
       await (wsIndexer as any).checkHealth();
 
       // Activity time should have been reset to recent
       expect(Date.now() - (wsIndexer as any).lastActivityTime).toBeLessThan(5000);
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(77);
     });
 
-    it("should force reconnect when stale AND RPC fails", async () => {
+    it("should force reconnect when stale AND onLogs heartbeat probe fails", async () => {
       createIndexer();
       await wsIndexer.start();
 
       // Make connection stale
       (wsIndexer as any).lastActivityTime = Date.now() - 130_000;
 
-      (mockConnection.getSlot as any).mockRejectedValue(new Error("RPC down"));
+      (mockConnection.onLogs as any).mockImplementationOnce(() => {
+        throw new Error("onLogs heartbeat down");
+      });
 
       // Spy on forceReconnect
       const forceReconnectSpy = vi.spyOn(wsIndexer as any, "forceReconnect").mockResolvedValue(undefined);
@@ -557,7 +584,7 @@ describe("WebSocketIndexer Coverage", () => {
       expect(saveIndexerState).toHaveBeenCalledWith(
         TEST_SIGNATURE,
         BigInt(TEST_SLOT),
-        null,
+        0,
         "websocket",
         expect.any(Date),
       );
@@ -1692,15 +1719,25 @@ describe("WebSocketIndexer Coverage", () => {
 describe("testWebSocketConnection - two argument form", () => {
   const web3Mock = web3 as typeof web3 & {
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
+    __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
+    __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
   };
 
   afterEach(() => {
     web3Mock.__setGetSlotMock(null);
+    web3Mock.__setOnLogsMock(null);
+    web3Mock.__setRemoveOnLogsListenerMock(null);
     vi.restoreAllMocks();
   });
 
   it("should return true when connection succeeds with rpcUrl + wsUrl", async () => {
     web3Mock.__setGetSlotMock(() => Promise.resolve(54321));
+    web3Mock.__setOnLogsMock((_filter, callback) => {
+      callback();
+      return 11;
+    });
+    const removeSpy = vi.fn().mockResolvedValue(undefined);
+    web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
 
     const result = await testWebSocketConnection(
       "https://api.devnet.solana.com",
@@ -1708,6 +1745,7 @@ describe("testWebSocketConnection - two argument form", () => {
     );
 
     expect(result).toBe(true);
+    expect(removeSpy).toHaveBeenCalledWith(11);
   });
 
   it("should return false when connection fails with rpcUrl + wsUrl", async () => {
@@ -1718,6 +1756,20 @@ describe("testWebSocketConnection - two argument form", () => {
     const result = await testWebSocketConnection(
       "https://invalid.rpc.local",
       "wss://invalid.ws.local"
+    );
+
+    expect(result).toBe(false);
+  });
+
+  it("should return false when websocket subscription cannot be established", async () => {
+    web3Mock.__setGetSlotMock(() => Promise.resolve(54321));
+    web3Mock.__setOnLogsMock(() => {
+      throw new Error("log subscription failed");
+    });
+
+    const result = await testWebSocketConnection(
+      "https://api.devnet.solana.com",
+      "wss://api.devnet.solana.com"
     );
 
     expect(result).toBe(false);

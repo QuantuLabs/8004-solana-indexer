@@ -190,7 +190,7 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
-    it("should assign next agentId from max existing assigned id", async () => {
+    it("should leave agentId null until deterministic verifier backfill assigns it", async () => {
       const event: ProgramEvent = {
         type: "AgentRegistered",
         data: {
@@ -203,21 +203,15 @@ describe("DB Handlers Coverage", () => {
       };
 
       (prisma.agent.findUnique as any).mockResolvedValue(null);
-      (prisma.agent.findMany as any).mockResolvedValue([{ agentId: 41n }]);
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.findMany).toHaveBeenCalledWith({
-        where: { agentId: { not: null } },
-        select: { agentId: true },
-        orderBy: { agentId: "desc" },
-        take: 1,
-      });
+      expect(prisma.agent.findMany).not.toHaveBeenCalled();
       expect(prisma.agent.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ agentId: 42n }),
-          update: expect.objectContaining({ agentId: 42n }),
+          create: expect.objectContaining({ agentId: null }),
+          update: expect.not.objectContaining({ agentId: expect.anything() }),
         })
       );
     });
@@ -2732,6 +2726,8 @@ describe("DB Handlers Coverage", () => {
       expect(executeRawUnsafe).toHaveBeenCalledTimes(1);
       const [sql, ...params] = (executeRawUnsafe as any).mock.calls[0] ?? [];
       expect(String(sql)).toContain("ON CONFLICT(\"col\", \"creator\") DO UPDATE");
+      expect(String(sql)).toContain("\"lastSeenSlot\" = CASE");
+      expect(String(sql)).toContain("\"lastSeenTxSignature\" = CASE");
       expect(params[0]).toBe("c1:new-pointer");
       expect(params[1]).toBe(immutableCreator);
       expect(prisma.collection.findMany).not.toHaveBeenCalled();
@@ -2887,6 +2883,92 @@ describe("DB Handlers Coverage", () => {
         .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
       expect(assignedIds).toEqual([1n, 2n]);
+    });
+
+    it("CollectionPointerSet should not regress lastSeen fields for an older same-slot signature in fallback mode", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.collection.findUnique as any).mockResolvedValue({
+        collectionId: 41n,
+        lastSeenSlot: ctx.slot,
+        lastSeenTxSignature: "sig-z",
+      });
+      (prisma.collection.upsert as any).mockResolvedValue({});
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+      const olderCtx: EventContext = {
+        ...ctx,
+        signature: "sig-a",
+      };
+
+      await handleEventAtomic(prisma, event, olderCtx);
+
+      expect(prisma.collection.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.not.objectContaining({
+            lastSeenAt: olderCtx.blockTime,
+            lastSeenSlot: olderCtx.slot,
+            lastSeenTxSignature: olderCtx.signature,
+          }),
+        })
+      );
+    });
+
+    it("CollectionPointerSet should advance lastSeen fields for a newer same-slot signature in fallback mode", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.collection.findUnique as any).mockResolvedValue({
+        collectionId: 41n,
+        lastSeenSlot: ctx.slot,
+        lastSeenTxSignature: "sig-a",
+      });
+      (prisma.collection.upsert as any).mockResolvedValue({});
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+      const newerCtx: EventContext = {
+        ...ctx,
+        signature: "sig-z",
+      };
+
+      await handleEventAtomic(prisma, event, newerCtx);
+
+      expect(prisma.collection.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSeenAt: newerCtx.blockTime,
+            lastSeenSlot: newerCtx.slot,
+            lastSeenTxSignature: newerCtx.signature,
+          }),
+        })
+      );
     });
 
     it("CollectionPointerSet should decrement previous collection and increment new collection count", async () => {

@@ -8,6 +8,7 @@ import { createChildLogger } from "../logger.js";
 import { config } from "../config.js";
 
 const logger = createChildLogger("decoder");
+const MAINNET_COMPANION_PROGRAM_ID = "8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ";
 
 /**
  * Parse value to bigint (handles Anchor BN format, string, number)
@@ -87,8 +88,8 @@ function parseOptionalHash32(value: unknown, fieldName: string): Uint8Array<Arra
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-export function resolveRuntimeIdlFilename(): string {
-  return config.solanaNetwork === "mainnet-beta"
+export function resolveRuntimeIdlFilename(programId = config.programId): string {
+  return programId === MAINNET_COMPANION_PROGRAM_ID
     ? "agent_registry_8004.mainnet.json"
     : "agent_registry_8004.json";
 }

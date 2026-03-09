@@ -122,3 +122,61 @@ describe('API Server (GraphQL-only)', () => {
     );
   });
 });
+
+describe('API Server GraphQL rate limiting', () => {
+  let createApiServer: typeof import('../../../src/api/server.js').createApiServer;
+  let app: Express;
+  let server: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'graphql',
+      ENABLE_GRAPHQL: 'true',
+      GRAPHQL_RATE_LIMIT_MAX_REQUESTS: '1',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    app = createApiServer({ pool: {} as any, prisma: null });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+  });
+
+  afterAll(async () => {
+    process.env = originalEnv;
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it('returns a rate limit message that matches the configured GraphQL limit', async () => {
+    const first = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
+    });
+
+    expect(second.status).toBe(429);
+    await expect(second.json()).resolves.toEqual({
+      error: 'GraphQL rate limited. Max 1 requests per minute.',
+    });
+  });
+});

@@ -40,9 +40,6 @@ export const agentResolvers = {
       return resolveChainId(ctx);
     },
     agentId(parent: AgentRow) {
-      if (!parent.agent_id) {
-        throw new Error(`Missing agent_id for agent ${parent.asset}`);
-      }
       return parent.agent_id;
     },
     agentURI(parent: AgentRow) {

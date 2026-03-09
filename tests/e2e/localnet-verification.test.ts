@@ -25,12 +25,12 @@ import * as path from "path";
 
 // Localnet RPC
 const LOCALNET_RPC = "http://localhost:8899";
-const PROGRAM_ID = new PublicKey("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
+const PROGRAM_ID = new PublicKey("8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ");
 const MPL_CORE_PROGRAM_ID = new PublicKey("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
 
-// Load devnet/default IDL for localnet tests; mainnet companion IDL is stored alongside it.
+// Localnet deploys the companion program ID that matches the mainnet-addressed IDL.
 function loadIdl(): any {
-  const idlPath = path.join(__dirname, "../../idl/agent_registry_8004.json");
+  const idlPath = path.join(__dirname, "../../idl/agent_registry_8004.mainnet.json");
   return JSON.parse(fs.readFileSync(idlPath, "utf-8"));
 }
 

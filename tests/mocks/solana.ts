@@ -34,6 +34,16 @@ export function createMockConnection() {
     getSlot: vi.fn().mockResolvedValue(Number(TEST_SLOT)),
     getSignaturesForAddress: vi.fn().mockResolvedValue([]),
     getParsedTransaction: vi.fn().mockResolvedValue(null),
+    getBlock: vi.fn().mockResolvedValue({
+      transactions: [
+        { transaction: { signatures: [TEST_SIGNATURE] } },
+      ],
+    }),
+    onSlotChange: vi.fn().mockImplementation((callback: () => void) => {
+      setTimeout(() => callback(), 0);
+      return 1;
+    }),
+    removeSlotChangeListener: vi.fn().mockResolvedValue(undefined),
     onLogs: vi.fn().mockReturnValue(1),
     removeOnLogsListener: vi.fn().mockResolvedValue(undefined),
   };

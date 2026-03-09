@@ -14,8 +14,13 @@ process.env.RPC_URL =
   process.env.DEVNET_RPC_URL ||
   process.env.RPC_URL ||
   "https://api.devnet.solana.com";
-process.env.WS_URL = process.env.WS_URL || "wss://api.devnet.solana.com";
-process.env.PROGRAM_ID = process.env.PROGRAM_ID || "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C";
+const isLocalnetRpc = /https?:\/\/(localhost|127\.0\.0\.1):8899\b/.test(process.env.RPC_URL);
+process.env.WS_URL = process.env.WS_URL || (isLocalnetRpc ? "ws://localhost:8900" : "wss://api.devnet.solana.com");
+process.env.PROGRAM_ID =
+  process.env.PROGRAM_ID ||
+  (isLocalnetRpc
+    ? "8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ"
+    : "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
 process.env.ATOM_ENGINE_PROGRAM_ID =
   process.env.ATOM_ENGINE_PROGRAM_ID || "AToMufS4QD6hEXvcvBDg9m1AHeCLpmZQsyfYa5h9MwAF";
 process.env.LOG_LEVEL = "silent";

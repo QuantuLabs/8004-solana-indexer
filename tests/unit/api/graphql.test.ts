@@ -414,9 +414,9 @@ describe('Agent Field Resolvers', () => {
     expect(agentResolvers.Agent.agentId(parent)).toBe('42');
   });
 
-  it('throws when DB agent_id is null', () => {
+  it('returns null when DB agent_id is null', () => {
     const parent = { asset: 'asset2', agent_id: null } as any;
-    expect(() => agentResolvers.Agent.agentId(parent)).toThrow('Missing agent_id');
+    expect(agentResolvers.Agent.agentId(parent)).toBeNull();
   });
 
   it('supports Agent.feedback ordering by sequential feedbackId', async () => {

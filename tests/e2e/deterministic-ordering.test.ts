@@ -627,11 +627,11 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       }
     }, 30000);
 
-    it("WebSocket path without tx_index should use tx_index only as signature-level tie-breaker", () => {
-      // Simulate WebSocket scenario: same slot + same signature, but no tx_index
+    it("NULL tx_index fallback should use signature ordering only after concrete tx_index values", () => {
+      // Simulate fallback scenario: same slot + same signature, but tx_index could not be resolved
       const wsAgent = {
         ...registeredAgents[0],
-        txIndex: null, // WebSocket doesn't resolve tx_index
+        txIndex: null, // Fallback path leaves tx_index unresolved
       };
 
       const withWs = [...registeredAgents, wsAgent];
@@ -652,7 +652,7 @@ describe("E2E: Localnet Deterministic Ordering", () => {
       expect(lastAgent.txIndex).toBeNull();
     });
 
-    it("WebSocket fallback should order multiple NULL tx_index by signature", () => {
+    it("NULL tx_index fallback should order multiple unresolved rows by signature", () => {
       const base = registeredAgents[0];
       if (!base) return;
 

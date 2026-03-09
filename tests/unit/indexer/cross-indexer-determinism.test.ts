@@ -7,7 +7,7 @@ import { describe, it, expect } from "vitest";
  * produces identical agent_id assignments regardless of which indexer runs:
  *   - RPC Poller (getBlock → enumerate → tx_index)
  *   - Substreams  (block.transactions.iter().enumerate() → tx_index)
- *   - WebSocket   (onLogs → no tx_index, NULL fallback)
+ *   - WebSocket   (onLogs → getBlock-enriched tx_index, NULL fallback only on block lookup failure)
  *
  * Also validates that the SQL ordering
  *   ORDER BY block_slot, tx_index NULLS LAST, tx_signature
@@ -135,11 +135,22 @@ function simulateSubstreamsOutput(
 }
 
 /**
- * Simulates what the WebSocket indexer produces:
- * - onLogs gives signature + slot, but no tx_index
- * - tx_index is always NULL
+ * Simulates the current WebSocket indexer when block enrichment succeeds:
+ * - onLogs gives signature + slot
+ * - getBlock resolves tx_index to the absolute block position
  */
-function simulateWebSocketOutput(
+function simulateWebSocketResolvedOutput(
+  blockTxOrder: Array<{ asset: string; slot: number; signature: string }>,
+): AgentRecord[] {
+  return simulatePollerOutput(blockTxOrder);
+}
+
+/**
+ * Simulates the WebSocket fallback path when tx_index enrichment is unavailable:
+ * - onLogs gives signature + slot
+ * - getBlock resolution fails, so tx_index stays NULL
+ */
+function simulateWebSocketFallbackOutput(
   blockTxOrder: Array<{ asset: string; slot: number; signature: string }>,
 ): AgentRecord[] {
   return blockTxOrder.map(tx => ({
@@ -192,8 +203,16 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     }
   });
 
-  it("WebSocket output with NULL tx_index still sorts deterministically via tx_signature", () => {
-    const wsResult = simulateWebSocketOutput(BLOCK_DATA);
+  it("WebSocket with resolved tx_index matches Poller/Substreams ordering", () => {
+    const pollerResult = simulatePollerOutput(BLOCK_DATA);
+    const wsResult = simulateWebSocketResolvedOutput(BLOCK_DATA);
+
+    expect(deterministicSort(wsResult)).toEqual(deterministicSort(pollerResult));
+    expect(assignGlobalIds(wsResult)).toEqual(assignGlobalIds(pollerResult));
+  });
+
+  it("WebSocket fallback with NULL tx_index still sorts deterministically via tx_signature", () => {
+    const wsResult = simulateWebSocketFallbackOutput(BLOCK_DATA);
     const sorted = deterministicSort(wsResult);
 
     // All tx_index are NULL → falls back to tx_signature alphabetical within slot
@@ -207,11 +226,11 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
     ]);
   });
 
-  it("WebSocket ordering can diverge from Poller/Substreams on multi-tx slots without tx_index", () => {
-    // Once tx_index becomes primary inside a slot, a websocket-only stream can diverge
+  it("WebSocket fallback ordering can diverge from Poller/Substreams on multi-tx slots without tx_index", () => {
+    // Once tx_index becomes primary inside a slot, a websocket fallback stream can diverge
     // from getBlock/substreams ordering whenever a slot contains multiple transactions.
     const pollerResult = simulatePollerOutput(BLOCK_DATA);
-    const wsResult = simulateWebSocketOutput(BLOCK_DATA);
+    const wsResult = simulateWebSocketFallbackOutput(BLOCK_DATA);
 
     const pollerIds = assignGlobalIds(pollerResult);
     const wsIds = assignGlobalIds(wsResult);
@@ -234,7 +253,7 @@ describe("Cross-indexer determinism: ordering equivalence", () => {
       if (pollerId !== wsId) hasDivergence = true;
     }
 
-    // Divergence is expected because websocket lacks tx_index.
+    // Divergence is expected only in the fallback path where tx_index stays NULL.
     expect(slotsWithMultiple.size).toBeGreaterThan(0);
     expect(hasDivergence).toBe(true);
   });
