@@ -750,6 +750,10 @@ describe("supabase.ts", () => {
         );
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("last_seen_tx_index");
+        expect(updateCall![0]).toContain("WHERE EXISTS (SELECT 1 FROM updated)");
+        expect(updateCall![0]).toContain("COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)");
+        expect(updateCall![1][6]).toBe(ctx.txIndex);
       });
 
       it("should not rewrite block_slot on ParentAssetSet", async () => {

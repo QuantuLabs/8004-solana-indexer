@@ -18,9 +18,9 @@ function isMissingCollectionIdSchemaError(error: unknown): boolean {
   const maybe = error as { code?: unknown; message?: unknown } | null;
   const code = typeof maybe?.code === "string" ? maybe.code : "";
   const message = typeof maybe?.message === "string" ? maybe.message : String(error);
-  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|column .*lastSeenTxIndex|no such column: collection_id|no such column: lastSeenTxIndex|has no column named collection_id|has no column named lastSeenTxIndex|column "?collection_id"? does not exist|column "?lastSeenTxIndex"? does not exist|Unknown arg .*collectionId|Unknown arg .*lastSeenTxIndex/i;
   if (code === "P2022") {
-    return /collection_id|collectionId|CollectionPointer/i.test(message);
+    return /collection_id|collectionId|lastSeenTxIndex|CollectionPointer/i.test(message);
   }
   if (code === "P2010") {
     return missingSchemaPattern.test(message);
@@ -30,7 +30,7 @@ function isMissingCollectionIdSchemaError(error: unknown): boolean {
 
 async function assertLocalCollectionIdSchema(prisma: PrismaClient): Promise<void> {
   try {
-    await prisma.$queryRawUnsafe('SELECT "collection_id" FROM "CollectionPointer" LIMIT 1');
+    await prisma.$queryRawUnsafe('SELECT "collection_id", "lastSeenTxIndex" FROM "CollectionPointer" LIMIT 1');
   } catch (error) {
     if (isMissingCollectionIdSchemaError(error)) {
       throw new Error(MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE);

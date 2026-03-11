@@ -220,6 +220,7 @@ type Protocol {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
+  totalValidations: BigInt!
   tags: [String!]!
 }
 
@@ -227,8 +228,55 @@ type GlobalStats {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
+  totalValidations: BigInt!
   totalCollections: BigInt!
+  platinumAgents: BigInt!
+  goldAgents: BigInt!
+  avgQuality: Int
   tags: [String!]!
+}
+
+type AgentReputation {
+  asset: String!
+  owner: String!
+  collection: String
+  nftName: String
+  agentUri: String
+  feedbackCount: Int!
+  avgScore: Int
+  positiveCount: Int!
+  negativeCount: Int!
+  validationCount: Int!
+}
+
+type LeaderboardEntry {
+  asset: String!
+  owner: String!
+  collection: String
+  nftName: String
+  agentUri: String
+  trustTier: Int
+  qualityScore: Int
+  confidence: Int
+  riskScore: Int
+  diversityRatio: Int
+  feedbackCount: Int
+  sortKey: BigInt!
+}
+
+type VerificationStatusCounts {
+  pending: Int!
+  finalized: Int!
+  orphaned: Int!
+}
+
+type VerificationStats {
+  agents: VerificationStatusCounts!
+  feedbacks: VerificationStatusCounts!
+  registries: VerificationStatusCounts!
+  metadata: VerificationStatusCounts!
+  feedbackResponses: VerificationStatusCounts!
+  revocations: VerificationStatusCounts!
 }
 
 type AgentRegistrationFile {
@@ -410,6 +458,13 @@ type Query {
   protocol(id: ID!): Protocol @deprecated(reason: "Use globalStats instead.")
   protocols(first: Int = 10, skip: Int = 0): [Protocol!]! @deprecated(reason: "Use globalStats instead.")
   globalStats: GlobalStats
+  agentReputation(asset: ID!): AgentReputation
+  leaderboard(
+    first: Int = 50
+    collection: String
+    includeOrphaned: Boolean = false
+  ): [LeaderboardEntry!]!
+  verificationStats: VerificationStats!
   agentSearch(query: String!, first: Int = 20): [Agent!]!
   agentRegistrationFiles(
     first: Int = 100

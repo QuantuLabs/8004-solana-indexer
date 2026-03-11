@@ -995,7 +995,11 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '10',
         total_feedback: '20',
+        total_validations: '0',
         total_collections: '4',
+        platinum_agents: '1',
+        gold_agents: '2',
+        avg_quality: '84',
         tags: ['ai'],
       }],
     });
@@ -1013,7 +1017,11 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     expect(first.id).toBe('global-devnet');
     expect(first.totalAgents).toBe('10');
+    expect(first.totalValidations).toBe('0');
     expect(first.totalCollections).toBe('4');
+    expect(first.platinumAgents).toBe('1');
+    expect(first.goldAgents).toBe('2');
+    expect(first.avgQuality).toBe(84);
     expect(second.totalAgents).toBe('10');
     expect(second.totalCollections).toBe('4');
     expect(second.tags).toEqual(['ai']);
@@ -1029,7 +1037,11 @@ describe('Query Aggregated Stats Cache', () => {
         rows: [{
           total_agents: '328',
           total_feedback: '301',
+          total_validations: '0',
           total_collections: '0',
+          platinum_agents: '11',
+          gold_agents: '22',
+          avg_quality: '77',
           tags: [],
         }],
       })
@@ -1037,7 +1049,11 @@ describe('Query Aggregated Stats Cache', () => {
         rows: [{
           total_agents: '329',
           total_feedback: '301',
+          total_validations: '0',
           total_collections: '0',
+          platinum_agents: '11',
+          gold_agents: '22',
+          avg_quality: '77',
           tags: [],
         }],
       });
@@ -1070,7 +1086,11 @@ describe('Query Aggregated Stats Cache', () => {
         // Example: active rows have agent_id values [1, 3], so count=2 while max(agent_id)=3.
         total_agents: '2',
         total_feedback: '9',
+        total_validations: '0',
         total_collections: '1',
+        platinum_agents: '0',
+        gold_agents: '1',
+        avg_quality: '91',
         tags: [],
       }],
     });
@@ -1088,9 +1108,9 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     const [sql] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain("(SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents");
+    expect(sql).toContain("(SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations");
     expect(sql).toContain('FROM collection_pointers');
     expect(sql).not.toContain('MAX(agent_id)');
-    expect(sql).not.toContain('FROM validations');
   });
 
   it('deduplicates concurrent globalStats refreshes', async () => {
@@ -1098,7 +1118,11 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '1',
         total_feedback: '2',
+        total_validations: '0',
         total_collections: '7',
+        platinum_agents: '0',
+        gold_agents: '0',
+        avg_quality: null,
         tags: ['x'],
       }],
     });
@@ -1123,7 +1147,11 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '10',
         total_feedback: '20',
+        total_validations: '0',
         total_collections: '4',
+        platinum_agents: '1',
+        gold_agents: '2',
+        avg_quality: '84',
         tags: ['ai'],
       }],
     });
@@ -1140,9 +1168,138 @@ describe('Query Aggregated Stats Cache', () => {
     const zeroFirst = await queryResolvers.Query.protocols({}, { first: 0, skip: 0 }, ctx);
 
     expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ totalValidations: '0' });
     expect(skipped).toEqual([]);
     expect(zeroFirst).toEqual([]);
     expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns agentReputation aggregate fields', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        asset: 'Agent111',
+        owner: 'Owner111',
+        collection: 'c1:bafy-test',
+        nft_name: 'Alpha',
+        agent_uri: 'https://example.com/a.json',
+        feedback_count: '3',
+        avg_score: '82',
+        positive_count: '2',
+        negative_count: '1',
+        validation_count: '4',
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.agentReputation({}, { asset: 'Agent111' }, ctx);
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM agents a');
+    expect(sql).toContain('LEFT JOIN feedback_stats fs');
+    expect(params).toEqual(['Agent111']);
+    expect(result).toEqual({
+      asset: 'Agent111',
+      owner: 'Owner111',
+      collection: 'c1:bafy-test',
+      nftName: 'Alpha',
+      agentUri: 'https://example.com/a.json',
+      feedbackCount: 3,
+      avgScore: 82,
+      positiveCount: 2,
+      negativeCount: 1,
+      validationCount: 4,
+    });
+  });
+
+  it('returns leaderboard entries using pool ordering semantics', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        asset: 'Agent111',
+        owner: 'Owner111',
+        collection: 'c1:bafy-test',
+        nft_name: 'Alpha',
+        agent_uri: 'https://example.com/a.json',
+        trust_tier: '3',
+        quality_score: '80',
+        confidence: '90',
+        risk_score: '5',
+        diversity_ratio: '12',
+        feedback_count: '7',
+        sort_key: '3008601739624372',
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.leaderboard(
+      {},
+      { first: 5, collection: 'c1:bafy-test', includeOrphaned: false },
+      ctx
+    );
+
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM agents');
+    expect(sql).toContain('trust_tier >= 2');
+    expect(sql).toContain('collection = ANY($2::text[])');
+    expect(params).toEqual([false, ['c1:bafy-test'], 5]);
+    expect(result).toEqual([
+      {
+        asset: 'Agent111',
+        owner: 'Owner111',
+        collection: 'c1:bafy-test',
+        nftName: 'Alpha',
+        agentUri: 'https://example.com/a.json',
+        trustTier: 3,
+        qualityScore: 80,
+        confidence: 90,
+        riskScore: 5,
+        diversityRatio: 12,
+        feedbackCount: 7,
+        sortKey: '3008601739624372',
+      },
+    ]);
+  });
+
+  it('returns verificationStats grouped by model', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [
+        { model: 'agents', pending_count: '1', finalized_count: '2', orphaned_count: '3' },
+        { model: 'feedback_responses', pending_count: '4', finalized_count: '5', orphaned_count: '6' },
+        { model: 'collections', pending_count: '7', finalized_count: '8', orphaned_count: '9' },
+      ],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.verificationStats({}, {}, ctx);
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      agents: { pending: 1, finalized: 2, orphaned: 3 },
+      feedbacks: { pending: 0, finalized: 0, orphaned: 0 },
+      registries: { pending: 7, finalized: 8, orphaned: 9 },
+      metadata: { pending: 0, finalized: 0, orphaned: 0 },
+      feedbackResponses: { pending: 4, finalized: 5, orphaned: 6 },
+      revocations: { pending: 0, finalized: 0, orphaned: 0 },
+    });
   });
 });
 

@@ -5,7 +5,8 @@ services:
       POSTGREST_URL: ${POSTGREST_URL:-http://postgrest:3000}
       POSTGREST_TOKEN: ${POSTGREST_TOKEN:?set POSTGREST_TOKEN}
     depends_on:
-      - postgrest
+      postgrest:
+        condition: service_healthy
 
   postgrest:
     profiles:
@@ -23,3 +24,12 @@ services:
       PGRST_JWT_SECRET: ${PGRST_JWT_SECRET:?set PGRST_JWT_SECRET}
       PGRST_SERVER_PORT: 3000
       PGRST_LOG_LEVEL: ${PGRST_LOG_LEVEL:-info}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 3 perl -MIO::Socket::INET -e '$$s = IO::Socket::INET->new(PeerAddr => "127.0.0.1:3000", Proto => "tcp", Timeout => 2) or exit 1; print $$s "GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"; my $$line = <$$s>; exit(($$line || "") =~ m{^HTTP/\S+ 200} ? 0 : 1)'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

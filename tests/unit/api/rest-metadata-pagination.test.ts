@@ -114,10 +114,10 @@ describe("REST metadata pagination parity", () => {
       const body = (await res.json()) as Array<{ id: string; asset: string; key: string; value: string }>;
       expect(body).toHaveLength(1);
       expect(body[0]).toMatchObject({
-        id: "asset-2:name",
+        id: "asset-2:82a3537ff0dbce7eec35d69edc3a189e",
         asset: "asset-2",
         key: "name",
-        value: Buffer.from("world", "utf8").toString("base64"),
+        value: rawStored("world").toString("base64"),
       });
 
       expect(prisma.agentMetadata.findMany).toHaveBeenCalledWith(

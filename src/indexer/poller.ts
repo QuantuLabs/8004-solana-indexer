@@ -39,6 +39,7 @@ export interface PollerOptions {
 
 export interface PollerBootstrapOptions {
   retryDelayMs?: number;
+  suppressEventLogWrites?: boolean;
 }
 
 interface ProcessNewTransactionsResult {
@@ -170,9 +171,9 @@ function isMissingCollectionIdSchemaError(error: unknown): boolean {
   const maybe = error as { code?: unknown; message?: unknown } | null;
   const code = typeof maybe?.code === "string" ? maybe.code : "";
   const message = typeof maybe?.message === "string" ? maybe.message : String(error);
-  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  const missingSchemaPattern = /missing collection_id schema|column .*collection_id|column .*lastSeenTxIndex|no such column: collection_id|no such column: lastSeenTxIndex|has no column named collection_id|has no column named lastSeenTxIndex|column "?collection_id"? does not exist|column "?lastSeenTxIndex"? does not exist|Unknown arg .*collectionId|Unknown arg .*lastSeenTxIndex/i;
   if (code === "P2022") {
-    return /collection_id|collectionId|CollectionPointer/i.test(message);
+    return /collection_id|collectionId|lastSeenTxIndex|CollectionPointer/i.test(message);
   }
   if (code === "P2010") {
     return missingSchemaPattern.test(message);
@@ -202,6 +203,10 @@ export class Poller {
   // In that case we skip processing this cycle to avoid cursor/state advance.
   private hadPaginationPartial = false;
   private configuredStartCursorValidated = false;
+  private suppressEventLogWrites = false;
+  private runPromise: Promise<void> | null = null;
+  private pollDelayTimeout: ReturnType<typeof setTimeout> | null = null;
+  private pollDelayResolve: ((cancelled?: boolean) => void) | null = null;
 
   // Batch processing components (Supabase mode only)
   private useBatchRpc: boolean;
@@ -249,6 +254,26 @@ export class Poller {
     }
   }
 
+  private async waitForDelay(ms: number): Promise<boolean> {
+    if (!this.isRunning || ms <= 0) return false;
+
+    return await new Promise<boolean>((resolve) => {
+      const complete = (cancelled = false) => {
+        if (this.pollDelayTimeout) {
+          clearTimeout(this.pollDelayTimeout);
+          this.pollDelayTimeout = null;
+        }
+        if (this.pollDelayResolve === complete) {
+          this.pollDelayResolve = null;
+        }
+        resolve(!cancelled);
+      };
+
+      this.pollDelayResolve = complete;
+      this.pollDelayTimeout = setTimeout(() => complete(false), ms);
+    });
+  }
+
   private stopBeforeNewerSlot(slot: number | bigint, phase: "backfill" | "polling"): boolean {
     if (this.stopSlot === null) return false;
     const nextSlot = typeof slot === "bigint" ? slot : BigInt(slot);
@@ -277,7 +302,12 @@ export class Poller {
 
     try {
       await this.initializeCursor();
-      this.poll();
+      const runPromise = this.poll().finally(() => {
+        if (this.runPromise === runPromise) {
+          this.runPromise = null;
+        }
+      });
+      this.runPromise = runPromise;
     } catch (error) {
       this.isRunning = false;
       throw error;
@@ -291,17 +321,17 @@ export class Poller {
     }
 
     this.isRunning = true;
+    this.suppressEventLogWrites = Boolean(options?.suppressEventLogWrites);
     logger.info({ programId: this.programId.toBase58() }, "Bootstrapping poller catch-up");
 
-    try {
+    const runPromise = (async () => {
       await this.initializeCursor();
 
       while (this.isRunning) {
         const result = await this.processNewTransactions();
         if (result.haltedOnError) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, options?.retryDelayMs ?? this.pollingInterval)
-          );
+          const shouldRetry = await this.waitForDelay(options?.retryDelayMs ?? this.pollingInterval);
+          if (!shouldRetry) break;
           continue;
         }
 
@@ -309,12 +339,19 @@ export class Poller {
           break;
         }
       }
-    } finally {
+    })().finally(() => {
       this.isRunning = false;
       this.pendingContinuation = null;
       this.pendingStopSignature = null;
       this.hadPaginationPartial = false;
-    }
+      this.suppressEventLogWrites = false;
+      if (this.runPromise === runPromise) {
+        this.runPromise = null;
+      }
+    });
+
+    this.runPromise = runPromise;
+    await runPromise;
   }
 
   private async initializeCursor(): Promise<void> {
@@ -365,7 +402,7 @@ export class Poller {
 
         if (signatures.length < this.batchSize) break;
 
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (!(await this.waitForDelay(100))) break;
 
         if (totalEstimate % 5000 === 0) {
           logger.info({ scanned: totalEstimate, checkpoints: checkpoints.length }, "Scanning progress...");
@@ -380,7 +417,7 @@ export class Poller {
           logger.fatal("Too many scan errors during backfill scan; aborting startup to avoid partial history gaps");
           throw new Error("Backfill scan failed after repeated RPC errors");
         }
-        await new Promise((resolve) => setTimeout(resolve, 1000 * scanErrors));
+        if (!(await this.waitForDelay(1000 * scanErrors))) break;
       }
     }
 
@@ -450,7 +487,7 @@ export class Poller {
 
         if (batch.length < this.batchSize) break;
 
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (!(await this.waitForDelay(50))) break;
         retryCount = 0; // Reset on success
       } catch (error) {
         retryCount++;
@@ -461,7 +498,7 @@ export class Poller {
           logger.fatal({ windowSize: windowSigs.length }, "Too many errors fetching signature window; aborting backfill to avoid partial history gaps");
           throw new Error("Backfill window fetch failed after repeated RPC errors");
         }
-        await new Promise((resolve) => setTimeout(resolve, 500 * retryCount));
+        if (!(await this.waitForDelay(500 * retryCount))) break;
       }
     }
 
@@ -632,7 +669,11 @@ export class Poller {
       } catch (error) {
         if (attempt < MAX_RETRIES) {
           logger.warn({ slot, attempt, error: error instanceof Error ? error.message : String(error) }, "getBlock failed, retrying");
-          await new Promise(r => setTimeout(r, 500 * attempt));
+          const shouldRetry = await this.waitForDelay(500 * attempt);
+          if (!shouldRetry) {
+            sigs.forEach(sig => txIndexMap.set(sig.signature, null));
+            break;
+          }
         } else {
           logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index is unavailable");
           sigs.forEach(sig => txIndexMap.set(sig.signature, null));
@@ -650,6 +691,20 @@ export class Poller {
       lastSignature: this.lastSignature?.slice(0, 16) + '...'
     }, "Stopping poller");
     this.isRunning = false;
+    if (this.pollDelayTimeout) {
+      clearTimeout(this.pollDelayTimeout);
+      this.pollDelayTimeout = null;
+    }
+    if (this.pollDelayResolve) {
+      const resolve = this.pollDelayResolve;
+      this.pollDelayResolve = null;
+      resolve(true);
+    }
+
+    const runPromise = this.runPromise;
+    if (runPromise) {
+      await Promise.allSettled([runPromise]);
+    }
 
     // Flush any remaining events in batch mode
     if (this.eventBuffer) {
@@ -949,9 +1004,12 @@ export class Poller {
         logger.error({ error }, "Error in polling loop");
       }
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, this.pollingInterval)
-      );
+      if (!this.isRunning) {
+        break;
+      }
+
+      const shouldContinue = await this.waitForDelay(this.pollingInterval);
+      if (!shouldContinue) break;
     }
   }
 
@@ -961,6 +1019,21 @@ export class Poller {
     try {
       const signatures = await this.fetchSignatures();
 
+      if (signatures.length === 0) {
+        if (this.hadPaginationPartial) {
+          logger.warn(
+            {
+              pendingContinuation: this.pendingContinuation,
+              pendingStopSignature: this.pendingStopSignature,
+            },
+            "Pagination retries exhausted before any signatures could be processed"
+          );
+          return { fetchedCount: 0, haltedOnError: true };
+        }
+        logger.debug("No new transactions");
+        return { fetchedCount: 0, haltedOnError: false };
+      }
+
       if (this.hadPaginationPartial) {
         logger.warn(
           {
@@ -968,14 +1041,8 @@ export class Poller {
             pendingContinuation: this.pendingContinuation,
             pendingStopSignature: this.pendingStopSignature,
           },
-          "Skipping partial pagination batch to prevent cursor advance"
+          "Processing retry-exhausted partial pagination frontier with continuation preserved"
         );
-        return { fetchedCount: signatures.length, haltedOnError: true };
-      }
-
-      if (signatures.length === 0) {
-        logger.debug("No new transactions");
-        return { fetchedCount: 0, haltedOnError: false };
       }
 
       logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
@@ -1005,6 +1072,7 @@ export class Poller {
 
       let haltedOnError = false;
       for (const slot of sortedSlots) {
+        if (!this.isRunning) break;
         if (this.stopBeforeNewerSlot(slot, "polling")) break;
         const sigs = bySlot.get(slot)!;
         const txIndexMap = await this.getTxIndexMap(slot, sigs);
@@ -1021,6 +1089,7 @@ export class Poller {
 
         let batchFailed = false;
         for (const { sig, txIndex } of sigsWithIndex) {
+          if (!this.isRunning) break;
           try {
             // Use cached transaction from batch RPC if available
             let blockTime: Date;
@@ -1028,6 +1097,9 @@ export class Poller {
               blockTime = await this.processTransactionBatch(sig, txIndex, txCache.get(sig.signature));
             } else {
               blockTime = await this.processTransaction(sig, txIndex);
+            }
+            if (!this.isRunning) {
+              break;
             }
             if (USE_BATCH_DB && this.eventBuffer) {
               this.eventBuffer.noteCursor({
@@ -1195,7 +1267,7 @@ export class Poller {
                 if (sameSlotBatch.length < pageLimit) break;
                 if (nextBefore === sameSlotBefore) break;
                 sameSlotBefore = nextBefore;
-                await new Promise((resolve) => setTimeout(resolve, 100));
+                if (!(await this.waitForDelay(100))) break;
               }
               let stopTxIndex = this.lastTxIndex ?? -1;
               const sameSlotCursorEntries = [sig, ...sameSlotCandidates];
@@ -1293,7 +1365,7 @@ export class Poller {
                 if (sameSlotBatch.length < pageLimit) break;
                 if (nextBefore === sameSlotBefore) break;
                 sameSlotBefore = nextBefore;
-                await new Promise((resolve) => setTimeout(resolve, 100));
+                if (!(await this.waitForDelay(100))) break;
               }
               let stopTxIndex = this.lastTxIndex ?? -1;
               const stopCursorSignature: ConfirmedSignatureInfo = {
@@ -1388,7 +1460,7 @@ export class Poller {
 
           // Small delay to avoid rate limiting during pagination
           if (batch.length >= pageLimit) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            if (!(await this.waitForDelay(100))) break;
           } else {
             // Got fewer than requested, no more signatures
             this.pendingStopSignature = null;
@@ -1414,7 +1486,7 @@ export class Poller {
           );
 
           if (retryCount >= 3) {
-            this.hadPaginationPartial = allSignatures.length > 0;
+            this.hadPaginationPartial = true;
             if (beforeSignature && !this.pendingContinuation) {
               this.pendingContinuation = beforeSignature;
               if (!this.pendingStopSignature) {
@@ -1437,7 +1509,7 @@ export class Poller {
             );
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, 500 * retryCount));
+          if (!(await this.waitForDelay(500 * retryCount))) break;
         }
       }
 
@@ -1492,7 +1564,7 @@ export class Poller {
       await handleEventAtomic(this.prisma, typedEvent, ctx);
 
       // Only log to Prisma in local mode
-      if (this.prisma) {
+      if (this.prisma && !this.suppressEventLogWrites) {
         await this.prisma.eventLog.create({
           data: {
             eventType: typedEvent.type,
@@ -1583,7 +1655,7 @@ export class Poller {
     error: unknown
   ): Promise<void> {
     // Only log errors to Prisma in local mode
-    if (!this.prisma) return;
+    if (!this.prisma || this.suppressEventLogWrites) return;
 
     await this.prisma.eventLog.create({
       data: {

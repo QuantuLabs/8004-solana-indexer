@@ -80,6 +80,7 @@ model Collection {
   firstSeenTxSignature String?
   lastSeenAt           DateTime @default(now())
   lastSeenSlot         BigInt
+  lastSeenTxIndex      Int?
   lastSeenTxSignature  String?
   assetCount           BigInt   @default(0)
   version              String?

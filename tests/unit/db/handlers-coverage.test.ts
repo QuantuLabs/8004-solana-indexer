@@ -1485,6 +1485,77 @@ describe("DB Handlers Coverage", () => {
       }, { timeout: 500 });
     });
 
+    it("should sweep URI recovery beyond the first recovery page", async () => {
+      vi.useFakeTimers();
+      resetLocalDerivedDigestsForTests(false);
+      const previousNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = "production";
+
+      const firstPage = Array.from({ length: 500 }, (_, index) => ({
+        id: `agent-${String(index).padStart(3, "0")}`,
+        uri: `https://example.com/${index}.json`,
+      }));
+      const legacyAgent = {
+        id: "legacy-agent",
+        uri: "https://example.com/legacy.json",
+      };
+      const okStatus = Buffer.concat([Buffer.from([0x00]), Buffer.from('{"status":"ok"}')]);
+
+      (prisma.agent.findMany as any).mockImplementation(async (args: any) => {
+        const cursor = args?.where?.id?.gt ?? null;
+        if (!cursor) return firstPage;
+        if (cursor === firstPage[firstPage.length - 1].id) return [legacyAgent];
+        return [];
+      });
+      (prisma.agentMetadata.findMany as any).mockImplementation(async (args: any) => {
+        const ids = args?.where?.agentId?.in ?? [];
+        if (ids.includes(legacyAgent.id)) {
+          return [];
+        }
+        return ids.flatMap((id: string) => {
+          const agent = firstPage.find((entry) => entry.id === id);
+          return [
+            {
+              agentId: id,
+              key: "_uri:_source",
+              value: Buffer.concat([Buffer.from([0x00]), Buffer.from(agent?.uri ?? "")]),
+            },
+            {
+              agentId: id,
+              key: "_uri:_status",
+              value: okStatus,
+            },
+          ];
+        });
+      });
+      mockDigestUri.mockResolvedValue({
+        status: "ok",
+        bytes: 123,
+        hash: "legacyhash",
+        fields: { "_uri:name": "Legacy Agent" },
+        truncatedKeys: false,
+      });
+
+      try {
+        enableLocalDerivedDigests(prisma as any);
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(prisma.agent.findMany).toHaveBeenCalledTimes(1);
+        expect(mockDigestUri).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(prisma.agent.findMany).toHaveBeenCalledTimes(2);
+        expect((prisma.agent.findMany as any).mock.calls[1][0]?.where?.id?.gt).toBe(firstPage[firstPage.length - 1].id);
+        expect((prisma.agentMetadata.findMany as any).mock.calls.some((call: any[]) =>
+          Array.isArray(call[0]?.where?.agentId?.in) && call[0].where.agentId.in.includes(legacyAgent.id)
+        )).toBe(true);
+      } finally {
+        process.env.NODE_ENV = previousNodeEnv;
+        resetLocalDerivedDigestsForTests(true);
+        vi.useRealTimers();
+      }
+    });
+
     it("should defer queued URI digest execution while local ingestion is suspended", async () => {
       const event: ProgramEvent = {
         type: "AgentRegistered",
@@ -2658,6 +2729,28 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
+    it("CollectionPointerSet should not create a collection pointer when the agent is missing (atomic)", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
+      (prisma.agent.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 0 });
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:missing-agent",
+          lock: true,
+        },
+      };
+
+      await handleEventAtomic(prisma, event, ctx);
+
+      expect(prisma.collection.upsert).not.toHaveBeenCalled();
+      expect(prisma.collection.update).not.toHaveBeenCalled();
+      expect(prisma.collection.updateMany).not.toHaveBeenCalled();
+    });
+
     it("CollectionPointerSet should retry collection_id assignment on unique collision (atomic)", async () => {
       (prisma as any).$executeRawUnsafe = undefined;
       const immutableCreator = TEST_OWNER.toBase58();
@@ -2727,6 +2820,7 @@ describe("DB Handlers Coverage", () => {
       const [sql, ...params] = (executeRawUnsafe as any).mock.calls[0] ?? [];
       expect(String(sql)).toContain("ON CONFLICT(\"col\", \"creator\") DO UPDATE");
       expect(String(sql)).toContain("\"lastSeenSlot\" = CASE");
+      expect(String(sql)).toContain("\"lastSeenTxIndex\" = CASE");
       expect(String(sql)).toContain("\"lastSeenTxSignature\" = CASE");
       expect(params[0]).toBe("c1:new-pointer");
       expect(params[1]).toBe(immutableCreator);
@@ -2897,6 +2991,7 @@ describe("DB Handlers Coverage", () => {
       (prisma.collection.findUnique as any).mockResolvedValue({
         collectionId: 41n,
         lastSeenSlot: ctx.slot,
+        lastSeenTxIndex: 7,
         lastSeenTxSignature: "sig-z",
       });
       (prisma.collection.upsert as any).mockResolvedValue({});
@@ -2912,6 +3007,7 @@ describe("DB Handlers Coverage", () => {
       };
       const olderCtx: EventContext = {
         ...ctx,
+        txIndex: 5,
         signature: "sig-a",
       };
 
@@ -2922,6 +3018,7 @@ describe("DB Handlers Coverage", () => {
           update: expect.not.objectContaining({
             lastSeenAt: olderCtx.blockTime,
             lastSeenSlot: olderCtx.slot,
+            lastSeenTxIndex: olderCtx.txIndex,
             lastSeenTxSignature: olderCtx.signature,
           }),
         })
@@ -2940,6 +3037,7 @@ describe("DB Handlers Coverage", () => {
       (prisma.collection.findUnique as any).mockResolvedValue({
         collectionId: 41n,
         lastSeenSlot: ctx.slot,
+        lastSeenTxIndex: 5,
         lastSeenTxSignature: "sig-a",
       });
       (prisma.collection.upsert as any).mockResolvedValue({});
@@ -2955,6 +3053,7 @@ describe("DB Handlers Coverage", () => {
       };
       const newerCtx: EventContext = {
         ...ctx,
+        txIndex: 7,
         signature: "sig-z",
       };
 
@@ -2965,7 +3064,54 @@ describe("DB Handlers Coverage", () => {
           update: expect.objectContaining({
             lastSeenAt: newerCtx.blockTime,
             lastSeenSlot: newerCtx.slot,
+            lastSeenTxIndex: newerCtx.txIndex,
             lastSeenTxSignature: newerCtx.signature,
+          }),
+        })
+      );
+    });
+
+    it("CollectionPointerSet should advance lastSeen fields for a newer same-slot tx index even with a lexicographically older signature", async () => {
+      (prisma as any).$executeRawUnsafe = undefined;
+      const immutableCreator = TEST_OWNER.toBase58();
+      (prisma.agent.findUnique as any).mockResolvedValue({
+        collectionPointer: "",
+        creator: immutableCreator,
+      });
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
+      (prisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (prisma.collection.findUnique as any).mockResolvedValue({
+        collectionId: 41n,
+        lastSeenSlot: ctx.slot,
+        lastSeenTxIndex: 2,
+        lastSeenTxSignature: "sig-z",
+      });
+      (prisma.collection.upsert as any).mockResolvedValue({});
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:new-pointer",
+          lock: true,
+        },
+      };
+      const newerTxIndexCtx: EventContext = {
+        ...ctx,
+        txIndex: 9,
+        signature: "sig-a",
+      };
+
+      await handleEventAtomic(prisma, event, newerTxIndexCtx);
+
+      expect(prisma.collection.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSeenAt: newerTxIndexCtx.blockTime,
+            lastSeenSlot: newerTxIndexCtx.slot,
+            lastSeenTxIndex: newerTxIndexCtx.txIndex,
+            lastSeenTxSignature: newerTxIndexCtx.signature,
           }),
         })
       );
@@ -3062,6 +3208,27 @@ describe("DB Handlers Coverage", () => {
       expect(updateCall?.data.collectionPointer).toBe("c1:next");
       expect(updateCall?.data.creator).toBe(TEST_OWNER.toBase58());
       expect("colLocked" in updateCall?.data).toBe(false);
+    });
+
+    it("CollectionPointerSet should not create a collection pointer when the agent is missing (non-atomic)", async () => {
+      (prisma.agent.findUnique as any).mockResolvedValue(null);
+      (prisma.agent.updateMany as any).mockResolvedValue({ count: 0 });
+
+      const event: ProgramEvent = {
+        type: "CollectionPointerSet",
+        data: {
+          asset: TEST_ASSET,
+          setBy: TEST_NEW_OWNER,
+          col: "c1:missing-agent",
+          lock: true,
+        },
+      };
+
+      await handleEvent(prisma, event, ctx);
+
+      expect(prisma.collection.upsert).not.toHaveBeenCalled();
+      expect(prisma.collection.update).not.toHaveBeenCalled();
+      expect(prisma.collection.updateMany).not.toHaveBeenCalled();
     });
 
     it("ParentAssetSet should apply parent lock when provided (atomic)", async () => {

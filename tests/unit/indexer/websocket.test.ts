@@ -1,12 +1,83 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+vi.mock("ws", () => {
+  let probeBehavior: "supported" | "unsupported" | "timeout" | "error" = "supported";
+
+  class MockWebSocket {
+    static OPEN = 1;
+    readyState = 0;
+    private handlers = new Map<string, Array<(...args: any[]) => void>>();
+
+    constructor(_url: string) {
+      queueMicrotask(() => {
+        if (probeBehavior === "error") {
+          this.emit("error", new Error("ws probe failed"));
+          return;
+        }
+        this.readyState = MockWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    on(event: string, handler: (...args: any[]) => void): this {
+      const current = this.handlers.get(event) ?? [];
+      current.push(handler);
+      this.handlers.set(event, current);
+      return this;
+    }
+
+    send(_payload: string): void {
+      if (probeBehavior === "timeout") return;
+
+      queueMicrotask(() => {
+        if (probeBehavior === "unsupported") {
+          this.emit("message", JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            error: { code: -32601, message: "Method 'logsSubscribe' not found" },
+          }));
+          return;
+        }
+
+        this.emit("message", JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: 1,
+        }));
+      });
+    }
+
+    close(): void {
+      queueMicrotask(() => {
+        this.emit("close");
+      });
+    }
+
+    private emit(event: string, ...args: any[]): void {
+      for (const handler of this.handlers.get(event) ?? []) {
+        handler(...args);
+      }
+    }
+  }
+
+  return {
+    default: MockWebSocket,
+    __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => {
+      probeBehavior = value;
+    },
+  };
+});
+
 vi.mock("@solana/web3.js", async () => {
   const actual = await vi.importActual<any>("@solana/web3.js");
   let getSlotMock: (() => Promise<number>) | null = null;
   let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
   let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
+  let rpcWebSocketConnected = false;
 
   class MockConnection {
+    _rpcWebSocketConnected = rpcWebSocketConnected;
+
     constructor(_endpoint: string, _config?: unknown) {}
 
     async getSlot(): Promise<number> {
@@ -43,10 +114,14 @@ vi.mock("@solana/web3.js", async () => {
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => {
       removeOnLogsListenerMock = fn;
     },
+    __setRpcWebSocketConnected: (value: boolean) => {
+      rpcWebSocketConnected = value;
+    },
   };
 });
 
 import * as web3 from "@solana/web3.js";
+import * as wsModule from "ws";
 import {
   WebSocketIndexer,
   testWebSocketConnection,
@@ -404,6 +479,67 @@ describe("WebSocketIndexer", () => {
       // Should have created at least one event log (Anchor parser behavior varies)
       expect(mockPrisma.eventLog.create).toHaveBeenCalled();
     });
+
+    it("should not advance cursor when a later event in the same transaction fails", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      const firstEvent = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmOne",
+      };
+      const secondEvent = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTwo",
+      };
+
+      const encoded1 = encodeAnchorEvent("AgentRegistered", firstEvent).toString("base64");
+      const encoded2 = encodeAnchorEvent("AgentRegistered", secondEvent).toString("base64");
+      const logs = [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        `Program data: ${encoded1}`,
+        `Program data: ${encoded2}`,
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ];
+
+      let agentUpsertCalls = 0;
+      (mockPrisma.agent.upsert as any).mockImplementation(async () => {
+        agentUpsertCalls += 1;
+        if (agentUpsertCalls === 2) {
+          throw new Error("second event failed");
+        }
+        return {};
+      });
+
+      await wsIndexer.start();
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: "second event failed",
+        }),
+      });
+    });
   });
 
   describe("reconnect", () => {
@@ -445,12 +581,18 @@ describe("testWebSocketConnection", () => {
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
     __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
+    __setRpcWebSocketConnected: (value: boolean) => void;
+  };
+  const wsMock = wsModule as typeof wsModule & {
+    __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => void;
   };
 
   afterEach(() => {
     web3Mock.__setGetSlotMock(null);
     web3Mock.__setOnLogsMock(null);
     web3Mock.__setRemoveOnLogsListenerMock(null);
+    web3Mock.__setRpcWebSocketConnected(false);
+    wsMock.__setWsProbeBehavior("supported");
     vi.restoreAllMocks();
   });
 
@@ -480,12 +622,25 @@ describe("testWebSocketConnection", () => {
     expect(result).toBe(false);
   });
 
+  it("should return false when the RPC provider does not support logsSubscribe", async () => {
+    web3Mock.__setGetSlotMock(() => Promise.resolve(123));
+    wsMock.__setWsProbeBehavior("unsupported");
+
+    const result = await testWebSocketConnection(
+      "https://api.devnet.solana.com",
+      "wss://api.devnet.solana.com"
+    );
+
+    expect(result).toBe(false);
+  });
+
   it("should return true when http and websocket probes succeed", async () => {
     web3Mock.__setGetSlotMock(() => Promise.resolve(123));
     web3Mock.__setOnLogsMock((_filter, callback) => {
       callback();
       return 7;
     });
+    web3Mock.__setRpcWebSocketConnected(true);
     const removeSpy = vi.fn().mockResolvedValue(undefined);
     web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
 
@@ -497,18 +652,78 @@ describe("testWebSocketConnection", () => {
     expect(removeSpy).toHaveBeenCalledWith(7);
   });
 
-  it("should return true when onLogs subscribe/remove succeeds without waiting for activity", async () => {
+  it("should return false when websocket transport never reports connected", async () => {
     web3Mock.__setGetSlotMock(() => Promise.resolve(123));
     web3Mock.__setOnLogsMock(() => 9);
     const removeSpy = vi.fn().mockResolvedValue(undefined);
     web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
+    web3Mock.__setRpcWebSocketConnected(false);
 
     const result = await testWebSocketConnection(
       "https://api.devnet.solana.com",
       "wss://api.devnet.solana.com"
     );
 
-    expect(result).toBe(true);
+    expect(result).toBe(false);
     expect(removeSpy).toHaveBeenCalledWith(9);
+  });
+});
+
+describe("WebSocketIndexer provider compatibility", () => {
+  const wsMock = wsModule as typeof wsModule & {
+    __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => void;
+  };
+  let localConnection: ReturnType<typeof createMockConnection>;
+  let localPrisma: ReturnType<typeof createMockPrismaClient>;
+
+  beforeEach(() => {
+    localConnection = createMockConnection();
+    localPrisma = createMockPrismaClient();
+  });
+
+  afterEach(() => {
+    wsMock.__setWsProbeBehavior("supported");
+  });
+
+  it("should not subscribe when the configured RPC provider does not support logsSubscribe", async () => {
+    wsMock.__setWsProbeBehavior("unsupported");
+
+    const localIndexer = new WebSocketIndexer({
+      connection: localConnection as any,
+      prisma: localPrisma,
+      programId: TEST_PROGRAM_ID,
+      wsUrl: "wss://unsupported.provider.example",
+      reconnectInterval: 100,
+      maxRetries: 3,
+    });
+
+    await localIndexer.start();
+
+    expect(localConnection.onLogs).not.toHaveBeenCalled();
+    expect(localIndexer.isActive()).toBe(false);
+
+    await localIndexer.stop();
+  });
+
+  it("should not arm health checks when subscribe fails with unsupported-provider error", async () => {
+    (localConnection.onLogs as any).mockImplementation(() => {
+      const error = Object.assign(new Error("Method 'logsSubscribe' not found"), { code: -32601 });
+      throw error;
+    });
+
+    const localIndexer = new WebSocketIndexer({
+      connection: localConnection as any,
+      prisma: localPrisma,
+      programId: TEST_PROGRAM_ID,
+      reconnectInterval: 100,
+      maxRetries: 3,
+    });
+
+    await localIndexer.start();
+
+    expect(localIndexer.isActive()).toBe(false);
+    expect((localIndexer as any).healthCheckTimer).toBeNull();
+
+    await localIndexer.stop();
   });
 });

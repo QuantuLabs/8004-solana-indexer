@@ -42,6 +42,7 @@ export interface EventContext {
   blockTime: Date;
   txIndex?: number; // Transaction index within the block (captured as metadata/tie-break context)
   eventOrdinal?: number; // Event index within parsed transaction events (deterministic intra-tx tie-break)
+  skipCursorUpdate?: boolean;
 }
 
 let pool: Pool | null = null;
@@ -668,7 +669,9 @@ export async function handleEventAtomic(
     await handleEventInTx(client, event, ctx);
 
     // Update cursor atomically with monotonic guard
-    await updateCursorAtomic(client, ctx);
+    if (!ctx.skipCursorUpdate) {
+      await updateCursorAtomic(client, ctx);
+    }
 
     await client.query("COMMIT");
   } catch (error: any) {
@@ -995,16 +998,16 @@ async function handleCollectionPointerSetTx(
        SET canonical_col = $2,
            creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
            updated_at = $5,
-           col_locked = COALESCE($7, col_locked)
+           col_locked = COALESCE($8, col_locked)
        WHERE asset = $1
        RETURNING 1
      ),
      inserted AS (
        INSERT INTO collection_pointers (
          col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
-         last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
+         last_seen_at, last_seen_slot, last_seen_tx_index, last_seen_tx_signature, asset_count
        )
-       SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $6, 1
+       SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $7, $6, 1
        WHERE EXISTS (SELECT 1 FROM updated)
        ON CONFLICT (col, creator) DO NOTHING
      ),
@@ -1019,9 +1022,70 @@ async function handleCollectionPointerSetTx(
        RETURNING 1
      )
      UPDATE collection_pointers cp
-     SET last_seen_at = $5,
-         last_seen_slot = $4,
-         last_seen_tx_signature = $6,
+     SET last_seen_at = CASE
+           WHEN cp.last_seen_slot IS NULL
+             OR $4 > cp.last_seen_slot
+             OR (
+               $4 = cp.last_seen_slot
+               AND (
+                 COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                 OR (
+                   COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                   AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                 )
+               )
+             )
+           THEN $5
+           ELSE cp.last_seen_at
+         END,
+         last_seen_slot = CASE
+           WHEN cp.last_seen_slot IS NULL
+             OR $4 > cp.last_seen_slot
+             OR (
+               $4 = cp.last_seen_slot
+               AND (
+                 COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                 OR (
+                   COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                   AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                 )
+               )
+             )
+           THEN $4
+           ELSE cp.last_seen_slot
+         END,
+         last_seen_tx_index = CASE
+           WHEN cp.last_seen_slot IS NULL
+             OR $4 > cp.last_seen_slot
+             OR (
+               $4 = cp.last_seen_slot
+               AND (
+                 COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                 OR (
+                   COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                   AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                 )
+               )
+             )
+           THEN $7
+           ELSE cp.last_seen_tx_index
+         END,
+         last_seen_tx_signature = CASE
+           WHEN cp.last_seen_slot IS NULL
+             OR $4 > cp.last_seen_slot
+             OR (
+               $4 = cp.last_seen_slot
+               AND (
+                 COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                 OR (
+                   COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                   AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                 )
+               )
+             )
+           THEN $6
+           ELSE cp.last_seen_tx_signature
+         END,
          asset_count = cp.asset_count + CASE
            WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
              OR COALESCE((SELECT prev_creator FROM previous), '') <> (SELECT creator_key FROM resolved)
@@ -1029,8 +1093,8 @@ async function handleCollectionPointerSetTx(
      WHERE cp.col = $2
        AND cp.creator = (SELECT creator_key FROM resolved)
        AND EXISTS (SELECT 1 FROM updated)`,
-     [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
-   );
+    [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, ctx.txIndex ?? null, lock]
+  );
 
   const currentResult = await client.query(
     `SELECT canonical_col AS col, COALESCE(creator, owner) AS creator
@@ -1654,16 +1718,16 @@ async function handleCollectionPointerSet(
          SET canonical_col = $2,
              creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
              updated_at = $5,
-             col_locked = COALESCE($7, col_locked)
+             col_locked = COALESCE($8, col_locked)
          WHERE asset = $1
          RETURNING 1
        ),
        inserted AS (
          INSERT INTO collection_pointers (
            col, creator, first_seen_asset, first_seen_at, first_seen_slot, first_seen_tx_signature,
-           last_seen_at, last_seen_slot, last_seen_tx_signature, asset_count
+           last_seen_at, last_seen_slot, last_seen_tx_index, last_seen_tx_signature, asset_count
          )
-         SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $6, 1
+         SELECT $2, (SELECT creator_key FROM resolved), $1, $5, $4, $6, $5, $4, $7, $6, 1
          WHERE EXISTS (SELECT 1 FROM updated)
          ON CONFLICT (col, creator) DO NOTHING
        ),
@@ -1678,9 +1742,70 @@ async function handleCollectionPointerSet(
          RETURNING 1
        )
        UPDATE collection_pointers cp
-       SET last_seen_at = $5,
-           last_seen_slot = $4,
-           last_seen_tx_signature = $6,
+       SET last_seen_at = CASE
+             WHEN cp.last_seen_slot IS NULL
+               OR $4 > cp.last_seen_slot
+               OR (
+                 $4 = cp.last_seen_slot
+                 AND (
+                   COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                   OR (
+                     COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                     AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                   )
+                 )
+               )
+             THEN $5
+             ELSE cp.last_seen_at
+           END,
+           last_seen_slot = CASE
+             WHEN cp.last_seen_slot IS NULL
+               OR $4 > cp.last_seen_slot
+               OR (
+                 $4 = cp.last_seen_slot
+                 AND (
+                   COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                   OR (
+                     COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                     AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                   )
+                 )
+               )
+             THEN $4
+             ELSE cp.last_seen_slot
+           END,
+           last_seen_tx_index = CASE
+             WHEN cp.last_seen_slot IS NULL
+               OR $4 > cp.last_seen_slot
+               OR (
+                 $4 = cp.last_seen_slot
+                 AND (
+                   COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                   OR (
+                     COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                     AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                   )
+                 )
+               )
+             THEN $7
+             ELSE cp.last_seen_tx_index
+           END,
+           last_seen_tx_signature = CASE
+             WHEN cp.last_seen_slot IS NULL
+               OR $4 > cp.last_seen_slot
+               OR (
+                 $4 = cp.last_seen_slot
+                 AND (
+                   COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)
+                   OR (
+                     COALESCE($7, -1) = COALESCE(cp.last_seen_tx_index, -1)
+                     AND COALESCE(cp.last_seen_tx_signature, '') <= $6
+                   )
+                 )
+               )
+             THEN $6
+             ELSE cp.last_seen_tx_signature
+           END,
            asset_count = cp.asset_count + CASE
              WHEN COALESCE((SELECT prev_col FROM previous), '') <> $2
                OR COALESCE((SELECT prev_creator FROM previous), '') <> (SELECT creator_key FROM resolved)
@@ -1688,7 +1813,7 @@ async function handleCollectionPointerSet(
        WHERE cp.col = $2
          AND cp.creator = (SELECT creator_key FROM resolved)
          AND EXISTS (SELECT 1 FROM updated)`,
-      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, lock]
+      [assetId, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, ctx.txIndex ?? null, lock]
     );
 
     const currentResult = await db.query(

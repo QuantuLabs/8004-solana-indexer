@@ -737,6 +737,7 @@ describe("Poller Coverage", () => {
         pollingInterval: 100,
         batchSize: 10,
       });
+      (poller as any).isRunning = true;
 
       const sig1 = createMockSignatureInfo("error-a", 400);
       const sig2 = createMockSignatureInfo("error-b", 400);
@@ -759,6 +760,7 @@ describe("Poller Coverage", () => {
         pollingInterval: 100,
         batchSize: 10,
       });
+      (poller as any).isRunning = true;
 
       const sig1 = createMockSignatureInfo("retry-a", 500);
       const sig2 = createMockSignatureInfo("retry-b", 500);
@@ -2446,14 +2448,37 @@ describe("Poller Coverage", () => {
 
       await (poller as any).processNewTransactions();
 
-      // No tx should be processed from a partial pagination result set
-      expect((poller as any).processedCount).toBe(0);
-      expect((poller as any).lastSignature).toBe("cursor-before-partial");
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
-      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
+      // The fetched frontier is still safe to process because continuation markers
+      // preserve the unresolved older gap for a later cycle.
+      expect((poller as any).processedCount).toBe(2);
+      expect((poller as any).lastSignature).toBe("partial-new-a");
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
 
-      // Continuation markers remain available for next cycle
+      // Continuation markers remain available for the unresolved older pages.
       expect((poller as any).pendingContinuation).toBeTruthy();
+      expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
+    });
+
+    it("should halt the cycle when pagination retries exhaust before collecting any signatures", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-before-partial";
+      (poller as any).pendingContinuation = "resume-from-here";
+      (poller as any).pendingStopSignature = "cursor-before-partial";
+
+      (mockConnection.getSignaturesForAddress as any).mockRejectedValue(new Error("pagination rpc error"));
+
+      const result = await (poller as any).processNewTransactions();
+
+      expect(result).toEqual({ fetchedCount: 0, haltedOnError: true });
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
+      expect((poller as any).pendingContinuation).toBe("resume-from-here");
       expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
     });
   });

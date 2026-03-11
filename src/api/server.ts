@@ -10,7 +10,8 @@ import { LRUCache } from 'lru-cache';
 import { Server } from 'http';
 import { PrismaClient, Prisma, Agent as PrismaAgent, Collection as PrismaCollection } from '@prisma/client';
 import { logger } from '../logger.js';
-import { decompressFromStorage } from '../utils/compression.js';
+import { computeKeyHash } from '../utils/pda.js';
+import { createGraphQLHandler } from './graphql/index.js';
 import {
   fetchReplayDataFromPool,
   getLatestCheckpointsFromPool,
@@ -60,7 +61,20 @@ export interface ApiServerOptions {
 }
 
 // LRU cache for leaderboard (prevents unbounded memory growth + repeated queries)
-type LeaderboardEntry = { asset: string; owner: string; collection: string; trust_score: number; feedback_count: number };
+type LeaderboardEntry = {
+  asset: string;
+  owner: string;
+  collection: string | null;
+  nft_name: string | null;
+  agent_uri: string | null;
+  trust_tier: number | null;
+  quality_score: number | null;
+  confidence: number | null;
+  risk_score: number | null;
+  diversity_ratio: number | null;
+  feedback_count: number | null;
+  sort_key: string;
+};
 const leaderboardCache = new LRUCache<string, LeaderboardEntry[]>({
   max: LEADERBOARD_CACHE_MAX_SIZE,
   ttl: LEADERBOARD_CACHE_TTL_MS,
@@ -549,9 +563,94 @@ type AgentApiRow = Pick<
   | 'agentId'
   | 'status'
   | 'verifiedAt'
+  | 'verifiedSlot'
   | 'createdAt'
   | 'updatedAt'
+  | 'createdTxSignature'
+  | 'createdSlot'
+  | 'txIndex'
+  | 'eventOrdinal'
 >;
+
+function rot32(value: number, bits: number): number {
+  return ((value << bits) | (value >>> (32 - bits))) >>> 0;
+}
+
+function mix32(a: number, b: number, c: number): [number, number, number] {
+  a = (a - c) >>> 0; a = (a ^ rot32(c, 4)) >>> 0; c = (c + b) >>> 0;
+  b = (b - a) >>> 0; b = (b ^ rot32(a, 6)) >>> 0; a = (a + c) >>> 0;
+  c = (c - b) >>> 0; c = (c ^ rot32(b, 8)) >>> 0; b = (b + a) >>> 0;
+  a = (a - c) >>> 0; a = (a ^ rot32(c, 16)) >>> 0; c = (c + b) >>> 0;
+  b = (b - a) >>> 0; b = (b ^ rot32(a, 19)) >>> 0; a = (a + c) >>> 0;
+  c = (c - b) >>> 0; c = (c ^ rot32(b, 4)) >>> 0; b = (b + a) >>> 0;
+  return [a, b, c];
+}
+
+function final32(a: number, b: number, c: number): [number, number, number] {
+  c = (c ^ b) >>> 0; c = (c - rot32(b, 14)) >>> 0;
+  a = (a ^ c) >>> 0; a = (a - rot32(c, 11)) >>> 0;
+  b = (b ^ a) >>> 0; b = (b - rot32(a, 25)) >>> 0;
+  c = (c ^ b) >>> 0; c = (c - rot32(b, 16)) >>> 0;
+  a = (a ^ c) >>> 0; a = (a - rot32(c, 4)) >>> 0;
+  b = (b ^ a) >>> 0; b = (b - rot32(a, 14)) >>> 0;
+  c = (c ^ b) >>> 0; c = (c - rot32(b, 24)) >>> 0;
+  return [a, b, c];
+}
+
+function pgHashBytes(input: Buffer): number {
+  let len = input.length >>> 0;
+  let a = (0x9e3779b9 + len + 3923095) >>> 0;
+  let b = a;
+  let c = a;
+  let offset = 0;
+
+  while (len >= 12) {
+    a = (a + input[offset + 0] + (input[offset + 1] << 8) + (input[offset + 2] << 16) + (input[offset + 3] << 24)) >>> 0;
+    b = (b + input[offset + 4] + (input[offset + 5] << 8) + (input[offset + 6] << 16) + (input[offset + 7] << 24)) >>> 0;
+    c = (c + input[offset + 8] + (input[offset + 9] << 8) + (input[offset + 10] << 16) + (input[offset + 11] << 24)) >>> 0;
+    [a, b, c] = mix32(a, b, c);
+    offset += 12;
+    len -= 12;
+  }
+
+  switch (len) {
+    case 11: c = (c + (input[offset + 10] << 24)) >>> 0;
+    case 10: c = (c + (input[offset + 9] << 16)) >>> 0;
+    case 9: c = (c + (input[offset + 8] << 8)) >>> 0;
+    case 8: b = (b + (input[offset + 7] << 24)) >>> 0;
+    case 7: b = (b + (input[offset + 6] << 16)) >>> 0;
+    case 6: b = (b + (input[offset + 5] << 8)) >>> 0;
+    case 5: b = (b + input[offset + 4]) >>> 0;
+    case 4: a = (a + (input[offset + 3] << 24)) >>> 0;
+    case 3: a = (a + (input[offset + 2] << 16)) >>> 0;
+    case 2: a = (a + (input[offset + 1] << 8)) >>> 0;
+    case 1: a = (a + input[offset + 0]) >>> 0;
+    default:
+      break;
+  }
+
+  [, , c] = final32(a, b, c);
+  return c >>> 0;
+}
+
+function pgHashtextTieBreaker(input: string): number {
+  const signed = pgHashBytes(Buffer.from(input, 'utf8')) | 0;
+  const abs = signed === -2147483648 ? 2147483648 : Math.abs(signed);
+  return abs % 10_000_000;
+}
+
+function computeLocalSortKey(agent: Pick<PrismaAgent, 'id' | 'trustTier' | 'qualityScore' | 'confidence'>): string {
+  const trustTier = BigInt(agent.trustTier ?? 0);
+  const qualityScore = BigInt(agent.qualityScore ?? 0);
+  const confidence = BigInt(agent.confidence ?? 0);
+  const tieBreaker = BigInt(pgHashtextTieBreaker(agent.id));
+  return (
+    trustTier * 1000200010000000n
+    + qualityScore * 100010000000n
+    + confidence * 10000000n
+    + tieBreaker
+  ).toString();
+}
 
 function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
   return {
@@ -576,8 +675,14 @@ function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
     diversity_ratio: a.diversityRatio,
     feedback_count: a.feedbackCount,
     raw_avg_score: a.rawAvgScore,
+    sort_key: computeLocalSortKey(a),
+    block_slot: a.createdSlot !== null ? Number(a.createdSlot) : 0,
+    tx_index: a.txIndex,
+    event_ordinal: a.eventOrdinal,
+    tx_signature: a.createdTxSignature,
     status: a.status,
     verified_at: a.verifiedAt?.toISOString() || null,
+    verified_slot: a.verifiedSlot !== null ? Number(a.verifiedSlot) : null,
     created_at: a.createdAt.toISOString(),
     updated_at: a.updatedAt.toISOString(),
   };
@@ -610,6 +715,249 @@ function mapCollectionToApi(collection: PrismaCollection): Record<string, unknow
     metadata_bytes: collection.metadataBytes,
     metadata_updated_at: collection.metadataUpdatedAt?.toISOString() || null,
   };
+}
+
+function checkpointEventCountToJson(value: bigint | number | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const numeric = typeof value === 'bigint' ? Number(value) : value;
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function extractAggregateCount(value: unknown): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (typeof value === 'bigint') return Number(value);
+  if (value && typeof value === 'object' && '_all' in value) {
+    const nested = (value as { _all?: unknown })._all;
+    if (typeof nested === 'number') return Number.isFinite(nested) ? nested : 0;
+    if (typeof nested === 'bigint') return Number(nested);
+  }
+  return 0;
+}
+
+function roundNullableScore(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  return Math.round(value);
+}
+
+function resolveFeedbackCount(aggregateCount: unknown, fallbackCount: number | null | undefined): number {
+  const count = extractAggregateCount(aggregateCount);
+  if (count > 0) return count;
+  return Number.isFinite(fallbackCount ?? NaN) ? Number(fallbackCount) : 0;
+}
+
+function resolveAverageScore(
+  feedbackCount: number,
+  aggregateAvg: number | null | undefined,
+  fallbackRawAvg: number | null | undefined,
+): number | null {
+  if (feedbackCount <= 0) return null;
+  const roundedAggregate = roundNullableScore(aggregateAvg);
+  if (roundedAggregate !== null) return roundedAggregate;
+  if (fallbackRawAvg === null || fallbackRawAvg === undefined || !Number.isFinite(fallbackRawAvg)) return null;
+  return Math.round(fallbackRawAvg);
+}
+
+function numericValue(value: string | number | bigint | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') return Number(value);
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isoStringOrNull(value: string | Date | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+type AgentReputationRow = {
+  asset: string;
+  owner: string;
+  collection: string;
+  nft_name: string | null;
+  agent_uri: string | null;
+  feedback_count: number;
+  avg_score: number | null;
+  positive_count: number;
+  negative_count: number;
+  validation_count: number;
+};
+
+type LocalLeaderboardRow = ReturnType<typeof mapAgentToApi> & {
+  asset: string;
+  sort_key: string;
+};
+
+type PoolAgentApiRow = {
+  asset: string;
+  owner: string;
+  creator: string | null;
+  agent_uri: string | null;
+  agent_wallet: string | null;
+  collection: string | null;
+  canonical_col: string | null;
+  col_locked: boolean | null;
+  parent_asset: string | null;
+  parent_creator: string | null;
+  parent_locked: boolean | null;
+  nft_name: string | null;
+  atom_enabled: boolean | null;
+  trust_tier: number | null;
+  quality_score: number | null;
+  confidence: number | null;
+  risk_score: number | null;
+  diversity_ratio: number | null;
+  feedback_count: string | number | null;
+  raw_avg_score: string | number | null;
+  agent_id: string | number | null;
+  status: string | null;
+  verified_at: string | Date | null;
+  verified_slot: string | number | null;
+  created_at: string | Date | null;
+  updated_at: string | Date | null;
+  tx_signature: string | null;
+  block_slot: string | number | null;
+  tx_index: number | null;
+  event_ordinal: number | null;
+  sort_key: string | number | null;
+};
+
+type PoolAgentTreeNodeRow = {
+  asset: string;
+  parent_asset: string | null;
+  path: string[];
+  depth: number;
+};
+
+function buildPoolAgentSelect(alias = 'a'): string {
+  return `${alias}.asset,
+          ${alias}.owner,
+          ${alias}.creator,
+          ${alias}.agent_uri,
+          ${alias}.agent_wallet,
+          ${alias}.collection,
+          ${alias}.canonical_col,
+          ${alias}.col_locked,
+          ${alias}.parent_asset,
+          ${alias}.parent_creator,
+          ${alias}.parent_locked,
+          ${alias}.nft_name,
+          ${alias}.atom_enabled,
+          ${alias}.trust_tier,
+          ${alias}.quality_score,
+          ${alias}.confidence,
+          ${alias}.risk_score,
+          ${alias}.diversity_ratio,
+          ${alias}.feedback_count,
+          ${alias}.raw_avg_score,
+          ${alias}.agent_id,
+          ${alias}.status,
+          ${alias}.verified_at,
+          ${alias}.verified_slot,
+          ${alias}.created_at,
+          ${alias}.updated_at,
+          ${alias}.tx_signature,
+          ${alias}.block_slot,
+          ${alias}.tx_index,
+          ${alias}.event_ordinal,
+          ${alias}.sort_key`;
+}
+
+function buildPoolStatusPredicate(
+  statusFilter: ReturnType<typeof buildStatusFilter>,
+  params: unknown[],
+  field: string,
+): string {
+  if (!statusFilter || isInvalidStatus(statusFilter)) return '';
+  const statusValue = (statusFilter as Record<string, unknown>).status;
+  if (typeof statusValue === 'string') {
+    params.push(statusValue);
+    return ` AND ${field} = $${params.length}::text`;
+  }
+  if (statusValue && typeof statusValue === 'object' && 'not' in statusValue) {
+    const notValue = (statusValue as { not?: unknown }).not;
+    if (typeof notValue === 'string') {
+      params.push(notValue);
+      return ` AND ${field} != $${params.length}::text`;
+    }
+  }
+  return '';
+}
+
+function mapPoolAgentToApi(row: PoolAgentApiRow): Record<string, unknown> {
+  return {
+    asset: row.asset,
+    agent_id: row.agent_id !== null && row.agent_id !== undefined ? String(row.agent_id) : null,
+    owner: row.owner,
+    creator: row.creator,
+    agent_uri: row.agent_uri,
+    agent_wallet: row.agent_wallet,
+    collection: row.collection,
+    collection_pointer: row.canonical_col,
+    col_locked: row.col_locked,
+    parent_asset: row.parent_asset,
+    parent_creator: row.parent_creator,
+    parent_locked: row.parent_locked,
+    nft_name: row.nft_name,
+    atom_enabled: row.atom_enabled,
+    trust_tier: numericValue(row.trust_tier),
+    quality_score: numericValue(row.quality_score),
+    confidence: numericValue(row.confidence),
+    risk_score: numericValue(row.risk_score),
+    diversity_ratio: numericValue(row.diversity_ratio),
+    feedback_count: numericValue(row.feedback_count),
+    raw_avg_score: numericValue(row.raw_avg_score),
+    sort_key: row.sort_key !== null && row.sort_key !== undefined ? String(row.sort_key) : null,
+    block_slot: numericValue(row.block_slot) ?? 0,
+    tx_index: row.tx_index,
+    event_ordinal: row.event_ordinal,
+    tx_signature: row.tx_signature,
+    status: row.status,
+    verified_at: isoStringOrNull(row.verified_at),
+    verified_slot: numericValue(row.verified_slot),
+    created_at: isoStringOrNull(row.created_at),
+    updated_at: isoStringOrNull(row.updated_at),
+  };
+}
+
+function mapAgentToLeaderboardEntry(
+  agent: Pick<PrismaAgent,
+    'id'
+    | 'owner'
+    | 'collection'
+    | 'nftName'
+    | 'uri'
+    | 'trustTier'
+    | 'qualityScore'
+    | 'confidence'
+    | 'riskScore'
+    | 'diversityRatio'
+    | 'feedbackCount'>
+): LeaderboardEntry {
+  return {
+    asset: agent.id,
+    owner: agent.owner,
+    collection: agent.collection,
+    nft_name: agent.nftName,
+    agent_uri: agent.uri,
+    trust_tier: agent.trustTier,
+    quality_score: agent.qualityScore,
+    confidence: agent.confidence,
+    risk_score: agent.riskScore,
+    diversity_ratio: agent.diversityRatio,
+    feedback_count: agent.feedbackCount,
+    sort_key: computeLocalSortKey(agent),
+  };
+}
+
+function parsePostgRESTInt(value: unknown): number | undefined | null {
+  const comparison = parsePostgRESTComparison(value);
+  if (!comparison) return undefined;
+  if (comparison.op !== 'eq') return null;
+  const parsed = Number.parseInt(comparison.value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 /**
@@ -721,11 +1069,18 @@ const REST_PROXY_PATH_ALLOWLIST = [
 ] as const;
 
 const REST_PROXY_LOCAL_COMPAT_PATHS = [
+  '/agent_reputation',
+  '/collection_pointers',
+  '/collection_stats',
   '/collections',
   '/collection_asset_count',
   '/collection_assets',
   '/checkpoints',
   '/events',
+  '/global_stats',
+  '/rpc/get_collection_agents',
+  '/rpc/get_leaderboard',
+  '/stats',
   '/verify/replay',
   '/agents/children',
   '/agents/tree',
@@ -874,7 +1229,7 @@ async function fetchFallbackGlobalStats(
   supabaseRestBaseUrl: string,
   upstreamHeaders: Headers,
   includeOrphaned: boolean,
-): Promise<Array<Record<string, number>>> {
+): Promise<Array<Record<string, number | null>>> {
   const agentParams = new URLSearchParams({ select: 'asset' });
   if (!includeOrphaned) agentParams.append('status', 'neq.ORPHANED');
 
@@ -895,6 +1250,10 @@ async function fetchFallbackGlobalStats(
     total_agents: totalAgents,
     total_feedbacks: totalFeedbacks,
     total_collections: totalCollections,
+    total_validations: 0,
+    platinum_agents: 0,
+    gold_agents: 0,
+    avg_quality: null,
   }];
 }
 
@@ -940,6 +1299,9 @@ export function createApiServer(options: ApiServerOptions): Express {
   const prisma = options.prisma as PrismaClient;
   const app = express();
   const isReady = options.isReady ?? (() => true);
+  const graphqlState = {
+    mounted: !graphqlEnabled || !options.pool,
+  };
 
   const trustProxyRaw = process.env.TRUST_PROXY;
   let trustProxy: string | number | boolean = false;
@@ -988,7 +1350,7 @@ export function createApiServer(options: ApiServerOptions): Express {
   });
 
   app.get('/ready', (_req: Request, res: Response) => {
-    if (!isReady()) {
+    if (!isReady() || !graphqlState.mounted) {
       res.status(503).json({ status: 'starting' });
       return;
     }
@@ -1003,7 +1365,7 @@ export function createApiServer(options: ApiServerOptions): Express {
   }
 
   app.use((req: Request, res: Response, next: NextFunction) => {
-    if (isReady()) {
+    if (isReady() && graphqlState.mounted) {
       next();
       return;
     }
@@ -1229,6 +1591,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const id = parsePostgRESTValue(req.query.id) ?? parsePostgRESTValue(req.query.asset);
       const agentIdRaw = parsePostgRESTValue(req.query.agent_id) ?? parsePostgRESTValue(req.query.agentId);
       const agentId = safeBigInt(agentIdRaw);
+      const blockSlotFilter = parsePostgRESTBigIntFilter(req.query.block_slot);
       const owner = parsePostgRESTValue(req.query.owner);
       const creator = parsePostgRESTValue(req.query.creator);
       const collection = parsePostgRESTValue(req.query.collection);
@@ -1245,9 +1608,14 @@ export function createApiServer(options: ApiServerOptions): Express {
       const updatedAtLt = updatedAtLtRaw ? parseTimestampValue(updatedAtLtRaw) : undefined;
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
 
       if (agentIdRaw !== undefined && agentId === undefined) {
         res.status(400).json({ error: 'Invalid agent_id filter value' });
+        return;
+      }
+      if (blockSlotFilter === null) {
+        res.status(400).json({ error: 'Invalid block_slot filter value' });
         return;
       }
 
@@ -1268,6 +1636,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.AgentWhereInput = { ...statusFilter };
       if (id) where.id = id;
       if (agentId !== undefined) where.agentId = agentId;
+      if (blockSlotFilter !== undefined) where.createdSlot = blockSlotFilter;
       if (owner) where.owner = owner;
       if (creator) where.creator = creator;
       if (collection) where.collection = collection;
@@ -1299,7 +1668,12 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const agents = await prisma.agent.findMany({
         where,
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        orderBy:
+          order === 'block_slot.asc'
+            ? [{ createdSlot: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { id: 'asc' }]
+            : order === 'block_slot.desc'
+              ? [{ createdSlot: 'desc' }, { txIndex: 'desc' }, { eventOrdinal: 'desc' }, { id: 'desc' }]
+              : [{ createdAt: 'desc' }, { id: 'desc' }],
         take: limit,
         skip: offset,
       });
@@ -1317,7 +1691,39 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/agents/children', async (req: Request, res: Response) => {
     try {
       if (!prisma) {
-        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        if (!options.pool) {
+          res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+          return;
+        }
+
+        const parentAsset = parsePostgRESTValue(req.query.parent_asset) ?? parsePostgRESTValue(req.query.parent);
+        if (!parentAsset) {
+          res.status(400).json({ error: 'Missing required query param: parent_asset' });
+          return;
+        }
+
+        const limit = safePaginationLimit(req.query.limit);
+        const offset = safePaginationOffset(req.query.offset);
+        const statusFilter = buildStatusFilter(req);
+        if (isInvalidStatus(statusFilter)) {
+          res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+          return;
+        }
+
+        const params: unknown[] = [parentAsset];
+        const statusSql = buildPoolStatusPredicate(statusFilter, params, 'a.status');
+        params.push(limit, offset);
+
+        const { rows } = await options.pool.query<PoolAgentApiRow>(
+          `SELECT ${buildPoolAgentSelect('a')}
+           FROM agents a
+           WHERE a.parent_asset = $1::text${statusSql}
+           ORDER BY a.created_at DESC, a.asset DESC
+           LIMIT $${params.length - 1}::int OFFSET $${params.length}::int`,
+          params
+        );
+
+        res.json(rows.map(mapPoolAgentToApi));
         return;
       }
 
@@ -1358,7 +1764,90 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/agents/tree', async (req: Request, res: Response) => {
     try {
       if (!prisma) {
-        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        if (!options.pool) {
+          res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+          return;
+        }
+
+        const rootAsset = parsePostgRESTValue(req.query.root_asset)
+          ?? parsePostgRESTValue(req.query.root)
+          ?? parsePostgRESTValue(req.query.parent_asset);
+        if (!rootAsset) {
+          res.status(400).json({ error: 'Missing required query param: root_asset' });
+          return;
+        }
+
+        const maxDepthRaw = safeQueryString(req.query.max_depth);
+        const parsedMaxDepth = maxDepthRaw ? parseInt(maxDepthRaw, 10) : 5;
+        const maxDepth = Number.isFinite(parsedMaxDepth)
+          ? Math.min(Math.max(parsedMaxDepth, 0), MAX_TREE_DEPTH)
+          : 5;
+        const includeRoot = parsePostgRESTBoolean(req.query.include_root) !== false;
+        const limit = safePaginationLimit(req.query.limit, 1000);
+        const offset = safePaginationOffset(req.query.offset);
+        const statusFilter = buildStatusFilter(req);
+        if (isInvalidStatus(statusFilter)) {
+          res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+          return;
+        }
+
+        const treeParams: unknown[] = [rootAsset, maxDepth, includeRoot];
+        const baseStatusSql = buildPoolStatusPredicate(statusFilter, treeParams, 'a.status');
+        const recursiveStatusSql = buildPoolStatusPredicate(statusFilter, treeParams, 'c.status');
+        treeParams.push(limit, offset);
+
+        const { rows } = await options.pool.query<PoolAgentTreeNodeRow>(
+          `WITH RECURSIVE tree AS (
+             SELECT
+               a.asset,
+               a.parent_asset,
+               ARRAY[a.asset]::text[] AS path,
+               0 AS depth
+             FROM agents a
+             WHERE a.asset = $1::text${baseStatusSql}
+             UNION ALL
+             SELECT
+               c.asset,
+               c.parent_asset,
+               t.path || c.asset,
+               t.depth + 1
+             FROM agents c
+             INNER JOIN tree t ON c.parent_asset = t.asset
+             WHERE t.depth < $2::int${recursiveStatusSql}
+               AND NOT (c.asset = ANY(t.path))
+           )
+           SELECT asset, parent_asset, path, depth
+           FROM tree
+           WHERE $3::boolean OR depth > 0
+           ORDER BY depth ASC, path ASC
+           LIMIT $${treeParams.length - 1}::int OFFSET $${treeParams.length}::int`,
+          treeParams
+        );
+
+        if (rows.length === 0) {
+          res.json([]);
+          return;
+        }
+
+        const assets = rows.map((row) => row.asset);
+        const { rows: agentRows } = await options.pool.query<PoolAgentApiRow>(
+          `SELECT ${buildPoolAgentSelect('a')}
+           FROM agents a
+           WHERE a.asset = ANY($1::text[])`,
+          [assets]
+        );
+        const byAsset = new Map(agentRows.map((row) => [row.asset, row]));
+        res.json(
+          rows.flatMap((row) => {
+            const agent = byAsset.get(row.asset);
+            if (!agent) return [];
+            return [{
+              ...mapPoolAgentToApi(agent),
+              depth: row.depth,
+              path: row.path,
+            }];
+          })
+        );
         return;
       }
 
@@ -1446,7 +1935,74 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.get('/rest/v1/agents/lineage', async (req: Request, res: Response) => {
     try {
       if (!prisma) {
-        res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+        if (!options.pool) {
+          res.status(503).json({ error: 'Agent hierarchy endpoints require local Prisma backend' });
+          return;
+        }
+
+        const asset = parsePostgRESTValue(req.query.asset);
+        if (!asset) {
+          res.status(400).json({ error: 'Missing required query param: asset' });
+          return;
+        }
+
+        const includeSelf = parsePostgRESTBoolean(req.query.include_self) !== false;
+        const limit = safePaginationLimit(req.query.limit);
+        const offset = safePaginationOffset(req.query.offset);
+        const statusFilter = buildStatusFilter(req);
+        if (isInvalidStatus(statusFilter)) {
+          res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
+          return;
+        }
+
+        const lineageParams: unknown[] = [asset, MAX_TREE_DEPTH * 4, includeSelf];
+        const baseStatusSql = buildPoolStatusPredicate(statusFilter, lineageParams, 'a.status');
+        const recursiveStatusSql = buildPoolStatusPredicate(statusFilter, lineageParams, 'p.status');
+        const { rows } = await options.pool.query<PoolAgentTreeNodeRow>(
+          `WITH RECURSIVE lineage AS (
+             SELECT
+               a.asset,
+               a.parent_asset,
+               ARRAY[a.asset]::text[] AS path,
+               0 AS depth
+             FROM agents a
+             WHERE a.asset = $1::text${baseStatusSql}
+             UNION ALL
+             SELECT
+               p.asset,
+               p.parent_asset,
+               l.path || p.asset,
+               l.depth + 1
+             FROM agents p
+             INNER JOIN lineage l ON l.parent_asset = p.asset
+             WHERE l.depth < $2::int${recursiveStatusSql}
+               AND NOT (p.asset = ANY(l.path))
+           )
+           SELECT asset, parent_asset, path, depth
+           FROM lineage
+           WHERE $3::boolean OR depth > 0
+           ORDER BY depth DESC, asset ASC`,
+          lineageParams
+        );
+
+        if (rows.length === 0) {
+          res.json([]);
+          return;
+        }
+
+        const assets = rows.map((row) => row.asset);
+        const { rows: agentRows } = await options.pool.query<PoolAgentApiRow>(
+          `SELECT ${buildPoolAgentSelect('a')}
+           FROM agents a
+           WHERE a.asset = ANY($1::text[])`,
+          [assets]
+        );
+        const byAsset = new Map(agentRows.map((row) => [row.asset, row]));
+        const ordered = rows.flatMap((row) => {
+          const agent = byAsset.get(row.asset);
+          return agent ? [mapPoolAgentToApi(agent)] : [];
+        });
+        res.json(ordered.slice(offset, offset + limit));
         return;
       }
 
@@ -1498,6 +2054,7 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
+      const blockSlotFilter = parsePostgRESTBigIntFilter(req.query.block_slot);
       const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
       const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
@@ -1519,6 +2076,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
 
+      if (blockSlotFilter === null) {
+        res.status(400).json({ error: 'Invalid block_slot filter value' });
+        return;
+      }
       if ((createdAtGtRaw && !createdAtGt) || (createdAtLtRaw && !createdAtLt)) {
         res.status(400).json({ error: 'Invalid created_at filter value' });
         return;
@@ -1543,6 +2104,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
       const where: Prisma.FeedbackWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
+      if (blockSlotFilter !== undefined) where.createdSlot = blockSlotFilter;
       if (client_address) where.client = client_address;
       if (feedback_id !== undefined) {
         const parsedFeedbackId = safeBigInt(feedback_id);
@@ -1733,6 +2295,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         status: f.status,
         verified_at: f.verifiedAt?.toISOString() || null,
         block_slot: Number(f.createdSlot || 0),
+        tx_index: f.txIndex,
+        event_ordinal: f.eventOrdinal,
         tx_signature: f.createdTxSignature || '',
         created_at: f.createdAt.toISOString(),
       }));
@@ -1752,6 +2316,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const responseIdComparison = parsePostgRESTComparison(req.query.response_id);
       const asset = parsePostgRESTValue(req.query.asset);
       const client_address = parsePostgRESTValue(req.query.client_address);
+      const blockSlotFilter = parsePostgRESTBigIntFilter(req.query.block_slot);
       const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
       const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
@@ -1761,6 +2326,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
 
+      if (blockSlotFilter === null) {
+        res.status(400).json({ error: 'Invalid block_slot filter value' });
+        return;
+      }
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
@@ -1780,6 +2349,17 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
       const where: Prisma.FeedbackResponseWhereInput = { ...statusFilter };
+      if (blockSlotFilter !== undefined) {
+        where.OR = [
+          { slot: blockSlotFilter },
+          {
+            AND: [
+              { slot: null },
+              { feedback: { createdSlot: blockSlotFilter } },
+            ],
+          },
+        ];
+      }
       if (txSignatureFilter !== undefined) {
         where.txSignature = txSignatureFilter;
       }
@@ -1939,6 +2519,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         status: r.status,
         verified_at: r.verifiedAt?.toISOString() || null,
         block_slot: r.slot ? Number(r.slot) : Number(r.feedback.createdSlot || 0),
+        tx_index: r.txIndex,
+        event_ordinal: r.eventOrdinal,
         tx_signature: r.txSignature || r.feedback.createdTxSignature || '',
         created_at: r.createdAt.toISOString(),
       }));
@@ -1957,6 +2539,7 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const client = parsePostgRESTValue(req.query.client_address) ?? parsePostgRESTValue(req.query.client);
+      const slotFilter = parsePostgRESTBigIntFilter(req.query.slot ?? req.query.block_slot);
       const feedbackIndexRaw = safeQueryString(req.query.feedback_index);
       const feedbackIndexFilter = parsePostgRESTBigIntFilter(req.query.feedback_index);
       const feedbackIndexInState = parsePostgRESTListOperator(req.query.feedback_index, 'in');
@@ -1972,6 +2555,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const order = safeQueryString(req.query.order);
 
+      if (slotFilter === null) {
+        res.status(400).json({ error: 'Invalid slot filter value' });
+        return;
+      }
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
@@ -1993,6 +2580,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.RevocationWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (client) where.client = client;
+      if (slotFilter !== undefined) where.slot = slotFilter;
       if (txSignatureFilter !== undefined) where.txSignature = txSignatureFilter;
       if (revocationIdRaw !== undefined && !asset) {
         res.status(400).json({ error: 'revocation_id is scoped by agent. Provide asset filter when using revocation_id.' });
@@ -2087,9 +2675,9 @@ export function createApiServer(options: ApiServerOptions): Express {
               ? [{ revocationId: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
               : order === 'revocation_id.desc'
                 ? [{ revocationId: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
-                : order === 'block_slot.asc'
+                : order === 'slot.asc' || order === 'block_slot.asc'
                   ? [{ slot: 'asc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
-                  : order === 'block_slot.desc'
+                  : order === 'slot.desc' || order === 'block_slot.desc'
                     ? [{ slot: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }]
             : [{ createdAt: 'desc' }, { agentId: 'asc' }, { client: 'asc' }, { feedbackIndex: 'asc' }, { txIndex: 'asc' }, { eventOrdinal: 'asc' }, { txSignature: { sort: 'asc', nulls: 'last' } }];
 
@@ -2121,6 +2709,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         had_impact: r.hadImpact,
         running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
         revoke_count: r.revokeCount.toString(),
+        tx_index: r.txIndex,
+        event_ordinal: r.eventOrdinal,
         tx_signature: r.txSignature,
         status: r.status,
         verified_at: r.verifiedAt?.toISOString() || null,
@@ -2135,18 +2725,24 @@ export function createApiServer(options: ApiServerOptions): Express {
   });
 
   // GET /rest/v1/collections - Canonical collections (creator + collection pointer key)
-  app.get('/rest/v1/collections', async (req: Request, res: Response) => {
+  const collectionsHandler = async (req: Request, res: Response) => {
     try {
       const collectionIdFilter = parsePostgRESTBigIntFilter(req.query.collection_id);
       const colRaw = parsePostgRESTValue(req.query.collection);
       const colVariants = colRaw ? collectionPointerVariants(colRaw) : [];
       const creator = parsePostgRESTValue(req.query.creator);
       const firstSeenAsset = parsePostgRESTValue(req.query.first_seen_asset);
+      const firstSeenSlotFilter = parsePostgRESTBigIntFilter(req.query.first_seen_slot);
       const limit = safePaginationLimit(req.query.limit);
       const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
 
       if (collectionIdFilter === null) {
         res.status(400).json({ error: 'Invalid collection_id filter: use eq/gt/gte/lt/lte with a valid integer' });
+        return;
+      }
+      if (firstSeenSlotFilter === null) {
+        res.status(400).json({ error: 'Invalid first_seen_slot filter: use eq/gt/gte/lt/lte with a valid integer' });
         return;
       }
 
@@ -2234,9 +2830,43 @@ export function createApiServer(options: ApiServerOptions): Express {
           filterParams.push(firstSeenAsset);
           paramIdx++;
         }
+        if (firstSeenSlotFilter !== undefined) {
+          if (typeof firstSeenSlotFilter === 'bigint') {
+            filterSql.push(`first_seen_slot = $${paramIdx}::bigint`);
+            filterParams.push(firstSeenSlotFilter.toString());
+            paramIdx++;
+          } else {
+            if (firstSeenSlotFilter.gt !== undefined) {
+              filterSql.push(`first_seen_slot > $${paramIdx}::bigint`);
+              filterParams.push(firstSeenSlotFilter.gt.toString());
+              paramIdx++;
+            }
+            if (firstSeenSlotFilter.gte !== undefined) {
+              filterSql.push(`first_seen_slot >= $${paramIdx}::bigint`);
+              filterParams.push(firstSeenSlotFilter.gte.toString());
+              paramIdx++;
+            }
+            if (firstSeenSlotFilter.lt !== undefined) {
+              filterSql.push(`first_seen_slot < $${paramIdx}::bigint`);
+              filterParams.push(firstSeenSlotFilter.lt.toString());
+              paramIdx++;
+            }
+            if (firstSeenSlotFilter.lte !== undefined) {
+              filterSql.push(`first_seen_slot <= $${paramIdx}::bigint`);
+              filterParams.push(firstSeenSlotFilter.lte.toString());
+              paramIdx++;
+            }
+          }
+        }
 
         const whereSql = filterSql.length > 0 ? `WHERE ${filterSql.join(' AND ')}` : '';
         const needsCount = wantsCount(req);
+        const rowsOrderSql =
+          order === 'first_seen_slot.asc'
+            ? 'ORDER BY first_seen_slot ASC, col ASC, creator ASC'
+            : order === 'first_seen_slot.desc'
+              ? 'ORDER BY first_seen_slot DESC, col ASC, creator ASC'
+              : 'ORDER BY first_seen_at DESC, col ASC, creator ASC';
         const rowsSql = `SELECT
                             collection_id::text,
                             col,
@@ -2264,7 +2894,7 @@ export function createApiServer(options: ApiServerOptions): Express {
                             metadata_updated_at
                          FROM collection_pointers
                          ${whereSql}
-                         ORDER BY first_seen_at DESC, col ASC, creator ASC
+                         ${rowsOrderSql}
                          LIMIT $${paramIdx}::int OFFSET $${paramIdx + 1}::int`;
 
         const [rowsResult, countResult] = await Promise.all([
@@ -2313,6 +2943,7 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const where: Prisma.CollectionWhereInput = {};
       if (collectionIdFilter !== undefined) where.collectionId = collectionIdFilter;
+      if (firstSeenSlotFilter !== undefined) where.firstSeenSlot = firstSeenSlotFilter;
       if (colVariants.length > 1) {
         where.OR = colVariants.map((value) => ({ col: value }));
       } else if (colVariants.length === 1) {
@@ -2325,11 +2956,16 @@ export function createApiServer(options: ApiServerOptions): Express {
       const [rows, totalCount] = await Promise.all([
         prisma.collection.findMany({
           where,
-          orderBy: [
-            { firstSeenAt: 'desc' },
-            { col: 'asc' },
-            { creator: 'asc' },
-          ],
+          orderBy:
+            order === 'first_seen_slot.asc'
+              ? [{ firstSeenSlot: 'asc' }, { col: 'asc' }, { creator: 'asc' }]
+              : order === 'first_seen_slot.desc'
+                ? [{ firstSeenSlot: 'desc' }, { col: 'asc' }, { creator: 'asc' }]
+                : [
+                    { firstSeenAt: 'desc' },
+                    { col: 'asc' },
+                    { creator: 'asc' },
+                  ],
           take: limit,
           skip: offset,
         }),
@@ -2345,7 +2981,9 @@ export function createApiServer(options: ApiServerOptions): Express {
       logger.error({ error }, 'Error fetching collections');
       res.status(500).json({ error: 'Internal server error' });
     }
-  });
+  };
+  app.get('/rest/v1/collections', collectionsHandler);
+  app.get('/rest/v1/collection_pointers', collectionsHandler);
 
   // GET /rest/v1/collection_asset_count - Count assets for creator+col scope
   app.get('/rest/v1/collection_asset_count', async (req: Request, res: Response) => {
@@ -2554,136 +3192,218 @@ export function createApiServer(options: ApiServerOptions): Express {
         return res.json(result);
       }
 
-      // If collection specified, get stats for that collection only
-      if (collection) {
-        const agentWhere: Prisma.AgentWhereInput = includeOrphaned
-          ? { collection }
-          : { collection, status: { not: 'ORPHANED' } };
-        const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned
-          ? { agent: { collection } }
-          : {
-              status: { not: 'ORPHANED' },
-              agent: { collection, status: { not: 'ORPHANED' } },
-            };
-        const registryWhere: Prisma.RegistryWhereInput = includeOrphaned
-          ? { collection }
-          : { collection, status: { not: 'ORPHANED' } };
+      type CollectionStatsRow = {
+        collection: string;
+        registry_type: string;
+        authority: string | null;
+        agent_count: bigint | number;
+        total_feedbacks: bigint | number;
+        avg_score: number | null;
+      };
 
-        const agentCount = await prisma.agent.count({
-          where: agentWhere,
-        });
+      let formattedStats: Array<{
+        collection: string;
+        registry_type: string;
+        authority: string | null;
+        agent_count: number;
+        total_feedbacks: number;
+        avg_score: number | null;
+      }>;
 
-        const feedbackAgg = await prisma.feedback.aggregate({
-          where: feedbackWhere,
-          _count: true,
-          _avg: { score: true },
-        });
+      if (prisma) {
+        if (collection) {
+          const agentWhere: Prisma.AgentWhereInput = includeOrphaned
+            ? { collection }
+            : { collection, status: { not: 'ORPHANED' } };
+          const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned
+            ? { agent: { collection } }
+            : {
+                status: { not: 'ORPHANED' },
+                agent: { collection, status: { not: 'ORPHANED' } },
+              };
+          const registryWhere: Prisma.RegistryWhereInput = includeOrphaned
+            ? { collection }
+            : { collection, status: { not: 'ORPHANED' } };
 
-        const registry = await prisma.registry.findFirst({
-          where: registryWhere,
-        });
+          const agentCount = await prisma.agent.count({ where: agentWhere });
+          const feedbackAgg = await prisma.feedback.aggregate({
+            where: feedbackWhere,
+            _count: true,
+            _avg: { score: true },
+          });
+          const registry = await prisma.registry.findFirst({ where: registryWhere });
 
-        const stats = [{
-          collection: collection,
-          registry_type: registry?.registryType || 'USER',
-          authority: registry?.authority || null,
-          agent_count: agentCount,
-          total_feedbacks: feedbackAgg._count || 0,
-          avg_score: feedbackAgg._avg?.score || null,
-        }];
+          formattedStats = [{
+            collection,
+            registry_type: registry?.registryType || 'USER',
+            authority: registry?.authority || null,
+            agent_count: agentCount,
+            total_feedbacks: extractAggregateCount(feedbackAgg._count),
+            avg_score: feedbackAgg._avg?.score || null,
+          }];
+        } else {
+          const stats = includeOrphaned
+            ? await prisma.$queryRaw<CollectionStatsRow[]>`
+                SELECT
+                  r.collection,
+                  r."registryType" as registry_type,
+                  r.authority,
+                  COALESCE(agent_stats.agent_count, 0) as agent_count,
+                  COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
+                  feedback_stats.avg_score
+                FROM "Registry" r
+                LEFT JOIN (
+                  SELECT collection, COUNT(*) as agent_count
+                  FROM "Agent"
+                  GROUP BY collection
+                ) agent_stats ON agent_stats.collection = r.collection
+                LEFT JOIN (
+                  SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
+                  FROM "Feedback" f
+                  JOIN "Agent" a ON a.id = f."agentId"
+                  GROUP BY a.collection
+                ) feedback_stats ON feedback_stats.collection = r.collection
+                ORDER BY r."createdAt" DESC
+                LIMIT ${MAX_COLLECTION_STATS}
+              `
+            : await prisma.$queryRaw<CollectionStatsRow[]>`
+                SELECT
+                  r.collection,
+                  r."registryType" as registry_type,
+                  r.authority,
+                  COALESCE(agent_stats.agent_count, 0) as agent_count,
+                  COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
+                  feedback_stats.avg_score
+                FROM "Registry" r
+                LEFT JOIN (
+                  SELECT collection, COUNT(*) as agent_count
+                  FROM "Agent"
+                  WHERE status != 'ORPHANED'
+                  GROUP BY collection
+                ) agent_stats ON agent_stats.collection = r.collection
+                LEFT JOIN (
+                  SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
+                  FROM "Feedback" f
+                  JOIN "Agent" a ON a.id = f."agentId"
+                  WHERE f.status != 'ORPHANED'
+                    AND a.status != 'ORPHANED'
+                  GROUP BY a.collection
+                ) feedback_stats ON feedback_stats.collection = r.collection
+                WHERE r.status != 'ORPHANED'
+                ORDER BY r."createdAt" DESC
+                LIMIT ${MAX_COLLECTION_STATS}
+              `;
 
-        collectionStatsCache.set(cacheKey, stats);
-        res.json(stats);
+          formattedStats = stats.map((s) => ({
+            collection: s.collection,
+            registry_type: s.registry_type,
+            authority: s.authority,
+            agent_count: Number(s.agent_count),
+            total_feedbacks: Number(s.total_feedbacks),
+            avg_score: s.avg_score,
+          }));
+        }
+      } else if (options.pool) {
+        type PoolCollectionStatsRow = {
+          collection: string;
+          registry_type: string | null;
+          authority: string | null;
+          agent_count: string | number | null;
+          total_feedbacks: string | number | null;
+          avg_score: number | null;
+        };
+
+        const activeCollectionsClause = includeOrphaned ? '' : `WHERE c.status != 'ORPHANED'`;
+        const activeAgentFilter = includeOrphaned ? '' : `WHERE status != 'ORPHANED'`;
+        const activeFeedbackFilter = includeOrphaned
+          ? ''
+          : `WHERE f.status != 'ORPHANED' AND a.status != 'ORPHANED'`;
+
+        if (collection) {
+          const rows = await options.pool.query<PoolCollectionStatsRow>(
+            `SELECT
+               c.collection,
+               c.registry_type,
+               c.authority,
+               COALESCE(agent_stats.agent_count, 0) AS agent_count,
+               COALESCE(feedback_stats.total_feedbacks, 0) AS total_feedbacks,
+               feedback_stats.avg_score
+             FROM collections c
+             LEFT JOIN (
+               SELECT collection, COUNT(*)::text AS agent_count
+               FROM agents
+               ${activeAgentFilter}
+               GROUP BY collection
+             ) agent_stats ON agent_stats.collection = c.collection
+             LEFT JOIN (
+               SELECT a.collection, COUNT(f.id)::text AS total_feedbacks, AVG(f.score) AS avg_score
+               FROM feedbacks f
+               JOIN agents a ON a.asset = f.asset
+               ${activeFeedbackFilter}
+               GROUP BY a.collection
+             ) feedback_stats ON feedback_stats.collection = c.collection
+             WHERE c.collection = $1
+             ${includeOrphaned ? '' : `AND c.status != 'ORPHANED'`}
+             LIMIT 1`,
+            [collection]
+          );
+
+          formattedStats = rows.rows.map((row) => ({
+            collection: row.collection,
+            registry_type: row.registry_type || 'USER',
+            authority: row.authority,
+            agent_count: Number(row.agent_count ?? 0),
+            total_feedbacks: Number(row.total_feedbacks ?? 0),
+            avg_score: row.avg_score,
+          }));
+        } else {
+          const rows = await options.pool.query<PoolCollectionStatsRow>(
+            `SELECT
+               c.collection,
+               c.registry_type,
+               c.authority,
+               COALESCE(agent_stats.agent_count, 0) AS agent_count,
+               COALESCE(feedback_stats.total_feedbacks, 0) AS total_feedbacks,
+               feedback_stats.avg_score
+             FROM collections c
+             LEFT JOIN (
+               SELECT collection, COUNT(*)::text AS agent_count
+               FROM agents
+               ${activeAgentFilter}
+               GROUP BY collection
+             ) agent_stats ON agent_stats.collection = c.collection
+             LEFT JOIN (
+               SELECT a.collection, COUNT(f.id)::text AS total_feedbacks, AVG(f.score) AS avg_score
+               FROM feedbacks f
+               JOIN agents a ON a.asset = f.asset
+               ${activeFeedbackFilter}
+               GROUP BY a.collection
+             ) feedback_stats ON feedback_stats.collection = c.collection
+             ${activeCollectionsClause}
+             ORDER BY c.created_at DESC
+             LIMIT $1`,
+            [MAX_COLLECTION_STATS]
+          );
+
+          formattedStats = rows.rows.map((row) => ({
+            collection: row.collection,
+            registry_type: row.registry_type || 'USER',
+            authority: row.authority,
+            agent_count: Number(row.agent_count ?? 0),
+            total_feedbacks: Number(row.total_feedbacks ?? 0),
+            avg_score: row.avg_score,
+          }));
+        }
       } else {
-        // Get stats for all collections using single SQL query (prevents N+1 DoS)
-        // Instead of 50 registries × 2 queries = 100 queries, this does 1 query
-        // Note: Table/column names match Prisma schema (Registry, Agent, Feedback)
-        const stats = includeOrphaned
-          ? await prisma.$queryRaw<Array<{
-              collection: string;
-              registry_type: string;
-              authority: string | null;
-              agent_count: bigint;
-              total_feedbacks: bigint;
-              avg_score: number | null;
-            }>>`
-              SELECT
-                r.collection,
-                r."registryType" as registry_type,
-                r.authority,
-                COALESCE(agent_stats.agent_count, 0) as agent_count,
-                COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
-                feedback_stats.avg_score
-              FROM "Registry" r
-              LEFT JOIN (
-                SELECT collection, COUNT(*) as agent_count
-                FROM "Agent"
-                GROUP BY collection
-              ) agent_stats ON agent_stats.collection = r.collection
-              LEFT JOIN (
-                SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
-                FROM "Feedback" f
-                JOIN "Agent" a ON a.id = f."agentId"
-                GROUP BY a.collection
-              ) feedback_stats ON feedback_stats.collection = r.collection
-              ORDER BY r."createdAt" DESC
-              LIMIT ${MAX_COLLECTION_STATS}
-            `
-          : await prisma.$queryRaw<Array<{
-              collection: string;
-              registry_type: string;
-              authority: string | null;
-              agent_count: bigint;
-              total_feedbacks: bigint;
-              avg_score: number | null;
-            }>>`
-              SELECT
-                r.collection,
-                r."registryType" as registry_type,
-                r.authority,
-                COALESCE(agent_stats.agent_count, 0) as agent_count,
-                COALESCE(feedback_stats.total_feedbacks, 0) as total_feedbacks,
-                feedback_stats.avg_score
-              FROM "Registry" r
-              LEFT JOIN (
-                SELECT collection, COUNT(*) as agent_count
-                FROM "Agent"
-                WHERE status != 'ORPHANED'
-                GROUP BY collection
-              ) agent_stats ON agent_stats.collection = r.collection
-              LEFT JOIN (
-                SELECT a.collection, COUNT(f.id) as total_feedbacks, AVG(f.score) as avg_score
-                FROM "Feedback" f
-                JOIN "Agent" a ON a.id = f."agentId"
-                WHERE f.status != 'ORPHANED'
-                  AND a.status != 'ORPHANED'
-                GROUP BY a.collection
-              ) feedback_stats ON feedback_stats.collection = r.collection
-              WHERE r.status != 'ORPHANED'
-              ORDER BY r."createdAt" DESC
-              LIMIT ${MAX_COLLECTION_STATS}
-            `;
-
-        // Convert BigInt to number for JSON serialization
-        const formattedStats = stats.map(s => ({
-          collection: s.collection,
-          registry_type: s.registry_type,
-          authority: s.authority,
-          agent_count: Number(s.agent_count),
-          total_feedbacks: Number(s.total_feedbacks),
-          avg_score: s.avg_score,
-        }));
-
-        // Cache before sorting (sort is cheap, aggregation is expensive)
-        collectionStatsCache.set(cacheKey, formattedStats);
-
-        // Sort by agent_count if requested
-        const result = orderBy === 'agent_count.desc'
-          ? [...formattedStats].sort((a, b) => b.agent_count - a.agent_count)
-          : formattedStats;
-
-        res.json(result);
+        res.status(503).json({ error: 'Collection stats unavailable without supported database backend' });
+        return;
       }
+
+      collectionStatsCache.set(cacheKey, formattedStats);
+      const result = orderBy === 'agent_count.desc'
+        ? [...formattedStats].sort((a, b) => b.agent_count - a.agent_count)
+        : formattedStats;
+      res.json(result);
     } catch (error) {
       logger.error({ error }, 'Error fetching collection stats');
       res.status(500).json({ error: 'Internal server error' });
@@ -2694,19 +3414,86 @@ export function createApiServer(options: ApiServerOptions): Express {
   const globalStatsHandler = async (req: Request, res: Response) => {
     try {
       const includeOrphaned = safeQueryString(req.query.includeOrphaned) === 'true';
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'Global stats unavailable without database backend' });
+          return;
+        }
+
+        type GlobalStatsRow = {
+          total_agents: string | number | null;
+          total_collections: string | number | null;
+          total_feedbacks: string | number | null;
+          platinum_agents: string | number | null;
+          gold_agents: string | number | null;
+          avg_quality: string | number | null;
+        };
+        const parseCount = (value: string | number | null | undefined): number => {
+          if (value === null || value === undefined) return 0;
+          if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : 0;
+        };
+        const parseNullableNumber = (value: string | number | null | undefined): number | null => {
+          if (value === null || value === undefined) return null;
+          if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : null;
+        };
+
+        try {
+          const result = await options.pool.query<GlobalStatsRow>(
+            `SELECT total_agents, total_collections, total_feedbacks, platinum_agents, gold_agents, avg_quality
+             FROM global_stats
+             LIMIT 1`
+          );
+          const row = result.rows[0] ?? null;
+          res.json([{
+            total_agents: parseCount(row?.total_agents),
+            total_feedbacks: parseCount(row?.total_feedbacks),
+            total_collections: parseCount(row?.total_collections),
+            total_validations: 0,
+            platinum_agents: parseCount(row?.platinum_agents),
+            gold_agents: parseCount(row?.gold_agents),
+            avg_quality: parseNullableNumber(row?.avg_quality),
+          }]);
+          return;
+        } catch {
+          const [fallbackRow] = await fetchFallbackGlobalStats(
+            supabaseRestBaseUrl ?? '',
+            buildSupabaseProxyHeaders(req),
+            includeOrphaned
+          );
+          res.json([fallbackRow]);
+          return;
+        }
+      }
+
       const agentWhere: Prisma.AgentWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
       const feedbackWhere: Prisma.FeedbackWhereInput = includeOrphaned ? {} : { status: { not: 'ORPHANED' } };
-      const [totalAgents, totalFeedbacks, totalCollections] = await Promise.all([
+      const [totalAgents, totalFeedbacks, totalCollections, platinumAgents, goldAgents, avgQuality] = await Promise.all([
         prisma.agent.count({ where: agentWhere }),
         prisma.feedback.count({ where: feedbackWhere }),
         prisma.collection.count({ where: {} }),
+        prisma.agent.count({ where: { ...agentWhere, trustTier: 4 } }),
+        prisma.agent.count({ where: { ...agentWhere, trustTier: 3 } }),
+        prisma.agent.aggregate({
+          where: { ...agentWhere, feedbackCount: { gt: 0 } },
+          _avg: { qualityScore: true },
+        }).then((result) => {
+          const value = result._avg.qualityScore;
+          return value === null || value === undefined ? null : Math.round(value);
+        }),
       ]);
 
-      // Return as array for SDK compatibility (PostgREST format)
       res.json([{
         total_agents: totalAgents,
         total_feedbacks: totalFeedbacks,
         total_collections: totalCollections,
+        total_validations: 0,
+        platinum_agents: platinumAgents,
+        gold_agents: goldAgents,
+        avg_quality: avgQuality,
       }]);
     } catch (error) {
       logger.error({ error }, 'Error fetching stats');
@@ -2757,6 +3544,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           feedback_responses: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          revocations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         };
 
         for (const row of grouped.rows) {
@@ -2775,16 +3563,18 @@ export function createApiServer(options: ApiServerOptions): Express {
           registries: statusMaps.registries,
           metadata: statusMaps.metadata,
           feedback_responses: statusMaps.feedback_responses,
+          revocations: statusMaps.revocations,
         });
         return;
       }
 
-      const [agents, feedbacks, registries, metadata, responses] = await Promise.all([
+      const [agents, feedbacks, registries, metadata, responses, revocations] = await Promise.all([
         prisma.agent.groupBy({ by: ['status'], _count: true }),
         prisma.feedback.groupBy({ by: ['status'], _count: true }),
         prisma.registry.groupBy({ by: ['status'], _count: true }),
         prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
         prisma.feedbackResponse.groupBy({ by: ['status'], _count: true }),
+        prisma.revocation.groupBy({ by: ['status'], _count: true }),
       ]);
 
       res.json({
@@ -2793,6 +3583,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         registries: toStatusMap(registries),
         metadata: toStatusMap(metadata),
         feedback_responses: toStatusMap(responses),
+        revocations: toStatusMap(revocations),
       });
     } catch (error) {
       logger.error({ error }, 'Error fetching verification stats');
@@ -2805,10 +3596,17 @@ export function createApiServer(options: ApiServerOptions): Express {
     try {
       const asset = parsePostgRESTValue(req.query.asset);
       const key = parsePostgRESTValue(req.query.key);
+      const blockSlotFilter = parsePostgRESTBigIntFilter(req.query.block_slot);
       // Use stricter limit for metadata (each value can be up to 100KB compressed)
       const requestedLimit = safePaginationLimit(req.query.limit);
       const limit = Math.min(requestedLimit, MAX_METADATA_LIMIT);
       const offset = safePaginationOffset(req.query.offset);
+      const order = safeQueryString(req.query.order);
+
+      if (blockSlotFilter === null) {
+        res.status(400).json({ error: 'Invalid block_slot filter value' });
+        return;
+      }
 
       const statusFilter = buildStatusFilter(req);
       if (isInvalidStatus(statusFilter)) {
@@ -2818,19 +3616,21 @@ export function createApiServer(options: ApiServerOptions): Express {
       const where: Prisma.AgentMetadataWhereInput = { ...statusFilter };
       if (asset) where.agentId = asset;
       if (key) where.key = key;
+      if (blockSlotFilter !== undefined) where.slot = blockSlotFilter;
+      const metadataOrderBy: Prisma.AgentMetadataOrderByWithRelationInput[] = [
+        ...(order === 'block_slot.asc'
+          ? [{ slot: Prisma.SortOrder.asc }, { txIndex: Prisma.SortOrder.asc }, { eventOrdinal: Prisma.SortOrder.asc }]
+          : [{ slot: Prisma.SortOrder.desc }, { txIndex: Prisma.SortOrder.desc }, { eventOrdinal: Prisma.SortOrder.desc }]),
+        { agentId: Prisma.SortOrder.asc },
+        { key: Prisma.SortOrder.asc },
+        { id: Prisma.SortOrder.asc },
+      ];
 
       const needsCount = wantsCount(req);
       const [metadata, totalCount] = await Promise.all([
         prisma.agentMetadata.findMany({
           where,
-          orderBy: [
-            { slot: 'desc' },
-            { txIndex: 'desc' },
-            { eventOrdinal: 'desc' },
-            { agentId: 'asc' },
-            { key: 'asc' },
-            { id: 'asc' },
-          ],
+          orderBy: metadataOrderBy,
           take: limit,
           skip: offset,
         }),
@@ -2838,42 +3638,34 @@ export function createApiServer(options: ApiServerOptions): Express {
       ]);
 
       // Decompress sequentially with aggregate size limit (prevent OOM)
-      const results: Array<{
-        id: string;
-        asset: string;
-        key: string;
-        value: string;
-        immutable: boolean;
-        status: string;
-        verified_at: string | null;
-      }> = [];
-      let totalBytes = 0;
+      const totalStoredBytes = metadata.reduce((sum, m) => sum + Buffer.from(m.value).length, 0);
+      if (totalStoredBytes > MAX_METADATA_AGGREGATE_BYTES) {
+        logger.warn({
+          totalStoredBytes,
+          limit: MAX_METADATA_AGGREGATE_BYTES,
+          totalItems: metadata.length,
+        }, 'Metadata aggregate size limit exceeded');
+        res.status(413).json({ error: 'Metadata aggregate size limit exceeded' });
+        return;
+      }
 
-      for (const m of metadata) {
-        const decompressed = await decompressFromStorage(Buffer.from(m.value));
-        totalBytes += decompressed.length;
-
-        // Stop if aggregate exceeds limit (prevent 1000 * 1MB = 1GB OOM)
-        if (totalBytes > MAX_METADATA_AGGREGATE_BYTES) {
-          logger.warn({
-            totalBytes,
-            limit: MAX_METADATA_AGGREGATE_BYTES,
-            itemsProcessed: results.length,
-            totalItems: metadata.length
-          }, 'Metadata aggregate size limit exceeded, truncating response');
-          break;
-        }
-
-        results.push({
-          id: `${m.agentId}:${m.key}`,
+      const results = metadata.map((m) => {
+        const keyHash = Buffer.from(computeKeyHash(m.key)).toString('hex');
+        return {
+          id: `${m.agentId}:${keyHash}`,
           asset: m.agentId,
           key: m.key,
-          value: decompressed.toString('base64'),
+          key_hash: keyHash,
+          value: Buffer.from(m.value).toString('base64'),
           immutable: m.immutable,
+          block_slot: Number(m.slot ?? 0n),
+          tx_index: m.txIndex ?? null,
+          event_ordinal: m.eventOrdinal ?? null,
+          tx_signature: m.txSignature ?? '',
           status: m.status,
           verified_at: m.verifiedAt?.toISOString() || null,
-        });
-      }
+        };
+      });
 
       if (needsCount) {
         setContentRange(res, offset, results.length, totalCount);
@@ -2882,6 +3674,194 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json(results);
     } catch (error) {
       logger.error({ error }, 'Error fetching metadata');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/rest/v1/agent_reputation', async (req: Request, res: Response) => {
+    try {
+      const asset = parsePostgRESTValue(req.query.asset);
+      if (!asset) {
+        res.status(400).json({ error: 'Missing required query param: asset' });
+        return;
+      }
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'agent_reputation requires local Prisma backend or REST proxy mode' });
+          return;
+        }
+
+        type PoolAgentReputationRow = {
+          asset: string;
+          owner: string;
+          collection: string;
+          nft_name: string | null;
+          agent_uri: string | null;
+          feedback_count: string | number | null;
+          avg_score: number | null;
+          positive_count: string | number | null;
+          negative_count: string | number | null;
+          validation_count: string | number | null;
+        };
+
+        const rows = await options.pool.query<PoolAgentReputationRow>(
+          `WITH feedback_stats AS (
+             SELECT
+               f.asset,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+               )::integer AS feedback_count,
+               ROUND(AVG(f.score) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+               ), 0) AS avg_score,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+                   AND f.score >= 50
+               )::integer AS positive_count,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+                   AND f.score < 50
+               )::integer AS negative_count
+             FROM feedbacks f
+             GROUP BY f.asset
+           ),
+           validation_stats AS (
+             SELECT
+               v.asset,
+               COUNT(*) FILTER (
+                 WHERE v.chain_status != 'ORPHANED'
+               )::integer AS validation_count
+             FROM validations v
+             GROUP BY v.asset
+           )
+           SELECT
+             a.asset,
+             a.owner,
+             a.collection,
+             a.nft_name,
+             a.agent_uri,
+             COALESCE(fs.feedback_count, a.feedback_count, 0) AS feedback_count,
+             CASE
+               WHEN COALESCE(fs.feedback_count, a.feedback_count, 0) > 0
+                 THEN COALESCE(fs.avg_score, a.raw_avg_score::numeric)
+               ELSE NULL
+             END AS avg_score,
+             COALESCE(fs.positive_count, 0) AS positive_count,
+             COALESCE(fs.negative_count, 0) AS negative_count,
+             COALESCE(vs.validation_count, 0) AS validation_count
+           FROM agents a
+           LEFT JOIN feedback_stats fs ON fs.asset = a.asset
+           LEFT JOIN validation_stats vs ON vs.asset = a.asset
+           WHERE a.asset = $1
+             AND a.status != 'ORPHANED'
+           LIMIT 1`,
+          [asset]
+        );
+
+        if (rows.rows.length === 0) {
+          res.json([]);
+          return;
+        }
+
+        const row = rows.rows[0];
+        res.json([{
+          asset: row.asset,
+          owner: row.owner,
+          collection: row.collection,
+          nft_name: row.nft_name,
+          agent_uri: row.agent_uri,
+          feedback_count: numericValue(row.feedback_count) ?? 0,
+          avg_score: roundNullableScore(row.avg_score),
+          positive_count: numericValue(row.positive_count) ?? 0,
+          negative_count: numericValue(row.negative_count) ?? 0,
+          validation_count: numericValue(row.validation_count) ?? 0,
+        } satisfies AgentReputationRow]);
+        return;
+      }
+
+      const agent = await prisma.agent.findFirst({
+        where: {
+          id: asset,
+          status: { not: 'ORPHANED' },
+        },
+        select: {
+          id: true,
+          owner: true,
+          collection: true,
+          nftName: true,
+          uri: true,
+          feedbackCount: true,
+          rawAvgScore: true,
+        },
+      });
+
+      if (!agent) {
+        res.json([]);
+        return;
+      }
+
+      const [feedbackAgg, positiveCount, negativeCount, validationCount] = await Promise.all([
+        prisma.feedback.aggregate({
+          where: {
+            agentId: asset,
+            status: { not: 'ORPHANED' },
+            revoked: false,
+            score: { not: null },
+          },
+          _count: true,
+          _avg: { score: true },
+        }),
+        prisma.feedback.count({
+          where: {
+            agentId: asset,
+            status: { not: 'ORPHANED' },
+            revoked: false,
+            score: { gte: 50 },
+          },
+        }),
+        prisma.feedback.count({
+          where: {
+            agentId: asset,
+            status: { not: 'ORPHANED' },
+            revoked: false,
+            score: { lt: 50 },
+          },
+        }),
+        prisma.validation.count({
+          where: {
+            agentId: asset,
+            chainStatus: { not: 'ORPHANED' },
+          },
+        }),
+      ]);
+
+      const feedbackCount = resolveFeedbackCount(feedbackAgg._count, agent.feedbackCount);
+
+      const row: AgentReputationRow = {
+        asset: agent.id,
+        owner: agent.owner,
+        collection: agent.collection,
+        nft_name: agent.nftName,
+        agent_uri: agent.uri,
+        feedback_count: feedbackCount,
+        avg_score: resolveAverageScore(feedbackCount, feedbackAgg._avg.score, agent.rawAvgScore),
+        positive_count: positiveCount,
+        negative_count: negativeCount,
+        validation_count: validationCount,
+      };
+
+      res.json([row]);
+    } catch (error) {
+      logger.error({ error }, 'Error fetching agent reputation');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -2903,104 +3883,38 @@ export function createApiServer(options: ApiServerOptions): Express {
         return res.json(cached.slice(0, limit));
       }
 
-      // Use Prisma.sql for safe parameterized queries (prevents SQL injection regression)
-      // This avoids the 1000 agents × 100 feedbacks = 100k objects memory issue
-      type LeaderboardRow = {
-        asset: string;
-        owner: string;
-        collection: string;
-        trust_score: number | bigint;
-        feedback_count: bigint;
-      };
+      const agents = await prisma.agent.findMany({
+        where: {
+          trustTier: { gte: 2 },
+          ...(collection ? { collection } : {}),
+          ...(includeOrphaned ? {} : { status: { not: 'ORPHANED' } }),
+        },
+        select: {
+          id: true,
+          owner: true,
+          collection: true,
+          nftName: true,
+          uri: true,
+          trustTier: true,
+          qualityScore: true,
+          confidence: true,
+          riskScore: true,
+          diversityRatio: true,
+          feedbackCount: true,
+        },
+      });
 
-      // Use separate queries to avoid dynamic SQL construction (safer pattern)
-      // Note: CAST instead of ::int for SQLite/PostgreSQL compatibility
-      // Note: Table names match Prisma model names (Agent, Feedback)
-      let result: LeaderboardRow[];
-      if (collection && includeOrphaned) {
-        result = await prisma.$queryRaw<LeaderboardRow[]>`
-          SELECT
-            a.id as asset,
-            a.owner,
-            a.collection,
-            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-            COUNT(f.id) as feedback_count
-          FROM "Agent" a
-          LEFT JOIN "Feedback" f ON f."agentId" = a.id
-            AND f.revoked = false
-            AND f.score IS NOT NULL
-          WHERE a.collection = ${collection}
-          GROUP BY a.id, a.owner, a.collection
-          HAVING COUNT(f.id) > 0
-          ORDER BY trust_score DESC, feedback_count DESC
-          LIMIT ${LEADERBOARD_POOL_SIZE}
-        `;
-      } else if (collection) {
-        result = await prisma.$queryRaw<LeaderboardRow[]>`
-          SELECT
-            a.id as asset,
-            a.owner,
-            a.collection,
-            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-            COUNT(f.id) as feedback_count
-          FROM "Agent" a
-          LEFT JOIN "Feedback" f ON f."agentId" = a.id
-            AND f.revoked = false
-            AND f.score IS NOT NULL
-            AND f.status != 'ORPHANED'
-          WHERE a.collection = ${collection}
-            AND a.status != 'ORPHANED'
-          GROUP BY a.id, a.owner, a.collection
-          HAVING COUNT(f.id) > 0
-          ORDER BY trust_score DESC, feedback_count DESC
-          LIMIT ${LEADERBOARD_POOL_SIZE}
-        `;
-      } else if (includeOrphaned) {
-        result = await prisma.$queryRaw<LeaderboardRow[]>`
-          SELECT
-            a.id as asset,
-            a.owner,
-            a.collection,
-            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-            COUNT(f.id) as feedback_count
-          FROM "Agent" a
-          LEFT JOIN "Feedback" f ON f."agentId" = a.id
-            AND f.revoked = false
-            AND f.score IS NOT NULL
-          GROUP BY a.id, a.owner, a.collection
-          HAVING COUNT(f.id) > 0
-          ORDER BY trust_score DESC, feedback_count DESC
-          LIMIT ${LEADERBOARD_POOL_SIZE}
-        `;
-      } else {
-        result = await prisma.$queryRaw<LeaderboardRow[]>`
-          SELECT
-            a.id as asset,
-            a.owner,
-            a.collection,
-            CAST(COALESCE(ROUND(AVG(f.score)), 0) AS INTEGER) as trust_score,
-            COUNT(f.id) as feedback_count
-          FROM "Agent" a
-          LEFT JOIN "Feedback" f ON f."agentId" = a.id
-            AND f.revoked = false
-            AND f.score IS NOT NULL
-            AND f.status != 'ORPHANED'
-          WHERE a.status != 'ORPHANED'
-          GROUP BY a.id, a.owner, a.collection
-          HAVING COUNT(f.id) > 0
-          ORDER BY trust_score DESC, feedback_count DESC
-          LIMIT ${LEADERBOARD_POOL_SIZE}
-        `;
-      }
-
-      // Convert BigInt to number for JSON serialization
-      const withScores = result.map(r => ({
-        asset: r.asset,
-        owner: r.owner,
-        collection: r.collection,
-        trust_score: Number(r.trust_score),
-        feedback_count: Number(r.feedback_count),
-      }));
+      const withScores = agents
+        .map(mapAgentToLeaderboardEntry)
+        .sort((a, b) => {
+          const aKey = BigInt(a.sort_key);
+          const bKey = BigInt(b.sort_key);
+          if (aKey === bKey) {
+            return a.asset.localeCompare(b.asset);
+          }
+          return aKey > bKey ? -1 : 1;
+        })
+        .slice(0, LEADERBOARD_POOL_SIZE);
 
       // Update LRU cache (TTL + max size handled automatically)
       leaderboardCache.set(cacheKey, withScores);
@@ -3008,6 +3922,373 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json(withScores.slice(0, limit));
     } catch (error) {
       logger.error({ error }, 'Error fetching leaderboard');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.post('/rest/v1/rpc/get_leaderboard', async (req: Request, res: Response) => {
+    try {
+      const body = isRecord(req.body) ? req.body : {};
+      const limit = Math.min(
+        Math.max(Number.parseInt(String(body.p_limit ?? '50'), 10) || 50, 1),
+        MAX_LIMIT
+      );
+      const minTier = Math.max(Number.parseInt(String(body.p_min_tier ?? '0'), 10) || 0, 0);
+      const collection = typeof body.p_collection === 'string' && body.p_collection.trim().length > 0
+        ? body.p_collection.trim()
+        : null;
+      const cursorSortKey = typeof body.p_cursor_sort_key === 'string' && body.p_cursor_sort_key.trim().length > 0
+        ? BigInt(body.p_cursor_sort_key)
+        : body.p_cursor_sort_key === null || body.p_cursor_sort_key === undefined
+          ? null
+          : BigInt(String(body.p_cursor_sort_key));
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'get_leaderboard requires local Prisma backend or REST proxy mode' });
+          return;
+        }
+
+        const rows = await options.pool.query<PoolAgentApiRow>(
+          `SELECT
+             a.asset,
+             a.owner,
+             a.creator,
+             a.agent_uri,
+             a.agent_wallet,
+             a.collection,
+             a.canonical_col,
+             a.col_locked,
+             a.parent_asset,
+             a.parent_creator,
+             a.parent_locked,
+             a.nft_name,
+             a.atom_enabled,
+             a.trust_tier,
+             a.quality_score,
+             a.confidence,
+             a.risk_score,
+             a.diversity_ratio,
+             a.feedback_count,
+             a.raw_avg_score,
+             a.agent_id,
+             a.status,
+             a.verified_at,
+             a.verified_slot,
+             a.created_at,
+             a.updated_at,
+             a.tx_signature,
+             a.block_slot,
+             a.tx_index,
+             a.event_ordinal,
+             a.sort_key
+           FROM agents a
+           WHERE a.trust_tier >= $1
+             AND ($2::text IS NULL OR a.collection = $2)
+             AND ($3::bigint IS NULL OR a.sort_key < $3)
+           ORDER BY a.sort_key DESC, a.asset ASC
+           LIMIT $4`,
+          [minTier, collection, cursorSortKey?.toString() ?? null, limit]
+        );
+
+        res.json(rows.rows.map(mapPoolAgentToApi));
+        return;
+      }
+
+      const agents = await prisma.agent.findMany({
+        where: {
+          trustTier: { gte: minTier },
+          ...(collection ? { collection } : {}),
+        },
+        select: {
+          id: true,
+          owner: true,
+          creator: true,
+          uri: true,
+          wallet: true,
+          collection: true,
+          collectionPointer: true,
+          colLocked: true,
+          parentAsset: true,
+          parentCreator: true,
+          parentLocked: true,
+          nftName: true,
+          atomEnabled: true,
+          trustTier: true,
+          qualityScore: true,
+          confidence: true,
+          riskScore: true,
+          diversityRatio: true,
+          feedbackCount: true,
+          rawAvgScore: true,
+          agentId: true,
+          status: true,
+          verifiedAt: true,
+          verifiedSlot: true,
+          createdAt: true,
+          updatedAt: true,
+          createdTxSignature: true,
+          createdSlot: true,
+          txIndex: true,
+          eventOrdinal: true,
+        },
+      });
+
+      const rows: LocalLeaderboardRow[] = agents
+        .map((agent) => ({
+          ...mapAgentToApi(agent),
+          sort_key: computeLocalSortKey(agent),
+        }) as LocalLeaderboardRow)
+        .filter((agent) => cursorSortKey === null || BigInt(String(agent.sort_key)) < cursorSortKey)
+        .sort((a, b) => {
+          const aKey = BigInt(String(a.sort_key));
+          const bKey = BigInt(String(b.sort_key));
+          if (aKey === bKey) {
+            return String(a.asset).localeCompare(String(b.asset));
+          }
+          return aKey > bKey ? -1 : 1;
+        })
+        .slice(0, limit);
+
+      res.json(rows);
+    } catch (error) {
+      logger.error({ error }, 'Error fetching RPC leaderboard');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/rest/v1/rpc/get_collection_agents', async (req: Request, res: Response) => {
+    try {
+      const collectionId = parsePostgRESTInt(req.query.collection_id);
+      const pageLimit = parsePostgRESTInt(req.query.page_limit);
+      const pageOffset = parsePostgRESTInt(req.query.page_offset);
+
+      if (collectionId === null || pageLimit === null || pageOffset === null) {
+        res.status(400).json({ error: 'Invalid collection_id/page_limit/page_offset filter value' });
+        return;
+      }
+      if (collectionId === undefined) {
+        res.status(400).json({ error: 'Missing required query param: collection_id' });
+        return;
+      }
+
+      const limit = Math.min(Math.max(pageLimit ?? 20, 1), MAX_LIMIT);
+      const offset = Math.max(pageOffset ?? 0, 0);
+
+      if (!prisma) {
+        if (!options.pool) {
+          res.status(503).json({ error: 'get_collection_agents requires local Prisma backend or REST proxy mode' });
+          return;
+        }
+
+        type PoolCollectionAgentRow = {
+          asset: string;
+          owner: string;
+          collection: string;
+          nft_name: string | null;
+          agent_uri: string | null;
+          feedback_count: string | number | null;
+          avg_score: number | null;
+          positive_count: string | number | null;
+          negative_count: string | number | null;
+          validation_count: string | number | null;
+        };
+
+        const rows = await options.pool.query<PoolCollectionAgentRow>(
+          `WITH feedback_stats AS (
+             SELECT
+               f.asset,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+               )::integer AS feedback_count,
+               ROUND(AVG(f.score) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+               ), 0) AS avg_score,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+                   AND f.score >= 50
+               )::integer AS positive_count,
+               COUNT(*) FILTER (
+                 WHERE f.status != 'ORPHANED'
+                   AND f.is_revoked = false
+                   AND f.score IS NOT NULL
+                   AND f.score < 50
+               )::integer AS negative_count
+             FROM feedbacks f
+             GROUP BY f.asset
+           ),
+           validation_stats AS (
+             SELECT
+               v.asset,
+               COUNT(*) FILTER (
+                 WHERE v.chain_status != 'ORPHANED'
+               )::integer AS validation_count
+             FROM validations v
+             GROUP BY v.asset
+           )
+           SELECT
+             a.asset,
+             a.owner,
+             a.collection,
+             a.nft_name,
+             a.agent_uri,
+             COALESCE(fs.feedback_count, a.feedback_count, 0) AS feedback_count,
+             CASE
+               WHEN COALESCE(fs.feedback_count, a.feedback_count, 0) > 0
+                 THEN COALESCE(fs.avg_score, a.raw_avg_score::numeric)
+               ELSE NULL
+             END AS avg_score,
+             COALESCE(fs.positive_count, 0) AS positive_count,
+             COALESCE(fs.negative_count, 0) AS negative_count,
+             COALESCE(vs.validation_count, 0) AS validation_count
+           FROM collection_pointers cp
+           JOIN agents a
+             ON a.canonical_col = cp.col
+            AND a.creator = cp.creator
+           LEFT JOIN feedback_stats fs ON fs.asset = a.asset
+           LEFT JOIN validation_stats vs ON vs.asset = a.asset
+           WHERE cp.collection_id = $1
+             AND a.status != 'ORPHANED'
+           ORDER BY a.created_at DESC, a.asset DESC
+           LIMIT $2
+           OFFSET $3`,
+          [collectionId, limit, offset]
+        );
+
+        res.json(rows.rows.map((row) => ({
+          asset: row.asset,
+          owner: row.owner,
+          collection: row.collection,
+          nft_name: row.nft_name,
+          agent_uri: row.agent_uri,
+          feedback_count: numericValue(row.feedback_count) ?? 0,
+          avg_score: roundNullableScore(row.avg_score),
+          positive_count: numericValue(row.positive_count) ?? 0,
+          negative_count: numericValue(row.negative_count) ?? 0,
+          validation_count: numericValue(row.validation_count) ?? 0,
+        })));
+        return;
+      }
+
+      const collection = await prisma.collection.findUnique({
+        where: { collectionId: BigInt(collectionId) },
+        select: { col: true, creator: true },
+      });
+
+      if (!collection) {
+        res.json([]);
+        return;
+      }
+
+      const agents = await prisma.agent.findMany({
+        where: {
+          collectionPointer: collection.col,
+          creator: collection.creator,
+          status: { not: 'ORPHANED' },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+        select: {
+          id: true,
+          owner: true,
+          collection: true,
+          nftName: true,
+          uri: true,
+          feedbackCount: true,
+          rawAvgScore: true,
+        },
+      });
+
+      const assetIds = agents.map((agent) => agent.id);
+      const [feedbackStats, validationStats] = await Promise.all([
+        assetIds.length === 0
+          ? Promise.resolve([])
+          : prisma.feedback.groupBy({
+              by: ['agentId'],
+              where: {
+                agentId: { in: assetIds },
+                status: { not: 'ORPHANED' },
+                revoked: false,
+                score: { not: null },
+              },
+              _count: true,
+              _avg: { score: true },
+            }),
+        assetIds.length === 0
+          ? Promise.resolve([])
+          : prisma.validation.groupBy({
+              by: ['agentId'],
+              where: {
+                agentId: { in: assetIds },
+                chainStatus: { not: 'ORPHANED' },
+              },
+              _count: true,
+            }),
+      ]);
+
+      const positiveByAgent = new Map<string, number>();
+      const negativeByAgent = new Map<string, number>();
+      if (assetIds.length > 0) {
+        const [positiveRows, negativeRows] = await Promise.all([
+          prisma.feedback.groupBy({
+            by: ['agentId'],
+            where: {
+              agentId: { in: assetIds },
+              status: { not: 'ORPHANED' },
+              revoked: false,
+              score: { gte: 50 },
+            },
+            _count: true,
+          }),
+          prisma.feedback.groupBy({
+            by: ['agentId'],
+            where: {
+              agentId: { in: assetIds },
+              status: { not: 'ORPHANED' },
+              revoked: false,
+              score: { lt: 50 },
+            },
+            _count: true,
+          }),
+        ]);
+        for (const row of positiveRows) positiveByAgent.set(row.agentId, row._count);
+        for (const row of negativeRows) negativeByAgent.set(row.agentId, row._count);
+      }
+
+      const feedbackByAgent = new Map(feedbackStats.map((row) => [
+        row.agentId,
+        {
+          feedback_count: resolveFeedbackCount(row._count, null),
+          avg_score: roundNullableScore(row._avg.score),
+        },
+      ]));
+      const validationByAgent = new Map(validationStats.map((row) => [row.agentId, Number(row._count ?? 0)]));
+
+      res.json(agents.map((agent) => {
+        const feedback = feedbackByAgent.get(agent.id);
+        const feedbackCount = feedback?.feedback_count ?? resolveFeedbackCount(null, agent.feedbackCount);
+        return {
+          asset: agent.id,
+          owner: agent.owner,
+          collection: agent.collection,
+          nft_name: agent.nftName,
+          agent_uri: agent.uri,
+          feedback_count: feedbackCount,
+          avg_score: feedback?.avg_score ?? resolveAverageScore(feedbackCount, null, agent.rawAvgScore),
+          positive_count: positiveByAgent.get(agent.id) ?? 0,
+          negative_count: negativeByAgent.get(agent.id) ?? 0,
+          validation_count: validationByAgent.get(agent.id) ?? 0,
+        };
+      }));
+    } catch (error) {
+      logger.error({ error }, 'Error fetching collection agents');
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -3039,7 +4320,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           checkpoints.slice(offset, offset + limit).map((cp) => ({
             agent_id: asset,
             chain_type: cp.chainType,
-            event_count: cp.eventCount,
+            event_count: checkpointEventCountToJson(cp.eventCount),
             digest: cp.digest,
             created_at: cp.createdAt,
           }))
@@ -3060,7 +4341,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.json(checkpoints.map(cp => ({
         agent_id: cp.agentId,
         chain_type: cp.chainType,
-        event_count: cp.eventCount,
+        event_count: checkpointEventCountToJson(cp.eventCount),
         digest: cp.digest,
         created_at: cp.createdAt.toISOString(),
       })));
@@ -3085,7 +4366,7 @@ export function createApiServer(options: ApiServerOptions): Express {
 
         const checkpoints = await getLatestCheckpointsFromPool(options.pool, asset);
         const fmt = (cp: typeof checkpoints.feedback) => cp ? {
-          event_count: cp.eventCount,
+          event_count: checkpointEventCountToJson(cp.eventCount),
           digest: cp.digest,
           created_at: cp.createdAt,
         } : null;
@@ -3108,7 +4389,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       );
 
       const fmt = (cp: typeof feedback) => cp ? {
-        event_count: cp.eventCount,
+        event_count: checkpointEventCountToJson(cp.eventCount),
         digest: cp.digest,
         created_at: cp.createdAt.toISOString(),
       } : null;
@@ -3295,27 +4576,24 @@ export function createApiServer(options: ApiServerOptions): Express {
 
   // GraphQL endpoint (behind feature flag)
   if (graphqlEnabled && options.pool) {
-    import('./graphql/index.js').then(({ createGraphQLHandler }) => {
-      const graphqlLimiter = rateLimit({
-        windowMs: GRAPHQL_RATE_LIMIT_WINDOW_MS,
-        max: GRAPHQL_RATE_LIMIT_MAX_REQUESTS,
-        message: {
-          error: `GraphQL rate limited. Max ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS} requests per minute.`,
-        },
-        standardHeaders: true,
-        legacyHeaders: false,
-      });
-      const yoga = createGraphQLHandler({ pool: options.pool!, prisma: options.prisma ?? null });
-      app.use('/v2/graphql', graphqlLimiter, yoga.handle as any);
-      app.use('/graphql', graphqlLimiter, (req: Request, res: Response, next: Function) => {
-        res.setHeader('Deprecation', 'true');
-        res.setHeader('Link', '</v2/graphql>; rel="successor-version"');
-        (yoga.handle as any)(req, res, next);
-      });
-      logger.info('GraphQL endpoint mounted at /v2/graphql (legacy alias /graphql)');
-    }).catch((err: unknown) => {
-      logger.error({ error: err }, 'Failed to mount GraphQL endpoint');
+    const graphqlLimiter = rateLimit({
+      windowMs: GRAPHQL_RATE_LIMIT_WINDOW_MS,
+      max: GRAPHQL_RATE_LIMIT_MAX_REQUESTS,
+      message: {
+        error: `GraphQL rate limited. Max ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS} requests per minute.`,
+      },
+      standardHeaders: true,
+      legacyHeaders: false,
     });
+    const yoga = createGraphQLHandler({ pool: options.pool!, prisma: options.prisma ?? null });
+    app.use('/v2/graphql', graphqlLimiter, yoga.handle as any);
+    app.use('/graphql', graphqlLimiter, (req: Request, res: Response, next: Function) => {
+      res.setHeader('Deprecation', 'true');
+      res.setHeader('Link', '</v2/graphql>; rel="successor-version"');
+      (yoga.handle as any)(req, res, next);
+    });
+    graphqlState.mounted = true;
+    logger.info('GraphQL endpoint mounted at /v2/graphql (legacy alias /graphql)');
   }
 
   return app;

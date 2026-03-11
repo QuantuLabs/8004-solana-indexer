@@ -45,6 +45,6 @@ describe("Docker Stack Config", () => {
   it("keeps API port wiring consistent across port mapping, env, and healthcheck", () => {
     expect(stackContent).toContain('- "${API_PORT:-3001}:${API_PORT:-3001}"');
     expect(stackContent).toContain("API_PORT: ${API_PORT:-3001}");
-    expect(stackContent).toContain("127.0.0.1:${API_PORT:-3001}/health");
+    expect(stackContent).toContain("127.0.0.1:${API_PORT:-3001}/ready");
   });
 });

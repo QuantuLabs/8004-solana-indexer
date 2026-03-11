@@ -2,7 +2,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
 import { Pool } from "pg";
 import { config, IndexerMode } from "../config.js";
-import { Poller } from "./poller.js";
+import { Poller, type PollerBootstrapOptions } from "./poller.js";
 import { WebSocketIndexer, testWebSocketConnection } from "./websocket.js";
 import { DataVerifier } from "./verifier.js";
 import { createChildLogger } from "../logger.js";
@@ -28,6 +28,12 @@ export class Processor {
   private wsMonitorInterval: ReturnType<typeof setInterval> | null = null;
   private wsMonitorInProgress = false; // Reentrancy guard for async interval
   private activeBootstrapPollers = new Set<Poller>();
+  private pendingPoller: Poller | null = null;
+  private pendingPollerStart: Promise<void> | null = null;
+  private pendingWsIndexer: WebSocketIndexer | null = null;
+  private pendingWsStart: Promise<void> | null = null;
+  private pendingVerifier: DataVerifier | null = null;
+  private pendingVerifierStart: Promise<void> | null = null;
 
   constructor(prisma: PrismaClient | null, pool: Pool | null = null, options?: ProcessorOptions) {
     this.prisma = prisma;
@@ -50,6 +56,13 @@ export class Processor {
     logger.info({ mode: this.mode }, "Starting processor");
 
     try {
+      // Run verifier concurrently with ingestion/bootstrap so websocket/auto
+      // do not accumulate unbounded PENDING rows during long catch-up.
+      await this.startVerifier();
+      if (!this.isRunning) {
+        return;
+      }
+
       switch (this.mode) {
         case "websocket":
           await this.startWebSocketPipeline();
@@ -64,9 +77,6 @@ export class Processor {
           await this.startAuto();
           break;
       }
-
-      // Start background verifier for reorg resilience
-      await this.startVerifier();
 
       if (this.prisma && config.dbMode === "local") {
         enableLocalDerivedDigests(this.prisma);
@@ -85,14 +95,30 @@ export class Processor {
 
   private async startVerifier(): Promise<void> {
     setVerifierActive(false);
-    this.verifier = new DataVerifier(
+    const nextVerifier = new DataVerifier(
       this.connection,
       this.prisma,
       this.pool,
       config.verifyIntervalMs
     );
-
-    await this.verifier.start();
+    this.verifier = nextVerifier;
+    this.pendingVerifier = nextVerifier;
+    const startPromise = nextVerifier.start();
+    this.pendingVerifierStart = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (this.pendingVerifierStart === startPromise) {
+        this.pendingVerifierStart = null;
+      }
+      if (this.pendingVerifier === nextVerifier) {
+        this.pendingVerifier = null;
+      }
+    }
+    if (!this.isRunning || this.verifier !== nextVerifier) {
+      await nextVerifier.stop();
+      return;
+    }
     setVerifierActive(true);
     logger.info({ intervalMs: config.verifyIntervalMs }, "Background verifier started");
   }
@@ -107,16 +133,46 @@ export class Processor {
       this.wsMonitorInterval = null;
     }
 
-    if (this.verifier) {
-      await this.verifier.stop();
-      this.verifier = null;
+    const verifier = this.verifier;
+    const pendingVerifier = this.pendingVerifier;
+    const pendingVerifierStart = this.pendingVerifierStart;
+
+    if (verifier) {
+      await verifier.stop();
+    } else if (pendingVerifier) {
+      await pendingVerifier.stop();
     }
+    if (pendingVerifierStart) {
+      await Promise.allSettled([pendingVerifierStart]);
+    }
+    this.verifier = null;
+    this.pendingVerifier = null;
+    this.pendingVerifierStart = null;
     setVerifierActive(false);
 
     if (this.activeBootstrapPollers.size > 0) {
       const bootstrapPollers = [...this.activeBootstrapPollers];
       this.activeBootstrapPollers.clear();
       await Promise.allSettled(bootstrapPollers.map((poller) => poller.stop()));
+    }
+
+    const pendingPoller = this.pendingPoller;
+    const pendingWsIndexer = this.pendingWsIndexer;
+    const pendingStarts = [
+      this.pendingPollerStart,
+      this.pendingWsStart,
+    ].filter((promise): promise is Promise<void> => promise !== null);
+
+    if (pendingPoller && pendingPoller !== this.poller) {
+      await pendingPoller.stop();
+    }
+
+    if (pendingWsIndexer && pendingWsIndexer !== this.wsIndexer) {
+      await pendingWsIndexer.stop();
+    }
+
+    if (pendingStarts.length > 0) {
+      await Promise.allSettled(pendingStarts);
     }
 
     if (this.poller) {
@@ -135,8 +191,29 @@ export class Processor {
       connection: this.connection,
       prisma: this.prisma,
       programId: this.programId,
+      wsUrl: config.wsUrl,
     });
-    await nextWsIndexer.start();
+    this.pendingWsIndexer = nextWsIndexer;
+    const startPromise = nextWsIndexer.start();
+    this.pendingWsStart = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (this.pendingWsStart === startPromise) {
+        this.pendingWsStart = null;
+      }
+      if (this.pendingWsIndexer === nextWsIndexer) {
+        this.pendingWsIndexer = null;
+      }
+    }
+    if (!this.isRunning) {
+      await nextWsIndexer.stop();
+      return;
+    }
+    if (!nextWsIndexer.isActive()) {
+      await nextWsIndexer.stop();
+      throw new Error("WebSocket indexer failed to establish an active subscription");
+    }
     this.wsIndexer = nextWsIndexer;
   }
 
@@ -151,15 +228,32 @@ export class Processor {
 
   private async startPolling(): Promise<void> {
     const nextPoller = this.createPoller();
-    await nextPoller.start();
+    this.pendingPoller = nextPoller;
+    const startPromise = nextPoller.start();
+    this.pendingPollerStart = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (this.pendingPollerStart === startPromise) {
+        this.pendingPollerStart = null;
+      }
+      if (this.pendingPoller === nextPoller) {
+        this.pendingPoller = null;
+      }
+    }
+    if (!this.isRunning) {
+      await nextPoller.stop();
+      return;
+    }
     this.poller = nextPoller;
   }
 
-  private async bootstrapAutoCatchUp(): Promise<void> {
+  private async bootstrapAutoCatchUp(options?: PollerBootstrapOptions): Promise<void> {
+    if (!this.isRunning) return;
     const bootstrapPoller = this.createPoller();
     this.activeBootstrapPollers.add(bootstrapPoller);
     try {
-      await bootstrapPoller.bootstrap();
+      await bootstrapPoller.bootstrap(options);
     } finally {
       this.activeBootstrapPollers.delete(bootstrapPoller);
     }
@@ -167,9 +261,13 @@ export class Processor {
 
   private async startWebSocketPipeline(): Promise<void> {
     await this.bootstrapAutoCatchUp();
+    if (!this.isRunning) return;
     await this.startWebSocket();
+    if (!this.isRunning) return;
+    // Close the bootstrap -> live subscription gap with a short catch-up pass.
+    await this.bootstrapAutoCatchUp({ suppressEventLogWrites: true });
+    if (!this.isRunning) return;
     this.monitorWebSocket();
-    await this.bootstrapAutoCatchUp();
   }
 
   private async startAutoWebSocketPipeline(): Promise<void> {
@@ -276,8 +374,10 @@ export class Processor {
     }
 
     await this.bootstrapAutoCatchUp();
+    if (!this.isRunning) return;
     await this.startWebSocket();
-    await this.bootstrapAutoCatchUp();
+    if (!this.isRunning) return;
+    await this.bootstrapAutoCatchUp({ suppressEventLogWrites: true });
   }
 
   private async failOverToPolling(): Promise<void> {
@@ -295,11 +395,11 @@ export class Processor {
       this.wsMonitorInterval = null;
     }
 
-    if (!this.poller) {
-      const nextPoller = this.createPoller(config.pollingInterval);
-      await nextPoller.start();
-      this.poller = nextPoller;
+    if (!this.isRunning || this.poller) {
+      return;
     }
+
+    await this.startPolling();
   }
 
   getStatus(): {

@@ -31,15 +31,20 @@ function makePrismaStub() {
       groupBy: vi.fn().mockResolvedValue([]),
     },
     feedback: {
+      aggregate: vi.fn().mockResolvedValue({ _count: { _all: 0 }, _avg: { score: null } }),
       groupBy: vi.fn().mockResolvedValue([]),
     },
     registry: {
+      findFirst: vi.fn().mockResolvedValue(null),
       groupBy: vi.fn().mockResolvedValue([]),
     },
     agentMetadata: {
       groupBy: vi.fn().mockResolvedValue([]),
     },
     feedbackResponse: {
+      groupBy: vi.fn().mockResolvedValue([]),
+    },
+    revocation: {
       groupBy: vi.fn().mockResolvedValue([]),
     },
     collection: {
@@ -127,8 +132,14 @@ describe("API_MODE=both behavior", () => {
 
       const verificationRes = await fetch(`${baseUrl}/rest/v1/stats/verification`);
       expect(verificationRes.status).toBe(200);
-      const verificationBody = await verificationRes.json();
-      expect(verificationBody).not.toHaveProperty("validations");
+      await expect(verificationRes.json()).resolves.toEqual({
+        agents: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        feedbacks: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        feedback_responses: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        revocations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+      });
 
       const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {
         method: "POST",
@@ -424,6 +435,7 @@ describe("API_MODE=both behavior", () => {
         firstSeenTxSignature: "sig-first",
         lastSeenAt: new Date("2026-03-02T00:00:00.000Z"),
         lastSeenSlot: 200n,
+        lastSeenTxIndex: null,
         lastSeenTxSignature: "sig-last",
         assetCount: 1n,
         version: "1.0.0",
@@ -635,15 +647,119 @@ describe("API_MODE=both behavior", () => {
   it("serves GraphQL and proxies REST when only Supabase pool is available with SUPABASE_URL + SUPABASE_KEY", async () => {
     process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
     process.env.SUPABASE_KEY = "service-role-key";
-    const poolQuery = vi.fn().mockResolvedValue({
-      rows: [
-        { model: "agents", pending_count: "2", finalized_count: "8", orphaned_count: "0" },
-        { model: "feedbacks", pending_count: "0", finalized_count: "5", orphaned_count: "0" },
-        { model: "collections", pending_count: "0", finalized_count: "0", orphaned_count: "1" },
-        { model: "metadata", pending_count: "3", finalized_count: "0", orphaned_count: "0" },
-        { model: "feedback_responses", pending_count: "0", finalized_count: "4", orphaned_count: "0" },
-        { model: "revocations", pending_count: "9", finalized_count: "9", orphaned_count: "9" },
-      ],
+    const poolQuery = vi.fn().mockImplementation(async (query: string) => {
+      if (query.includes("FROM global_stats")) {
+        return {
+          rows: [{
+            total_agents: "10",
+            total_collections: "3",
+            total_feedbacks: "7",
+            platinum_agents: "1",
+            gold_agents: "2",
+            avg_quality: "84",
+          }],
+        };
+      }
+
+      if (query.includes("FROM verification_stats")) {
+        return {
+          rows: [
+            { model: "agents", pending_count: "2", finalized_count: "8", orphaned_count: "0" },
+            { model: "feedbacks", pending_count: "0", finalized_count: "5", orphaned_count: "0" },
+            { model: "collections", pending_count: "0", finalized_count: "0", orphaned_count: "1" },
+            { model: "metadata", pending_count: "3", finalized_count: "0", orphaned_count: "0" },
+            { model: "feedback_responses", pending_count: "0", finalized_count: "4", orphaned_count: "0" },
+            { model: "revocations", pending_count: "9", finalized_count: "9", orphaned_count: "9" },
+          ],
+        };
+      }
+
+      if (query.includes("FROM collections c")) {
+        return {
+          rows: [{
+            collection: "Collection11111111111111111111111111111111",
+            registry_type: "USER",
+            authority: "Authority111111111111111111111111111111111",
+            agent_count: "1",
+            total_feedbacks: "3",
+            avg_score: 83,
+          }],
+        };
+      }
+
+      if (query.includes("WHERE a.asset = $1")) {
+        return {
+          rows: [{
+            asset: "ProxyAgent11111111111111111111111111111111",
+            owner: "ProxyOwner11111111111111111111111111111111",
+            collection: "Collection11111111111111111111111111111111",
+            nft_name: "Proxy Agent",
+            agent_uri: "https://proxy.example/agent.json",
+            feedback_count: "3",
+            avg_score: 83,
+            positive_count: "2",
+            negative_count: "1",
+            validation_count: "4",
+          }],
+        };
+      }
+
+      if (query.includes("FROM collection_pointers cp")) {
+        return {
+          rows: [{
+            asset: "ProxyAgent11111111111111111111111111111111",
+            owner: "ProxyOwner11111111111111111111111111111111",
+            collection: "Collection11111111111111111111111111111111",
+            nft_name: "Proxy Agent",
+            agent_uri: "https://proxy.example/agent.json",
+            feedback_count: "3",
+            avg_score: 83,
+            positive_count: "2",
+            negative_count: "1",
+            validation_count: "4",
+          }],
+        };
+      }
+
+      if (query.includes("ORDER BY a.sort_key DESC, a.asset ASC")) {
+        return {
+          rows: [{
+            asset: "ProxyAgent11111111111111111111111111111111",
+            owner: "ProxyOwner11111111111111111111111111111111",
+            creator: "Creator11111111111111111111111111111111",
+            agent_uri: "https://proxy.example/agent.json",
+            agent_wallet: "Wallet111111111111111111111111111111111",
+            collection: "Collection11111111111111111111111111111111",
+            canonical_col: "c1:proxy",
+            col_locked: false,
+            parent_asset: null,
+            parent_creator: null,
+            parent_locked: false,
+            nft_name: "Proxy Agent",
+            atom_enabled: true,
+            trust_tier: 3,
+            quality_score: 80,
+            confidence: 90,
+            risk_score: 5,
+            diversity_ratio: 12,
+            feedback_count: "3",
+            raw_avg_score: "83",
+            agent_id: "7",
+            status: "FINALIZED",
+            verified_at: new Date("2026-03-09T20:00:00.000Z"),
+            verified_slot: "447346482",
+            created_at: new Date("2026-03-09T19:00:00.000Z"),
+            updated_at: new Date("2026-03-09T19:10:00.000Z"),
+            tx_signature: "ProxySig1111111111111111111111111111111111111111111111111",
+            block_slot: "447346400",
+            tx_index: 3,
+            event_ordinal: 1,
+            sort_key: "3008601739624372",
+          }],
+        };
+      }
+
+      return { rows: [] };
     });
     const realFetch = globalThis.fetch;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
@@ -1192,8 +1308,18 @@ describe("API_MODE=both behavior", () => {
       expect(revokeCountInUrl.searchParams.get("status")).toBe("neq.ORPHANED");
 
       const statsCallStart = fetchSpy.mock.calls.length;
+      const statsPoolCallStart = poolQuery.mock.calls.length;
       const statsRes = await fetch(`${baseUrl}/rest/v1/stats?limit=1`);
       expect(statsRes.status).toBe(200);
+      await expect(statsRes.json()).resolves.toEqual([{
+        total_agents: 10,
+        total_feedbacks: 7,
+        total_collections: 3,
+        total_validations: 0,
+        platinum_agents: 1,
+        gold_agents: 2,
+        avg_quality: 84,
+      }]);
       const statsUpstreamCall = fetchSpy.mock.calls.slice(statsCallStart).find(([input]) => {
         const url = typeof input === "string"
           ? input
@@ -1202,20 +1328,24 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/global_stats");
       });
-      expect(statsUpstreamCall).toBeTruthy();
-      const statsUpstreamUrlRaw = typeof statsUpstreamCall?.[0] === "string"
-        ? statsUpstreamCall[0]
-        : statsUpstreamCall?.[0] instanceof URL
-          ? statsUpstreamCall[0].toString()
-          : statsUpstreamCall?.[0]?.url;
-      expect(typeof statsUpstreamUrlRaw).toBe("string");
-      const statsUpstreamUrl = new URL(statsUpstreamUrlRaw as string);
-      expect(statsUpstreamUrl.pathname).toBe("/rest/v1/global_stats");
-      expect(statsUpstreamUrl.searchParams.get("limit")).toBe("1");
+      expect(statsUpstreamCall).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(statsPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("FROM global_stats")
+      )).toBeTruthy();
 
       const statsIncludeOrphanedCallStart = fetchSpy.mock.calls.length;
+      const statsIncludeOrphanedPoolCallStart = poolQuery.mock.calls.length;
       const statsIncludeOrphanedRes = await fetch(`${baseUrl}/rest/v1/stats?includeOrphaned=true&limit=2`);
       expect(statsIncludeOrphanedRes.status).toBe(200);
+      await expect(statsIncludeOrphanedRes.json()).resolves.toEqual([{
+        total_agents: 10,
+        total_feedbacks: 7,
+        total_collections: 3,
+        total_validations: 0,
+        platinum_agents: 1,
+        gold_agents: 2,
+        avg_quality: 84,
+      }]);
       const statsIncludeOrphanedUpstreamCall = fetchSpy.mock.calls.slice(statsIncludeOrphanedCallStart).find(([input]) => {
         const url = typeof input === "string"
           ? input
@@ -1224,17 +1354,10 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/rest/v1/global_stats");
       });
-      expect(statsIncludeOrphanedUpstreamCall).toBeTruthy();
-      const statsIncludeOrphanedUpstreamUrlRaw = typeof statsIncludeOrphanedUpstreamCall?.[0] === "string"
-        ? statsIncludeOrphanedUpstreamCall[0]
-        : statsIncludeOrphanedUpstreamCall?.[0] instanceof URL
-          ? statsIncludeOrphanedUpstreamCall[0].toString()
-          : statsIncludeOrphanedUpstreamCall?.[0]?.url;
-      expect(typeof statsIncludeOrphanedUpstreamUrlRaw).toBe("string");
-      const statsIncludeOrphanedUpstreamUrl = new URL(statsIncludeOrphanedUpstreamUrlRaw as string);
-      expect(statsIncludeOrphanedUpstreamUrl.pathname).toBe("/rest/v1/global_stats");
-      expect(statsIncludeOrphanedUpstreamUrl.searchParams.get("includeOrphaned")).toBeNull();
-      expect(statsIncludeOrphanedUpstreamUrl.searchParams.get("limit")).toBe("2");
+      expect(statsIncludeOrphanedUpstreamCall).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(statsIncludeOrphanedPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("FROM global_stats")
+      )).toBeTruthy();
 
       const verificationCallStart = fetchSpy.mock.calls.length;
       const verificationPoolCallStart = poolQuery.mock.calls.length;
@@ -1246,6 +1369,7 @@ describe("API_MODE=both behavior", () => {
         registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 1 },
         metadata: { PENDING: 3, FINALIZED: 0, ORPHANED: 0 },
         feedback_responses: { PENDING: 0, FINALIZED: 4, ORPHANED: 0 },
+        revocations: { PENDING: 9, FINALIZED: 9, ORPHANED: 9 },
       });
       const verificationProxyCall = fetchSpy.mock.calls.slice(verificationCallStart).find(([input]) => {
         const url = typeof input === "string"
@@ -1416,11 +1540,40 @@ describe("API_MODE=both behavior", () => {
       });
       expect(directCollectionCompatProxyCall).toBeUndefined();
 
+      const collectionStatsCallStart = fetchSpy.mock.calls.length;
+      const collectionStatsRes = await fetch(
+        `${baseUrl}/rest/v1/collection_stats?collection=eq.Collection11111111111111111111111111111111`
+      );
+      expect(collectionStatsRes.status).toBe(200);
+      const collectionStatsUpstreamCall = fetchSpy.mock.calls.slice(collectionStatsCallStart).find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string"
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/collection_stats");
+      });
+      expect(collectionStatsUpstreamCall).toBeUndefined();
+
       const agentReputationCallStart = fetchSpy.mock.calls.length;
+      const agentReputationPoolCallStart = poolQuery.mock.calls.length;
       const agentReputationRes = await fetch(
         `${baseUrl}/rest/v1/agent_reputation?asset=eq.ProxyAgent11111111111111111111111111111111`
       );
       expect(agentReputationRes.status).toBe(200);
+      await expect(agentReputationRes.json()).resolves.toEqual([{
+        asset: "ProxyAgent11111111111111111111111111111111",
+        owner: "ProxyOwner11111111111111111111111111111111",
+        collection: "Collection11111111111111111111111111111111",
+        nft_name: "Proxy Agent",
+        agent_uri: "https://proxy.example/agent.json",
+        feedback_count: 3,
+        avg_score: 83,
+        positive_count: 2,
+        negative_count: 1,
+        validation_count: 4,
+      }]);
       const agentReputationUpstreamCall = fetchSpy.mock.calls.slice(agentReputationCallStart).find(([input]) => {
         const url = typeof input === "string"
           ? input
@@ -1430,13 +1583,29 @@ describe("API_MODE=both behavior", () => {
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/agent_reputation?");
       });
-      expect(agentReputationUpstreamCall).toBeTruthy();
+      expect(agentReputationUpstreamCall).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(agentReputationPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("WHERE a.asset = $1")
+      )).toBeTruthy();
 
       const collectionAgentsCallStart = fetchSpy.mock.calls.length;
+      const collectionAgentsPoolCallStart = poolQuery.mock.calls.length;
       const collectionAgentsRes = await fetch(
         `${baseUrl}/rest/v1/rpc/get_collection_agents?collection_id=38&page_limit=1&page_offset=0`
       );
       expect(collectionAgentsRes.status).toBe(200);
+      await expect(collectionAgentsRes.json()).resolves.toEqual([{
+        asset: "ProxyAgent11111111111111111111111111111111",
+        owner: "ProxyOwner11111111111111111111111111111111",
+        collection: "Collection11111111111111111111111111111111",
+        nft_name: "Proxy Agent",
+        agent_uri: "https://proxy.example/agent.json",
+        feedback_count: 3,
+        avg_score: 83,
+        positive_count: 2,
+        negative_count: 1,
+        validation_count: 4,
+      }]);
       const collectionAgentsUpstreamCall = fetchSpy.mock.calls.slice(collectionAgentsCallStart).find(([input]) => {
         const url = typeof input === "string"
           ? input
@@ -1446,15 +1615,30 @@ describe("API_MODE=both behavior", () => {
         return typeof url === "string"
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/rpc/get_collection_agents?");
       });
-      expect(collectionAgentsUpstreamCall).toBeTruthy();
+      expect(collectionAgentsUpstreamCall).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(collectionAgentsPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("FROM collection_pointers cp")
+      )).toBeTruthy();
 
       const leaderboardRpcCallStart = fetchSpy.mock.calls.length;
+      const leaderboardRpcPoolCallStart = poolQuery.mock.calls.length;
       const leaderboardRpcRes = await fetch(`${baseUrl}/rest/v1/rpc/get_leaderboard`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ p_limit: 1, p_min_tier: 0, p_collection: null, p_cursor_sort_key: null }),
       });
       expect(leaderboardRpcRes.status).toBe(200);
+      await expect(leaderboardRpcRes.json()).resolves.toEqual([
+        expect.objectContaining({
+          asset: "ProxyAgent11111111111111111111111111111111",
+          owner: "ProxyOwner11111111111111111111111111111111",
+          collection: "Collection11111111111111111111111111111111",
+          collection_pointer: "c1:proxy",
+          trust_tier: 3,
+          feedback_count: 3,
+          sort_key: "3008601739624372",
+        }),
+      ]);
       const leaderboardRpcUpstreamCall = fetchSpy.mock.calls.slice(leaderboardRpcCallStart).find(([input, init]) => {
         const url = typeof input === "string"
           ? input
@@ -1466,7 +1650,10 @@ describe("API_MODE=both behavior", () => {
           && url === "https://proxy-test.supabase.co/rest/v1/rpc/get_leaderboard"
           && method === "POST";
       });
-      expect(leaderboardRpcUpstreamCall).toBeTruthy();
+      expect(leaderboardRpcUpstreamCall).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(leaderboardRpcPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("ORDER BY a.sort_key DESC, a.asset ASC")
+      )).toBeTruthy();
 
       const writeAttempt = await fetch(`${baseUrl}/rest/v1/agents`, {
         method: "POST",
@@ -1801,7 +1988,7 @@ describe("API_MODE=both behavior", () => {
     }
   });
 
-  it("returns explicit 503s for agent hierarchy helpers in pool-only proxy mode instead of proxying them", async () => {
+  it("serves agent hierarchy helpers from pool-only mode without proxying them upstream", async () => {
     process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
     process.env.SUPABASE_KEY = "service-role-key";
     const realFetch = globalThis.fetch;
@@ -1817,29 +2004,176 @@ describe("API_MODE=both behavior", () => {
       return realFetch(input, init);
     });
 
+    const poolQuery = vi.fn(async (sql: string) => {
+      if (sql.includes("WHERE a.parent_asset = $1::text")) {
+        return {
+          rows: [{
+            asset: "Child111",
+            owner: "Owner111",
+            creator: "Creator111",
+            agent_uri: "https://example.com/child.json",
+            agent_wallet: "Wallet111",
+            collection: "Collection111",
+            canonical_col: "c1:bafy-test",
+            col_locked: false,
+            parent_asset: "Parent111",
+            parent_creator: "Creator111",
+            parent_locked: false,
+            nft_name: "Child Agent",
+            atom_enabled: true,
+            trust_tier: 3,
+            quality_score: 80,
+            confidence: 90,
+            risk_score: 5,
+            diversity_ratio: 12,
+            feedback_count: 7,
+            raw_avg_score: 88,
+            agent_id: "42",
+            status: "FINALIZED",
+            verified_at: "2026-03-09T20:00:00.000Z",
+            verified_slot: "447346482",
+            created_at: "2026-03-09T19:00:00.000Z",
+            updated_at: "2026-03-09T19:10:00.000Z",
+            tx_signature: "SigChild111",
+            block_slot: "447346400",
+            tx_index: 3,
+            event_ordinal: 1,
+            sort_key: "3008601739624372",
+          }],
+        };
+      }
+
+      if (sql.includes("WITH RECURSIVE tree AS")) {
+        return {
+          rows: [
+            { asset: "Parent111", parent_asset: null, path: ["Parent111"], depth: 0 },
+            { asset: "Child111", parent_asset: "Parent111", path: ["Parent111", "Child111"], depth: 1 },
+          ],
+        };
+      }
+
+      if (sql.includes("WITH RECURSIVE lineage AS")) {
+        return {
+          rows: [
+            { asset: "Parent111", parent_asset: null, path: ["Child111", "Parent111"], depth: 1 },
+            { asset: "Child111", parent_asset: "Parent111", path: ["Child111"], depth: 0 },
+          ],
+        };
+      }
+
+      if (sql.includes("WHERE a.asset = ANY($1::text[])")) {
+        return {
+          rows: [
+            {
+              asset: "Parent111",
+              owner: "OwnerParent",
+              creator: "Creator111",
+              agent_uri: "https://example.com/parent.json",
+              agent_wallet: "WalletParent",
+              collection: "Collection111",
+              canonical_col: "c1:bafy-test",
+              col_locked: false,
+              parent_asset: null,
+              parent_creator: null,
+              parent_locked: false,
+              nft_name: "Parent Agent",
+              atom_enabled: true,
+              trust_tier: 4,
+              quality_score: 95,
+              confidence: 98,
+              risk_score: 2,
+              diversity_ratio: 15,
+              feedback_count: 9,
+              raw_avg_score: 93,
+              agent_id: "41",
+              status: "FINALIZED",
+              verified_at: "2026-03-09T20:00:00.000Z",
+              verified_slot: "447346482",
+              created_at: "2026-03-09T18:00:00.000Z",
+              updated_at: "2026-03-09T18:10:00.000Z",
+              tx_signature: "SigParent111",
+              block_slot: "447346300",
+              tx_index: 1,
+              event_ordinal: 0,
+              sort_key: "4009501739624372",
+            },
+            {
+              asset: "Child111",
+              owner: "Owner111",
+              creator: "Creator111",
+              agent_uri: "https://example.com/child.json",
+              agent_wallet: "Wallet111",
+              collection: "Collection111",
+              canonical_col: "c1:bafy-test",
+              col_locked: false,
+              parent_asset: "Parent111",
+              parent_creator: "Creator111",
+              parent_locked: false,
+              nft_name: "Child Agent",
+              atom_enabled: true,
+              trust_tier: 3,
+              quality_score: 80,
+              confidence: 90,
+              risk_score: 5,
+              diversity_ratio: 12,
+              feedback_count: 7,
+              raw_avg_score: 88,
+              agent_id: "42",
+              status: "FINALIZED",
+              verified_at: "2026-03-09T20:00:00.000Z",
+              verified_slot: "447346482",
+              created_at: "2026-03-09T19:00:00.000Z",
+              updated_at: "2026-03-09T19:10:00.000Z",
+              tx_signature: "SigChild111",
+              block_slot: "447346400",
+              tx_index: 3,
+              event_ordinal: 1,
+              sort_key: "3008601739624372",
+            },
+          ],
+        };
+      }
+
+      return { rows: [] };
+    });
+
     const { server, baseUrl } = await startServer({
       prisma: null as any,
-      pool: { query: vi.fn() } as any,
+      pool: { query: poolQuery } as any,
     });
 
     try {
       const childrenRes = await fetch(`${baseUrl}/rest/v1/agents/children?parent_asset=11111111111111111111111111111111`);
-      expect(childrenRes.status).toBe(503);
-      expect(await childrenRes.json()).toEqual({
-        error: "Agent hierarchy endpoints require local Prisma backend",
-      });
+      expect(childrenRes.status).toBe(200);
+      await expect(childrenRes.json()).resolves.toEqual([
+        expect.objectContaining({
+          asset: "Child111",
+          parent_asset: "Parent111",
+          agent_id: "42",
+        }),
+      ]);
 
       const treeRes = await fetch(`${baseUrl}/rest/v1/agents/tree?root_asset=11111111111111111111111111111111`);
-      expect(treeRes.status).toBe(503);
-      expect(await treeRes.json()).toEqual({
-        error: "Agent hierarchy endpoints require local Prisma backend",
-      });
+      expect(treeRes.status).toBe(200);
+      await expect(treeRes.json()).resolves.toEqual([
+        expect.objectContaining({
+          asset: "Parent111",
+          depth: 0,
+          path: ["Parent111"],
+        }),
+        expect.objectContaining({
+          asset: "Child111",
+          depth: 1,
+          path: ["Parent111", "Child111"],
+        }),
+      ]);
 
       const lineageRes = await fetch(`${baseUrl}/rest/v1/agents/lineage?asset=11111111111111111111111111111111`);
-      expect(lineageRes.status).toBe(503);
-      expect(await lineageRes.json()).toEqual({
-        error: "Agent hierarchy endpoints require local Prisma backend",
-      });
+      expect(lineageRes.status).toBe(200);
+      await expect(lineageRes.json()).resolves.toEqual([
+        expect.objectContaining({ asset: "Parent111" }),
+        expect.objectContaining({ asset: "Child111" }),
+      ]);
 
       const upstreamAgentHelperCall = fetchSpy.mock.calls.find(([input]) => {
         const url = typeof input === "string"
@@ -1850,6 +2184,7 @@ describe("API_MODE=both behavior", () => {
         return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/");
       });
       expect(upstreamAgentHelperCall).toBeUndefined();
+      expect(poolQuery).toHaveBeenCalled();
     } finally {
       await stopServer(server);
     }
@@ -1977,6 +2312,12 @@ describe("API_MODE=both behavior", () => {
             { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/3" } }
           );
         }
+        if (parsed.pathname === "/validations") {
+          return new Response(
+            JSON.stringify([{ id: "validation-1" }]),
+            { status: 206, headers: { "content-type": "application/json", "content-range": "0-0/5" } }
+          );
+        }
       }
 
       return realFetch(input, init);
@@ -1994,6 +2335,10 @@ describe("API_MODE=both behavior", () => {
         total_agents: 10,
         total_feedbacks: 7,
         total_collections: 3,
+        total_validations: 0,
+        platinum_agents: 0,
+        gold_agents: 0,
+        avg_quality: null,
       }]);
 
       const upstreamGlobalStatsCall = fetchSpy.mock.calls.find(([input]) => {
@@ -2004,7 +2349,7 @@ describe("API_MODE=both behavior", () => {
             : input?.url;
         return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/global_stats");
       });
-      expect(upstreamGlobalStatsCall).toBeTruthy();
+      expect(upstreamGlobalStatsCall).toBeUndefined();
 
       const agentCountCall = fetchSpy.mock.calls.find(([input]) => {
         const url = typeof input === "string"
@@ -2070,6 +2415,18 @@ describe("API_MODE=both behavior", () => {
       );
       expect(collectionCountUrl.searchParams.get("registry_type")).toBeNull();
       expect(collectionCountUrl.searchParams.get("status")).toBeNull();
+
+      const validationCountCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        if (typeof url !== "string") return false;
+        const parsed = new URL(url);
+        return parsed.pathname === "/validations" && parsed.searchParams.get("select") === "id";
+      });
+      expect(validationCountCall).toBeUndefined();
 
       await waitForGraphqlMount(baseUrl);
       const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {

@@ -7,6 +7,7 @@ import {
 } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
 import PQueue from "p-queue";
+import WebSocket from "ws";
 import { config } from "../config.js";
 import { parseTransaction, parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
 import {
@@ -34,27 +35,104 @@ export interface WebSocketIndexerOptions {
   connection: Connection;
   prisma: PrismaClient | null;
   programId: PublicKey;
+  wsUrl?: string;
   reconnectInterval?: number;
   maxRetries?: number;
 }
 
+type LogsSubscribeProbeResult = "supported" | "unsupported" | "unknown";
+
+function isUnsupportedLogsSubscribeError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { code?: unknown; message?: unknown; error?: { code?: unknown; message?: unknown } };
+  const nested = maybeError.error;
+  const code = nested?.code ?? maybeError.code;
+  const message = String(nested?.message ?? maybeError.message ?? "");
+  return code === -32601 || /logsSubscribe/i.test(message) || /Method .*not found/i.test(message);
+}
+
+function logUnsupportedLogsSubscribe(wsUrl: string): void {
+  logger.warn(
+    { wsUrl },
+    "RPC provider does not support Solana log subscriptions (logsSubscribe); websocket transport unavailable, use polling or a compatible streaming endpoint"
+  );
+}
+
+async function probeRawLogsSubscribe(wsUrl: string, programId: string): Promise<LogsSubscribeProbeResult> {
+  return await new Promise<LogsSubscribeProbeResult>((resolve) => {
+    let settled = false;
+    const ws = new WebSocket(wsUrl);
+    const finish = (result: LogsSubscribeProbeResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        ws.close();
+      } catch {
+        // ignore close errors during probe cleanup
+      }
+      resolve(result);
+    };
+    const timeout = setTimeout(() => finish("unknown"), 3000);
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "logsSubscribe",
+        params: [{ mentions: [programId] }, { commitment: "confirmed" }],
+      }));
+    });
+
+    ws.on("message", (raw) => {
+      try {
+        const parsed = JSON.parse(String(raw)) as { result?: unknown; error?: unknown };
+        if (parsed.error) {
+          finish(isUnsupportedLogsSubscribeError(parsed.error) ? "unsupported" : "unknown");
+          return;
+        }
+        finish(parsed.result !== undefined ? "supported" : "unknown");
+      } catch {
+        finish("unknown");
+      }
+    });
+
+    ws.on("error", () => finish("unknown"));
+    ws.on("close", () => finish("unknown"));
+  });
+}
+
 async function probeTemporaryLogsSubscription(
-  connection: Pick<Connection, "onLogs" | "removeOnLogsListener">,
+  connection: Pick<Connection, "onLogs" | "removeOnLogsListener"> & { _rpcWebSocketConnected?: boolean },
   programId: PublicKey
 ): Promise<boolean> {
-  let subscriptionId: number | null = null;
+  let logsSubscriptionId: number | null = null;
   try {
-    subscriptionId = connection.onLogs(programId, () => undefined, "confirmed");
-    return true;
+    logsSubscriptionId = connection.onLogs(programId, () => undefined, "confirmed");
+
+    const hasTransportFlag = Object.prototype.hasOwnProperty.call(connection, "_rpcWebSocketConnected");
+    if (!hasTransportFlag) {
+      return true;
+    }
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      if (connection._rpcWebSocketConnected === true) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    return connection._rpcWebSocketConnected === true;
   } catch (error) {
     logger.debug({ error }, "WebSocket log subscription probe failed");
     return false;
   } finally {
-    if (subscriptionId !== null) {
+    if (logsSubscriptionId !== null) {
       try {
-        await connection.removeOnLogsListener(subscriptionId);
+        await connection.removeOnLogsListener(logsSubscriptionId);
       } catch (error) {
-        logger.debug({ error, subscriptionId }, "Failed to remove temporary log subscription");
+        logger.debug({ error, subscriptionId: logsSubscriptionId }, "Failed to remove temporary log subscription");
       }
     }
   }
@@ -85,6 +163,7 @@ export class WebSocketIndexer {
   private programId: PublicKey;
   private reconnectInterval: number;
   private maxRetries: number;
+  private wsUrl: string | null;
   private subscriptionId: number | null = null;
   private isRunning = false;
   private retryCount = 0;
@@ -96,6 +175,9 @@ export class WebSocketIndexer {
   private isCheckingHealth = false;
   private isReconnecting = false;
   private overflowStopInProgress = false;
+  private reconnectDelayTimer: NodeJS.Timeout | null = null;
+  private reconnectDelayPromise: Promise<void> | null = null;
+  private reconnectDelayResolve: (() => void) | null = null;
   // Bounded concurrency queue to prevent OOM during high traffic
   private logQueue: PQueue;
   private droppedLogs = 0;
@@ -106,6 +188,7 @@ export class WebSocketIndexer {
     this.connection = options.connection;
     this.prisma = options.prisma;
     this.programId = options.programId;
+    this.wsUrl = options.wsUrl ?? null;
     this.reconnectInterval = options.reconnectInterval || config.wsReconnectInterval;
     this.maxRetries = options.maxRetries || config.wsMaxRetries;
   }
@@ -120,7 +203,20 @@ export class WebSocketIndexer {
     this.lastActivityTime = Date.now();
     logger.info({ programId: this.programId.toBase58() }, "Starting WebSocket indexer");
 
+    if (this.wsUrl) {
+      const logsSupport = await probeRawLogsSubscribe(this.wsUrl, this.programId.toBase58());
+      if (logsSupport === "unsupported") {
+        logUnsupportedLogsSubscribe(this.wsUrl);
+        this.isRunning = false;
+        return;
+      }
+    }
+
     await this.subscribe();
+    if (!this.isRunning || this.subscriptionId === null) {
+      return;
+    }
+
     this.startHealthCheck();
   }
 
@@ -134,6 +230,7 @@ export class WebSocketIndexer {
 
     this.isRunning = false;
     this.stopHealthCheck();
+    this.clearReconnectDelay();
 
     if (this.subscriptionId !== null) {
       try {
@@ -171,6 +268,44 @@ export class WebSocketIndexer {
       this.healthCheckTimer = null;
       logger.debug("Health check timer stopped");
     }
+  }
+
+  private clearReconnectDelay(): void {
+    if (this.reconnectDelayTimer) {
+      clearTimeout(this.reconnectDelayTimer);
+      this.reconnectDelayTimer = null;
+    }
+
+    const resolve = this.reconnectDelayResolve;
+    this.reconnectDelayResolve = null;
+    this.reconnectDelayPromise = null;
+    resolve?.();
+  }
+
+  private waitForReconnectDelay(): Promise<void> {
+    if (this.reconnectDelayPromise) {
+      return this.reconnectDelayPromise;
+    }
+
+    this.reconnectDelayPromise = new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (this.reconnectDelayTimer) {
+          clearTimeout(this.reconnectDelayTimer);
+          this.reconnectDelayTimer = null;
+        }
+        this.reconnectDelayResolve = null;
+        this.reconnectDelayPromise = null;
+        resolve();
+      };
+
+      this.reconnectDelayResolve = finish;
+      this.reconnectDelayTimer = setTimeout(finish, this.reconnectInterval);
+    });
+
+    return this.reconnectDelayPromise;
   }
 
   private async checkHealth(): Promise<void> {
@@ -324,6 +459,12 @@ export class WebSocketIndexer {
       this.retryCount = 0;
       this.errorCount = 0;
     } catch (error) {
+      if (this.wsUrl && isUnsupportedLogsSubscribeError(error)) {
+        logUnsupportedLogsSubscribe(this.wsUrl);
+        this.isRunning = false;
+        this.stopHealthCheck();
+        return;
+      }
       logger.error({ error }, "Failed to subscribe to logs");
       await this.reconnect();
     }
@@ -420,6 +561,7 @@ export class WebSocketIndexer {
             txIndex,
             eventOrdinal,
             source: "websocket",
+            skipCursorUpdate: true,
           };
 
           let eventProcessed = true;
@@ -595,9 +737,7 @@ export class WebSocketIndexer {
       "Reconnecting WebSocket"
     );
 
-    await new Promise((resolve) =>
-      setTimeout(resolve, this.reconnectInterval)
-    );
+    await this.waitForReconnectDelay();
 
     // Re-check after timeout - stop() may have been called during wait
     if (!this.isRunning) {
@@ -652,6 +792,13 @@ export async function testWebSocketConnection(rpcUrl: string, wsUrl: string, pro
     });
 
     const slot = await connection.getSlot();
+
+    const rawSupport = await probeRawLogsSubscribe(wsUrl, programId);
+    if (rawSupport === "unsupported") {
+      logUnsupportedLogsSubscribe(wsUrl);
+      logger.debug({ slot, rawSupport }, "WebSocket connection test complete");
+      return false;
+    }
 
     const wsReady = await probeTemporaryLogsSubscription(connection, new PublicKey(programId));
 

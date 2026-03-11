@@ -115,8 +115,55 @@ interface AgentTreeNodeRow {
 interface AggregatedStats {
   totalAgents: string;
   totalFeedback: string;
+  totalValidations: string;
   totalCollections: string;
+  platinumAgents: string;
+  goldAgents: string;
+  avgQuality: number | null;
   tags: string[];
+}
+
+export interface AgentReputationResult {
+  asset: string;
+  owner: string;
+  collection: string | null;
+  nftName: string | null;
+  agentUri: string | null;
+  feedbackCount: number;
+  avgScore: number | null;
+  positiveCount: number;
+  negativeCount: number;
+  validationCount: number;
+}
+
+export interface LeaderboardResult {
+  asset: string;
+  owner: string;
+  collection: string | null;
+  nftName: string | null;
+  agentUri: string | null;
+  trustTier: number | null;
+  qualityScore: number | null;
+  confidence: number | null;
+  riskScore: number | null;
+  diversityRatio: number | null;
+  feedbackCount: number | null;
+  sortKey: string;
+}
+
+export interface VerificationStatusCounts {
+  pending: number;
+  finalized: number;
+  orphaned: number;
+}
+
+export interface VerificationStatsResult {
+  agents: VerificationStatusCounts;
+  feedbacks: VerificationStatusCounts;
+  registries: VerificationStatusCounts;
+  metadata: VerificationStatusCounts;
+  feedbackResponses: VerificationStatusCounts;
+  revocations: VerificationStatusCounts;
 }
 
 interface CachedAggregatedStats {
@@ -247,18 +294,47 @@ function toUnixTimestamp(dateStr: string): string {
   return String(Math.floor(new Date(dateStr).getTime() / 1000));
 }
 
+function parseNullableInt(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') return Number(value);
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseCount(value: unknown): number {
+  return parseNullableInt(value) ?? 0;
+}
+
+function emptyVerificationStatusCounts(): VerificationStatusCounts {
+  return { pending: 0, finalized: 0, orphaned: 0 };
+}
+
 async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStats> {
   const { rows } = await ctx.pool.query<{
     total_agents: string;
     total_feedback: string;
+    total_validations: string;
     total_collections: string;
+    platinum_agents: string;
+    gold_agents: string;
+    avg_quality: string | number | null;
     tags: string[] | null;
   }>(
     `SELECT
        (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
        (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
+       (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations,
        (SELECT COUNT(*)::text
         FROM collection_pointers) AS total_collections,
+       (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED' AND trust_tier = 4) AS platinum_agents,
+       (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED' AND trust_tier = 3) AS gold_agents,
+       (
+         SELECT ROUND(AVG(quality_score))::integer
+         FROM agents
+         WHERE status != 'ORPHANED'
+           AND feedback_count > 0
+       ) AS avg_quality,
        COALESCE((
          SELECT ARRAY(
            SELECT tag FROM (
@@ -275,7 +351,11 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
   return {
     totalAgents: rows[0]?.total_agents ?? '0',
     totalFeedback: rows[0]?.total_feedback ?? '0',
+    totalValidations: rows[0]?.total_validations ?? '0',
     totalCollections: rows[0]?.total_collections ?? '0',
+    platinumAgents: rows[0]?.platinum_agents ?? '0',
+    goldAgents: rows[0]?.gold_agents ?? '0',
+    avgQuality: parseNullableInt(rows[0]?.avg_quality),
     tags: rows[0]?.tags ?? [],
   };
 }
@@ -788,6 +868,7 @@ export const queryResolvers = {
         id: args.id,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
+        totalValidations: stats.totalValidations,
         tags: stats.tags,
       };
     },
@@ -811,9 +892,219 @@ export const queryResolvers = {
         id: `global-${ctx.networkMode}`,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
+        totalValidations: stats.totalValidations,
         totalCollections: stats.totalCollections,
+        platinumAgents: stats.platinumAgents,
+        goldAgents: stats.goldAgents,
+        avgQuality: stats.avgQuality,
         tags: stats.tags,
       };
+    },
+
+    async agentReputation(_: unknown, args: { asset: string }, ctx: GraphQLContext): Promise<AgentReputationResult | null> {
+      const asset = resolveAssetId(args.asset);
+      const { rows } = await ctx.pool.query<{
+        asset: string;
+        owner: string;
+        collection: string | null;
+        nft_name: string | null;
+        agent_uri: string | null;
+        feedback_count: string | number | null;
+        avg_score: string | number | null;
+        positive_count: string | number | null;
+        negative_count: string | number | null;
+        validation_count: string | number | null;
+      }>(
+        `WITH feedback_stats AS (
+           SELECT
+             f.asset,
+             COUNT(*) FILTER (
+               WHERE f.status != 'ORPHANED'
+                 AND f.is_revoked = false
+                 AND f.score IS NOT NULL
+             )::integer AS feedback_count,
+             ROUND(AVG(f.score) FILTER (
+               WHERE f.status != 'ORPHANED'
+                 AND f.is_revoked = false
+                 AND f.score IS NOT NULL
+             ), 0) AS avg_score,
+             COUNT(*) FILTER (
+               WHERE f.status != 'ORPHANED'
+                 AND f.is_revoked = false
+                 AND f.score IS NOT NULL
+                 AND f.score >= 50
+             )::integer AS positive_count,
+             COUNT(*) FILTER (
+               WHERE f.status != 'ORPHANED'
+                 AND f.is_revoked = false
+                 AND f.score IS NOT NULL
+                 AND f.score < 50
+             )::integer AS negative_count
+           FROM feedbacks f
+           GROUP BY f.asset
+         ),
+         validation_stats AS (
+           SELECT
+             v.asset,
+             COUNT(*) FILTER (
+               WHERE v.chain_status != 'ORPHANED'
+             )::integer AS validation_count
+           FROM validations v
+           GROUP BY v.asset
+         )
+         SELECT
+           a.asset,
+           a.owner,
+           a.collection,
+           a.nft_name,
+           a.agent_uri,
+           COALESCE(fs.feedback_count, a.feedback_count, 0) AS feedback_count,
+           CASE
+             WHEN COALESCE(fs.feedback_count, a.feedback_count, 0) > 0
+               THEN COALESCE(fs.avg_score, a.raw_avg_score::numeric)
+             ELSE NULL
+           END AS avg_score,
+           COALESCE(fs.positive_count, 0) AS positive_count,
+           COALESCE(fs.negative_count, 0) AS negative_count,
+           COALESCE(vs.validation_count, 0) AS validation_count
+         FROM agents a
+         LEFT JOIN feedback_stats fs ON fs.asset = a.asset
+         LEFT JOIN validation_stats vs ON vs.asset = a.asset
+         WHERE a.asset = $1
+           AND a.status != 'ORPHANED'
+         LIMIT 1`,
+        [asset]
+      );
+
+      const row = rows[0];
+      if (!row) return null;
+
+      return {
+        asset: row.asset,
+        owner: row.owner,
+        collection: row.collection,
+        nftName: row.nft_name,
+        agentUri: row.agent_uri,
+        feedbackCount: parseCount(row.feedback_count),
+        avgScore: parseNullableInt(row.avg_score),
+        positiveCount: parseCount(row.positive_count),
+        negativeCount: parseCount(row.negative_count),
+        validationCount: parseCount(row.validation_count),
+      };
+    },
+
+    async leaderboard(
+      _: unknown,
+      args: { first?: number; collection?: string; includeOrphaned?: boolean },
+      ctx: GraphQLContext
+    ): Promise<LeaderboardResult[]> {
+      const first = clampFirst(args.first);
+      const includeOrphaned = args.includeOrphaned === true;
+      const collectionVariants = args.collection ? collectionPointerVariants(args.collection) : [];
+      const collectionParam = collectionVariants.length > 0 ? collectionVariants : null;
+
+      const { rows } = await ctx.pool.query<{
+        asset: string;
+        owner: string;
+        collection: string | null;
+        nft_name: string | null;
+        agent_uri: string | null;
+        trust_tier: string | number | null;
+        quality_score: string | number | null;
+        confidence: string | number | null;
+        risk_score: string | number | null;
+        diversity_ratio: string | number | null;
+        feedback_count: string | number | null;
+        sort_key: string | number;
+      }>(
+        `SELECT
+           asset,
+           owner,
+           collection,
+           nft_name,
+           agent_uri,
+           trust_tier,
+           quality_score,
+           confidence,
+           risk_score,
+           diversity_ratio,
+           feedback_count,
+           sort_key
+         FROM agents
+         WHERE trust_tier >= 2
+           AND ($1::boolean OR status != 'ORPHANED')
+           AND ($2::text[] IS NULL OR collection = ANY($2::text[]))
+         ORDER BY sort_key DESC, asset ASC
+         LIMIT $3::int`,
+        [includeOrphaned, collectionParam, first]
+      );
+
+      return rows.map((row) => ({
+        asset: row.asset,
+        owner: row.owner,
+        collection: row.collection,
+        nftName: row.nft_name,
+        agentUri: row.agent_uri,
+        trustTier: parseNullableInt(row.trust_tier),
+        qualityScore: parseNullableInt(row.quality_score),
+        confidence: parseNullableInt(row.confidence),
+        riskScore: parseNullableInt(row.risk_score),
+        diversityRatio: parseNullableInt(row.diversity_ratio),
+        feedbackCount: parseNullableInt(row.feedback_count),
+        sortKey: String(row.sort_key),
+      }));
+    },
+
+    async verificationStats(_: unknown, _args: Record<string, never>, ctx: GraphQLContext): Promise<VerificationStatsResult> {
+      const { rows } = await ctx.pool.query<{
+        model: string;
+        pending_count: string | number | null;
+        finalized_count: string | number | null;
+        orphaned_count: string | number | null;
+      }>(
+        `SELECT model, pending_count, finalized_count, orphaned_count FROM verification_stats`
+      );
+
+      const result: VerificationStatsResult = {
+        agents: emptyVerificationStatusCounts(),
+        feedbacks: emptyVerificationStatusCounts(),
+        registries: emptyVerificationStatusCounts(),
+        metadata: emptyVerificationStatusCounts(),
+        feedbackResponses: emptyVerificationStatusCounts(),
+        revocations: emptyVerificationStatusCounts(),
+      };
+
+      for (const row of rows) {
+        const counts: VerificationStatusCounts = {
+          pending: parseCount(row.pending_count),
+          finalized: parseCount(row.finalized_count),
+          orphaned: parseCount(row.orphaned_count),
+        };
+        switch (row.model) {
+          case 'agents':
+            result.agents = counts;
+            break;
+          case 'feedbacks':
+            result.feedbacks = counts;
+            break;
+          case 'collections':
+            result.registries = counts;
+            break;
+          case 'metadata':
+            result.metadata = counts;
+            break;
+          case 'feedback_responses':
+            result.feedbackResponses = counts;
+            break;
+          case 'revocations':
+            result.revocations = counts;
+            break;
+          default:
+            break;
+        }
+      }
+
+      return result;
     },
 
     async agentSearch(

@@ -252,6 +252,28 @@ describe("DataVerifier", () => {
       expect(mockConnection.getSlot).not.toHaveBeenCalled();
     });
 
+    it("should not arm the interval after stop during initial verification", async () => {
+      let resolveSlot!: (value: number) => void;
+      mockConnection.getSlot.mockImplementationOnce(
+        () => new Promise<number>((resolve) => {
+          resolveSlot = resolve;
+        })
+      );
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const startPromise = verifier.start();
+
+      await Promise.resolve();
+      await verifier.stop();
+      resolveSlot(100000);
+      await startPromise;
+
+      mockConnection.getSlot.mockClear();
+      vi.advanceTimersByTime(1100);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mockConnection.getSlot).not.toHaveBeenCalled();
+    });
+
     it("should handle initial verification failure gracefully", async () => {
       mockConnection.getSlot.mockRejectedValueOnce(new Error("RPC down"));
       const verifier = new DataVerifier(mockConnection, mockPrisma, null);

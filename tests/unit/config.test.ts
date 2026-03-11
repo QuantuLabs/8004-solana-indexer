@@ -63,7 +63,7 @@ describe("Config", () => {
       // programId comes from SDK (PROGRAM_ID.toBase58()), not env var
       expect(config.programId).toBe("8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C");
       expect(config.indexerMode).toBe("polling");
-      expect(config.pollingInterval).toBe(5000);
+      expect(config.pollingInterval).toBe(15000);
       expect(config.batchSize).toBe(100);
       expect(config.wsReconnectInterval).toBe(3000);
       expect(config.wsMaxRetries).toBe(5);

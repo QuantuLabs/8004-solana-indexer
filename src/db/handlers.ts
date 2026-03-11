@@ -51,6 +51,8 @@ let localRecoveryInterval: NodeJS.Timeout | null = null;
 let localRecoveryInFlight = false;
 let localDerivedDigestsEnabled = process.env.NODE_ENV === "test";
 let localDerivedDigestsSuspendCount = 0;
+let localUriRecoveryCursor: string | null = null;
+let localCollectionRecoveryCursor: { col: string; creator: string } | null = null;
 let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
 let responseIdAssignmentTail: Promise<void> = Promise.resolve();
 let revocationIdAssignmentTail: Promise<void> = Promise.resolve();
@@ -116,6 +118,7 @@ type CollectionDelegate = {
   findUnique(args: unknown): Promise<{
     collectionId: bigint | null;
     lastSeenSlot?: bigint | null;
+    lastSeenTxIndex?: number | null;
     lastSeenTxSignature?: string | null;
   } | null>;
   findMany(args: unknown): Promise<Array<{ collectionId: bigint | null }>>;
@@ -138,11 +141,12 @@ INSERT INTO "CollectionPointer" (
   "firstSeenTxSignature",
   "lastSeenAt",
   "lastSeenSlot",
+  "lastSeenTxIndex",
   "lastSeenTxSignature",
   "assetCount",
   "collection_id"
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
   SELECT COALESCE(MAX("collection_id"), 0) + 1
   FROM "CollectionPointer"
   WHERE "collection_id" IS NOT NULL
@@ -153,7 +157,13 @@ ON CONFLICT("col", "creator") DO UPDATE SET
       OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
       OR (
         excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
-        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+        AND (
+          COALESCE(excluded."lastSeenTxIndex", -1) > COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+          OR (
+            COALESCE(excluded."lastSeenTxIndex", -1) = COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+            AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+          )
+        )
       )
     THEN excluded."lastSeenAt"
     ELSE "CollectionPointer"."lastSeenAt"
@@ -163,17 +173,45 @@ ON CONFLICT("col", "creator") DO UPDATE SET
       OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
       OR (
         excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
-        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+        AND (
+          COALESCE(excluded."lastSeenTxIndex", -1) > COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+          OR (
+            COALESCE(excluded."lastSeenTxIndex", -1) = COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+            AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+          )
+        )
       )
     THEN excluded."lastSeenSlot"
     ELSE "CollectionPointer"."lastSeenSlot"
+  END,
+  "lastSeenTxIndex" = CASE
+    WHEN "CollectionPointer"."lastSeenSlot" IS NULL
+      OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
+      OR (
+        excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
+        AND (
+          COALESCE(excluded."lastSeenTxIndex", -1) > COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+          OR (
+            COALESCE(excluded."lastSeenTxIndex", -1) = COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+            AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+          )
+        )
+      )
+    THEN excluded."lastSeenTxIndex"
+    ELSE "CollectionPointer"."lastSeenTxIndex"
   END,
   "lastSeenTxSignature" = CASE
     WHEN "CollectionPointer"."lastSeenSlot" IS NULL
       OR excluded."lastSeenSlot" > "CollectionPointer"."lastSeenSlot"
       OR (
         excluded."lastSeenSlot" = "CollectionPointer"."lastSeenSlot"
-        AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+        AND (
+          COALESCE(excluded."lastSeenTxIndex", -1) > COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+          OR (
+            COALESCE(excluded."lastSeenTxIndex", -1) = COALESCE("CollectionPointer"."lastSeenTxIndex", -1)
+            AND COALESCE("CollectionPointer"."lastSeenTxSignature", '') <= COALESCE(excluded."lastSeenTxSignature", '')
+          )
+        )
       )
     THEN excluded."lastSeenTxSignature"
     ELSE "CollectionPointer"."lastSeenTxSignature"
@@ -192,9 +230,9 @@ function isMissingCollectionIdSchemaError(error: unknown): boolean {
   const maybe = error as { code?: unknown; message?: unknown } | null;
   const code = typeof maybe?.code === "string" ? maybe.code : "";
   const message = typeof maybe?.message === "string" ? maybe.message : String(error);
-  const missingSchemaPattern = /column .*collection_id|no such column: collection_id|has no column named collection_id|column "?collection_id"? does not exist|Unknown arg .*collectionId/i;
+  const missingSchemaPattern = /column .*collection_id|column .*lastSeenTxIndex|no such column: collection_id|no such column: lastSeenTxIndex|has no column named collection_id|has no column named lastSeenTxIndex|column "?collection_id"? does not exist|column "?lastSeenTxIndex"? does not exist|Unknown arg .*collectionId|Unknown arg .*lastSeenTxIndex/i;
   if (code === "P2022") {
-    return /collection_id|collectionId|CollectionPointer/i.test(message);
+    return /collection_id|collectionId|lastSeenTxIndex|CollectionPointer/i.test(message);
   }
   if (code === "P2010") {
     return missingSchemaPattern.test(message);
@@ -225,10 +263,11 @@ function shouldAdvanceCollectionPointerLastSeen(
   current:
     | {
         lastSeenSlot?: bigint | null;
+        lastSeenTxIndex?: number | null;
         lastSeenTxSignature?: string | null;
       }
     | null,
-  next: Pick<EventContext, "slot" | "signature">
+  next: Pick<EventContext, "slot" | "signature" | "txIndex">
 ): boolean {
   if (!current || current.lastSeenSlot === null || current.lastSeenSlot === undefined) {
     return true;
@@ -237,6 +276,14 @@ function shouldAdvanceCollectionPointerLastSeen(
     return true;
   }
   if (next.slot < current.lastSeenSlot) {
+    return false;
+  }
+  const currentTxIndex = current.lastSeenTxIndex ?? -1;
+  const nextTxIndex = next.txIndex ?? -1;
+  if (nextTxIndex > currentTxIndex) {
+    return true;
+  }
+  if (nextTxIndex < currentTxIndex) {
     return false;
   }
   return (current.lastSeenTxSignature ?? "") <= next.signature;
@@ -264,6 +311,7 @@ async function tryDbSideCollectionIdUpsert(
     ctx.signature,
     ctx.blockTime,
     ctx.slot,
+    ctx.txIndex ?? null,
     ctx.signature,
     0n
   );
@@ -289,12 +337,14 @@ async function upsertCollectionPointerWithOptionalCollectionId(
     firstSeenTxSignature: ctx.signature,
     lastSeenAt: ctx.blockTime,
     lastSeenSlot: ctx.slot,
+    lastSeenTxIndex: ctx.txIndex ?? null,
     lastSeenTxSignature: ctx.signature,
     assetCount: 0n,
   };
   const updateBase = {
     lastSeenAt: ctx.blockTime,
     lastSeenSlot: ctx.slot,
+    lastSeenTxIndex: ctx.txIndex ?? null,
     lastSeenTxSignature: ctx.signature,
   };
 
@@ -328,17 +378,12 @@ async function upsertCollectionPointerWithOptionalCollectionId(
           select: {
             collectionId: true,
             lastSeenSlot: true,
+            lastSeenTxIndex: true,
             lastSeenTxSignature: true,
           },
         });
         const shouldUpdateLastSeen = shouldAdvanceCollectionPointerLastSeen(existingCollection, ctx);
-        const monotonicUpdateBase = shouldUpdateLastSeen
-          ? {
-              lastSeenAt: ctx.blockTime,
-              lastSeenSlot: ctx.slot,
-              lastSeenTxSignature: ctx.signature,
-            }
-          : {};
+        const monotonicUpdateBase = shouldUpdateLastSeen ? updateBase : {};
         let assignedCollectionId: bigint | undefined;
         if (!existingCollection || existingCollection.collectionId === null) {
           const highestAssigned = await collection.findMany({
@@ -507,6 +552,76 @@ function shouldRetryUriRecovery(status: string | null | undefined): boolean {
   return true;
 }
 
+async function fetchNextLocalUriRecoveryBatch(prisma: PrismaClient): Promise<Array<{ id: string; uri: string }>> {
+  const query = () => prisma.agent.findMany({
+    where: {
+      uri: { not: "" },
+      ...(localUriRecoveryCursor ? { id: { gt: localUriRecoveryCursor } } : {}),
+    },
+    select: {
+      id: true,
+      uri: true,
+    },
+    orderBy: { id: "asc" },
+    take: LOCAL_RECOVERY_BATCH_SIZE,
+  });
+
+  let agents = await query();
+  if (agents.length === 0 && localUriRecoveryCursor !== null) {
+    localUriRecoveryCursor = null;
+    agents = await query();
+  }
+  localUriRecoveryCursor = agents.length > 0 ? agents[agents.length - 1].id : null;
+  return agents;
+}
+
+async function fetchNextLocalCollectionRecoveryBatch(prisma: PrismaClient): Promise<Array<{
+  col: string;
+  creator: string;
+  metadataStatus: string | null;
+  metadataUpdatedAt: Date | null;
+  lastSeenAt: Date;
+}>> {
+  const query = () => prisma.collection.findMany({
+    where: localCollectionRecoveryCursor
+      ? {
+          OR: [
+            { col: { gt: localCollectionRecoveryCursor.col } },
+            {
+              col: localCollectionRecoveryCursor.col,
+              creator: { gt: localCollectionRecoveryCursor.creator },
+            },
+          ],
+        }
+      : undefined,
+    select: {
+      col: true,
+      creator: true,
+      metadataStatus: true,
+      metadataUpdatedAt: true,
+      lastSeenAt: true,
+    },
+    orderBy: [
+      { col: "asc" },
+      { creator: "asc" },
+    ],
+    take: LOCAL_RECOVERY_BATCH_SIZE,
+  });
+
+  let collections = await query();
+  if (collections.length === 0 && localCollectionRecoveryCursor !== null) {
+    localCollectionRecoveryCursor = null;
+    collections = await query();
+  }
+  localCollectionRecoveryCursor = collections.length > 0
+    ? {
+        col: collections[collections.length - 1].col,
+        creator: collections[collections.length - 1].creator,
+      }
+    : null;
+  return collections;
+}
+
 function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
   if (!localDerivedDigestsEnabled || process.env.NODE_ENV === "test" || localRecoveryInterval) {
     return;
@@ -517,17 +632,7 @@ function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
     localRecoveryInFlight = true;
     try {
       if (config.metadataIndexMode !== "off") {
-        const agents = await prisma.agent.findMany({
-          where: {
-            uri: { not: "" },
-          },
-          select: {
-            id: true,
-            uri: true,
-          },
-          orderBy: { updatedAt: "desc" },
-          take: LOCAL_RECOVERY_BATCH_SIZE,
-        });
+        const agents = await fetchNextLocalUriRecoveryBatch(prisma);
 
         if (agents.length > 0) {
           const metadataRows = await prisma.agentMetadata.findMany({
@@ -564,17 +669,7 @@ function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
       }
 
       if (config.collectionMetadataIndexEnabled) {
-        const collections = await prisma.collection.findMany({
-          select: {
-            col: true,
-            creator: true,
-            metadataStatus: true,
-            metadataUpdatedAt: true,
-            lastSeenAt: true,
-          },
-          orderBy: { lastSeenAt: "desc" },
-          take: LOCAL_RECOVERY_BATCH_SIZE,
-        });
+        const collections = await fetchNextLocalCollectionRecoveryBatch(prisma);
 
         for (const collection of collections) {
           const stale =
@@ -668,6 +763,8 @@ export function resetLocalDerivedDigestsForTests(enabled: boolean = process.env.
     localRecoveryInterval = null;
   }
   localRecoveryInFlight = false;
+  localUriRecoveryCursor = null;
+  localCollectionRecoveryCursor = null;
   localDerivedDigestsEnabled = enabled;
   localDerivedDigestsSuspendCount = 0;
   uriDigestQueue.clear();
@@ -966,6 +1063,7 @@ export interface EventContext {
   txIndex?: number; // Transaction index within the block (metadata / tertiary tie-breaker)
   eventOrdinal?: number; // Event index within the transaction (deterministic intra-tx ordering)
   source?: "poller" | "websocket" | "substreams"; // Event source for cursor tracking
+  skipCursorUpdate?: boolean;
 }
 
 /**
@@ -1000,9 +1098,11 @@ export async function handleEventAtomic(
       await handleMetadataDeleted(prisma, event.data, ctx);
     }
 
-    await prisma.$transaction(async (tx) => {
-      await updateCursorAtomic(tx, ctx);
-    });
+    if (!ctx.skipCursorUpdate) {
+      await prisma.$transaction(async (tx) => {
+        await updateCursorAtomic(tx, ctx);
+      });
+    }
     return;
   }
 
@@ -1013,7 +1113,9 @@ export async function handleEventAtomic(
         await handleEventInner(tx, event, ctx);
 
         // 2. Update cursor atomically with monotonic guard
-        await updateCursorAtomic(tx, ctx);
+        if (!ctx.skipCursorUpdate) {
+          await updateCursorAtomic(tx, ctx);
+        }
       });
       break;
     } catch (error) {
@@ -1694,17 +1796,6 @@ async function handleCollectionPointerSetTx(
   });
   const creator = existing?.creator ?? setBy;
 
-  await withCollectionIdAssignmentLock(async () => {
-    await upsertCollectionPointerWithOptionalCollectionId(
-      tx,
-      tx.collection as unknown as CollectionDelegate,
-      pointer,
-      creator,
-      assetId,
-      ctx
-    );
-  });
-
   const result = await tx.agent.updateMany({
     where: { id: assetId },
     data: {
@@ -1716,6 +1807,17 @@ async function handleCollectionPointerSetTx(
   });
 
   if (result.count > 0) {
+    await withCollectionIdAssignmentLock(async () => {
+      await upsertCollectionPointerWithOptionalCollectionId(
+        tx,
+        tx.collection as unknown as CollectionDelegate,
+        pointer,
+        creator,
+        assetId,
+        ctx
+      );
+    });
+
     const previousPointer = existing?.collectionPointer ?? "";
     const previousCreator = existing?.creator ?? creator;
     if (previousPointer !== pointer && previousPointer !== "") {
@@ -1762,17 +1864,6 @@ async function handleCollectionPointerSet(
   });
   const creator = existing?.creator ?? setBy;
 
-  await withCollectionIdAssignmentLock(async () => {
-    await upsertCollectionPointerWithOptionalCollectionId(
-      prisma,
-      prisma.collection as unknown as CollectionDelegate,
-      pointer,
-      creator,
-      assetId,
-      ctx
-    );
-  });
-
   const result = await prisma.agent.updateMany({
     where: { id: assetId },
     data: {
@@ -1784,6 +1875,17 @@ async function handleCollectionPointerSet(
   });
 
   if (result.count > 0) {
+    await withCollectionIdAssignmentLock(async () => {
+      await upsertCollectionPointerWithOptionalCollectionId(
+        prisma,
+        prisma.collection as unknown as CollectionDelegate,
+        pointer,
+        creator,
+        assetId,
+        ctx
+      );
+    });
+
     const previousPointer = existing?.collectionPointer ?? "";
     const previousCreator = existing?.creator ?? creator;
     if (previousPointer !== pointer && previousPointer !== "") {
@@ -1815,7 +1917,7 @@ async function handleCollectionPointerSet(
 
   logger.info({ assetId, col: pointer, setBy }, "Collection pointer set");
 
-  if (config.collectionMetadataIndexEnabled) {
+  if (result.count > 0 && config.collectionMetadataIndexEnabled) {
     scheduleCollectionDigest(prisma, assetId, pointer);
   }
 }

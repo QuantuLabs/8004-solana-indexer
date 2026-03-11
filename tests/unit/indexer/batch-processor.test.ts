@@ -485,6 +485,32 @@ describe("EventBuffer", () => {
       expect(agentCallIndex).toBeGreaterThan(collectionCallIndex);
     });
 
+    it("should use monotonic CollectionPointerSet SQL with tx_index in batch mode", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("CollectionPointerSet", {
+          asset: "assetKey123456789012345678901234",
+          setBy: "ownerKey123456789012345678901234",
+          col: "c1:test-pointer",
+          lock: true,
+        }, {
+          txIndex: 7,
+        })
+      );
+
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const updateCall = client.query.mock.calls.find((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("INSERT INTO collection_pointers")
+      );
+      expect(updateCall).toBeDefined();
+      expect(updateCall![0]).toContain("last_seen_tx_index");
+      expect(updateCall![0]).toContain("WHERE EXISTS (SELECT 1 FROM updated)");
+      expect(updateCall![0]).toContain("COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)");
+      expect(updateCall![1][6]).toBe(7);
+    });
+
     it("replays orphan response and revocation chains when agent registration replays orphan feedback", async () => {
       const client = mockPool._client;
       const feedbackHash = "ab".repeat(32);

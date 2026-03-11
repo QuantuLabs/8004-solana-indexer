@@ -99,6 +99,9 @@ function makePrismaStub() {
         },
       ]),
       count: vi.fn().mockResolvedValue(1),
+      aggregate: vi.fn().mockResolvedValue({
+        _avg: { qualityScore: null },
+      }),
     },
     feedback: {
       findMany: vi.fn().mockResolvedValue([
@@ -157,6 +160,9 @@ function makePrismaStub() {
     },
     collection: {
       count: vi.fn().mockResolvedValue(1),
+    },
+    validation: {
+      count: vi.fn().mockResolvedValue(0),
     },
   };
 }

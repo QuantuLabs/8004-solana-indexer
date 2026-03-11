@@ -113,6 +113,7 @@ describe("supabase schema revocations bootstrap parity", () => {
   });
 
   it("defines proxy schema objects used by agent0 REST clients", () => {
+    expect(schemaSql).toContain("last_seen_tx_index INTEGER");
     expect(schemaSql).toContain("DROP VIEW IF EXISTS agent_reputation CASCADE;");
     expect(schemaSql).toContain("CREATE OR REPLACE VIEW agent_reputation");
     expect(schemaSql).toContain("LEFT JOIN feedback_stats fs");

@@ -110,6 +110,7 @@ CREATE TABLE collection_pointers (
   first_seen_tx_signature TEXT,
   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_seen_slot BIGINT NOT NULL,
+  last_seen_tx_index INTEGER,
   last_seen_tx_signature TEXT,
   asset_count BIGINT NOT NULL DEFAULT 0 CHECK (asset_count >= 0),
   version TEXT,

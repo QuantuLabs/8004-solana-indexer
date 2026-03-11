@@ -32,7 +32,7 @@ services:
       GRAPHQL_RATE_LIMIT_MAX_REQUESTS: ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS:-30}
       RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
       INDEXER_MODE: ${INDEXER_MODE:-polling}
-      POLLING_INTERVAL: ${POLLING_INTERVAL:-5000}
+      POLLING_INTERVAL: ${POLLING_INTERVAL:-15000}
       BATCH_SIZE: ${BATCH_SIZE:-100}
       POLLER_BATCH_RPC_ENABLED: ${POLLER_BATCH_RPC_ENABLED:-true}
       POLLER_RPC_CHUNK_SIZE: ${POLLER_RPC_CHUNK_SIZE:-100}
@@ -67,7 +67,7 @@ services:
     volumes:
       - indexer_data:/app/data
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${API_PORT:-3001}/health').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${API_PORT:-3001}/ready').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 5s
       retries: 3

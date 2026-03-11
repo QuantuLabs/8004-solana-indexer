@@ -309,7 +309,7 @@ export const config = {
   indexerMode: parseIndexerMode(process.env.INDEXER_MODE),
 
   // Polling config
-  pollingInterval: parseInt(process.env.POLLING_INTERVAL || "5000", 10),
+  pollingInterval: parseInt(process.env.POLLING_INTERVAL || "15000", 10),
   batchSize: parseInt(process.env.BATCH_SIZE || "100", 10),
   pollerBatchRpcEnabled: parseBoolean(process.env.POLLER_BATCH_RPC_ENABLED, true),
   // Batch RPC pressure knobs for the classic poller (getParsedTransactions chunking)

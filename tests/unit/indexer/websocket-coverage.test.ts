@@ -13,14 +13,85 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+vi.mock("ws", () => {
+  let probeBehavior: "supported" | "unsupported" | "timeout" | "error" = "supported";
+
+  class MockWebSocket {
+    static OPEN = 1;
+    readyState = 0;
+    private handlers = new Map<string, Array<(...args: any[]) => void>>();
+
+    constructor(_url: string) {
+      queueMicrotask(() => {
+        if (probeBehavior === "error") {
+          this.emit("error", new Error("ws probe failed"));
+          return;
+        }
+        this.readyState = MockWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    on(event: string, handler: (...args: any[]) => void): this {
+      const current = this.handlers.get(event) ?? [];
+      current.push(handler);
+      this.handlers.set(event, current);
+      return this;
+    }
+
+    send(_payload: string): void {
+      if (probeBehavior === "timeout") return;
+
+      queueMicrotask(() => {
+        if (probeBehavior === "unsupported") {
+          this.emit("message", JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            error: { code: -32601, message: "Method 'logsSubscribe' not found" },
+          }));
+          return;
+        }
+
+        this.emit("message", JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: 1,
+        }));
+      });
+    }
+
+    close(): void {
+      queueMicrotask(() => {
+        this.emit("close");
+      });
+    }
+
+    private emit(event: string, ...args: any[]): void {
+      for (const handler of this.handlers.get(event) ?? []) {
+        handler(...args);
+      }
+    }
+  }
+
+  return {
+    default: MockWebSocket,
+    __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => {
+      probeBehavior = value;
+    },
+  };
+});
+
 // Mock @solana/web3.js Connection for testWebSocketConnection tests
 vi.mock("@solana/web3.js", async () => {
   const actual = await vi.importActual<any>("@solana/web3.js");
   let getSlotMock: (() => Promise<number>) | null = null;
   let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
   let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
+  let rpcWebSocketConnected = false;
 
   class MockConnection {
+    _rpcWebSocketConnected = rpcWebSocketConnected;
+
     constructor(_endpoint: string, _config?: unknown) {}
 
     async getSlot(): Promise<number> {
@@ -57,6 +128,9 @@ vi.mock("@solana/web3.js", async () => {
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => {
       removeOnLogsListenerMock = fn;
     },
+    __setRpcWebSocketConnected: (value: boolean) => {
+      rpcWebSocketConnected = value;
+    },
   };
 });
 
@@ -73,6 +147,7 @@ vi.mock("../../../src/db/handlers.js", () => ({
 }));
 
 import * as web3 from "@solana/web3.js";
+import * as wsModule from "ws";
 import {
   WebSocketIndexer,
   testWebSocketConnection,
@@ -1721,12 +1796,18 @@ describe("testWebSocketConnection - two argument form", () => {
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
     __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
+    __setRpcWebSocketConnected: (value: boolean) => void;
+  };
+  const wsMock = wsModule as typeof wsModule & {
+    __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => void;
   };
 
   afterEach(() => {
     web3Mock.__setGetSlotMock(null);
     web3Mock.__setOnLogsMock(null);
     web3Mock.__setRemoveOnLogsListenerMock(null);
+    web3Mock.__setRpcWebSocketConnected(false);
+    wsMock.__setWsProbeBehavior("supported");
     vi.restoreAllMocks();
   });
 
@@ -1736,6 +1817,7 @@ describe("testWebSocketConnection - two argument form", () => {
       callback();
       return 11;
     });
+    web3Mock.__setRpcWebSocketConnected(true);
     const removeSpy = vi.fn().mockResolvedValue(undefined);
     web3Mock.__setRemoveOnLogsListenerMock(removeSpy);
 

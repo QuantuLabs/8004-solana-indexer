@@ -16,6 +16,16 @@ import {
   TEST_REGISTRY,
 } from "../../mocks/solana.js";
 
+const createDeferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
 describe("Poller", () => {
   let poller: Poller;
   let mockConnection: ReturnType<typeof createMockConnection>;
@@ -135,6 +145,60 @@ describe("Poller", () => {
       expect(processSpy).toHaveBeenCalledTimes(2);
       vi.useRealTimers();
     });
+
+    it("should cancel bootstrap retry sleep when stopped", async () => {
+      vi.useFakeTimers();
+
+      vi.spyOn(poller as any, "loadState").mockResolvedValue(undefined);
+      const processSpy = vi
+        .spyOn(poller as any, "processNewTransactions")
+        .mockResolvedValue({ fetchedCount: 1, haltedOnError: true });
+
+      const bootstrapPromise = poller.bootstrap({ retryDelayMs: 5000 });
+      await vi.advanceTimersByTimeAsync(0);
+
+      let stopped = false;
+      const stopPromise = poller.stop().then(() => {
+        stopped = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(stopped).toBe(true);
+
+      await stopPromise;
+      await bootstrapPromise;
+      expect(processSpy).toHaveBeenCalledTimes(1);
+
+      vi.useRealTimers();
+    });
+
+    it("should suppress event log writes during bootstrap catch-up when requested", async () => {
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmBootstrap",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+      const sig = createMockSignatureInfo();
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, logs);
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "previous-sig",
+        lastSlot: 100n,
+      });
+      (mockConnection.getSignaturesForAddress as any)
+        .mockResolvedValueOnce([sig])
+        .mockResolvedValue([]);
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
+
+      await poller.bootstrap({ suppressEventLogWrites: true });
+
+      expect(mockPrisma.agent.upsert).toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
+    });
   });
 
   describe("stop", () => {
@@ -147,6 +211,82 @@ describe("Poller", () => {
 
       // Poller should be stopped (no more polling)
       expect(true).toBe(true); // Poller stopped successfully
+    });
+
+    it("should cancel the pending poll sleep so stop resolves immediately", async () => {
+      vi.useFakeTimers();
+
+      const sleepyPoller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 60_000,
+        batchSize: 10,
+      });
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: TEST_SIGNATURE,
+        lastSlot: TEST_SLOT,
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await sleepyPoller.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      let stopped = false;
+      const stopPromise = sleepyPoller.stop().then(() => {
+        stopped = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(stopped).toBe(true);
+      await stopPromise;
+      vi.useRealTimers();
+    });
+
+    it("should not save cursor after stop interrupts an in-flight transaction", async () => {
+      const sig = createMockSignatureInfo();
+      const txDone = createDeferred<Date>();
+
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "previous-sig";
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
+      const processSpy = vi
+        .spyOn(poller as any, "processTransaction")
+        .mockImplementation(() => txDone.promise);
+      const saveStateSpy = vi.spyOn(poller as any, "saveState");
+
+      const cyclePromise = (poller as any).processNewTransactions();
+      await Promise.resolve();
+      const stopPromise = poller.stop();
+      txDone.resolve(new Date());
+      await cyclePromise;
+      await stopPromise;
+
+      expect(processSpy.mock.calls.length).toBeLessThanOrEqual(1);
+      expect(saveStateSpy).not.toHaveBeenCalled();
+    });
+
+    it("should not retry getBlock after stop cancels retry delay", async () => {
+      vi.useFakeTimers();
+
+      const sig = createMockSignatureInfo();
+      (mockConnection.getBlock as any)
+        .mockRejectedValueOnce(new Error("RPC temporary failure"))
+        .mockResolvedValueOnce({ transactions: [] });
+
+      const txIndexPromise = (poller as any).getTxIndexMap(Number(TEST_SLOT), [sig]);
+      await vi.advanceTimersByTimeAsync(0);
+
+      await poller.stop();
+      await vi.advanceTimersByTimeAsync(0);
+      const txIndexMap = await txIndexPromise;
+
+      expect(mockConnection.getBlock).toHaveBeenCalledTimes(1);
+      expect(txIndexMap.get(sig.signature)).toBeNull();
+
+      vi.useRealTimers();
     });
   });
 

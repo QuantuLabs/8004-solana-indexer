@@ -85,6 +85,7 @@ export class DataVerifier {
   private interval: ReturnType<typeof setInterval> | null = null;
   private isRunning = false;
   private verifyInProgress = false; // Reentrancy guard for async verification cycles
+  private activeCycle: Promise<void> | null = null;
   private stats: VerificationStats = {
     agentsVerified: 0,
     agentsOrphaned: 0,
@@ -125,13 +126,17 @@ export class DataVerifier {
     logger.info({ intervalMs: this.verifyIntervalMs }, "Starting data verifier");
 
     // Run immediately on start
-    await this.verifyAll().catch(err => {
+    await this.runVerificationCycle().catch(err => {
       logger.error({ error: err.message }, "Initial verification failed");
     });
 
+    if (!this.isRunning) {
+      return;
+    }
+
     // Then run periodically
     this.interval = setInterval(() => {
-      this.verifyAll().catch(err => {
+      this.runVerificationCycle().catch(err => {
         logger.error({ error: err.message }, "Verification cycle failed");
       });
     }, this.verifyIntervalMs);
@@ -148,6 +153,18 @@ export class DataVerifier {
 
   getStats(): VerificationStats {
     return { ...this.stats };
+  }
+
+  private async runVerificationCycle(): Promise<void> {
+    const cycle = this.verifyAll();
+    this.activeCycle = cycle;
+    try {
+      await cycle;
+    } finally {
+      if (this.activeCycle === cycle) {
+        this.activeCycle = null;
+      }
+    }
   }
 
   private async verifyAll(): Promise<void> {
