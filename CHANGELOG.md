@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-03-15
+
+### Fixed
+- Local SQLite startup now reapplies the canonical `agents.agent_id` ordering for historically drifted databases, so upgraded local DBs realign with fresh local/pool/live order without requiring a full reindex.
+- `API_MODE=both` no longer blocks local REST business routes on pool readiness, and local `/leaderboard` reads now stay aligned with GraphQL/pool sequence-id semantics.
+- REST/GraphQL readiness and verification surfaces were realigned around the current runtime contract, including the removal of stale validation totals from public global stats.
+
+### Changed
+- Release docs now describe the supported no-reindex SQLite repair path for affected local `agent_id` drift.
+
 ## [1.8.1] - 2026-03-07
 
 ### Fixed

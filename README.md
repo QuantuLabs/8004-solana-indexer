@@ -9,10 +9,11 @@ Solana indexer for the 8004 Agent Registry with GraphQL v2 and transitional REST
 - GraphQL API (`/v2/graphql`) with query depth/complexity guards
 - Legacy REST v1 (`/rest/v1/*`) available when `API_MODE=rest|both`
 - Supabase/PostgreSQL data backend support
-- Strict events-only integrity policy:
-  - revoke/response without parent feedback => `ORPHANED`
+- Strict parent-aware entity policy on top of event integrity:
+  - revoke without parent feedback => `ORPHANED`
+  - response without parent feedback => staged in `orphan_responses` until a matching parent exists
   - revocation `seal_hash` mismatch with parent feedback => logged/flagged (not `ORPHANED`)
-  - response `seal_hash` mismatch => `ORPHANED`
+  - response `seal_hash` mismatch => logged/flagged while the parent exists (not `ORPHANED`)
   - GraphQL filters exclude `ORPHANED` records by default
 
 ## Transition Notes
@@ -35,8 +36,16 @@ If you are upgrading from `v1.7.7`, read:
   - `20260306164000_add_indexer_state_last_tx_index.sql`
   - `20260306210000_add_orphan_responses.sql`
   - `20260306223000_reorder_canonical_indexes.sql`
+  - `20260306230000_align_global_stats_collection_pointers.sql`
   - `20260307111500_deterministic_id_counter_timestamps.sql`
   - `20260307123000_backfill_legacy_orphan_responses.sql`
+  - `20260309190000_add_agent_reputation_proxy_objects.sql`
+  - `20260311173000_add_collection_pointer_last_seen_tx_index.sql`
+  - `20260312123000_align_proxy_views_and_leaderboard_grant.sql`
+  - `20260313193000_add_feedback_response_seal_hash.sql`
+  - `20260314150000_include_staging_orphans_in_verification_stats.sql`
+  - `20260315193000_add_validations_to_verification_stats.sql`
+  - `20260315195500_fix_recovered_orphan_agent_id_assignment.sql`
 - Restart the indexer on the same database.
 - Do not run `supabase/schema.sql` on an existing database.
 - Keep an operator record of the last migration filename you applied; the repo does not maintain a PG migration-tracking table for you.
@@ -56,6 +65,9 @@ If you are upgrading from `v1.7.7`, read:
   - `20260306233000_add_missing_agent_runtime_columns_sqlite`
   - `20260306234500_sqlite_fix_feedback_value_text`
   - `20260307000500_fix_indexer_state_monotonic_guard_tx_index`
+  - `20260311173000_add_collection_pointer_last_seen_tx_index`
+  - `20260312110000_add_local_collection_id_counter`
+  - `20260313193000_add_feedback_response_seal_hash`
 - If the file comes from the known `v1.7.7` local/Docker `prisma db push` flow without a valid `_prisma_migrations` baseline, do not run a blind `prisma migrate deploy`. Apply the shipped legacy bundle against that same file:
   - `sqlite3 /path/to/indexer.db < prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql`
 - That bundle is intentionally scoped to the proven `v1.7.7` db-push shape and already excludes the two duplicate-column migrations that fail on that legacy schema.
@@ -69,7 +81,7 @@ If you are upgrading from `v1.7.7`, read:
 - Container startup does not run upgrade migrations automatically.
 - If the container uses PostgreSQL / Supabase, apply the pending `supabase/migrations/*.sql` to that persisted database, then restart the container.
 - If the container uses local SQLite, run `prisma migrate deploy` against the same persisted SQLite file, then restart the container.
-- The runtime image defaults local SQLite to `file:/app/prisma/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
+- The runtime image defaults local SQLite to `file:/app/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
 - If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, apply `prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql` with `sqlite3` against the mounted file, then restart the container.
 - If the file is older/unknown and does not match that proven shape, do not force a blind migrate; reindex into a fresh SQLite file unless you are deliberately doing a manual baseline.
 - Restart the container with the same volume/env after the backend-specific upgrade step completes.
@@ -77,7 +89,8 @@ If you are upgrading from `v1.7.7`, read:
 ### When Migration + Restart Is Enough
 
 - This is the supported path when you keep the same network/program/history and upgrade an already indexed database through the shipped migrations only.
-- Shipped upgrade migrations are intended to fill missing runtime data needed by the newer runtime without deliberately renumbering existing public sequential IDs.
+- Shipped upgrade migrations are intended to fill missing runtime data needed by the newer runtime without a full reindex.
+- For affected local SQLite drift, startup repair may rewrite previously wrong `agents.agent_id` values to their canonical order without requiring a reindex.
 - Do not treat an in-place upgrade on a historically drifted database as proof that every public sequential ID will match a fresh rebuild row-for-row.
 - Do not treat an in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
 
@@ -89,7 +102,8 @@ If you are upgrading from `v1.7.7`, read:
 
 ### How To Verify After Upgrade
 
-- Check `/health`.
+- Check `/health` for process liveness.
+- Check `/ready` for readiness plus current indexer state. The response keeps `status` (`starting|ready`) and now also includes `phase` plus a `state` block with the current `mainSlot`, object counts, and pending/orphan counts when the backend can provide them.
 - Confirm the persisted cursor resumes from the existing state and advances.
 - Verify representative `agents`, `feedbacks`, `responses`, `revocations`, and `collections` still resolve through the API.
 - If you use collection-scoped reads, verify them with `creator + collection`.
@@ -189,7 +203,7 @@ Notes:
   - `DB_MODE=local` (Prisma), or
   - `DB_MODE=supabase` with PostgREST proxy auth (`SUPABASE_URL` + `SUPABASE_KEY`, or `POSTGREST_URL` + `POSTGREST_TOKEN`).
 - Runtime default is `API_MODE=both` when unset; `.env.example` pins `API_MODE=graphql` as the recommended production baseline.
-- The deployment stack expects explicit `DB_MODE` and `API_MODE` from your env file instead of silently defaulting them inside Docker.
+- Set `DB_MODE` and `API_MODE` explicitly in production env files. Docker still falls back to `API_MODE=both` if unset, and the PostgREST overlay forces `API_MODE=both`.
 - `.env.devnet.example` includes the current devnet bootstrap cursor as an exact validated signature/slot pair.
 - `.env.mainnet.example` is prefilled with current mainnet `PROGRAM_ID` and `ATOM_ENGINE_PROGRAM_ID`, plus a commented validated bootstrap pair for history-capable RPCs.
 - IDLs are stored side-by-side in `idl/`: `agent_registry_8004.json` (devnet/testnet companion) and `agent_registry_8004.mainnet.json` (mainnet/localnet companion). Runtime selection follows the effective `PROGRAM_ID`.
@@ -256,14 +270,38 @@ Runtime stack (digest-pin friendly):
 docker compose -f docker/stack/indexer-stack.yml up -d
 ```
 
+Local PostgreSQL bootstrap for `DB_MODE=supabase`:
+
+```bash
+scripts/start-local-postgres.sh
+PGPASSWORD=indexer /opt/homebrew/opt/postgresql@17/bin/psql \
+  -h 127.0.0.1 -p 55432 -U indexer -d indexer \
+  -f supabase/schema.sql
+```
+
+Then point the indexer at:
+
+```bash
+SUPABASE_DSN=postgresql://indexer:indexer@127.0.0.1:55432/indexer?sslmode=disable
+SUPABASE_SSL_VERIFY=false
+```
+
+Important:
+
+- `docker/stack/indexer-stack.yml` does not start PostgreSQL for you.
+- `docker/stack/indexer-stack.postgrest.yml` only adds PostgREST; it still expects an existing PostgreSQL server.
+- `scripts/start-local-postgres.sh` defaults to Homebrew PostgreSQL 17 under `/opt/homebrew/opt/postgresql@17/bin`; override `PG_BIN` if your local binaries live elsewhere.
+- For a fresh local PostgreSQL database, load `supabase/schema.sql` as the `indexer` owner user, not as `postgres`, otherwise the runtime service role will hit permission errors on tables like `indexer_state`.
+
 Optional PostgREST sidecar (local PostgreSQL REST, default stack unchanged):
 
 ```bash
 cp docker/stack/postgrest.env.example .env.postgrest
 # edit .env.postgrest with your local PostgreSQL DSN/role/secret
+# POSTGREST_* takes precedence over SUPABASE_* when both are set
 
-# generate a local POSTGREST_TOKEN (HS256 JWT with role=web_anon by default)
-node -e 'const c=require("crypto");const enc=(o)=>Buffer.from(JSON.stringify(o)).toString("base64url");const secret=process.env.SECRET||"replace-with-random-secret";const payload={role:"web_anon",iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+315360000};const token=enc({alg:"HS256",typ:"JWT"})+"."+enc(payload);const sig=c.createHmac("sha256",secret).update(token).digest("base64url");console.log(token+"."+sig)'
+# generate a local POSTGREST_TOKEN (HS256 JWT with role=anon by default)
+node -e 'const c=require("crypto");const enc=(o)=>Buffer.from(JSON.stringify(o)).toString("base64url");const secret=process.env.SECRET||"replace-with-random-secret";const payload={role:"anon",iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+315360000};const token=enc({alg:"HS256",typ:"JWT"})+"."+enc(payload);const sig=c.createHmac("sha256",secret).update(token).digest("base64url");console.log(token+"."+sig)'
 
 docker compose \
   --env-file .env \
@@ -279,27 +317,29 @@ PostgREST endpoint:
 http://localhost:3002
 ```
 
-Indexer endpoint remains unchanged:
+Indexer endpoint remains unchanged when the indexer REST surface is enabled:
 
 ```text
 http://localhost:3001/rest/v1/*
 ```
 
-Minimum PostgreSQL grants for `PGRST_DB_ANON_ROLE` (example role `web_anon`):
+Set `API_MODE=both` or `API_MODE=rest` if you want the indexer itself to expose `/rest/v1/*`; the default `.env.example` keeps `API_MODE=graphql`.
+
+Minimum PostgreSQL grants for `PGRST_DB_ANON_ROLE` (example role `anon`):
 
 ```sql
-create role web_anon nologin;
-grant usage on schema public to web_anon;
-grant select on all tables in schema public to web_anon;
-alter default privileges in schema public grant select on tables to web_anon;
+create role anon nologin;
+grant usage on schema public to anon;
+grant select on all tables in schema public to anon;
+alter default privileges in schema public grant select on tables to anon;
 ```
 
 Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.1 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.1
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.2 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.2
 ```
 
 ## GraphQL Example

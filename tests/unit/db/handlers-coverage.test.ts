@@ -190,7 +190,7 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.indexerState.upsert).toHaveBeenCalled();
     });
 
-    it("should leave agentId null until deterministic verifier backfill assigns it", async () => {
+    it("should assign agentId deterministically at ingest in local mode", async () => {
       const event: ProgramEvent = {
         type: "AgentRegistered",
         data: {
@@ -207,11 +207,17 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.findMany).not.toHaveBeenCalled();
+      expect(prisma.agent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { agentId: { not: null } },
+          orderBy: { agentId: "desc" },
+          take: 1,
+        })
+      );
       expect(prisma.agent.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ agentId: null }),
-          update: expect.not.objectContaining({ agentId: expect.anything() }),
+          create: expect.objectContaining({ agentId: 1n }),
+          update: expect.objectContaining({ agentId: 1n }),
         })
       );
     });
@@ -236,9 +242,7 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.findMany).not.toHaveBeenCalledWith(
-        expect.objectContaining({ where: { agentId: { not: null } } })
-      );
+      expect(prisma.agent.findMany).not.toHaveBeenCalled();
       const upsertArgs = (prisma.agent.upsert as any).mock.calls[0]?.[0];
       expect(upsertArgs?.create?.agentId).toBeNull();
       expect(upsertArgs?.update?.agentId).toBeUndefined();
@@ -965,7 +969,7 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
-    it("should keep PENDING when seal_hash mismatches but feedback exists", async () => {
+    it("should keep revocation PENDING when seal_hash differs from stored feedback hash", async () => {
       const differentHash = new Uint8Array(32).fill(0xcd);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         feedbackHash: Uint8Array.from(differentHash),
@@ -2277,6 +2281,7 @@ describe("DB Handlers Coverage", () => {
           }),
         })
       );
+      expect(prisma.$transaction).toHaveBeenCalled();
       expect(prisma.orphanResponse.delete).toHaveBeenCalledWith({ where: { id: "orphan-2" } });
     });
 
@@ -2296,7 +2301,7 @@ describe("DB Handlers Coverage", () => {
   // 17. ResponseAppended seal_hash mismatch (lines 1079-1085)
   // ==========================================================================
   describe("ResponseAppended seal_hash mismatch in atomic path", () => {
-    it("should log warning and store response as ORPHANED on seal_hash mismatch", async () => {
+    it("should keep response canonical when feedback exists but seal_hash differs", async () => {
       const differentHash = new Uint8Array(32).fill(0xee);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         id: "fb-mismatch",
@@ -2322,14 +2327,8 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          create: expect.objectContaining({
-            feedbackId: "fb-mismatch",
-            status: "ORPHANED",
-          }),
-        })
-      );
+      expect(prisma.feedbackResponse.upsert).toHaveBeenCalled();
+      expect(prisma.orphanResponse.upsert).not.toHaveBeenCalled();
     });
   });
 
@@ -2473,7 +2472,7 @@ describe("DB Handlers Coverage", () => {
       );
     });
 
-    it("should keep PENDING on seal_hash mismatch when feedback exists (non-atomic)", async () => {
+    it("should keep revocation PENDING on seal_hash mismatch when feedback exists (non-atomic)", async () => {
       const differentHash = new Uint8Array(32).fill(0xdd);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         feedbackHash: Uint8Array.from(differentHash),
@@ -2553,7 +2552,7 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.feedbackResponse.upsert).not.toHaveBeenCalled();
     });
 
-    it("should warn and store response as ORPHANED on seal_hash mismatch (non-atomic)", async () => {
+    it("should keep response canonical when feedback exists but seal_hash differs (non-atomic)", async () => {
       const differentHash = new Uint8Array(32).fill(0xcc);
       (prisma.feedback.findUnique as any).mockResolvedValue({
         id: "fb-mismatch-na",
@@ -2563,14 +2562,8 @@ describe("DB Handlers Coverage", () => {
       const event: ProgramEvent = { type: "ResponseAppended", data: responseData };
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          create: expect.objectContaining({
-            feedbackId: "fb-mismatch-na",
-            status: "ORPHANED",
-          }),
-        })
-      );
+      expect(prisma.feedbackResponse.upsert).toHaveBeenCalled();
+      expect(prisma.orphanResponse.upsert).not.toHaveBeenCalled();
     });
   });
 
@@ -2760,7 +2753,6 @@ describe("DB Handlers Coverage", () => {
       });
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
-      (prisma.collection.findMany as any).mockResolvedValue([{ collectionId: 41n }]);
 
       const uniqueError = Object.assign(
         new Error("Unique constraint failed on the fields: (`collection_id`)"),
@@ -2783,11 +2775,10 @@ describe("DB Handlers Coverage", () => {
       await handleEventAtomic(prisma, event, ctx);
 
       expect(prisma.collection.upsert).toHaveBeenCalledTimes(2);
-      expect(prisma.collection.findMany).toHaveBeenCalledTimes(2);
       expect(prisma.collection.upsert).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ collectionId: 42n }),
-          update: expect.objectContaining({ collectionId: 42n }),
+          create: expect.not.objectContaining({ collectionId: expect.anything() }),
+          update: expect.not.objectContaining({ collectionId: expect.anything() }),
         })
       );
     });
@@ -2822,13 +2813,15 @@ describe("DB Handlers Coverage", () => {
       expect(String(sql)).toContain("\"lastSeenSlot\" = CASE");
       expect(String(sql)).toContain("\"lastSeenTxIndex\" = CASE");
       expect(String(sql)).toContain("\"lastSeenTxSignature\" = CASE");
+      expect(String(sql)).not.toContain('MAX("collection_id")');
+      expect(String(sql)).not.toContain('"collection_id" = COALESCE');
       expect(params[0]).toBe("c1:new-pointer");
       expect(params[1]).toBe(immutableCreator);
       expect(prisma.collection.findMany).not.toHaveBeenCalled();
       expect(prisma.collection.upsert).not.toHaveBeenCalled();
     });
 
-    it("CollectionPointerSet should fallback to max-scan assignment when db-side allocation fails (atomic)", async () => {
+    it("CollectionPointerSet should fallback to Prisma upsert when db-side raw SQL fails (atomic)", async () => {
       const immutableCreator = TEST_OWNER.toBase58();
       (prisma.agent.findUnique as any).mockResolvedValue({
         collectionPointer: "c1:old-pointer",
@@ -2836,7 +2829,6 @@ describe("DB Handlers Coverage", () => {
       });
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
-      (prisma.collection.findMany as any).mockResolvedValue([{ collectionId: 41n }]);
       (prisma.collection.upsert as any).mockResolvedValue({});
 
       const executeRawUnsafe = vi.fn().mockRejectedValueOnce(new Error("sqlite raw allocator failed"));
@@ -2855,10 +2847,11 @@ describe("DB Handlers Coverage", () => {
       await handleEventAtomic(prisma, event, ctx);
 
       expect(executeRawUnsafe).toHaveBeenCalledTimes(1);
+      expect(prisma.collection.findMany).not.toHaveBeenCalled();
       expect(prisma.collection.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ collectionId: 42n }),
-          update: expect.objectContaining({ collectionId: 42n }),
+          create: expect.not.objectContaining({ collectionId: expect.anything() }),
+          update: expect.not.objectContaining({ collectionId: expect.anything() }),
         })
       );
     });
@@ -2872,15 +2865,7 @@ describe("DB Handlers Coverage", () => {
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
-      let maxCollectionId = 41n;
-      (prisma.collection.findMany as any).mockImplementation(async () => [{ collectionId: maxCollectionId }]);
-      (prisma.collection.upsert as any).mockImplementation(async (args: any) => {
-        const assigned = args?.create?.collectionId;
-        if (typeof assigned === "bigint" && assigned > maxCollectionId) {
-          maxCollectionId = assigned;
-        }
-        return {};
-      });
+      (prisma.collection.upsert as any).mockResolvedValue({});
 
       const rawUniqueError = Object.assign(
         new Error("Raw query failed. Code: `2067`. Message: `UNIQUE constraint failed: CollectionPointer.collection_id`"),
@@ -2920,7 +2905,7 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.collection.upsert).toHaveBeenCalled();
     });
 
-    it("CollectionPointerSet should keep sequential collection_id under concurrent atomic calls in fallback mode", async () => {
+    it("CollectionPointerSet should not assign collection_id in application fallback mode", async () => {
       (prisma as any).$executeRawUnsafe = undefined;
       const immutableCreator = TEST_OWNER.toBase58();
       (prisma.agent.findUnique as any).mockResolvedValue({
@@ -2929,15 +2914,8 @@ describe("DB Handlers Coverage", () => {
       });
       (prisma.agent.updateMany as any).mockResolvedValue({ count: 1 });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
-
-      let maxCollectionId = 0n;
-      (prisma.collection.findMany as any).mockImplementation(async () => [{ collectionId: maxCollectionId }]);
-      (prisma.collection.upsert as any).mockImplementation(async (args: any) => {
+      (prisma.collection.upsert as any).mockImplementation(async () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
-        const assigned = args?.create?.collectionId;
-        if (typeof assigned === "bigint" && assigned > maxCollectionId) {
-          maxCollectionId = assigned;
-        }
         return {};
       });
 
@@ -2971,12 +2949,12 @@ describe("DB Handlers Coverage", () => {
         handleEventAtomic(prisma, eventB, ctxB),
       ]);
 
-      const assignedIds = ((prisma.collection.upsert as any).mock.calls as Array<[any]>)
-        .map((call) => call[0]?.create?.collectionId)
-        .filter((value): value is bigint => typeof value === "bigint")
-        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-      expect(assignedIds).toEqual([1n, 2n]);
+      const createPayloads = ((prisma.collection.upsert as any).mock.calls as Array<[any]>)
+        .map((call) => call[0]?.create);
+      expect(createPayloads).toHaveLength(2);
+      for (const payload of createPayloads) {
+        expect(payload).not.toHaveProperty("collectionId");
+      }
     });
 
     it("CollectionPointerSet should not regress lastSeen fields for an older same-slot signature in fallback mode", async () => {

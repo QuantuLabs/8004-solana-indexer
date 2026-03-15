@@ -210,6 +210,7 @@ model FeedbackResponse {
   responder     String
   responseUri   String
   responseHash  Bytes?
+  sealHash      Bytes?
   runningDigest Bytes?
   responseCount BigInt?
   createdAt     DateTime @default(now())

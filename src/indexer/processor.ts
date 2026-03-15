@@ -34,6 +34,8 @@ export class Processor {
   private pendingWsStart: Promise<void> | null = null;
   private pendingVerifier: DataVerifier | null = null;
   private pendingVerifierStart: Promise<void> | null = null;
+  private lastAutoWsProbeAt = 0;
+  private runToken = 0;
 
   constructor(prisma: PrismaClient | null, pool: Pool | null = null, options?: ProcessorOptions) {
     this.prisma = prisma;
@@ -43,7 +45,20 @@ export class Processor {
     this.connection = new Connection(config.rpcUrl, {
       wsEndpoint: config.wsUrl,
       commitment: "confirmed",
+      disableRetryOnRateLimit: true,
     });
+  }
+
+  isCaughtUp(): boolean {
+    if (this.activeBootstrapPollers.size > 0) {
+      return false;
+    }
+
+    if (this.mode === "polling") {
+      return this.poller?.isCaughtUp() ?? false;
+    }
+
+    return true;
   }
 
   async start(): Promise<void> {
@@ -53,29 +68,34 @@ export class Processor {
     }
 
     this.isRunning = true;
+    this.runToken += 1;
+    const expectedRunToken = this.runToken;
+    this.lastAutoWsProbeAt = 0;
     logger.info({ mode: this.mode }, "Starting processor");
 
     try {
-      // Run verifier concurrently with ingestion/bootstrap so websocket/auto
-      // do not accumulate unbounded PENDING rows during long catch-up.
-      await this.startVerifier();
-      if (!this.isRunning) {
-        return;
-      }
-
       switch (this.mode) {
         case "websocket":
-          await this.startWebSocketPipeline();
+          await this.startWebSocketPipeline(expectedRunToken);
           break;
 
         case "polling":
-          await this.startPolling();
+          await this.startPolling(expectedRunToken);
           break;
 
         case "auto":
         default:
-          await this.startAuto();
+          await this.startAuto(expectedRunToken);
           break;
+      }
+
+      if (!this.isRunning || this.runToken !== expectedRunToken) {
+        return;
+      }
+
+      await this.startVerifier(expectedRunToken);
+      if (!this.isRunning || this.runToken !== expectedRunToken) {
+        return;
       }
 
       if (this.prisma && config.dbMode === "local") {
@@ -83,6 +103,10 @@ export class Processor {
         logger.info("Local derived digest workers enabled after bootstrap");
       }
     } catch (error) {
+      if (this.runToken !== expectedRunToken) {
+        logger.warn({ error }, "Ignoring stale processor startup failure from previous run");
+        throw error;
+      }
       logger.error({ error }, "Processor startup failed, cleaning up partial state");
       try {
         await this.stop();
@@ -93,7 +117,7 @@ export class Processor {
     }
   }
 
-  private async startVerifier(): Promise<void> {
+  private async startVerifier(expectedRunToken: number): Promise<void> {
     setVerifierActive(false);
     const nextVerifier = new DataVerifier(
       this.connection,
@@ -115,7 +139,7 @@ export class Processor {
         this.pendingVerifier = null;
       }
     }
-    if (!this.isRunning || this.verifier !== nextVerifier) {
+    if (!this.isRunning || this.runToken !== expectedRunToken || this.verifier !== nextVerifier) {
       await nextVerifier.stop();
       return;
     }
@@ -126,6 +150,8 @@ export class Processor {
   async stop(): Promise<void> {
     logger.info("Stopping processor");
     this.isRunning = false;
+    this.runToken += 1;
+    this.lastAutoWsProbeAt = 0;
 
     // Clean up WebSocket monitor timeout
     if (this.wsMonitorInterval) {
@@ -186,7 +212,7 @@ export class Processor {
     }
   }
 
-  private async startWebSocket(): Promise<void> {
+  private async startWebSocket(expectedRunToken: number): Promise<void> {
     const nextWsIndexer = new WebSocketIndexer({
       connection: this.connection,
       prisma: this.prisma,
@@ -206,7 +232,7 @@ export class Processor {
         this.pendingWsIndexer = null;
       }
     }
-    if (!this.isRunning) {
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
       await nextWsIndexer.stop();
       return;
     }
@@ -226,7 +252,7 @@ export class Processor {
     });
   }
 
-  private async startPolling(): Promise<void> {
+  private async startPolling(expectedRunToken: number): Promise<void> {
     const nextPoller = this.createPoller();
     this.pendingPoller = nextPoller;
     const startPromise = nextPoller.start();
@@ -241,15 +267,15 @@ export class Processor {
         this.pendingPoller = null;
       }
     }
-    if (!this.isRunning) {
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
       await nextPoller.stop();
       return;
     }
     this.poller = nextPoller;
   }
 
-  private async bootstrapAutoCatchUp(options?: PollerBootstrapOptions): Promise<void> {
-    if (!this.isRunning) return;
+  private async bootstrapAutoCatchUp(expectedRunToken: number, options?: PollerBootstrapOptions): Promise<void> {
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
     const bootstrapPoller = this.createPoller();
     this.activeBootstrapPollers.add(bootstrapPoller);
     try {
@@ -259,29 +285,33 @@ export class Processor {
     }
   }
 
-  private async startWebSocketPipeline(): Promise<void> {
-    await this.bootstrapAutoCatchUp();
-    if (!this.isRunning) return;
-    await this.startWebSocket();
-    if (!this.isRunning) return;
+  private async startWebSocketPipeline(expectedRunToken: number): Promise<void> {
+    await this.bootstrapAutoCatchUp(expectedRunToken);
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
+    await this.startWebSocket(expectedRunToken);
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
     // Close the bootstrap -> live subscription gap with a short catch-up pass.
-    await this.bootstrapAutoCatchUp({ suppressEventLogWrites: true });
-    if (!this.isRunning) return;
+    await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
     this.monitorWebSocket();
   }
 
-  private async startAutoWebSocketPipeline(): Promise<void> {
-    await this.startWebSocketPipeline();
+  private async startAutoWebSocketPipeline(expectedRunToken: number): Promise<void> {
+    await this.startWebSocketPipeline(expectedRunToken);
   }
 
-  private async startAuto(): Promise<void> {
+  private async startAuto(expectedRunToken: number): Promise<void> {
     logger.info("Testing WebSocket connection...");
     const wsAvailable = await testWebSocketConnection(config.rpcUrl, config.wsUrl, config.programId);
+
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
+      return;
+    }
 
     if (wsAvailable) {
       try {
         logger.info("WebSocket available, using WebSocket mode");
-        await this.startAutoWebSocketPipeline();
+        await this.startAutoWebSocketPipeline(expectedRunToken);
         return;
       } catch (error) {
         logger.warn({ error }, "WebSocket startup failed, falling back to polling mode");
@@ -297,13 +327,19 @@ export class Processor {
           }
           this.wsIndexer = null;
         }
-        await this.startPolling();
+        await this.startPolling(expectedRunToken);
+        if (this.isRunning && this.runToken === expectedRunToken) {
+          this.monitorWebSocket();
+        }
         return;
       }
     }
 
     logger.info("WebSocket not available, falling back to polling mode");
-    await this.startPolling();
+    await this.startPolling(expectedRunToken);
+    if (this.isRunning && this.runToken === expectedRunToken) {
+      this.monitorWebSocket();
+    }
   }
 
   private monitorWebSocket(): void {
@@ -328,8 +364,26 @@ export class Processor {
       return;
     }
 
+    const runToken = this.runToken;
+    const shouldRetryAutoWebSocket = this.mode === "auto" && !!this.poller && !this.wsIndexer;
+    if (shouldRetryAutoWebSocket) {
+      this.wsMonitorInProgress = true;
+      try {
+        const now = Date.now();
+        if (now - this.lastAutoWsProbeAt >= 60_000) {
+          this.lastAutoWsProbeAt = now;
+          await this.tryPromoteAutoBackToWebSocket(runToken);
+        }
+      } catch (error) {
+        logger.error({ error }, "Error while probing WebSocket recovery in auto mode");
+      } finally {
+        this.wsMonitorInProgress = false;
+      }
+    }
+
+    const shouldRecoverWebSocketMode = this.mode === "websocket" && !this.wsIndexer;
     const shouldRetryAutoFailover = this.mode === "auto" && !this.wsIndexer && !this.poller;
-    if (shouldRetryAutoFailover || (this.wsIndexer && !this.wsIndexer.isActive())) {
+    if (shouldRecoverWebSocketMode || shouldRetryAutoFailover || (this.wsIndexer && !this.wsIndexer.isActive())) {
       // Check if WS is in self-healing mode (reconnecting/health-checking)
       if (this.wsIndexer?.isRecovering()) {
         logger.debug("WebSocket in recovery mode, waiting for self-heal");
@@ -341,10 +395,10 @@ export class Processor {
       try {
         if (this.mode === "websocket") {
           logger.warn("WebSocket connection lost and not recovering, restarting websocket with catch-up");
-          await this.recoverWebSocketMode();
+          await this.recoverWebSocketMode(runToken);
         } else {
           logger.warn("WebSocket connection lost and not recovering, switching to polling");
-          await this.failOverToPolling();
+          await this.failOverToPolling(runToken);
         }
       } catch (error) {
         logger.error({ error }, "Error in WebSocket monitor fallback");
@@ -353,17 +407,23 @@ export class Processor {
       }
     }
 
-    if (this.mode === "websocket" || this.wsIndexer || (this.mode === "auto" && !this.poller)) {
+    if (this.mode === "websocket" || this.mode === "auto" || this.wsIndexer) {
       this.scheduleNextWsCheck();
     }
   }
 
   private scheduleNextWsCheck(): void {
     if (!this.isRunning) return;
+    if (this.wsMonitorInterval) {
+      clearTimeout(this.wsMonitorInterval);
+    }
     this.wsMonitorInterval = setTimeout(() => this.runWebSocketCheck(), 10000);
   }
 
-  private async recoverWebSocketMode(): Promise<void> {
+  private async recoverWebSocketMode(expectedRunToken: number): Promise<void> {
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
+      return;
+    }
     if (this.wsIndexer) {
       try {
         await this.wsIndexer.stop();
@@ -373,14 +433,17 @@ export class Processor {
       this.wsIndexer = null;
     }
 
-    await this.bootstrapAutoCatchUp();
-    if (!this.isRunning) return;
-    await this.startWebSocket();
-    if (!this.isRunning) return;
-    await this.bootstrapAutoCatchUp({ suppressEventLogWrites: true });
+    await this.bootstrapAutoCatchUp(expectedRunToken);
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
+    await this.startWebSocket(expectedRunToken);
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
+    await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
   }
 
-  private async failOverToPolling(): Promise<void> {
+  private async failOverToPolling(expectedRunToken: number): Promise<void> {
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
+      return;
+    }
     if (this.wsIndexer) {
       try {
         await this.wsIndexer.stop();
@@ -395,11 +458,51 @@ export class Processor {
       this.wsMonitorInterval = null;
     }
 
-    if (!this.isRunning || this.poller) {
+    if (!this.isRunning || this.runToken !== expectedRunToken || this.poller) {
       return;
     }
 
-    await this.startPolling();
+    await this.startPolling(expectedRunToken);
+  }
+
+  private async tryPromoteAutoBackToWebSocket(expectedRunToken: number): Promise<void> {
+    if (!this.isRunning || this.runToken !== expectedRunToken || this.mode !== "auto" || !this.poller || this.wsIndexer) {
+      return;
+    }
+
+    const wsAvailable = await testWebSocketConnection(config.rpcUrl, config.wsUrl, config.programId);
+    if (!wsAvailable || !this.isRunning || this.runToken !== expectedRunToken || this.mode !== "auto" || !this.poller || this.wsIndexer) {
+      return;
+    }
+
+    logger.info("WebSocket available again, promoting auto mode back to websocket");
+
+    const currentPoller = this.poller;
+    await currentPoller.stop();
+    if (this.poller === currentPoller) {
+      this.poller = null;
+    }
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
+      return;
+    }
+
+    try {
+      await this.startAutoWebSocketPipeline(expectedRunToken);
+    } catch (error) {
+      logger.warn({ error }, "Auto mode websocket promotion failed, returning to polling");
+      const currentWsIndexer = this.wsIndexer as { stop: () => Promise<void> } | null;
+      if (currentWsIndexer) {
+        try {
+          await currentWsIndexer.stop();
+        } catch (stopError) {
+          logger.warn({ error: stopError }, "Failed to stop WebSocket indexer after auto promotion error");
+        }
+        this.wsIndexer = null;
+      }
+      if (!this.poller && this.isRunning && this.runToken === expectedRunToken) {
+        await this.startPolling(expectedRunToken);
+      }
+    }
   }
 
   getStatus(): {

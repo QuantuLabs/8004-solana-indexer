@@ -17,7 +17,7 @@ export default defineConfig({
       reporter: ["text", "json", "html"],
       reportsDirectory: "./coverage/e2e",
       include: ["src/**/*.ts"],
-      exclude: ["src/index.ts", "src/**/index.ts", "src/**/*.d.ts"],
+      exclude: ["src/**/index.ts", "src/**/*.d.ts"],
     },
   },
 });

@@ -47,7 +47,7 @@ describe('API Server (GraphQL-only)', () => {
 
   afterAll(async () => {
     process.env = originalEnv;
-    if (server) {
+    if (server?.listening) {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
@@ -65,11 +65,110 @@ describe('API Server (GraphQL-only)', () => {
     const res = await fetch(`${baseUrl}/ready`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ status: 'ready' });
+    expect(body).toEqual({
+      status: 'ready',
+      phase: 'catching_up',
+      state: null,
+    });
+  });
+
+  it('reports /ready as starting when the pool readiness probe fails', async () => {
+    vi.resetModules();
+    process.env = {
+      ...suiteEnv,
+      API_MODE: 'graphql',
+      ENABLE_GRAPHQL: 'true',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const failingPool = {
+      query: vi.fn().mockRejectedValue(new Error('pool down')),
+    } as any;
+    const failingApp = createApiServer({ pool: failingPool, prisma: null });
+
+    let failingServer: Server | undefined;
+    let failingBaseUrl = '';
+    await new Promise<void>((resolve, reject) => {
+      failingServer = failingApp.listen(0, '127.0.0.1', () => {
+        const addr = failingServer!.address() as AddressInfo;
+        failingBaseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      failingServer.on('error', reject);
+    });
+
+    const res = await fetch(`${failingBaseUrl}/ready`);
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({
+      status: 'starting',
+      phase: 'bootstrapping',
+      state: null,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      failingServer!.close((err) => (err ? reject(err) : resolve()));
+    });
+
+    process.env = suiteEnv;
+  });
+
+  it('returns 503 for business routes when the pool readiness probe fails', async () => {
+    vi.resetModules();
+    process.env = {
+      ...suiteEnv,
+      API_MODE: 'graphql',
+      ENABLE_GRAPHQL: 'true',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const failingPool = {
+      query: vi.fn().mockRejectedValue(new Error('pool down')),
+    } as any;
+    const failingApp = createApiServer({ pool: failingPool, prisma: null });
+
+    let failingServer: Server | undefined;
+    let failingBaseUrl = '';
+    await new Promise<void>((resolve, reject) => {
+      failingServer = failingApp.listen(0, '127.0.0.1', () => {
+        const addr = failingServer!.address() as AddressInfo;
+        failingBaseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      failingServer.on('error', reject);
+    });
+
+    const res = await fetch(`${failingBaseUrl}/v2/graphql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
+    });
+
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({
+      error: 'Indexer bootstrap in progress. Retry shortly.',
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      failingServer!.close((err) => (err ? reject(err) : resolve()));
+    });
+
+    process.env = suiteEnv;
   });
 
   it('serves /v2/graphql endpoint', async () => {
     const res = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ data: { ok: true } });
+  });
+
+  it('serves /graphql alias endpoint', async () => {
+    const res = await fetch(`${baseUrl}/graphql`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
@@ -125,7 +224,7 @@ describe('API Server (GraphQL-only)', () => {
 
   it('throws when no API backend is available', () => {
     expect(() => createApiServer({ pool: null as any, prisma: null as any })).toThrow(
-      'No API backend available for API_MODE. Provide Prisma (REST), Supabase pool (GraphQL), or set API_MODE explicitly.'
+      'GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)'
     );
   });
 
@@ -172,7 +271,7 @@ describe('API Server readiness gate', () => {
 
   afterAll(async () => {
     process.env = originalEnv;
-    if (server) {
+    if (server?.listening) {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
@@ -188,7 +287,11 @@ describe('API Server readiness gate', () => {
   it('exposes /ready as 503 while bootstrap is in progress', async () => {
     const res = await fetch(`${baseUrl}/ready`);
     expect(res.status).toBe(503);
-    await expect(res.json()).resolves.toEqual({ status: 'starting' });
+    await expect(res.json()).resolves.toEqual({
+      status: 'starting',
+      phase: 'bootstrapping',
+      state: null,
+    });
   });
 
   it('returns 503 for business routes while bootstrap is in progress', async () => {
@@ -209,6 +312,433 @@ describe('API Server readiness gate', () => {
     await expect(graphqlRes.json()).resolves.toEqual({
       error: 'Indexer bootstrap in progress. Retry shortly.',
     });
+  });
+});
+
+describe('API Server REST proxy readiness', () => {
+  let createApiServer: typeof import('../../../src/api/server.js').createApiServer;
+  let server: Server;
+  let baseUrl: string;
+
+  async function boot(checkRestProxyReady: () => Promise<boolean>) {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+      SUPABASE_URL: 'https://proxy-test.supabase.co',
+      SUPABASE_KEY: 'service-role-key',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({
+      pool: {} as any,
+      prisma: null,
+      checkRestProxyReady,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+  }
+
+  afterAll(async () => {
+    process.env = originalEnv;
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it('reports /ready as starting when the REST proxy backend is unavailable', async () => {
+    await boot(async () => false);
+    const res = await fetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({
+      status: 'starting',
+      phase: 'bootstrapping',
+      state: null,
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
+  });
+
+  it('reports /ready as ready when the REST proxy backend is available', async () => {
+    await boot(async () => true);
+    const res = await fetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      status: 'ready',
+      phase: 'catching_up',
+      state: null,
+    });
+  });
+
+  it('coalesces concurrent /ready proxy probes into a single upstream probe cycle', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+      SUPABASE_URL: 'https://proxy-test.supabase.co',
+      SUPABASE_KEY: 'service-role-key',
+    };
+
+    const nativeFetch = globalThis.fetch;
+    let agentsCalls = 0;
+    let leaderboardCalls = 0;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('http://127.0.0.1:')) {
+        return await nativeFetch(input, init);
+      }
+      if (url === 'https://proxy-test.supabase.co/rest/v1/agents?select=asset&limit=1') {
+        agentsCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return new Response(JSON.stringify([{ asset: 'ok' }]), { status: 200 });
+      }
+      if (url === 'https://proxy-test.supabase.co/rest/v1/leaderboard?select=asset&limit=1') {
+        leaderboardCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return new Response(JSON.stringify([{ asset: 'ok' }]), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchSpy as typeof fetch);
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({
+      pool: {} as any,
+      prisma: null,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const [first, second] = await Promise.all([
+      nativeFetch(`${baseUrl}/ready`),
+      nativeFetch(`${baseUrl}/ready`),
+    ]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(agentsCalls).toBe(1);
+    expect(leaderboardCalls).toBe(1);
+
+    vi.unstubAllGlobals();
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
+  });
+
+  it('reports /ready as starting when leaderboard proxy probe fails', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+      SUPABASE_URL: 'https://proxy-test.supabase.co',
+      SUPABASE_KEY: 'service-role-key',
+    };
+
+    const nativeFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('http://127.0.0.1:')) {
+        return await nativeFetch(input, init);
+      }
+      if (url === 'https://proxy-test.supabase.co/rest/v1/agents?select=asset&limit=1') {
+        return new Response(JSON.stringify([{ asset: 'ok' }]), { status: 200 });
+      }
+      if (url === 'https://proxy-test.supabase.co/rest/v1/leaderboard?select=asset&limit=1') {
+        return new Response('forbidden', { status: 403 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchSpy as typeof fetch);
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({
+      pool: {} as any,
+      prisma: null,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const res = await nativeFetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({
+      status: 'starting',
+      phase: 'bootstrapping',
+      state: null,
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://proxy-test.supabase.co/rest/v1/leaderboard?select=asset&limit=1',
+      expect.objectContaining({ method: 'GET' }),
+    );
+
+    vi.unstubAllGlobals();
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
+  });
+
+  it('includes runtime state details in /ready when a real Prisma backend is available', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+    };
+
+    const prisma = {
+      indexerState: {
+        findUnique: vi.fn().mockResolvedValue({ lastSlot: 123n, lastTxIndex: 7 }),
+      },
+      agent: {
+        count: vi.fn()
+          .mockResolvedValueOnce(11)
+          .mockResolvedValueOnce(2)
+          .mockResolvedValueOnce(1),
+      },
+      feedback: {
+        count: vi.fn()
+          .mockResolvedValueOnce(22)
+          .mockResolvedValueOnce(3)
+          .mockResolvedValueOnce(1),
+      },
+      feedbackResponse: {
+        count: vi.fn()
+          .mockResolvedValueOnce(33)
+          .mockResolvedValueOnce(4)
+          .mockResolvedValueOnce(2),
+      },
+      revocation: {
+        count: vi.fn()
+          .mockResolvedValueOnce(44)
+          .mockResolvedValueOnce(5)
+          .mockResolvedValueOnce(0),
+      },
+      orphanFeedback: {
+        count: vi.fn().mockResolvedValue(4),
+      },
+      orphanResponse: {
+        count: vi.fn().mockResolvedValue(5),
+      },
+      agentMetadata: {
+        count: vi.fn()
+          .mockResolvedValueOnce(6)
+          .mockResolvedValueOnce(2),
+      },
+      registry: {
+        count: vi.fn()
+          .mockResolvedValueOnce(7)
+          .mockResolvedValueOnce(1),
+      },
+      validation: {
+        count: vi.fn()
+          .mockResolvedValueOnce(8)
+          .mockResolvedValueOnce(3),
+      },
+      collection: { count: vi.fn().mockResolvedValue(6) },
+    } as any;
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({ prisma, pool: null as any });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const res = await fetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      status: 'ready',
+      phase: 'catching_up',
+      state: {
+        mainSlot: 123,
+        mainTxIndex: 7,
+        counts: {
+          agents: 11,
+          feedbacks: 22,
+          responses: 33,
+          revocations: 44,
+          collections: 6,
+        },
+        pending: {
+          agents: 2,
+          feedbacks: 3,
+          responses: 4,
+          revocations: 5,
+          metadata: 6,
+          registries: 7,
+          validations: 8,
+        },
+        orphans: {
+          agents: 1,
+          feedbacks: 5,
+          responses: 7,
+          revocations: 0,
+          metadata: 2,
+          registries: 1,
+          validations: 3,
+        },
+      },
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
+  });
+
+  it('reports /ready as starting when runtime state details cannot be loaded from Prisma', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+    };
+
+    const prisma = {
+      indexerState: {
+        findUnique: vi.fn().mockRejectedValue(new Error('state query failed')),
+      },
+    } as any;
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({ prisma, pool: null as any });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const res = await fetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({
+      status: 'starting',
+      phase: 'bootstrapping',
+      state: null,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
+  });
+
+  it('keeps /ready in catching_up when runtime backlog is empty but the poller has not reached an idle frontier yet', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+    };
+
+    const prisma = {
+      indexerState: {
+        findUnique: vi.fn().mockResolvedValue({ lastSlot: 123n, lastTxIndex: 7 }),
+      },
+      agent: {
+        count: vi.fn()
+          .mockResolvedValueOnce(11)
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      feedback: {
+        count: vi.fn()
+          .mockResolvedValueOnce(22)
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      feedbackResponse: {
+        count: vi.fn()
+          .mockResolvedValueOnce(33)
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      revocation: {
+        count: vi.fn()
+          .mockResolvedValueOnce(44)
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      orphanFeedback: { count: vi.fn().mockResolvedValue(0) },
+      orphanResponse: { count: vi.fn().mockResolvedValue(0) },
+      agentMetadata: {
+        count: vi.fn()
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      registry: {
+        count: vi.fn()
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      validation: {
+        count: vi.fn()
+          .mockResolvedValueOnce(0)
+          .mockResolvedValueOnce(0),
+      },
+      collection: { count: vi.fn().mockResolvedValue(6) },
+    } as any;
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    const app = createApiServer({ prisma, pool: null as any, isCaughtUp: () => false });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const res = await fetch(`${baseUrl}/ready`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual(expect.objectContaining({
+      status: 'ready',
+      phase: 'catching_up',
+    }));
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
   });
 });
 
@@ -267,6 +797,51 @@ describe('API Server GraphQL rate limiting', () => {
     await expect(second.json()).resolves.toEqual({
       error: 'GraphQL rate limited. Max 1 requests per minute.',
     });
+  });
+
+  it('does not apply the global REST limiter to GraphQL routes', async () => {
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'both',
+      ENABLE_GRAPHQL: 'true',
+      RATE_LIMIT_MAX_REQUESTS: '1',
+      GRAPHQL_RATE_LIMIT_MAX_REQUESTS: '2',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    app = createApiServer({ pool: {} as any, prisma: {
+      agent: { findMany: vi.fn().mockResolvedValue([]) },
+    } as any });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+
+    const rest = await fetch(`${baseUrl}/rest/v1/agents`);
+    expect(rest.status).toBe(200);
+
+    const gql = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '{ stats { totalAgents } }' }),
+    });
+    expect(gql.status).toBe(200);
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    server = undefined as unknown as Server;
   });
 });
 
@@ -369,7 +944,9 @@ describe('API Server replay-data status filtering', () => {
   let server: Server;
   let baseUrl: string;
   const feedbackFindMany = vi.fn().mockResolvedValue([]);
+  const orphanFeedbackFindMany = vi.fn().mockResolvedValue([]);
   const responseFindMany = vi.fn().mockResolvedValue([]);
+  const orphanResponseFindMany = vi.fn().mockResolvedValue([]);
   const revocationFindMany = vi.fn().mockResolvedValue([]);
 
   beforeAll(async () => {
@@ -384,7 +961,9 @@ describe('API Server replay-data status filtering', () => {
     app = createApiServer({
       prisma: {
         feedback: { findMany: feedbackFindMany },
+        orphanFeedback: { findMany: orphanFeedbackFindMany },
         feedbackResponse: { findMany: responseFindMany },
+        orphanResponse: { findMany: orphanResponseFindMany },
         revocation: { findMany: revocationFindMany },
       } as any,
       pool: null,
@@ -411,11 +990,13 @@ describe('API Server replay-data status filtering', () => {
 
   beforeEach(() => {
     feedbackFindMany.mockClear();
+    orphanFeedbackFindMany.mockClear();
     responseFindMany.mockClear();
+    orphanResponseFindMany.mockClear();
     revocationFindMany.mockClear();
   });
 
-  it('excludes ORPHANED feedbacks from replay-data queries', async () => {
+  it('includes orphan feedback staging when serving feedback replay-data locally', async () => {
     const asset = '11111111111111111111111111111111';
     const res = await fetch(`${baseUrl}/rest/v1/events/${asset}/replay-data?chainType=feedback`);
     expect(res.status).toBe(200);
@@ -423,30 +1004,81 @@ describe('API Server replay-data status filtering', () => {
       expect.objectContaining({
         where: expect.objectContaining({
           agentId: asset,
-          status: { not: 'ORPHANED' },
+        }),
+      })
+    );
+    expect(orphanFeedbackFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          agentId: asset,
         }),
       })
     );
   });
 
-  it('excludes ORPHANED responses from replay-data queries', async () => {
+  it('includes orphan response staging when serving response replay-data locally', async () => {
     const asset = '11111111111111111111111111111111';
     const res = await fetch(`${baseUrl}/rest/v1/events/${asset}/replay-data?chainType=response`);
     expect(res.status).toBe(200);
     expect(responseFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          status: { not: 'ORPHANED' },
           feedback: {
             agentId: asset,
-            status: { not: 'ORPHANED' },
           },
+        }),
+      })
+    );
+    expect(orphanResponseFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          agentId: asset,
         }),
       })
     );
   });
 
-  it('excludes ORPHANED revocations from replay-data queries', async () => {
+  it('does not synthesize response feedback_hash from the parent feedback when sealHash is null', async () => {
+    const asset = '11111111111111111111111111111111';
+    responseFindMany.mockResolvedValueOnce([{
+      id: 'response-row-1',
+      responder: 'Responder11111111111111111111111111111111',
+      responseHash: Buffer.from('aa'.repeat(32), 'hex'),
+      sealHash: null,
+      runningDigest: Buffer.from('bb'.repeat(32), 'hex'),
+      responseCount: 0n,
+      slot: 123n,
+      txIndex: 1,
+      eventOrdinal: 0,
+      txSignature: 'Sig111111111111111111111111111111111111111111111111111111',
+      feedback: {
+        agentId: asset,
+        client: 'Client111111111111111111111111111111111',
+        feedbackIndex: 0n,
+        feedbackHash: Buffer.from('cc'.repeat(32), 'hex'),
+      },
+    }]);
+
+    const res = await fetch(`${baseUrl}/rest/v1/events/${asset}/replay-data?chainType=response`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      events: [{
+        asset,
+        client: 'Client111111111111111111111111111111111',
+        feedback_index: '0',
+        responder: 'Responder11111111111111111111111111111111',
+        response_hash: 'aa'.repeat(32),
+        feedback_hash: null,
+        slot: 123,
+        running_digest: 'bb'.repeat(32),
+        response_count: 0,
+      }],
+      hasMore: false,
+      nextFromCount: 1,
+    });
+  });
+
+  it('includes canonical orphan revocations when serving revoke replay-data locally', async () => {
     const asset = '11111111111111111111111111111111';
     const res = await fetch(`${baseUrl}/rest/v1/events/${asset}/replay-data?chainType=revoke`);
     expect(res.status).toBe(200);
@@ -454,10 +1086,73 @@ describe('API Server replay-data status filtering', () => {
       expect.objectContaining({
         where: expect.objectContaining({
           agentId: asset,
-          status: { not: 'ORPHANED' },
         }),
       })
     );
+  });
+});
+
+describe('API Server verification stats staging parity', () => {
+  let createApiServer: typeof import('../../../src/api/server.js').createApiServer;
+  let app: Express;
+  let server: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'rest',
+      ENABLE_GRAPHQL: 'false',
+    };
+
+    ({ createApiServer } = await import('../../../src/api/server.js'));
+    app = createApiServer({
+      prisma: {
+        agent: { groupBy: vi.fn().mockResolvedValue([]) },
+        feedback: { groupBy: vi.fn().mockResolvedValue([{ status: 'FINALIZED', _count: { _all: 10 } }]) },
+        registry: { groupBy: vi.fn().mockResolvedValue([]) },
+        agentMetadata: { groupBy: vi.fn().mockResolvedValue([]) },
+        validation: { groupBy: vi.fn().mockResolvedValue([{ chainStatus: 'ORPHANED', _count: { _all: 4 } }]) },
+        feedbackResponse: { groupBy: vi.fn().mockResolvedValue([{ status: 'FINALIZED', _count: { _all: 4 } }]) },
+        revocation: { groupBy: vi.fn().mockResolvedValue([{ status: 'ORPHANED', _count: { _all: 2 } }]) },
+        orphanFeedback: { count: vi.fn().mockResolvedValue(3) },
+        orphanResponse: { count: vi.fn().mockResolvedValue(5) },
+      } as any,
+      pool: null,
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+      server.on('error', reject);
+    });
+  });
+
+  afterAll(async () => {
+    process.env = originalEnv;
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it('includes orphan staging tables in local verification stats', async () => {
+    const res = await fetch(`${baseUrl}/rest/v1/stats/verification`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      agents: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+      feedbacks: { PENDING: 0, FINALIZED: 10, ORPHANED: 3 },
+      registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+      metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+      validations: { PENDING: 0, FINALIZED: 0, ORPHANED: 4 },
+      feedback_responses: { PENDING: 0, FINALIZED: 4, ORPHANED: 5 },
+      revocations: { PENDING: 0, FINALIZED: 0, ORPHANED: 2 },
+    });
   });
 });
 
@@ -540,6 +1235,7 @@ describe('API Server local reputation/rpc parity', () => {
     registryType: 'USER',
     authority: 'Authority111111111111111111111111111111111',
   });
+  const agentDigestCacheFindMany = vi.fn().mockResolvedValue([]);
 
   beforeAll(async () => {
     vi.resetModules();
@@ -568,6 +1264,9 @@ describe('API Server local reputation/rpc parity', () => {
         },
         registry: {
           findFirst: registryFindFirst,
+        },
+        agentDigestCache: {
+          findMany: agentDigestCacheFindMany,
         },
         collection: {
           findUnique: collectionFindUnique,
@@ -621,6 +1320,59 @@ describe('API Server local reputation/rpc parity', () => {
     validationGroupBy.mockClear();
     collectionFindUnique.mockClear();
     registryFindFirst.mockClear();
+    agentDigestCacheFindMany.mockClear();
+    agentDigestCacheFindMany.mockResolvedValue([]);
+  });
+
+  it('serves local /agents with cumulative digest feedback_count and normalized nft_name', async () => {
+    agentFindMany.mockResolvedValueOnce([
+      {
+        id: 'Agent1111111111111111111111111111111111111',
+        owner: 'Owner111111111111111111111111111111111111',
+        creator: 'Creator11111111111111111111111111111111111',
+        uri: 'https://example.com/agent-111.json',
+        wallet: 'Wallet11111111111111111111111111111111111',
+        collection: 'Collection11111111111111111111111111111111',
+        collectionPointer: 'c1:bafybeigdyrzt4x7n3z6l6zjptk5f5t5b4v5l5m5n5p5q5r5s5t5u5v5w5x',
+        colLocked: false,
+        parentAsset: null,
+        parentCreator: null,
+        parentLocked: false,
+        nftName: '',
+        atomEnabled: true,
+        trustTier: 2,
+        qualityScore: 8000,
+        confidence: 9000,
+        riskScore: 10,
+        diversityRatio: 20,
+        feedbackCount: 2,
+        rawAvgScore: 58,
+        agentId: 42n,
+        status: 'FINALIZED',
+        verifiedAt: new Date('2026-03-15T00:00:00.000Z'),
+        verifiedSlot: 123n,
+        createdAt: new Date('2026-03-15T00:00:00.000Z'),
+        updatedAt: new Date('2026-03-15T00:00:00.000Z'),
+        createdTxSignature: 'Sig111111111111111111111111111111111111111111111111',
+        createdSlot: 123n,
+        txIndex: 7,
+        eventOrdinal: 0,
+      },
+    ]);
+    agentDigestCacheFindMany.mockResolvedValueOnce([
+      { agentId: 'Agent1111111111111111111111111111111111111', feedbackCount: 5n },
+    ]);
+
+    const res = await fetch(`${baseUrl}/rest/v1/agents?limit=1`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual([
+      expect.objectContaining({
+        asset: 'Agent1111111111111111111111111111111111111',
+        agent_id: '42',
+        feedback_count: 5,
+        nft_name: null,
+      }),
+    ]);
   });
 
   it('serves local agent_reputation for asset lookups', async () => {
@@ -665,6 +1417,27 @@ describe('API Server local reputation/rpc parity', () => {
         }),
       })
     );
+  });
+
+  it('normalizes empty local agent_reputation nft_name to null', async () => {
+    agentFindFirst.mockResolvedValueOnce({
+      id: 'Agent1111111111111111111111111111111111111',
+      owner: 'Owner111111111111111111111111111111111111',
+      collection: 'Collection11111111111111111111111111111111',
+      nftName: '',
+      uri: 'https://example.com/agent-111.json',
+      feedbackCount: 1,
+      rawAvgScore: 58,
+    });
+
+    const res = await fetch(`${baseUrl}/rest/v1/agent_reputation?asset=eq.Agent1111111111111111111111111111111111111`);
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual([
+      expect.objectContaining({
+        asset: 'Agent1111111111111111111111111111111111111',
+        nft_name: null,
+      }),
+    ]);
   });
 
   it('serves local collection_stats with Prisma aggregate count objects', async () => {
@@ -773,6 +1546,58 @@ describe('API Server local reputation/rpc parity', () => {
         sort_key: '3008601730779997',
       }),
     ]);
+  });
+
+  it('excludes ORPHANED agents from local get_leaderboard RPC by default', async () => {
+    agentFindMany.mockResolvedValueOnce([
+      {
+        id: 'Agent1111111111111111111111111111111111111',
+        owner: 'Owner111111111111111111111111111111111111',
+        creator: null,
+        uri: 'https://example.com/agent-111.json',
+        wallet: null,
+        collection: null,
+        collectionPointer: null,
+        colLocked: false,
+        parentAsset: null,
+        parentCreator: null,
+        parentLocked: false,
+        nftName: 'Alpha Agent',
+        atomEnabled: true,
+        trustTier: 3,
+        qualityScore: 80,
+        confidence: 90,
+        riskScore: 5,
+        diversityRatio: 12,
+        feedbackCount: 3,
+        rawAvgScore: 88,
+        agentId: 7n,
+        status: 'FINALIZED',
+        verifiedAt: null,
+        verifiedSlot: null,
+        createdAt: new Date('2026-03-09T19:00:00.000Z'),
+        updatedAt: new Date('2026-03-09T19:10:00.000Z'),
+        createdTxSignature: 'Sig111111111111111111111111111111111111111111111111111',
+        createdSlot: 447346400n,
+        txIndex: 3,
+        eventOrdinal: 1,
+      },
+    ]);
+
+    const res = await fetch(`${baseUrl}/rest/v1/rpc/get_leaderboard`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ p_limit: 1, p_min_tier: 0 }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(agentFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { not: 'ORPHANED' },
+        }),
+      })
+    );
   });
 
   it('serves local leaderboard view shape compatible with proxy mode ordering', async () => {
@@ -1236,6 +2061,19 @@ describe('API Server REST cutoff/order parity', () => {
     );
   });
 
+  it('serves collection_pointers as an alias of collections', async () => {
+    const res = await fetch(`${baseUrl}/rest/v1/collection_pointers?collection=eq.Collection11111111111111111111111111111111&limit=1`);
+    expect(res.status).toBe(200);
+    expect(collectionFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          col: 'Collection11111111111111111111111111111111',
+        }),
+        take: 1,
+      })
+    );
+  });
+
   it('applies block_slot filters on metadata and returns Supabase-compatible fields', async () => {
     const res = await fetch(`${baseUrl}/rest/v1/metadata?asset=eq.Agent1111111111111111111111111111111111111&block_slot=lte.88&order=block_slot.asc&limit=1`);
     expect(res.status).toBe(200);
@@ -1277,22 +2115,44 @@ describe('API Server checkpoint JSON normalization', () => {
   let app: Express;
   let server: Server;
   let baseUrl: string;
-  const checkpointFindMany = vi.fn().mockResolvedValue([
+  const feedbackFindMany = vi.fn().mockResolvedValue([
     {
-      agentId: 'Agent1111111111111111111111111111111111111',
-      chainType: 'feedback',
-      eventCount: 1000n,
-      digest: '11'.repeat(32),
+      id: 'fb-1',
+      feedbackIndex: 999n,
+      runningDigest: Buffer.from('11'.repeat(32), 'hex'),
       createdAt: new Date('2026-03-09T10:00:00.000Z'),
+      createdSlot: 10n,
+      txIndex: 1,
+      eventOrdinal: 0,
+      createdTxSignature: 'sig-feedback',
     },
   ]);
-  const checkpointFindFirst = vi.fn().mockResolvedValue({
-    agentId: 'Agent1111111111111111111111111111111111111',
-    chainType: 'feedback',
-    eventCount: 1000n,
-    digest: '11'.repeat(32),
-    createdAt: new Date('2026-03-09T10:00:00.000Z'),
-  });
+  const orphanFeedbackFindMany = vi.fn().mockResolvedValue([]);
+  const feedbackResponseFindMany = vi.fn().mockResolvedValue([
+    {
+      id: 'resp-1',
+      responseCount: 999n,
+      runningDigest: Buffer.from('11'.repeat(32), 'hex'),
+      createdAt: new Date('2026-03-09T10:00:00.000Z'),
+      slot: 11n,
+      txIndex: 1,
+      eventOrdinal: 0,
+      txSignature: 'sig-response',
+    },
+  ]);
+  const orphanResponseFindMany = vi.fn().mockResolvedValue([]);
+  const revocationFindMany = vi.fn().mockResolvedValue([
+    {
+      id: 'rev-1',
+      revokeCount: 999n,
+      runningDigest: Buffer.from('11'.repeat(32), 'hex'),
+      createdAt: new Date('2026-03-09T10:00:00.000Z'),
+      slot: 12n,
+      txIndex: 1,
+      eventOrdinal: 0,
+      txSignature: 'sig-revoke',
+    },
+  ]);
 
   beforeAll(async () => {
     vi.resetModules();
@@ -1305,10 +2165,11 @@ describe('API Server checkpoint JSON normalization', () => {
     ({ createApiServer } = await import('../../../src/api/server.js'));
     app = createApiServer({
       prisma: {
-        hashChainCheckpoint: {
-          findMany: checkpointFindMany,
-          findFirst: checkpointFindFirst,
-        },
+        feedback: { findMany: feedbackFindMany },
+        orphanFeedback: { findMany: orphanFeedbackFindMany },
+        feedbackResponse: { findMany: feedbackResponseFindMany },
+        orphanResponse: { findMany: orphanResponseFindMany },
+        revocation: { findMany: revocationFindMany },
       } as any,
       pool: null,
     });
@@ -1334,7 +2195,7 @@ describe('API Server checkpoint JSON normalization', () => {
 
   it('serializes local checkpoint event_count values as JSON numbers', async () => {
     const asset = 'Agent1111111111111111111111111111111111111';
-    const listRes = await fetch(`${baseUrl}/rest/v1/checkpoints/${asset}`);
+    const listRes = await fetch(`${baseUrl}/rest/v1/checkpoints/${asset}?chainType=feedback`);
     expect(listRes.status).toBe(200);
     await expect(listRes.json()).resolves.toEqual([
       {
@@ -1354,16 +2215,8 @@ describe('API Server checkpoint JSON normalization', () => {
         digest: '11'.repeat(32),
         created_at: '2026-03-09T10:00:00.000Z',
       },
-      response: {
-        event_count: 1000,
-        digest: '11'.repeat(32),
-        created_at: '2026-03-09T10:00:00.000Z',
-      },
-      revoke: {
-        event_count: 1000,
-        digest: '11'.repeat(32),
-        created_at: '2026-03-09T10:00:00.000Z',
-      },
+      response: null,
+      revoke: null,
     });
   });
 });

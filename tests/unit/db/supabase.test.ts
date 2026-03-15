@@ -184,7 +184,7 @@ function resetPoolMocks() {
   mockPoolInstance.connect.mockResolvedValue(mockClientInstance);
 
   mockClientInstance.query.mockReset();
-  mockClientInstance.query.mockResolvedValue({ rows: [], rowCount: 0 });
+  mockClientInstance.query.mockImplementation((...args: any[]) => mockPoolInstance.query(...args));
   mockClientInstance.release.mockClear();
 }
 
@@ -409,6 +409,9 @@ describe("supabase.ts", () => {
         expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("UPDATE revocations")
         )).toBe(true);
+        expect(mockPoolInstance.connect).toHaveBeenCalled();
+        expect(mockClientInstance.query).toHaveBeenCalledWith("BEGIN");
+        expect(mockClientInstance.query).toHaveBeenCalledWith("COMMIT");
       });
 
       it("still cascades orphan response and revocation replay when orphan feedback already exists", async () => {
@@ -1002,14 +1005,18 @@ describe("supabase.ts", () => {
         expect(replayInsert).toBeDefined();
         expect(replayInsert![1][1]).toBeNull();
         expect(replayInsert![1][5]).toBe(TEST_RESPONDER.toBase58());
-        expect(replayInsert![1][10]).toBe("123456");
-        expect(replayInsert![1][11]).toBe(4);
-        expect(replayInsert![1][12]).toBe(1);
-        expect(replayInsert![1][15]).toBe("PENDING");
+        expect(replayInsert![1][10]).toBe("3");
+        expect(replayInsert![1][11]).toBe("123456");
+        expect(replayInsert![1][12]).toBe(4);
+        expect(replayInsert![1][13]).toBe(1);
+        expect(replayInsert![1][16]).toBe("PENDING");
         expect(cleanupCall).toBeDefined();
+        expect(mockPoolInstance.connect).toHaveBeenCalled();
+        expect(mockClientInstance.query).toHaveBeenCalledWith("BEGIN");
+        expect(mockClientInstance.query).toHaveBeenCalledWith("COMMIT");
       });
 
-      it("should keep replayed orphan response ORPHANED when staged seal_hash mismatches", async () => {
+      it("should keep staged orphan response when seal_hash differs from feedback hash", async () => {
         const feedbackHash = Buffer.from(TEST_HASH).toString("hex");
         mockPoolInstance.query.mockImplementation((sql: string) => {
           if (sql.includes("SELECT 1 FROM agents")) {
@@ -1068,9 +1075,11 @@ describe("supabase.ts", () => {
         const replayInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
         );
+        const cleanupCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("DELETE FROM orphan_responses")
+        );
         expect(replayInsert).toBeDefined();
-        expect(replayInsert![1][1]).toBeNull();
-        expect(replayInsert![1][15]).toBe("ORPHANED");
+        expect(cleanupCall).toBeDefined();
       });
 
       it("should insert feedback with atomEnabled=false (no ATOM update)", async () => {
@@ -1101,21 +1110,22 @@ describe("supabase.ts", () => {
         expect(insertCall![1][11]).toBe("");
       });
 
-      it("should handle duplicate feedback (rowCount=0)", async () => {
-        mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 0 });
+      it("should repair duplicate feedback and refresh agent stats", async () => {
+        mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 1 });
         const event = {
           type: "NewFeedback" as const,
           data: makeFeedbackData(),
         };
         await handleEvent(event, ctx);
-        // Only the insert query should be called, not the UPDATE agents
         const calls = mockPoolInstance.query.mock.calls;
-        // First calls: ensureCollection insert + feedback insert (which returns rowCount=0)
-        // No UPDATE agents calls after
+        const insertCall = calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO feedbacks")
+        );
+        expect(insertCall?.[0]).toContain("ON CONFLICT (id) DO UPDATE SET");
         const updateCalls = calls.filter((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("UPDATE agents SET")
         );
-        expect(updateCalls.length).toBe(0);
+        expect(updateCalls.length).toBeGreaterThan(0);
       });
 
       it("should include sealHash as feedback_hash", async () => {
@@ -1288,7 +1298,7 @@ describe("supabase.ts", () => {
         expect(agentSideEffects).toHaveLength(0);
       });
 
-      it("should warn on seal_hash mismatch", async () => {
+      it("should keep revocation PENDING when feedback exists but seal_hash differs", async () => {
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: "ff".repeat(32) }], rowCount: 1 }) // mismatched hash
           .mockResolvedValue({ rows: [], rowCount: 1 });
@@ -1298,7 +1308,11 @@ describe("supabase.ts", () => {
           data: makeRevokeData(),
         };
         await handleEvent(event, ctx);
-        // Should not throw, just warns
+        const revokeInsert = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO revocations")
+        );
+        expect(revokeInsert).toBeDefined();
+        expect(revokeInsert![1]).toContain("PENDING");
       });
 
       it("should update ATOM stats when atomEnabled + hadImpact", async () => {
@@ -2136,7 +2150,7 @@ describe("supabase.ts", () => {
         expect(revokeUpdate).toBeUndefined();
       });
 
-      it("FeedbackRevoked - hash mismatch", async () => {
+      it("FeedbackRevoked - hash mismatch stays PENDING when feedback exists", async () => {
         mockClientInstance.query
           .mockResolvedValueOnce(undefined) // BEGIN
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: "cc".repeat(32) }], rowCount: 1 })
@@ -2161,7 +2175,11 @@ describe("supabase.ts", () => {
           },
         };
         await handleEventAtomic(event, ctx);
-        // Warns but continues
+        const revokeInsert = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO revocations")
+        );
+        expect(revokeInsert).toBeDefined();
+        expect(revokeInsert![1]).toContain("PENDING");
       });
 
       it("ResponseAppended - feedback exists, matching hash", async () => {
@@ -2775,11 +2793,9 @@ describe("supabase.ts", () => {
       expect(state.lastSlot).toBeNull();
     });
 
-    it("should return null state on query error (fallback)", async () => {
+    it("should throw on query error", async () => {
       mockPoolInstance.query.mockRejectedValueOnce(new Error("db down"));
-      const state = await loadIndexerState();
-      expect(state.lastSignature).toBeNull();
-      expect(state.lastSlot).toBeNull();
+      await expect(loadIndexerState()).rejects.toThrow("db down");
     });
   });
 
@@ -2804,10 +2820,11 @@ describe("supabase.ts", () => {
       expect(upsertCall![1]).toContain(updatedAt.toISOString());
     });
 
-    it("should catch query error", async () => {
+    it("should throw on query error", async () => {
       mockPoolInstance.query.mockRejectedValueOnce(new Error("save fail"));
-      await saveIndexerState("sig", 1n, null, "poller", new Date("2026-03-06T10:31:29.259Z"));
-      // Should not throw
+      await expect(
+        saveIndexerState("sig", 1n, null, "poller", new Date("2026-03-06T10:31:29.259Z"))
+      ).rejects.toThrow("save fail");
     });
   });
 

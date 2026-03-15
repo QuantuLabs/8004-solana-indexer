@@ -21,6 +21,13 @@ const deterministicCounterMigrationSql = readFileSync(
   ),
   "utf8"
 );
+const recoveredOrphanMigrationSql = readFileSync(
+  resolve(
+    __dirname,
+    "../../../supabase/migrations/20260315195500_fix_recovered_orphan_agent_id_assignment.sql"
+  ),
+  "utf8"
+);
 const supabaseRuntime = readFileSync(resolve(__dirname, "../../../src/db/supabase.ts"), "utf8");
 const batchProcessorRuntime = readFileSync(
   resolve(__dirname, "../../../src/indexer/batch-processor.ts"),
@@ -152,6 +159,16 @@ describe("agent_id conflict-safe trigger semantics for ON CONFLICT", () => {
       "NEW.revocation_id := alloc_gapless_id('revocation:' || NEW.asset, COALESCE(NEW.created_at, NOW()));"
     );
     expect(deterministicCounterMigrationSql).toContain("DROP FUNCTION IF EXISTS alloc_gapless_id(TEXT);");
+  });
+
+  it("assigns agent_id when an orphaned agent is recovered to a non-orphan status", () => {
+    expect(recoveredOrphanMigrationSql).toContain("CREATE OR REPLACE FUNCTION assign_agent_id()");
+    expect(recoveredOrphanMigrationSql).toContain(
+      "OR (TG_OP = 'UPDATE' AND OLD.status = 'ORPHANED')"
+    );
+    expect(recoveredOrphanMigrationSql).toContain(
+      "NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));"
+    );
   });
 
   it("upserts agents via ON CONFLICT(asset) without mutating agent_id in runtime SQL", () => {

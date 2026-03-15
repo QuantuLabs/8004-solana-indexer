@@ -16,6 +16,7 @@ import { config } from "../config.js";
 import { metadataQueue } from "./metadata-queue.js";
 import { collectionMetadataQueue } from "./collection-metadata-queue.js";
 import { classifyRevocationStatus } from "../db/revocation-classification.js";
+import { classifyResponseStatus } from "../db/response-classification.js";
 import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { REVOCATION_CONFLICT_UPDATE_WHERE_SQL } from "../db/revocation-upsert-order.js";
 import { compressForStorage } from "../utils/compression.js";
@@ -31,6 +32,9 @@ const FLUSH_INTERVAL_MS = 500;     // Flush every 500ms even if batch not full
 const DEFAULT_MAX_PARALLEL_RPC = 3;        // Parallel RPC batch requests
 const MAX_DEAD_LETTER = 10000;     // Max diagnostic events retained in dead letter queue
 const DEAD_LETTER_BACKPRESSURE = 0.8; // Warn at 80% diagnostic queue capacity
+
+const PROVIDER_BACKOFF_MIN_MS = 2000;
+const PROVIDER_BACKOFF_MAX_MS = 30000;
 
 const ZERO_HASH_HEX = "0".repeat(64);
 
@@ -104,7 +108,7 @@ interface BatchRpcFetcherOptions {
   maxParallelChunks?: number;
 }
 
-function isRateLimitError(error: unknown): boolean {
+function isProviderOverloadedError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;
   }
@@ -114,9 +118,25 @@ function isRateLimitError(error: unknown): boolean {
     status?: unknown;
     message?: unknown;
     response?: { status?: unknown };
+    cause?: unknown;
+    data?: unknown;
+    error?: unknown;
   };
 
-  if (maybeError.code === 429 || maybeError.status === 429 || maybeError.response?.status === 429) {
+  if (
+    maybeError.code === 429 ||
+    maybeError.status === 429 ||
+    maybeError.response?.status === 429 ||
+    maybeError.code === 502 ||
+    maybeError.status === 502 ||
+    maybeError.response?.status === 502 ||
+    maybeError.code === 503 ||
+    maybeError.status === 503 ||
+    maybeError.response?.status === 503 ||
+    maybeError.code === 504 ||
+    maybeError.status === 504 ||
+    maybeError.response?.status === 504
+  ) {
     return true;
   }
 
@@ -125,7 +145,83 @@ function isRateLimitError(error: unknown): boolean {
   }
 
   const message = maybeError.message.toLowerCase();
-  return message.includes("429") || message.includes("too many requests") || message.includes("rate limit");
+  if (
+    message.includes("429") ||
+    message.includes("too many requests") ||
+    message.includes("rate limit") ||
+    message.includes("502") ||
+    message.includes("503") ||
+    message.includes("504") ||
+    message.includes("bad gateway") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout") ||
+    message.includes("cloudflare") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("socket hang up") ||
+    message.includes("econnreset") ||
+    message.includes("fetch failed")
+  ) {
+    return true;
+  }
+
+  return (
+    (maybeError.cause !== undefined && maybeError.cause !== error && isProviderOverloadedError(maybeError.cause)) ||
+    (maybeError.data !== undefined && maybeError.data !== error && isProviderOverloadedError(maybeError.data)) ||
+    (maybeError.error !== undefined && maybeError.error !== error && isProviderOverloadedError(maybeError.error))
+  );
+}
+
+function isBatchUnsupportedError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const maybeError = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    response?: { status?: unknown };
+    cause?: unknown;
+    data?: unknown;
+    error?: unknown;
+  };
+
+  if (maybeError.code === -32403) {
+    return true;
+  }
+
+  if (typeof maybeError.message !== "string") {
+    return false;
+  }
+
+  const message = maybeError.message.toLowerCase();
+  if (
+    message.includes("batch requests are only available") ||
+    message.includes("batch request is only available") ||
+    message.includes("batch requests are not available") ||
+    message.includes("batch request not supported") ||
+    message.includes("batch unsupported") ||
+    message.includes("-32403")
+  ) {
+    return true;
+  }
+
+  return (
+    (maybeError.cause !== undefined && maybeError.cause !== error && isBatchUnsupportedError(maybeError.cause)) ||
+    (maybeError.data !== undefined && maybeError.data !== error && isBatchUnsupportedError(maybeError.data)) ||
+    (maybeError.error !== undefined && maybeError.error !== error && isBatchUnsupportedError(maybeError.error))
+  );
+}
+
+export class BatchRpcBackoffRequiredError extends Error {
+  readonly retryAfterMs: number;
+
+  constructor(message: string, retryAfterMs: number) {
+    super(message);
+    this.name = "BatchRpcBackoffRequiredError";
+    this.retryAfterMs = retryAfterMs;
+  }
 }
 
 /**
@@ -136,6 +232,11 @@ export class BatchRpcFetcher {
   private chunkSize: number;
   private currentChunkSize: number;
   private maxParallelChunks: number;
+  private currentMaxParallelChunks: number;
+  private batchRpcUnsupported = false;
+  private batchRpcUnsupportedLogged = false;
+  private providerCooldownUntil = 0;
+  private providerCooldownMs = 0;
   private stats = { batchCount: 0, totalTime: 0 };
 
   constructor(connection: Connection, options: BatchRpcFetcherOptions = {}) {
@@ -143,6 +244,69 @@ export class BatchRpcFetcher {
     this.chunkSize = options.chunkSize ?? config.pollerRpcChunkSize ?? DEFAULT_BATCH_SIZE_RPC;
     this.currentChunkSize = this.chunkSize;
     this.maxParallelChunks = options.maxParallelChunks ?? config.pollerRpcChunkConcurrency ?? DEFAULT_MAX_PARALLEL_RPC;
+    this.currentMaxParallelChunks = this.maxParallelChunks;
+  }
+
+  private getProviderCooldownRemainingMs(): number {
+    return Math.max(0, this.providerCooldownUntil - Date.now());
+  }
+
+  private enterProviderCooldown(error: unknown): number {
+    const nextCooldownMs = this.providerCooldownMs > 0
+      ? Math.min(PROVIDER_BACKOFF_MAX_MS, this.providerCooldownMs * 2)
+      : PROVIDER_BACKOFF_MIN_MS;
+    this.providerCooldownMs = nextCooldownMs;
+    this.providerCooldownUntil = Date.now() + nextCooldownMs;
+    this.currentMaxParallelChunks = Math.max(1, Math.floor(this.currentMaxParallelChunks / 2));
+    logger.warn(
+      {
+        retryAfterMs: nextCooldownMs,
+        currentChunkSize: this.currentChunkSize,
+        currentMaxParallelChunks: this.currentMaxParallelChunks,
+        error,
+      },
+      "RPC provider overloaded, entering batch fetch cooldown"
+    );
+    return nextCooldownMs;
+  }
+
+  private async fetchTransactionsIndividually(
+    signatures: string[],
+    reason: "single-signature" | "batch-unsupported" | "fallback"
+  ): Promise<Map<string, ParsedTransactionWithMeta>> {
+    const results = new Map<string, ParsedTransactionWithMeta>();
+
+    if (reason === "batch-unsupported") {
+      if (!this.batchRpcUnsupportedLogged) {
+        this.batchRpcUnsupportedLogged = true;
+        logger.warn(
+          { count: signatures.length },
+          "Batch parsed RPC unsupported by provider, using individual transaction fetches"
+        );
+      }
+    }
+
+    for (const sig of signatures) {
+      try {
+        const tx = await this.connection.getParsedTransaction(sig, {
+          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion
+        });
+        if (tx) {
+          results.set(sig, tx);
+        }
+      } catch (error) {
+        if (isProviderOverloadedError(error)) {
+          const retryAfterMs = this.enterProviderCooldown(error);
+          throw new BatchRpcBackoffRequiredError(
+            "RPC provider overloaded during individual transaction fetch",
+            retryAfterMs
+          );
+        }
+        logger.warn({ signature: sig, error }, "Individual fetch failed");
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -153,6 +317,22 @@ export class BatchRpcFetcher {
     signatures: string[]
   ): Promise<Map<string, ParsedTransactionWithMeta>> {
     const results = new Map<string, ParsedTransactionWithMeta>();
+    const providerCooldownRemainingMs = this.getProviderCooldownRemainingMs();
+
+    if (providerCooldownRemainingMs > 0) {
+      throw new BatchRpcBackoffRequiredError(
+        "RPC provider cooldown active for batch fetch",
+        providerCooldownRemainingMs
+      );
+    }
+
+    if (signatures.length === 1) {
+      return this.fetchTransactionsIndividually(signatures, "single-signature");
+    }
+
+    if (this.batchRpcUnsupported) {
+      return this.fetchTransactionsIndividually(signatures, "batch-unsupported");
+    }
 
     // Split into chunks of configured getParsedTransactions size
     const chunks: string[][] = [];
@@ -163,8 +343,8 @@ export class BatchRpcFetcher {
     const startTime = Date.now();
 
     // Process chunks with limited parallelism
-    for (let i = 0; i < chunks.length; i += this.maxParallelChunks) {
-      const parallelChunks = chunks.slice(i, i + this.maxParallelChunks);
+    for (let i = 0; i < chunks.length; i += this.currentMaxParallelChunks) {
+      const parallelChunks = chunks.slice(i, i + this.currentMaxParallelChunks);
 
       const batchResults = await Promise.all(
         parallelChunks.map(chunk => this.fetchChunk(chunk))
@@ -213,7 +393,11 @@ export class BatchRpcFetcher {
         }
       }
     } catch (error) {
-      if (isRateLimitError(error) && signatures.length > 1) {
+      if (isProviderOverloadedError(error)) {
+        this.currentMaxParallelChunks = Math.max(1, Math.floor(this.currentMaxParallelChunks / 2));
+      }
+
+      if (isProviderOverloadedError(error) && signatures.length > 1) {
         const nextChunkSize = Math.max(1, Math.floor(signatures.length / 2));
         if (nextChunkSize < this.currentChunkSize) {
           this.currentChunkSize = nextChunkSize;
@@ -222,9 +406,10 @@ export class BatchRpcFetcher {
           {
             count: signatures.length,
             nextChunkSize: this.currentChunkSize,
+            nextParallelChunks: this.currentMaxParallelChunks,
             error,
           },
-          "Batch RPC fetch rate-limited, reducing chunk size and retrying"
+          "Batch RPC fetch overloaded, reducing chunk size and retrying subchunks"
         );
 
         const splitResults = new Map<string, ParsedTransactionWithMeta>();
@@ -238,22 +423,23 @@ export class BatchRpcFetcher {
         return splitResults;
       }
 
+      if (isProviderOverloadedError(error)) {
+        const retryAfterMs = this.enterProviderCooldown(error);
+        throw new BatchRpcBackoffRequiredError(
+          "RPC provider overloaded during batch fetch",
+          retryAfterMs
+        );
+      }
+
+      if (isBatchUnsupportedError(error)) {
+        this.batchRpcUnsupported = true;
+        return this.fetchTransactionsIndividually(signatures, "batch-unsupported");
+      }
+
       logger.warn({ error, count: signatures.length }, "Batch RPC fetch failed, falling back to individual");
 
       // Fallback to individual fetches
-      for (const sig of signatures) {
-        try {
-          const tx = await this.connection.getParsedTransaction(sig, {
-            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion
-          });
-          if (tx) {
-            results.set(sig, tx);
-          }
-        } catch (e) {
-          logger.warn({ signature: sig, error: e }, "Individual fetch failed");
-        }
-      }
-      return results;
+      return this.fetchTransactionsIndividually(signatures, "fallback");
     }
 
     if (missing.length > 0) {
@@ -267,6 +453,13 @@ export class BatchRpcFetcher {
             results.set(sig, tx);
           }
         } catch (error) {
+          if (isProviderOverloadedError(error)) {
+            const retryAfterMs = this.enterProviderCooldown(error);
+            throw new BatchRpcBackoffRequiredError(
+              "RPC provider overloaded while refetching missing transactions",
+              retryAfterMs
+            );
+          }
           logger.warn({ signature: sig, error }, "Individual refetch after partial batch null failed");
         }
       }
@@ -279,6 +472,7 @@ export class BatchRpcFetcher {
     return {
       batchCount: this.stats.batchCount,
       chunkSize: this.currentChunkSize,
+      parallelChunks: this.currentMaxParallelChunks,
       avgTime: this.stats.batchCount > 0
         ? Math.round(this.stats.totalTime / this.stats.batchCount)
         : 0
@@ -776,7 +970,9 @@ export class EventBuffer {
       const insertResult = await client.query(`
         INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'PENDING')
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (id) DO UPDATE SET
+          feedback_hash = EXCLUDED.feedback_hash,
+          running_digest = EXCLUDED.running_digest
       `, [
         row.id, null, row.asset, row.client_address, row.feedback_index,
         row.value?.toString() ?? "0", row.value_decimals ?? 0, row.score,
@@ -905,15 +1101,22 @@ export class EventBuffer {
     );
 
     for (const row of pending.rows) {
-      const responseStatus = hashesMatchHex(row.seal_hash ?? null, feedbackHash)
-        ? "PENDING"
-        : "ORPHANED";
+      const sealMismatch = !hashesMatchHex(row.seal_hash ?? null, feedbackHash);
+      if (sealMismatch) {
+        logger.warn(
+          { asset, clientAddr, feedbackIndex: feedbackIndex.toString(), responder: row.responder },
+          "Orphan response seal_hash mismatch with parent feedback during replay"
+        );
+      }
+
+      const responseStatus = classifyResponseStatus(true, sealMismatch);
       await client.query(
-        `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
          ON CONFLICT (id) DO UPDATE SET
            response_uri = EXCLUDED.response_uri,
            response_hash = EXCLUDED.response_hash,
+           seal_hash = EXCLUDED.seal_hash,
            running_digest = EXCLUDED.running_digest,
            response_count = EXCLUDED.response_count,
            block_slot = EXCLUDED.block_slot,
@@ -931,6 +1134,7 @@ export class EventBuffer {
           row.responder,
           row.response_uri,
           row.response_hash,
+          row.seal_hash,
           row.running_digest,
           row.response_count?.toString?.() ?? row.response_count ?? "0",
           row.block_slot?.toString?.() ?? row.block_slot,
@@ -950,7 +1154,7 @@ export class EventBuffer {
     asset: string,
     clientAddr: string,
     feedbackIndex: bigint,
-    feedbackHash: string | null
+    _feedbackHash: string | null
   ): Promise<void> {
     const existing = await client.query(
       `SELECT feedback_hash, status
@@ -962,7 +1166,7 @@ export class EventBuffer {
     if ((existing.rowCount ?? existing.rows.length) === 0) return;
     const row = existing.rows[0];
     if (!row) return;
-    if (row.status !== "ORPHANED" || !hashesMatchHex(row.feedback_hash ?? null, feedbackHash)) return;
+    if (row.status !== "ORPHANED") return;
 
     await client.query(
       `UPDATE revocations
@@ -994,40 +1198,43 @@ export class EventBuffer {
     const insertResult = await client.query(`
       INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash, running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'PENDING')
-      ON CONFLICT (id) DO NOTHING
+      ON CONFLICT (id) DO UPDATE SET
+        feedback_hash = EXCLUDED.feedback_hash,
+        running_digest = EXCLUDED.running_digest
     `, [id, null, asset, client_addr, feedbackIndex.toString(),
         data.value?.toString() || "0", data.valueDecimals || 0, data.score,
         data.tag1 || null, data.tag2 || null, data.endpoint || null,
         data.feedbackUri ?? null, feedbackHash, runningDigest,
         false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
 
-    if ((insertResult.rowCount ?? 0) > 0) {
-      // Update agent stats (consistent with supabase.ts)
-      const baseUpdate = `
-        feedback_count = COALESCE((
-          SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        raw_avg_score = COALESCE((
-          SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        updated_at = $1
-      `;
-      if (data.atomEnabled) {
-        await client.query(
-          `UPDATE agents SET
-             trust_tier = $3, quality_score = $4, confidence = $5,
-             risk_score = $6, diversity_ratio = $7, ${baseUpdate}
-           WHERE asset = $2`,
-          [ctx.blockTime.toISOString(), asset,
-           data.newTrustTier, data.newQualityScore, data.newConfidence,
-           data.newRiskScore, data.newDiversityRatio]
-        );
-      } else {
-        await client.query(
-          `UPDATE agents SET ${baseUpdate} WHERE asset = $2`,
-          [ctx.blockTime.toISOString(), asset]
-        );
-      }
+    if ((insertResult.rowCount ?? 0) !== 1) {
+      logger.warn({ asset, feedbackIndex: feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected batch feedback upsert result");
+    }
+    // Update agent stats (consistent with supabase.ts)
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
+    if (data.atomEnabled) {
+      await client.query(
+        `UPDATE agents SET
+           trust_tier = $3, quality_score = $4, confidence = $5,
+           risk_score = $6, diversity_ratio = $7, ${baseUpdate}
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), asset,
+         data.newTrustTier, data.newQualityScore, data.newConfidence,
+         data.newRiskScore, data.newDiversityRatio]
+      );
+    } else {
+      await client.query(
+        `UPDATE agents SET ${baseUpdate} WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), asset]
+      );
     }
     await this.replayOrphanResponsesSupabase(client, asset, client_addr, feedbackIndex, feedbackHash);
     await this.reconcileOrphanRevocationSupabase(client, asset, client_addr, feedbackIndex, feedbackHash);
@@ -1043,23 +1250,21 @@ export class EventBuffer {
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`, [id]
     );
     const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
-    const revokeStatus = classifyRevocationStatus(hasFeedback);
-    const isOrphan = revokeStatus === "ORPHANED";
-
-    if (!isOrphan) {
-      const storedHash = feedbackCheck.rows[0].feedback_hash;
-      const eventHash = toRequiredHashHex(data.sealHash);
-      if (!hashesMatchHex(storedHash, eventHash)) {
-        logger.warn({ asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
-          "seal_hash mismatch: revocation sealHash does not match stored feedbackHash");
-      }
+    const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+    const revokeSealHash = toRequiredHashHex(data.sealHash);
+    const sealMismatch = hasFeedback && !hashesMatchHex(revokeSealHash, feedbackHash);
+    const revokeStatus = classifyRevocationStatus(hasFeedback, sealMismatch);
+    if (sealMismatch) {
+      logger.warn(
+        { asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
+        "Revocation seal_hash mismatch with parent feedback"
+      );
     }
 
     // Insert into revocations table
     const revokeDigest = data.newRevokeDigest
       ? Buffer.from(data.newRevokeDigest)
       : null;
-    const revokeSealHash = toRequiredHashHex(data.sealHash);
     const revokeResult = await client.query(`
       INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
@@ -1140,20 +1345,23 @@ export class EventBuffer {
       return;
     }
 
-    const storedHash = feedbackCheck.rows[0].feedback_hash;
     const eventHash = toRequiredHashHex(data.sealHash);
-    const sealMismatch = !hashesMatchHex(storedHash, eventHash);
+    const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+    const sealMismatch = !hashesMatchHex(eventHash, feedbackHash);
+    const responseStatus = classifyResponseStatus(true, sealMismatch);
     if (sealMismatch) {
-      logger.warn({ asset, client: client_addr, feedbackIndex: feedbackIndex.toString() },
-        "seal_hash mismatch: response sealHash does not match stored feedbackHash");
+      logger.warn(
+        { asset, client: client_addr, feedbackIndex: feedbackIndex.toString(), responder },
+        "Response seal_hash mismatch with parent feedback"
+      );
     }
-    const responseStatus = sealMismatch ? "ORPHANED" : "PENDING";
     await client.query(
-      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (id) DO UPDATE SET
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
+         seal_hash = EXCLUDED.seal_hash,
          running_digest = EXCLUDED.running_digest,
          response_count = EXCLUDED.response_count,
          block_slot = EXCLUDED.block_slot,
@@ -1162,7 +1370,7 @@ export class EventBuffer {
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
       [id, null, asset, client_addr, feedbackIndex.toString(), responder,
-        data.responseUri || "", responseHash, responseRunningDigest, responseCount.toString(),
+        data.responseUri || "", responseHash, eventHash, responseRunningDigest, responseCount.toString(),
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
   }

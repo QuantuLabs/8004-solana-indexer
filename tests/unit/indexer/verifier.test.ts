@@ -1,15 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PublicKey } from "@solana/web3.js";
+import { createEventLogs, createMockParsedTransaction } from "../../mocks/solana.js";
 
 // Mock config before import
 vi.mock("../../../src/config.js", () => ({
   config: {
+    programId: "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C",
     verifyIntervalMs: 1000,
     verifyBatchSize: 100,
     verifySafetyMarginSlots: 32,
     verifyMaxRetries: 3,
     verifyRecoveryCycles: 10,
     verifyRecoveryBatchSize: 50,
+    maxSupportedTransactionVersion: 0,
   },
 }));
 
@@ -58,11 +61,13 @@ function createMockConnection() {
     getSlot: vi.fn().mockResolvedValue(100000),
     getMultipleAccountsInfo: vi.fn().mockResolvedValue([]),
     getAccountInfo: vi.fn().mockResolvedValue(null),
+    getParsedTransaction: vi.fn().mockResolvedValue(null),
   } as any;
 }
 
 function createMockPrisma() {
-  return {
+  const mockPrisma = {
+    $transaction: vi.fn().mockImplementation(async (fn: (tx: any) => Promise<any>) => fn(mockPrisma)),
     agent: {
       findMany: vi.fn().mockResolvedValue([]),
       findFirst: vi.fn().mockResolvedValue(null),
@@ -87,11 +92,22 @@ function createMockPrisma() {
       count: vi.fn().mockResolvedValue(0),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
+    orphanFeedback: {
+      findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
+      count: vi.fn().mockResolvedValue(0),
+    },
     feedbackResponse: {
       findMany: vi.fn().mockResolvedValue([]),
       findFirst: vi.fn().mockResolvedValue(null),
       count: vi.fn().mockResolvedValue(0),
+      update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    orphanResponse: {
+      findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn().mockResolvedValue(null),
+      count: vi.fn().mockResolvedValue(0),
     },
     revocation: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -102,7 +118,8 @@ function createMockPrisma() {
     agentDigestCache: {
       upsert: vi.fn().mockResolvedValue({}),
     },
-  } as any;
+  };
+  return mockPrisma as any;
 }
 
 function createMockPool() {
@@ -618,14 +635,18 @@ describe("DataVerifier", () => {
   describe("verifyAgents (Pool)", () => {
     it("should finalize agents that exist (pool path)", async () => {
       const agentId = AGENT_KEY.toBase58();
-      mockPool.query.mockResolvedValueOnce({
-        rows: [{ id: agentId }],
-        rowCount: 1,
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedback_responses") && sql.includes("seal_hash IS NULL")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.includes("SELECT id FROM agents") || (sql.includes("FROM agents") && sql.includes("status = 'PENDING'"))) {
+          return { rows: [{ id: agentId }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
       });
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
         { data: Buffer.alloc(10) },
       ]);
-      mockPool.query.mockResolvedValue({ rows: [], rowCount: 0 });
 
       const verifier = new DataVerifier(mockConnection, null, mockPool);
       await verifier.start();
@@ -637,12 +658,16 @@ describe("DataVerifier", () => {
 
     it("should orphan agents not found (pool path)", async () => {
       const agentId = AGENT_KEY.toBase58();
-      mockPool.query.mockResolvedValueOnce({
-        rows: [{ id: agentId }],
-        rowCount: 1,
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedback_responses") && sql.includes("seal_hash IS NULL")) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.includes("SELECT id FROM agents") || (sql.includes("FROM agents") && sql.includes("status = 'PENDING'"))) {
+          return { rows: [{ id: agentId }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
       });
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([null]);
-      mockPool.query.mockResolvedValue({ rows: [], rowCount: 0 });
 
       const verifier = new DataVerifier(mockConnection, null, mockPool);
       await verifier.start();
@@ -1071,6 +1096,7 @@ describe("DataVerifier", () => {
   describe("verifyFeedbackResponses (Prisma)", () => {
     it("should orphan responses with orphaned feedback", async () => {
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([
           {
             id: "r1",
@@ -1086,15 +1112,65 @@ describe("DataVerifier", () => {
       await verifier.stop();
     });
 
+    it("should not orphan responses only because sealHash differs from parent feedback", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      const digest = new Uint8Array(32).fill(0xcc);
+
+      mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
+        .mockResolvedValueOnce([
+          {
+            id: "r-mismatch",
+            sealHash: Buffer.from("aa".repeat(32), "hex"),
+            feedback: {
+              agentId,
+              status: "FINALIZED",
+              feedbackHash: Buffer.from("bb".repeat(32), "hex"),
+            },
+          },
+        ])
+        .mockResolvedValue([]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([{ data: Buffer.alloc(10) }]);
+      mockConnection.getAccountInfo.mockResolvedValue({
+        data: buildAgentAccountData({
+          responseDigest: digest,
+          responseCount: 1n,
+        }),
+      });
+
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+      mockPrisma.feedback.count.mockResolvedValue(0);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValue({
+        runningDigest: Buffer.from(digest),
+      });
+      mockPrisma.feedbackResponse.count.mockResolvedValue(1);
+      mockPrisma.revocation.findFirst.mockResolvedValue(null);
+      mockPrisma.revocation.count.mockResolvedValue(0);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(verifier.getStats().responsesOrphaned).toBe(0);
+      expect(verifier.getStats().responsesVerified).toBe(1);
+      await verifier.stop();
+    });
+
     it("should finalize responses when hash-chain matches", async () => {
       const agentId = AGENT_KEY.toBase58();
       const digest = new Uint8Array(32).fill(0xcc);
 
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([
           {
             id: "r1",
-            feedback: { agentId, status: "FINALIZED" },
+            sealHash: Buffer.from("cc".repeat(32), "hex"),
+            feedback: {
+              agentId,
+              status: "FINALIZED",
+              feedbackHash: Buffer.from("cc".repeat(32), "hex"),
+            },
           },
         ])
         .mockResolvedValue([]);
@@ -1129,6 +1205,7 @@ describe("DataVerifier", () => {
     it("should orphan responses when agent doesn't exist", async () => {
       const agentId = AGENT_KEY.toBase58();
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([
           { id: "r1", feedback: { agentId, status: "PENDING" } },
         ])
@@ -1149,7 +1226,7 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("feedback_responses") && sql.includes("PENDING")) {
-          return { rows: [{ id: "r1", agentId, feedbackStatus: "ORPHANED" }] };
+          return { rows: [{ id: "r1", agentId, feedbackStatus: "ORPHANED", responseSealHash: "aa".repeat(32), feedbackHash: "aa".repeat(32) }] };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -1160,6 +1237,31 @@ describe("DataVerifier", () => {
       expect(verifier.getStats().responsesOrphaned).toBe(1);
       await verifier.stop();
     });
+
+    it("should not orphan pending responses via pool when sealHash differs from parent feedback", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("feedback_responses") && sql.includes("PENDING")) {
+          return {
+            rows: [{
+              id: "r-mismatch",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              responseSealHash: "aa".repeat(32),
+              feedbackHash: "bb".repeat(32),
+            }],
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().responsesOrphaned).toBe(0);
+      expect(verifier.getStats().responsesVerified).toBe(0);
+      await verifier.stop();
+    });
   });
 
   describe("verifyRevocations (Prisma)", () => {
@@ -1168,8 +1270,11 @@ describe("DataVerifier", () => {
       const digest = new Uint8Array(32).fill(0xdd);
 
       mockPrisma.revocation.findMany
-        .mockResolvedValueOnce([{ id: "rev1", agentId }])
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client: "client-1", feedbackIndex: 0n, feedbackHash: Buffer.from("aa".repeat(32), "hex") }])
         .mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([
+        { agentId, client: "client-1", feedbackIndex: 0n, status: "FINALIZED", feedbackHash: Buffer.from("aa".repeat(32), "hex") },
+      ]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
         { data: Buffer.alloc(10) },
@@ -1198,12 +1303,52 @@ describe("DataVerifier", () => {
       await verifier.stop();
     });
 
+    it("should not orphan revocations only because sealHash differs from parent feedback", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      const digest = new Uint8Array(32).fill(0xdd);
+
+      mockPrisma.revocation.findMany
+        .mockResolvedValueOnce([{ id: "rev-mismatch", agentId, client: "client-1", feedbackIndex: 0n, feedbackHash: Buffer.from("aa".repeat(32), "hex") }])
+        .mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([
+        { agentId, client: "client-1", feedbackIndex: 0n, status: "FINALIZED", feedbackHash: Buffer.from("bb".repeat(32), "hex") },
+      ]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+      mockConnection.getAccountInfo.mockResolvedValue({
+        data: buildAgentAccountData({
+          revokeDigest: digest,
+          revokeCount: 1n,
+        }),
+      });
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+      mockPrisma.feedback.count.mockResolvedValue(0);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValue(null);
+      mockPrisma.feedbackResponse.count.mockResolvedValue(0);
+      mockPrisma.revocation.findFirst.mockResolvedValue({
+        runningDigest: Buffer.from(digest),
+      });
+      mockPrisma.revocation.count.mockResolvedValue(1);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(verifier.getStats().revocationsOrphaned).toBe(0);
+      expect(verifier.getStats().revocationsVerified).toBe(1);
+      await verifier.stop();
+    });
+
     it("should orphan revocations when agent doesn't exist", async () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPrisma.revocation.findMany
-        .mockResolvedValueOnce([{ id: "rev1", agentId }])
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client: "client-1", feedbackIndex: 0n, feedbackHash: Buffer.from("aa".repeat(32), "hex") }])
         .mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([
+        { agentId, client: "client-1", feedbackIndex: 0n, status: "FINALIZED", feedbackHash: Buffer.from("aa".repeat(32), "hex") },
+      ]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([null]);
 
@@ -1220,7 +1365,7 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM revocations") && sql.includes("PENDING")) {
-          return { rows: [{ id: "rev1", agentId }] };
+          return { rows: [{ id: "rev1", agentId, feedbackStatus: "FINALIZED", revocationFeedbackHash: "aa".repeat(32), feedbackHash: "aa".repeat(32) }] };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -1231,6 +1376,31 @@ describe("DataVerifier", () => {
       await verifier.start();
 
       expect(verifier.getStats().revocationsOrphaned).toBe(1);
+      await verifier.stop();
+    });
+
+    it("should not orphan pending revocations via pool when sealHash differs from parent feedback", async () => {
+      const agentId = AGENT_KEY.toBase58();
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM revocations") && sql.includes("PENDING")) {
+          return {
+            rows: [{
+              id: "rev-mismatch",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              revocationFeedbackHash: "aa".repeat(32),
+              feedbackHash: "bb".repeat(32),
+            }],
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().revocationsOrphaned).toBe(0);
+      expect(verifier.getStats().revocationsVerified).toBe(0);
       await verifier.stop();
     });
   });
@@ -1301,8 +1471,17 @@ describe("DataVerifier", () => {
       mockPrisma.feedbackResponse.findMany.mockResolvedValue([]);
       mockPrisma.revocation.findMany
         .mockResolvedValueOnce([]) // verifyRevocations
-        .mockResolvedValueOnce([{ id: "rev1", agentId, client, feedbackIndex: 1n }]); // recovery
-      mockPrisma.feedback.findFirst.mockResolvedValue({ id: "f-parent" });
+        .mockResolvedValueOnce([{
+          id: "rev1",
+          agentId,
+          client,
+          feedbackIndex: 1n,
+          feedbackHash: Buffer.from("ab".repeat(32), "hex"),
+        }]); // recovery
+      mockPrisma.feedback.findFirst.mockResolvedValue({
+        id: "f-parent",
+        feedbackHash: Buffer.from("ab".repeat(32), "hex"),
+      });
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
         { data: Buffer.alloc(10) },
@@ -1325,8 +1504,17 @@ describe("DataVerifier", () => {
       mockPrisma.agent.findMany.mockResolvedValue([]);
       mockPrisma.feedback.findMany.mockResolvedValue([]);
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([]) // verifyFeedbackResponses
-        .mockResolvedValueOnce([{ id: "resp1", feedback: { agentId, status: "FINALIZED" } }]); // recovery
+        .mockResolvedValueOnce([{
+          id: "resp1",
+          sealHash: Buffer.from("cd".repeat(32), "hex"),
+          feedback: {
+            agentId,
+            status: "FINALIZED",
+            feedbackHash: Buffer.from("cd".repeat(32), "hex"),
+          },
+        }]); // recovery
       mockPrisma.revocation.findMany.mockResolvedValue([]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
@@ -1353,7 +1541,13 @@ describe("DataVerifier", () => {
       mockPrisma.feedbackResponse.findMany.mockResolvedValue([]);
       mockPrisma.revocation.findMany
         .mockResolvedValueOnce([]) // verifyRevocations
-        .mockResolvedValueOnce([{ id: "rev1", agentId, client, feedbackIndex: 1n }]); // recovery
+        .mockResolvedValueOnce([{
+          id: "rev1",
+          agentId,
+          client,
+          feedbackIndex: 1n,
+          feedbackHash: Buffer.from("ab".repeat(32), "hex"),
+        }]); // recovery
       mockPrisma.feedback.findFirst.mockResolvedValue(null);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
@@ -1377,8 +1571,17 @@ describe("DataVerifier", () => {
       mockPrisma.agent.findMany.mockResolvedValue([]);
       mockPrisma.feedback.findMany.mockResolvedValue([]);
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([]) // verifyFeedbackResponses
-        .mockResolvedValueOnce([{ id: "resp1", feedback: { agentId, status: "ORPHANED" } }]); // recovery
+        .mockResolvedValueOnce([{
+          id: "resp1",
+          sealHash: Buffer.from("cd".repeat(32), "hex"),
+          feedback: {
+            agentId,
+            status: "ORPHANED",
+            feedbackHash: Buffer.from("cd".repeat(32), "hex"),
+          },
+        }]); // recovery
       mockPrisma.revocation.findMany.mockResolvedValue([]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
@@ -1393,7 +1596,7 @@ describe("DataVerifier", () => {
       (config as any).verifyRecoveryCycles = 10;
     });
 
-    it("should not recover orphaned responses without responseId even when parent feedback is active", async () => {
+    it("should keep orphaned responses orphaned without sealHash proof when parent feedback is active", async () => {
       const { config } = await import("../../../src/config.js");
       (config as any).verifyRecoveryCycles = 1;
 
@@ -1402,8 +1605,17 @@ describe("DataVerifier", () => {
       mockPrisma.agent.findMany.mockResolvedValue([]);
       mockPrisma.feedback.findMany.mockResolvedValue([]);
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([]) // verifyFeedbackResponses
-        .mockResolvedValueOnce([]); // recovery now filters responseId != null
+        .mockResolvedValueOnce([{
+          id: "resp-no-id",
+          sealHash: null,
+          feedback: {
+            agentId,
+            status: "FINALIZED",
+            feedbackHash: Buffer.from("cd".repeat(32), "hex"),
+          },
+        }]);
       mockPrisma.revocation.findMany.mockResolvedValue([]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
@@ -1414,12 +1626,46 @@ describe("DataVerifier", () => {
       await verifier.start();
 
       expect(mockPrisma.feedbackResponse.findMany).toHaveBeenNthCalledWith(
-        2,
+        3,
         expect.objectContaining({
-          where: { status: "ORPHANED", responseId: { not: null } },
+          where: { status: "ORPHANED" },
         })
       );
-      expect(verifier.getStats().orphansRecovered).toBe(0);
+      expect(verifier.getStats().orphansRecovered).toBe(1);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
+
+    it("should keep orphaned responses orphaned when parent feedback is active but sealHash differs", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPrisma.agent.findMany.mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([]);
+      mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{
+          id: "resp-mismatch",
+          sealHash: Buffer.from("aa".repeat(32), "hex"),
+          feedback: {
+            agentId,
+            status: "FINALIZED",
+            feedbackHash: Buffer.from("bb".repeat(32), "hex"),
+          },
+        }]);
+      mockPrisma.revocation.findMany.mockResolvedValue([]);
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(1);
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
     });
@@ -1434,6 +1680,7 @@ describe("DataVerifier", () => {
 
       // verifyAll queries return empty, then recovery queries
       mockPool.query
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce({ rows: [] }) // agents
         .mockResolvedValueOnce({ rows: [] }) // validations
         .mockResolvedValueOnce({ rows: [] }) // metadata
@@ -1651,6 +1898,229 @@ describe("DataVerifier", () => {
     });
   });
 
+  describe("getLastDbDigests response/revoke chains", () => {
+    it("includes orphan feedback staging rows in digest/count state", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const agentId = AGENT_KEY.toBase58();
+      const digest = Buffer.from(new Uint8Array(32).fill(0xcc));
+
+      mockPrisma.feedback.findFirst.mockResolvedValueOnce(null);
+      mockPrisma.orphanFeedback.findFirst.mockResolvedValueOnce({
+        runningDigest: digest,
+        txSignature: "fb-sig",
+        slot: 55n,
+        txIndex: 2,
+        eventOrdinal: 0,
+        feedbackIndex: 8n,
+        id: "orphan-fb-1",
+      });
+      mockPrisma.feedback.count.mockResolvedValueOnce(2);
+      mockPrisma.orphanFeedback.count.mockResolvedValueOnce(1);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValue(null);
+      mockPrisma.orphanResponse.findFirst.mockResolvedValue(null);
+      mockPrisma.feedbackResponse.count.mockResolvedValue(0);
+      mockPrisma.orphanResponse.count.mockResolvedValue(0);
+      mockPrisma.revocation.findFirst.mockResolvedValue(null);
+      mockPrisma.revocation.count.mockResolvedValue(0);
+
+      const result = await (verifier as any).getLastDbDigests(agentId);
+
+      expect(result.feedbackDigest).toEqual(digest);
+      expect(result.feedbackCount).toBe(9n);
+      expect(result.feedbackSignature).toBe("fb-sig");
+    });
+
+    it("includes ORPHANED responses in digest/count state", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const agentId = AGENT_KEY.toBase58();
+      const digest = Buffer.from(new Uint8Array(32).fill(0xaa));
+
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+      mockPrisma.feedback.count.mockResolvedValue(0);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValueOnce({
+        runningDigest: digest,
+        txSignature: "resp-sig",
+        slot: 42n,
+        responseCount: 11n,
+      });
+      mockPrisma.feedbackResponse.count.mockResolvedValueOnce(8);
+      mockPrisma.revocation.findFirst.mockResolvedValue(null);
+      mockPrisma.revocation.count.mockResolvedValue(0);
+
+      const result = await (verifier as any).getLastDbDigests(agentId);
+
+      expect(result.responseDigest).toEqual(digest);
+      expect(result.responseCount).toBe(11n);
+      expect(mockPrisma.feedbackResponse.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            feedback: { agentId },
+            runningDigest: { not: null },
+          }),
+        })
+      );
+      expect(mockPrisma.feedbackResponse.findFirst).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: expect.anything() }),
+        })
+      );
+      expect(mockPrisma.feedbackResponse.count).toHaveBeenCalledWith({
+        where: { feedback: { agentId } },
+      });
+    });
+
+    it("includes orphan response staging rows in digest/count state", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const agentId = AGENT_KEY.toBase58();
+      const digest = Buffer.from(new Uint8Array(32).fill(0xab));
+
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+      mockPrisma.orphanFeedback.findFirst.mockResolvedValue(null);
+      mockPrisma.feedback.count.mockResolvedValue(0);
+      mockPrisma.orphanFeedback.count.mockResolvedValue(0);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValueOnce({
+        runningDigest: Buffer.from(new Uint8Array(32).fill(0x11)),
+        txSignature: "resp-sig-2",
+        slot: 41n,
+        txIndex: 1,
+        eventOrdinal: 0,
+        responseCount: 2n,
+        id: "resp-2",
+      });
+      mockPrisma.orphanResponse.findFirst.mockResolvedValueOnce({
+        runningDigest: digest,
+        txSignature: "resp-sig-3",
+        slot: 42n,
+        txIndex: 0,
+        eventOrdinal: 0,
+        responseCount: 3n,
+        id: "orphan-resp-3",
+      });
+      mockPrisma.feedbackResponse.count.mockResolvedValueOnce(2);
+      mockPrisma.orphanResponse.count.mockResolvedValueOnce(1);
+      mockPrisma.revocation.findFirst.mockResolvedValue(null);
+      mockPrisma.revocation.count.mockResolvedValue(0);
+
+      const result = await (verifier as any).getLastDbDigests(agentId);
+
+      expect(result.responseDigest).toEqual(digest);
+      expect(result.responseCount).toBe(3n);
+      expect(result.responseSignature).toBe("resp-sig-3");
+    });
+
+    it("includes ORPHANED revocations in digest/count state", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const agentId = AGENT_KEY.toBase58();
+      const digest = Buffer.from(new Uint8Array(32).fill(0xbb));
+
+      mockPrisma.feedback.findFirst.mockResolvedValue(null);
+      mockPrisma.feedback.count.mockResolvedValue(0);
+      mockPrisma.feedbackResponse.findFirst.mockResolvedValue(null);
+      mockPrisma.feedbackResponse.count.mockResolvedValue(0);
+      mockPrisma.revocation.findFirst.mockResolvedValueOnce({
+        runningDigest: digest,
+        txSignature: "revoke-sig",
+        slot: 99n,
+        revokeCount: 6n,
+      });
+      mockPrisma.revocation.count.mockResolvedValueOnce(3);
+
+      const result = await (verifier as any).getLastDbDigests(agentId);
+
+      expect(result.revokeDigest).toEqual(digest);
+      expect(result.revokeCount).toBe(6n);
+      expect(mockPrisma.revocation.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            agentId,
+            runningDigest: { not: null },
+          }),
+        })
+      );
+      expect(mockPrisma.revocation.count).toHaveBeenCalledWith({
+        where: { agentId },
+      });
+    });
+  });
+
+  describe("backfillMissingResponseSealHashes", () => {
+    it("backfills missing response sealHash via prisma from tx logs", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      const sealHash = new Uint8Array(32).fill(0x44);
+      const responseHash = new Uint8Array(32).fill(0x55);
+      const digest = new Uint8Array(32).fill(0x66);
+      const logs = createEventLogs("ResponseAppended", {
+        asset: AGENT_KEY,
+        client: VALIDATOR_KEY,
+        feedbackIndex: 0n,
+        responder: COLLECTION_KEY,
+        responseUri: "https://x",
+        responseHash,
+        sealHash,
+        slot: 123n,
+        newResponseDigest: digest,
+        newResponseCount: 1n,
+      });
+
+      mockPrisma.feedbackResponse.findMany.mockResolvedValueOnce([
+        { id: "resp-1", txSignature: "sig-1", eventOrdinal: 0 },
+      ]);
+      mockConnection.getParsedTransaction.mockResolvedValueOnce(
+        createMockParsedTransaction("sig-1", logs)
+      );
+
+      await (verifier as any).backfillMissingResponseSealHashes();
+
+      expect(mockPrisma.feedbackResponse.update).toHaveBeenCalledWith({
+        where: { id: "resp-1" },
+        data: { sealHash: Uint8Array.from(sealHash) },
+      });
+    });
+
+    it("backfills missing response seal_hash via pool from tx logs", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      const sealHash = new Uint8Array(32).fill(0x77);
+      const responseHash = new Uint8Array(32).fill(0x88);
+      const digest = new Uint8Array(32).fill(0x99);
+      const logs = createEventLogs("ResponseAppended", {
+        asset: AGENT_KEY,
+        client: VALIDATOR_KEY,
+        feedbackIndex: 0n,
+        responder: COLLECTION_KEY,
+        responseUri: "https://x",
+        responseHash,
+        sealHash,
+        slot: 123n,
+        newResponseDigest: digest,
+        newResponseCount: 1n,
+      });
+
+      mockPool.query.mockImplementation((sql: string) => {
+        if (sql.includes("FROM feedback_responses") && sql.includes("seal_hash IS NULL")) {
+          return Promise.resolve({
+            rows: [{ id: "resp-2", txSignature: "sig-2", eventOrdinal: 0 }],
+            rowCount: 1,
+          });
+        }
+        if (sql.includes("UPDATE feedback_responses")) {
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      });
+      mockConnection.getParsedTransaction.mockResolvedValueOnce(
+        createMockParsedTransaction("sig-2", logs)
+      );
+
+      await (verifier as any).backfillMissingResponseSealHashes();
+
+      const updateCall = mockPool.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("UPDATE feedback_responses")
+      );
+      expect(updateCall).toBeDefined();
+      expect(updateCall![1]).toEqual(["resp-2", Buffer.from(sealHash).toString("hex")]);
+    });
+  });
+
   describe("checkDigestMatch edge cases", () => {
     it("should return true when both DB and on-chain count are zero", async () => {
       const agentId = AGENT_KEY.toBase58();
@@ -1849,8 +2319,90 @@ describe("DataVerifier", () => {
         typeof call[0] === "string" && call[0].includes("FROM feedback_responses") && call[0].includes("running_digest")
       )?.[0];
 
-      expect(feedbackQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC");
-      expect(responseQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC");
+      expect(feedbackQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC");
+      expect(responseQuery).toContain("ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC");
+    });
+
+    it("uses persisted response/revoke chain counters instead of raw row counts when available", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      let countQueries = 0;
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedbacks") && sql.includes("running_digest")) {
+          return { rows: [] };
+        }
+        if (sql.includes("COUNT(*)::bigint AS cnt FROM feedbacks")) {
+          return { rows: [{ cnt: "0" }] };
+        }
+        if (sql.includes("FROM feedback_responses") && sql.includes("running_digest")) {
+          return { rows: [{ running_digest: "\\x" + "aa".repeat(32), tx_signature: "resp-sig", block_slot: "42", response_count: "11" }] };
+        }
+        if (sql.includes("COUNT(*) FROM feedback_responses") && sql.includes("orphan_responses")) {
+          countQueries += 1;
+          return { rows: [{ cnt: "2" }] };
+        }
+        if (sql.includes("FROM revocations") && sql.includes("running_digest")) {
+          return { rows: [{ running_digest: "\\x" + "bb".repeat(32), tx_signature: "rev-sig", slot: "99", revoke_count: "6" }] };
+        }
+        if (sql.includes("COUNT(*)::bigint AS cnt FROM revocations")) {
+          countQueries += 1;
+          return { rows: [{ cnt: "2" }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const result = await (verifier as any).getLastDbDigests(AGENT_KEY.toBase58());
+
+      expect(result.responseCount).toBe(11n);
+      expect(result.revokeCount).toBe(6n);
+      expect(countQueries).toBe(2);
+    });
+
+    it("includes orphan response and orphan feedback staging rows in pool digest/count state", async () => {
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM (") && sql.includes("orphan_feedbacks")) {
+          return {
+            rows: [{
+              running_digest: "\\x" + "cc".repeat(32),
+              tx_signature: "fb-orphan-sig",
+              block_slot: "55",
+              feedback_index: "8",
+            }],
+          };
+        }
+        if (sql.includes("COUNT(*) FROM feedbacks") && sql.includes("orphan_feedbacks")) {
+          return { rows: [{ cnt: "3" }] };
+        }
+        if (sql.includes("FROM (") && sql.includes("orphan_responses")) {
+          return {
+            rows: [{
+              running_digest: "\\x" + "ab".repeat(32),
+              tx_signature: "resp-orphan-sig",
+              block_slot: "42",
+              response_count: "3",
+            }],
+          };
+        }
+        if (sql.includes("COUNT(*) FROM feedback_responses") && sql.includes("orphan_responses")) {
+          return { rows: [{ cnt: "3" }] };
+        }
+        if (sql.includes("FROM revocations") && sql.includes("running_digest")) {
+          return { rows: [] };
+        }
+        if (sql.includes("COUNT(*)::bigint AS cnt FROM revocations")) {
+          return { rows: [{ cnt: "0" }] };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const result = await (verifier as any).getLastDbDigests(AGENT_KEY.toBase58());
+
+      expect(result.feedbackCount).toBe(9n);
+      expect(result.responseCount).toBe(3n);
+      expect(result.feedbackSignature).toBe("fb-orphan-sig");
+      expect(result.responseSignature).toBe("resp-orphan-sig");
     });
   });
 
@@ -1915,6 +2467,7 @@ describe("DataVerifier", () => {
           data: { feedbackId: 5n },
         })
       );
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
     it("assigns feedback_id in canonical on-chain order, not UUID order (prisma path)", async () => {
@@ -2165,6 +2718,7 @@ describe("DataVerifier", () => {
           data: { responseId: 10n },
         })
       );
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
     it("assigns response_id in canonical on-chain order, not UUID order (prisma path)", async () => {
@@ -2349,6 +2903,34 @@ describe("DataVerifier", () => {
           data: { revocationId: 14n },
         })
       );
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps prisma status promotion and public id backfill in one transaction", async () => {
+      const verifier = new DataVerifier(mockConnection, mockPrisma, null);
+      mockPrisma.feedback.findMany.mockResolvedValueOnce([
+        {
+          id: "fb-atomic",
+          agentId: AGENT_KEY.toBase58(),
+          createdSlot: 10n,
+          createdTxSignature: "sig-a",
+          txIndex: 0,
+          eventOrdinal: 0,
+          client: VALIDATOR_KEY.toBase58(),
+          feedbackIndex: 1n,
+        },
+      ]);
+      mockPrisma.feedback.findFirst.mockRejectedValueOnce(new Error("backfill failed"));
+
+      await expect((verifier as any).batchUpdateStatus(
+        "feedbacks",
+        "id",
+        ["fb-atomic"],
+        "FINALIZED",
+        new Date()
+      )).rejects.toThrow("backfill failed");
+
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2783,7 +3365,15 @@ describe("DataVerifier", () => {
 
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM revocations r")) {
-          return { rows: [{ id: "rev1", agentId, feedbackStatus: "FINALIZED" }] };
+          return {
+            rows: [{
+              id: "rev1",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              revocationFeedbackHash: "ab".repeat(32),
+              feedbackHash: "ab".repeat(32),
+            }],
+          };
         }
         if (sql.includes("FROM feedback_responses fr")) {
           return { rows: [] };
@@ -2811,7 +3401,15 @@ describe("DataVerifier", () => {
 
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM feedback_responses fr")) {
-          return { rows: [{ id: "resp1", agentId, feedbackStatus: "FINALIZED" }] };
+          return {
+            rows: [{
+              id: "resp1",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              responseSealHash: "cd".repeat(32),
+              feedbackHash: "cd".repeat(32),
+            }],
+          };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -2836,7 +3434,15 @@ describe("DataVerifier", () => {
 
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM revocations r")) {
-          return { rows: [{ id: "rev1", agentId, feedbackStatus: "ORPHANED" }] };
+          return {
+            rows: [{
+              id: "rev1",
+              agentId,
+              feedbackStatus: "ORPHANED",
+              revocationFeedbackHash: "ab".repeat(32),
+              feedbackHash: "ab".repeat(32),
+            }],
+          };
         }
         if (sql.includes("FROM feedback_responses fr")) {
           return { rows: [] };
@@ -2864,7 +3470,15 @@ describe("DataVerifier", () => {
 
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM feedback_responses fr")) {
-          return { rows: [{ id: "resp1", agentId, feedbackStatus: "ORPHANED" }] };
+          return {
+            rows: [{
+              id: "resp1",
+              agentId,
+              feedbackStatus: "ORPHANED",
+              responseSealHash: "cd".repeat(32),
+              feedbackHash: "cd".repeat(32),
+            }],
+          };
         }
         return { rows: [], rowCount: 0 };
       });
@@ -2881,13 +3495,14 @@ describe("DataVerifier", () => {
       (config as any).verifyRecoveryCycles = 10;
     });
 
-    it("should only query recoverable pool orphaned responses with response_id", async () => {
+    it("should load hash material for pool orphaned response recovery", async () => {
       const { config } = await import("../../../src/config.js");
       (config as any).verifyRecoveryCycles = 1;
 
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("FROM feedback_responses fr")) {
-          expect(sql).toContain("fr.response_id IS NOT NULL");
+          expect(sql).toContain("fr.seal_hash AS \"responseSealHash\"");
+          expect(sql).toContain("f.feedback_hash AS \"feedbackHash\"");
           return { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 0 };
@@ -2904,6 +3519,39 @@ describe("DataVerifier", () => {
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
     });
+
+    it("should keep orphaned responses via pool when sealHash differs from parent feedbackHash", async () => {
+      const { config } = await import("../../../src/config.js");
+      (config as any).verifyRecoveryCycles = 1;
+
+      const agentId = AGENT_KEY.toBase58();
+
+      mockPool.query.mockImplementation(async (sql: string) => {
+        if (sql.includes("FROM feedback_responses fr")) {
+          return {
+            rows: [{
+              id: "resp1",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              responseSealHash: "aa".repeat(32),
+              feedbackHash: "bb".repeat(32),
+            }],
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      mockConnection.getMultipleAccountsInfo.mockResolvedValue([
+        { data: Buffer.alloc(10) },
+      ]);
+
+      const verifier = new DataVerifier(mockConnection, null, mockPool);
+      await verifier.start();
+
+      expect(verifier.getStats().orphansRecovered).toBe(1);
+      await verifier.stop();
+      (config as any).verifyRecoveryCycles = 10;
+    });
   });
 
   describe("verifyFeedbackResponses pool path with valid responses", () => {
@@ -2911,7 +3559,15 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
       mockPool.query.mockImplementation(async (sql: string) => {
         if (sql.includes("feedback_responses") && sql.includes("PENDING")) {
-          return { rows: [{ id: "r1", agentId, feedbackStatus: "FINALIZED" }] };
+          return {
+            rows: [{
+              id: "r1",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              responseSealHash: "aa".repeat(32),
+              feedbackHash: "aa".repeat(32),
+            }],
+          };
         }
         if (sql.includes("COUNT")) {
           return { rows: [{ cnt: "0" }] };
@@ -2939,7 +3595,15 @@ describe("DataVerifier", () => {
 
       mockPool.query.mockImplementation(async (sql: string, params?: any[]) => {
         if (sql.includes("FROM revocations") && sql.includes("PENDING")) {
-          return { rows: [{ id: "rev1", agentId }] };
+          return {
+            rows: [{
+              id: "rev1",
+              agentId,
+              feedbackStatus: "FINALIZED",
+              revocationFeedbackHash: "aa".repeat(32),
+              feedbackHash: "aa".repeat(32),
+            }],
+          };
         }
         if (sql.includes("running_digest") && sql.includes("revocations")) {
           return { rows: [{ running_digest: Buffer.from(digest) }] };
@@ -3361,8 +4025,17 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPrisma.feedbackResponse.findMany
+        .mockResolvedValueOnce([]) // backfillMissingResponseSealHashes
         .mockResolvedValueOnce([
-          { id: "r1", feedback: { agentId, status: "FINALIZED" } },
+          {
+            id: "r1",
+            sealHash: Buffer.from("cd".repeat(32), "hex"),
+            feedback: {
+              agentId,
+              status: "FINALIZED",
+              feedbackHash: Buffer.from("cd".repeat(32), "hex"),
+            },
+          },
         ])
         .mockResolvedValue([]);
 
@@ -3383,8 +4056,11 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPrisma.revocation.findMany
-        .mockResolvedValueOnce([{ id: "rev1", agentId }])
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client: "client-1", feedbackIndex: 0n, feedbackHash: Buffer.from("aa".repeat(32), "hex") }])
         .mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([
+        { agentId, client: "client-1", feedbackIndex: 0n, status: "FINALIZED", feedbackHash: Buffer.from("aa".repeat(32), "hex") },
+      ]);
 
       mockConnection.getMultipleAccountsInfo.mockRejectedValue(new Error("RPC fail"));
       mockConnection.getAccountInfo.mockRejectedValue(new Error("RPC fail"));
@@ -3404,8 +4080,11 @@ describe("DataVerifier", () => {
       const agentId = AGENT_KEY.toBase58();
 
       mockPrisma.revocation.findMany
-        .mockResolvedValueOnce([{ id: "rev1", agentId }])
+        .mockResolvedValueOnce([{ id: "rev1", agentId, client: "client-1", feedbackIndex: 0n, feedbackHash: Buffer.from("aa".repeat(32), "hex") }])
         .mockResolvedValue([]);
+      mockPrisma.feedback.findMany.mockResolvedValue([
+        { agentId, client: "client-1", feedbackIndex: 0n, status: "FINALIZED", feedbackHash: Buffer.from("aa".repeat(32), "hex") },
+      ]);
 
       mockConnection.getMultipleAccountsInfo.mockResolvedValue([
         { data: Buffer.alloc(10) },

@@ -17,7 +17,12 @@ import {
   resumeLocalDerivedDigests,
 } from "../db/handlers.js";
 import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
-import { saveIndexerState } from "../db/supabase.js";
+import {
+  clearIndexerStateSnapshot,
+  loadIndexerStateSnapshot,
+  restoreIndexerStateSnapshot,
+  saveIndexerState,
+} from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
 
@@ -27,8 +32,8 @@ const logger = createChildLogger("websocket");
 const HEALTH_CHECK_INTERVAL = 30_000;
 // Consider connection stale if no activity for 2 minutes
 const STALE_THRESHOLD = 120_000;
-// Concurrency limits to prevent OOM during high traffic
-const MAX_CONCURRENT_HANDLERS = 10;
+// Keep websocket tx handling sequential so cursor advancement remains prefix-safe.
+const MAX_CONCURRENT_HANDLERS = 1;
 const MAX_QUEUE_SIZE = 10_000;
 
 export interface WebSocketIndexerOptions {
@@ -40,7 +45,21 @@ export interface WebSocketIndexerOptions {
   maxRetries?: number;
 }
 
+type PersistedCursorSnapshot = {
+  signature: string;
+  slot: bigint;
+  txIndex: number | null;
+  source: string | null;
+  updatedAt: Date;
+};
+
 type LogsSubscribeProbeResult = "supported" | "unsupported" | "unknown";
+
+type ConnectionWithLogsProbeInternals = Pick<Connection, "onLogs" | "removeOnLogsListener"> & {
+  _rpcWebSocketConnected?: boolean;
+  _subscriptionHashByClientSubscriptionId?: Record<number, string>;
+  _subscriptionsByHash?: Record<string, { state?: string; serverSubscriptionId?: number | string }>;
+};
 
 function isUnsupportedLogsSubscribeError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -55,6 +74,13 @@ function logUnsupportedLogsSubscribe(wsUrl: string): void {
   logger.warn(
     { wsUrl },
     "RPC provider does not support Solana log subscriptions (logsSubscribe); websocket transport unavailable, use polling or a compatible streaming endpoint"
+  );
+}
+
+function logUnavailableLogsSubscribe(wsUrl: string, result: LogsSubscribeProbeResult): void {
+  logger.warn(
+    { wsUrl, result },
+    "RPC provider could not establish a confirmed Solana log subscription probe; websocket transport unavailable, use polling or a compatible streaming endpoint"
   );
 }
 
@@ -103,27 +129,39 @@ async function probeRawLogsSubscribe(wsUrl: string, programId: string): Promise<
 }
 
 async function probeTemporaryLogsSubscription(
-  connection: Pick<Connection, "onLogs" | "removeOnLogsListener"> & { _rpcWebSocketConnected?: boolean },
+  connection: ConnectionWithLogsProbeInternals,
   programId: PublicKey
 ): Promise<boolean> {
+  const hasTransportFlag = Object.prototype.hasOwnProperty.call(connection, "_rpcWebSocketConnected");
+  const hasSubscriptionStateMaps =
+    !!connection._subscriptionHashByClientSubscriptionId && !!connection._subscriptionsByHash;
+  if (!hasTransportFlag || !hasSubscriptionStateMaps) {
+    return false;
+  }
+
   let logsSubscriptionId: number | null = null;
   try {
     logsSubscriptionId = connection.onLogs(programId, () => undefined, "confirmed");
-
-    const hasTransportFlag = Object.prototype.hasOwnProperty.call(connection, "_rpcWebSocketConnected");
-    if (!hasTransportFlag) {
-      return true;
-    }
-
     const deadline = Date.now() + 2_000;
     while (Date.now() < deadline) {
-      if (connection._rpcWebSocketConnected === true) {
+      const hash = logsSubscriptionId !== null
+        ? connection._subscriptionHashByClientSubscriptionId?.[logsSubscriptionId]
+        : undefined;
+      const subscription = hash ? connection._subscriptionsByHash?.[hash] : undefined;
+      const confirmed =
+        subscription?.state === "subscribed"
+        && subscription.serverSubscriptionId !== null
+        && subscription.serverSubscriptionId !== undefined;
+      if (confirmed) {
         return true;
+      }
+      if (hasTransportFlag && connection._rpcWebSocketConnected !== true) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-
-    return connection._rpcWebSocketConnected === true;
+    return false;
   } catch (error) {
     logger.debug({ error }, "WebSocket log subscription probe failed");
     return false;
@@ -178,9 +216,14 @@ export class WebSocketIndexer {
   private reconnectDelayTimer: NodeJS.Timeout | null = null;
   private reconnectDelayPromise: Promise<void> | null = null;
   private reconnectDelayResolve: (() => void) | null = null;
+  private failSafeStopInProgress = false;
+  private stopRequested = false;
+  private freezeCursorAdvancement = false;
+  private runToken = 0;
   // Bounded concurrency queue to prevent OOM during high traffic
   private logQueue: PQueue;
   private droppedLogs = 0;
+  private lastPersistedCursor: PersistedCursorSnapshot | null = null;
 
   constructor(options: WebSocketIndexerOptions) {
     // Initialize bounded queue for log processing
@@ -200,13 +243,63 @@ export class WebSocketIndexer {
     }
 
     this.isRunning = true;
+    this.stopRequested = false;
+    this.freezeCursorAdvancement = false;
+    this.retryCount = 0;
+    this.runToken += 1;
+    this.lastPersistedCursor = null;
+    this.logQueue.start();
     this.lastActivityTime = Date.now();
+    if (this.prisma) {
+      try {
+        const current = await this.prisma.indexerState.findUnique({
+          where: { id: "main" },
+          select: {
+            lastSignature: true,
+            lastSlot: true,
+            lastTxIndex: true,
+            source: true,
+            updatedAt: true,
+          },
+        });
+        if (current?.lastSignature && current.lastSlot !== null) {
+          this.lastPersistedCursor = {
+            signature: current.lastSignature,
+            slot: BigInt(current.lastSlot),
+            txIndex: current.lastTxIndex ?? null,
+            source: current.source ?? null,
+            updatedAt: current.updatedAt ?? new Date(),
+          };
+        }
+      } catch (error) {
+        logger.warn({ error }, "Failed to snapshot current cursor before starting websocket indexer");
+      }
+    } else {
+      try {
+        const current = await loadIndexerStateSnapshot();
+        if (current?.lastSignature && current.lastSlot !== null) {
+          this.lastPersistedCursor = {
+            signature: current.lastSignature,
+            slot: current.lastSlot,
+            txIndex: current.lastTxIndex ?? null,
+            source: current.source ?? null,
+            updatedAt: current.updatedAt,
+          };
+        }
+      } catch (error) {
+        logger.warn({ error }, "Failed to snapshot current Supabase cursor before starting websocket indexer");
+      }
+    }
     logger.info({ programId: this.programId.toBase58() }, "Starting WebSocket indexer");
 
     if (this.wsUrl) {
       const logsSupport = await probeRawLogsSubscribe(this.wsUrl, this.programId.toBase58());
-      if (logsSupport === "unsupported") {
-        logUnsupportedLogsSubscribe(this.wsUrl);
+      if (logsSupport !== "supported") {
+        if (logsSupport === "unsupported") {
+          logUnsupportedLogsSubscribe(this.wsUrl);
+        } else {
+          logUnavailableLogsSubscribe(this.wsUrl, logsSupport);
+        }
         this.isRunning = false;
         return;
       }
@@ -229,8 +322,23 @@ export class WebSocketIndexer {
     }, "Stopping WebSocket indexer");
 
     this.isRunning = false;
+    this.stopRequested = true;
+    this.freezeCursorAdvancement = true;
+    this.retryCount = 0;
     this.stopHealthCheck();
     this.clearReconnectDelay();
+
+    this.logQueue.pause();
+    const clearedQueuedLogs = this.logQueue.size;
+    const hadInFlightWork = this.logQueue.pending > 0;
+    const restoreCursorSnapshot = this.lastPersistedCursor
+      ? { ...this.lastPersistedCursor }
+      : null;
+    if (clearedQueuedLogs > 0) {
+      this.logQueue.clear();
+      this.droppedLogs += clearedQueuedLogs;
+      logger.info({ clearedQueuedLogs, droppedLogs: this.droppedLogs }, "Cleared queued WebSocket logs during shutdown");
+    }
 
     if (this.subscriptionId !== null) {
       try {
@@ -248,6 +356,97 @@ export class WebSocketIndexer {
       logger.info({ queueSize: this.logQueue.size, pending: this.logQueue.pending }, "Draining log queue before shutdown");
       await this.logQueue.onIdle();
     }
+
+    if (restoreCursorSnapshot && (clearedQueuedLogs > 0 || hadInFlightWork)) {
+      try {
+        if (this.prisma) {
+          await this.prisma.indexerState.upsert({
+            where: { id: "main" },
+            create: {
+              id: "main",
+              lastSignature: restoreCursorSnapshot.signature,
+              lastSlot: restoreCursorSnapshot.slot,
+              lastTxIndex: restoreCursorSnapshot.txIndex,
+              source: restoreCursorSnapshot.source ?? "websocket",
+              updatedAt: restoreCursorSnapshot.updatedAt,
+            },
+            update: {
+              lastSignature: restoreCursorSnapshot.signature,
+              lastSlot: restoreCursorSnapshot.slot,
+              lastTxIndex: restoreCursorSnapshot.txIndex,
+              source: restoreCursorSnapshot.source ?? "websocket",
+              updatedAt: restoreCursorSnapshot.updatedAt,
+            },
+          });
+        } else {
+          await restoreIndexerStateSnapshot(
+            restoreCursorSnapshot.signature,
+            restoreCursorSnapshot.slot,
+            restoreCursorSnapshot.txIndex,
+            (restoreCursorSnapshot.source as "poller" | "websocket" | "substreams" | null) ?? "websocket",
+            restoreCursorSnapshot.updatedAt,
+          );
+        }
+        logger.info(
+          {
+            signature: restoreCursorSnapshot.signature,
+            slot: restoreCursorSnapshot.slot.toString(),
+            txIndex: restoreCursorSnapshot.txIndex,
+          },
+          "Restored safe cursor snapshot after websocket shutdown"
+        );
+      } catch (error) {
+        logger.warn({ error }, "Failed to restore safe cursor snapshot after websocket shutdown");
+      }
+    } else if (clearedQueuedLogs > 0 || hadInFlightWork) {
+      const clearedAt = new Date();
+      try {
+        if (this.prisma) {
+          await this.prisma.indexerState.upsert({
+            where: { id: "main" },
+            create: {
+              id: "main",
+              lastSignature: null,
+              lastSlot: null,
+              lastTxIndex: null,
+              source: "websocket",
+              updatedAt: clearedAt,
+            },
+            update: {
+              lastSignature: null,
+              lastSlot: null,
+              lastTxIndex: null,
+              source: "websocket",
+              updatedAt: clearedAt,
+            },
+          });
+        } else {
+          await clearIndexerStateSnapshot("websocket", clearedAt);
+        }
+        logger.info("Cleared websocket cursor after shutdown because no safe snapshot existed");
+      } catch (error) {
+        logger.warn({ error }, "Failed to clear websocket cursor after shutdown without a safe snapshot");
+      }
+    }
+  }
+
+  private rememberPersistedCursor(
+    signature: string,
+    slot: bigint,
+    txIndex: number | null,
+    source: string,
+    updatedAt: Date,
+  ): void {
+    if (this.stopRequested || this.freezeCursorAdvancement || !this.isRunning) {
+      return;
+    }
+    this.lastPersistedCursor = {
+      signature,
+      slot,
+      txIndex,
+      source,
+      updatedAt,
+    };
   }
 
   private startHealthCheck(): void {
@@ -310,6 +509,8 @@ export class WebSocketIndexer {
 
   private async checkHealth(): Promise<void> {
     if (!this.isRunning) return;
+    const runToken = this.runToken;
+    const observedSubscriptionId = this.subscriptionId;
 
     // Reentrancy guard - prevent overlapping health checks
     if (this.isCheckingHealth) {
@@ -331,6 +532,9 @@ export class WebSocketIndexer {
       // Check if connection is stale (no activity for too long)
       if (timeSinceActivity > STALE_THRESHOLD) {
         const wsHealthy = await probeTemporaryLogsSubscription(this.connection, this.programId);
+        if (!this.isRunning || this.runToken !== runToken) {
+          return;
+        }
         if (wsHealthy) {
           logger.info({
             timeSinceActivity,
@@ -343,24 +547,31 @@ export class WebSocketIndexer {
           timeSinceActivity,
           threshold: STALE_THRESHOLD,
         }, "WebSocket stale and onLogs heartbeat probe failed, reconnecting...");
-        await this.forceReconnect();
+        await this.forceReconnect(observedSubscriptionId);
         return;
       }
 
       // Regular connectivity check (not stale, just verify RPC is up)
       try {
         const slot = await this.connection.getSlot();
+        if (!this.isRunning || this.runToken !== runToken) {
+          return;
+        }
         logger.debug({ slot }, "HTTP connectivity OK");
       } catch (error) {
+        if (!this.isRunning || this.runToken !== runToken) {
+          return;
+        }
         logger.error({ error }, "Health check failed - connection error");
-        await this.forceReconnect();
+        await this.forceReconnect(observedSubscriptionId);
       }
     } finally {
       this.isCheckingHealth = false;
     }
   }
 
-  private async forceReconnect(): Promise<void> {
+  private async forceReconnect(expectedSubscriptionId: number | null = this.subscriptionId): Promise<void> {
+    const runToken = this.runToken;
     // Concurrency guard - prevent overlapping reconnects
     if (this.isReconnecting) {
       logger.debug("Reconnection already in progress, skipping");
@@ -372,17 +583,25 @@ export class WebSocketIndexer {
       logger.info("Forcing WebSocket reconnection...");
 
       // Clean up existing subscription
-      if (this.subscriptionId !== null) {
+      if (expectedSubscriptionId !== null) {
         try {
-          await this.connection.removeOnLogsListener(this.subscriptionId);
+          if (!this.isRunning || this.runToken !== runToken) {
+            return;
+          }
+          await this.connection.removeOnLogsListener(expectedSubscriptionId);
         } catch (error) {
           logger.debug({ error }, "Error removing old subscription during reconnect");
         }
-        this.subscriptionId = null;
+        if (this.subscriptionId === expectedSubscriptionId) {
+          this.subscriptionId = null;
+        }
       }
 
       // Reconnect
-      await this.reconnect();
+      if (!this.isRunning || this.runToken !== runToken) {
+        return;
+      }
+      await this.reconnect(this.runToken);
     } finally {
       this.isReconnecting = false;
     }
@@ -466,13 +685,28 @@ export class WebSocketIndexer {
         return;
       }
       logger.error({ error }, "Failed to subscribe to logs");
-      await this.reconnect();
+      await this.reconnect(this.runToken);
     }
+  }
+
+  private scheduleFailSafeStop(reason: string, details: Record<string, unknown>): void {
+    if (this.failSafeStopInProgress) {
+      return;
+    }
+    this.failSafeStopInProgress = true;
+    this.freezeCursorAdvancement = true;
+    logger.error(details, reason);
+    void this.stop().finally(() => {
+      this.failSafeStopInProgress = false;
+    });
   }
 
   private async handleLogs(logs: Logs, ctx: Context): Promise<void> {
     if (logs.err) {
       logger.debug({ signature: logs.signature }, "Transaction failed, skipping");
+      return;
+    }
+    if (!this.isRunning || this.stopRequested) {
       return;
     }
 
@@ -493,6 +727,7 @@ export class WebSocketIndexer {
           parsedTx = await this.connection.getParsedTransaction(logs.signature, {
             maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
           });
+          if (!this.isRunning || this.stopRequested) return;
 
           if (parsedTx) {
             const parsed = parseTransaction(parsedTx);
@@ -528,6 +763,7 @@ export class WebSocketIndexer {
           maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
           transactionDetails: "full",
         });
+        if (!this.isRunning || this.stopRequested) return;
         if (block?.blockTime !== null && block?.blockTime !== undefined) {
           blockTimeSeconds = block.blockTime;
         }
@@ -544,6 +780,19 @@ export class WebSocketIndexer {
         );
       }
 
+      if (txIndex === undefined) {
+        this.errorCount++;
+        this.scheduleFailSafeStop(
+          "Deterministic tx_index unavailable in websocket mode; entering fail-safe stop so catch-up can recover missed events",
+          {
+            slot: ctx.slot,
+            signature: logs.signature,
+            errorCount: this.errorCount,
+          }
+        );
+        return;
+      }
+
       const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
 
       let allEventsProcessed = true;
@@ -551,6 +800,11 @@ export class WebSocketIndexer {
       if (suspendLocalDigests) await suspendLocalDerivedDigests();
       try {
         for (const [eventOrdinal, event] of events.entries()) {
+          if (!this.isRunning || this.stopRequested) {
+            allEventsProcessed = false;
+            logger.info({ signature: logs.signature, slot: ctx.slot }, "Stopping WebSocket transaction processing before cursor advancement");
+            return;
+          }
           const typedEvent = toTypedEvent(event);
           if (!typedEvent) continue;
 
@@ -569,6 +823,11 @@ export class WebSocketIndexer {
 
           try {
             await handleEventAtomic(this.prisma, typedEvent, eventCtx);
+            if (!this.isRunning || this.stopRequested) {
+              allEventsProcessed = false;
+              logger.info({ signature: logs.signature, slot: ctx.slot }, "WebSocket stop requested during event processing; cursor will not advance");
+              return;
+            }
           } catch (eventError) {
             eventProcessed = false;
             allEventsProcessed = false;
@@ -582,6 +841,10 @@ export class WebSocketIndexer {
 
           // Only log to Prisma if in local mode
           if (this.prisma) {
+            if (!this.isRunning || this.stopRequested) {
+              allEventsProcessed = false;
+              return;
+            }
             try {
               await this.prisma.eventLog.create({
                 data: {
@@ -610,14 +873,30 @@ export class WebSocketIndexer {
           return;
         }
 
+        if (this.freezeCursorAdvancement || this.stopRequested || !this.isRunning) {
+          logger.info(
+            { signature: logs.signature, slot: ctx.slot },
+            "Skipping cursor update during websocket shutdown/fail-safe stop"
+          );
+          return;
+        }
+
         // Update state - both local and Supabase modes (with monotonic guard)
         try {
+          if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) return;
           const newSlot = BigInt(ctx.slot);
           if (this.prisma) {
             const current = await this.prisma.indexerState.findUnique({
               where: { id: "main" },
               select: { lastSlot: true, lastTxIndex: true, lastSignature: true },
             });
+            if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) {
+              logger.info(
+                { signature: logs.signature, slot: ctx.slot },
+                "Skipping cursor update after shutdown while websocket state read was in flight"
+              );
+              return;
+            }
             if (!shouldAdvanceCursor(
               current?.lastSlot,
               current?.lastTxIndex,
@@ -645,6 +924,13 @@ export class WebSocketIndexer {
                 source: "websocket",
                 updatedAt: blockTime,
               }))) {
+                if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) {
+                  logger.info(
+                    { signature: logs.signature, slot: ctx.slot },
+                    "Skipping cursor upsert after shutdown while websocket SQL guard path was in flight"
+                  );
+                  return;
+                }
                 await this.prisma.indexerState.upsert({
                   where: { id: "main" },
                   create: {
@@ -662,10 +948,24 @@ export class WebSocketIndexer {
                   },
                 });
               }
+              this.rememberPersistedCursor(
+                logs.signature,
+                newSlot,
+                txIndex ?? null,
+                "websocket",
+                blockTime
+              );
             }
           } else {
             // Supabase mode — saveIndexerState already has SQL-level monotonic guard
             await saveIndexerState(logs.signature, newSlot, txIndex ?? null, "websocket", blockTime);
+            this.rememberPersistedCursor(
+              logs.signature,
+              newSlot,
+              txIndex ?? null,
+              "websocket",
+              blockTime
+            );
           }
         } catch (stateError) {
           logger.error({
@@ -691,6 +991,9 @@ export class WebSocketIndexer {
       }
 
     } catch (error) {
+      if (!this.isRunning || this.stopRequested) {
+        return;
+      }
       const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error({ error: errorMessage, signature: logs.signature }, "Error handling logs");
 
@@ -718,8 +1021,8 @@ export class WebSocketIndexer {
     }
   }
 
-  private async reconnect(): Promise<void> {
-    if (!this.isRunning) return;
+  private async reconnect(expectedRunToken: number = this.runToken): Promise<void> {
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
 
     if (this.retryCount >= this.maxRetries) {
       logger.error({
@@ -740,7 +1043,7 @@ export class WebSocketIndexer {
     await this.waitForReconnectDelay();
 
     // Re-check after timeout - stop() may have been called during wait
-    if (!this.isRunning) {
+    if (!this.isRunning || this.runToken !== expectedRunToken) {
       logger.info("Reconnect aborted - stop() was called during wait");
       return;
     }
@@ -789,13 +1092,18 @@ export async function testWebSocketConnection(rpcUrl: string, wsUrl: string, pro
     const connection = new Connection(rpcUrl, {
       wsEndpoint: wsUrl,
       commitment: "confirmed",
+      disableRetryOnRateLimit: true,
     });
 
     const slot = await connection.getSlot();
 
     const rawSupport = await probeRawLogsSubscribe(wsUrl, programId);
-    if (rawSupport === "unsupported") {
-      logUnsupportedLogsSubscribe(wsUrl);
+    if (rawSupport !== "supported") {
+      if (rawSupport === "unsupported") {
+        logUnsupportedLogsSubscribe(wsUrl);
+      } else {
+        logUnavailableLogsSubscribe(wsUrl, rawSupport);
+      }
       logger.debug({ slot, rawSupport }, "WebSocket connection test complete");
       return false;
     }

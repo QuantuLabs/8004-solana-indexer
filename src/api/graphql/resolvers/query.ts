@@ -5,6 +5,7 @@ import { buildWhereClause } from '../utils/filters.js';
 import { createBadUserInputError } from '../utils/errors.js';
 import type { AgentRow, FeedbackRow, ResponseRow, RevocationRow } from '../dataloaders.js';
 import { config } from '../../../config.js';
+import { VERIFICATION_STATS_SQL } from '../../verification-stats-sql.js';
 
 const ORDER_MAP_AGENT: Record<string, string> = {
   createdAt: 'created_at',
@@ -115,7 +116,6 @@ interface AgentTreeNodeRow {
 interface AggregatedStats {
   totalAgents: string;
   totalFeedback: string;
-  totalValidations: string;
   totalCollections: string;
   platinumAgents: string;
   goldAgents: string;
@@ -162,6 +162,7 @@ export interface VerificationStatsResult {
   feedbacks: VerificationStatusCounts;
   registries: VerificationStatusCounts;
   metadata: VerificationStatusCounts;
+  validations: VerificationStatusCounts;
   feedbackResponses: VerificationStatusCounts;
   revocations: VerificationStatusCounts;
 }
@@ -306,6 +307,11 @@ function parseCount(value: unknown): number {
   return parseNullableInt(value) ?? 0;
 }
 
+function normalizeNullableText(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return value ?? null;
+  return value.length > 0 ? value : null;
+}
+
 function emptyVerificationStatusCounts(): VerificationStatusCounts {
   return { pending: 0, finalized: 0, orphaned: 0 };
 }
@@ -314,7 +320,6 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
   const { rows } = await ctx.pool.query<{
     total_agents: string;
     total_feedback: string;
-    total_validations: string;
     total_collections: string;
     platinum_agents: string;
     gold_agents: string;
@@ -324,7 +329,6 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
     `SELECT
        (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents,
        (SELECT COUNT(*)::text FROM feedbacks WHERE status != 'ORPHANED') AS total_feedback,
-       (SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations,
        (SELECT COUNT(*)::text
         FROM collection_pointers) AS total_collections,
        (SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED' AND trust_tier = 4) AS platinum_agents,
@@ -351,7 +355,6 @@ async function fetchAggregatedStats(ctx: GraphQLContext): Promise<AggregatedStat
   return {
     totalAgents: rows[0]?.total_agents ?? '0',
     totalFeedback: rows[0]?.total_feedback ?? '0',
-    totalValidations: rows[0]?.total_validations ?? '0',
     totalCollections: rows[0]?.total_collections ?? '0',
     platinumAgents: rows[0]?.platinum_agents ?? '0',
     goldAgents: rows[0]?.gold_agents ?? '0',
@@ -868,7 +871,6 @@ export const queryResolvers = {
         id: args.id,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
-        totalValidations: stats.totalValidations,
         tags: stats.tags,
       };
     },
@@ -892,7 +894,6 @@ export const queryResolvers = {
         id: `global-${ctx.networkMode}`,
         totalAgents: stats.totalAgents,
         totalFeedback: stats.totalFeedback,
-        totalValidations: stats.totalValidations,
         totalCollections: stats.totalCollections,
         platinumAgents: stats.platinumAgents,
         goldAgents: stats.goldAgents,
@@ -983,7 +984,7 @@ export const queryResolvers = {
         asset: row.asset,
         owner: row.owner,
         collection: row.collection,
-        nftName: row.nft_name,
+        nftName: normalizeNullableText(row.nft_name),
         agentUri: row.agent_uri,
         feedbackCount: parseCount(row.feedback_count),
         avgScore: parseNullableInt(row.avg_score),
@@ -1018,23 +1019,24 @@ export const queryResolvers = {
         sort_key: string | number;
       }>(
         `SELECT
-           asset,
-           owner,
-           collection,
-           nft_name,
-           agent_uri,
-           trust_tier,
-           quality_score,
-           confidence,
-           risk_score,
-           diversity_ratio,
-           feedback_count,
-           sort_key
-         FROM agents
-         WHERE trust_tier >= 2
+           a.asset,
+           a.owner,
+           a.collection,
+           a.nft_name,
+           a.agent_uri,
+           a.trust_tier,
+           a.quality_score,
+           a.confidence,
+           a.risk_score,
+           a.diversity_ratio,
+           COALESCE(adc.feedback_count::text, a.feedback_count::text, '0') AS feedback_count,
+           a.sort_key
+         FROM agents a
+         LEFT JOIN agent_digest_cache adc ON adc.agent_id = a.asset
+         WHERE a.trust_tier >= 2
            AND ($1::boolean OR status != 'ORPHANED')
-           AND ($2::text[] IS NULL OR collection = ANY($2::text[]))
-         ORDER BY sort_key DESC, asset ASC
+           AND ($2::text[] IS NULL OR a.collection = ANY($2::text[]))
+         ORDER BY a.sort_key DESC, a.asset ASC
          LIMIT $3::int`,
         [includeOrphaned, collectionParam, first]
       );
@@ -1043,7 +1045,7 @@ export const queryResolvers = {
         asset: row.asset,
         owner: row.owner,
         collection: row.collection,
-        nftName: row.nft_name,
+        nftName: normalizeNullableText(row.nft_name),
         agentUri: row.agent_uri,
         trustTier: parseNullableInt(row.trust_tier),
         qualityScore: parseNullableInt(row.quality_score),
@@ -1061,15 +1063,14 @@ export const queryResolvers = {
         pending_count: string | number | null;
         finalized_count: string | number | null;
         orphaned_count: string | number | null;
-      }>(
-        `SELECT model, pending_count, finalized_count, orphaned_count FROM verification_stats`
-      );
+      }>(VERIFICATION_STATS_SQL);
 
       const result: VerificationStatsResult = {
         agents: emptyVerificationStatusCounts(),
         feedbacks: emptyVerificationStatusCounts(),
         registries: emptyVerificationStatusCounts(),
         metadata: emptyVerificationStatusCounts(),
+        validations: emptyVerificationStatusCounts(),
         feedbackResponses: emptyVerificationStatusCounts(),
         revocations: emptyVerificationStatusCounts(),
       };
@@ -1092,6 +1093,9 @@ export const queryResolvers = {
             break;
           case 'metadata':
             result.metadata = counts;
+            break;
+          case 'validations':
+            result.validations = counts;
             break;
           case 'feedback_responses':
             result.feedbackResponses = counts;

@@ -251,7 +251,10 @@ BEGIN
       RETURN NEW;
     END IF;
 
-    IF existing_status IS NULL OR existing_status != 'ORPHANED' THEN
+    IF existing_status IS NULL
+      OR existing_status != 'ORPHANED'
+      OR (TG_OP = 'UPDATE' AND OLD.status = 'ORPHANED')
+    THEN
       NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));
       UPDATE agents
       SET agent_id = NEW.agent_id
@@ -448,6 +451,7 @@ CREATE TABLE feedback_responses (
   responder TEXT NOT NULL,
   response_uri TEXT,
   response_hash TEXT,
+  seal_hash TEXT,
   running_digest BYTEA,
   response_count BIGINT NOT NULL DEFAULT 0,
   block_slot BIGINT NOT NULL,
@@ -842,7 +846,8 @@ SELECT
   diversity_ratio, feedback_count, sort_key
 FROM agents
 WHERE trust_tier >= 2
-ORDER BY sort_key DESC;
+  AND status != 'ORPHANED'
+ORDER BY sort_key DESC, asset ASC;
 
 -- Agent reputation summary used by REST clients
 CREATE OR REPLACE VIEW agent_reputation
@@ -912,10 +917,11 @@ SELECT
   c.registry_type,
   c.authority,
   COUNT(a.asset) AS agent_count,
-  COUNT(a.asset) FILTER (WHERE a.trust_tier >= 3) AS top_agents,
-  ROUND(AVG(a.quality_score) FILTER (WHERE a.feedback_count > 0), 0) AS avg_quality
+  COUNT(f.id) FILTER (WHERE f.status != 'ORPHANED') AS total_feedbacks,
+  AVG(f.score) FILTER (WHERE f.status != 'ORPHANED') AS avg_score
 FROM collections c
 LEFT JOIN agents a ON c.collection = a.collection
+LEFT JOIN feedbacks f ON a.asset = f.asset
 GROUP BY c.collection, c.registry_type, c.authority;
 
 -- Global stats
@@ -925,9 +931,9 @@ SELECT
   (SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED') AS total_agents,
   (SELECT COUNT(*) FROM collection_pointers) AS total_collections,
   (SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks,
-  (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
-  (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,
-  (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE feedback_count > 0) AS avg_quality;
+  (SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED' AND trust_tier = 4) AS platinum_agents,
+  (SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED' AND trust_tier = 3) AS gold_agents,
+  (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE status != 'ORPHANED' AND feedback_count > 0) AS avg_quality;
 
 -- Verification stats (reorg resilience)
 CREATE OR REPLACE VIEW verification_stats
@@ -950,14 +956,20 @@ SELECT
   'feedbacks' AS model,
   COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
   COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
-  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+  (
+    COUNT(*) FILTER (WHERE status = 'ORPHANED')
+    + COALESCE((SELECT COUNT(*) FROM orphan_feedbacks), 0)
+  ) AS orphaned_count
 FROM feedbacks
 UNION ALL
 SELECT
   'feedback_responses' AS model,
   COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
   COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
-  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+  (
+    COUNT(*) FILTER (WHERE status = 'ORPHANED')
+    + COALESCE((SELECT COUNT(*) FROM orphan_responses), 0)
+  ) AS orphaned_count
 FROM feedback_responses
 UNION ALL
 SELECT
@@ -972,7 +984,14 @@ SELECT
   COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
   COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
   COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
-FROM metadata;
+FROM metadata
+UNION ALL
+SELECT
+  'validations' AS model,
+  COUNT(*) FILTER (WHERE chain_status = 'PENDING') AS pending_count,
+  COUNT(*) FILTER (WHERE chain_status = 'FINALIZED') AS finalized_count,
+  COUNT(*) FILTER (WHERE chain_status = 'ORPHANED') AS orphaned_count
+FROM validations;
 
 -- =============================================
 -- RPC FUNCTIONS
@@ -1006,8 +1025,9 @@ BEGIN
   FROM agents a
   WHERE a.trust_tier >= p_min_tier
     AND (p_collection IS NULL OR a.collection = p_collection)
+    AND a.status != 'ORPHANED'
     AND (p_cursor_sort_key IS NULL OR a.sort_key < p_cursor_sort_key)
-  ORDER BY a.sort_key DESC
+  ORDER BY a.sort_key DESC, a.asset ASC
   LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
@@ -1192,6 +1212,10 @@ GRANT SELECT ON global_stats TO anon;
 GRANT SELECT ON global_stats TO authenticated;
 GRANT SELECT ON verification_stats TO anon;
 GRANT SELECT ON verification_stats TO authenticated;
+GRANT SELECT ON leaderboard TO anon;
+GRANT SELECT ON leaderboard TO authenticated;
+GRANT EXECUTE ON FUNCTION get_leaderboard(TEXT, INT, INT, BIGINT) TO anon;
+GRANT EXECUTE ON FUNCTION get_leaderboard(TEXT, INT, INT, BIGINT) TO authenticated;
 GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO anon;
 GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO authenticated;
 

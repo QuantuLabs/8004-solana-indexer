@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { PublicKey } from "@solana/web3.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import { TEST_ASSET, TEST_CLIENT, TEST_OWNER } from "../../mocks/solana.js";
-import { ReplayVerifier } from "../../../src/services/replay-verifier.js";
+import {
+  ReplayVerifier,
+  PoolReplayVerifier,
+  fetchReplayDataFromPool,
+  getLatestCheckpointsFromPool,
+} from "../../../src/services/replay-verifier.js";
 
 const ZERO_DIGEST_HEX = Buffer.alloc(32).toString("hex");
 const AGENT_ID = TEST_ASSET.toBase58();
@@ -18,33 +23,46 @@ function makeSealHash(index: number): Buffer {
 function makeFeedbackRow(index: number, opts?: { runningDigest?: Buffer | null }) {
   const sealHash = makeSealHash(index);
   return {
+    id: `fb-${index}`,
     agentId: AGENT_ID,
     client: CLIENT_ID,
     feedbackIndex: BigInt(index),
     feedbackHash: new Uint8Array(sealHash),
     createdSlot: 100n + BigInt(index),
+    txIndex: 0,
+    eventOrdinal: 0,
+    createdTxSignature: `fb-sig-${index}`,
     runningDigest: opts?.runningDigest ? new Uint8Array(opts.runningDigest) : null,
   };
 }
 
 function makeRevocationRow(index: number, revokeCount: number, opts?: { runningDigest?: Buffer | null }) {
   return {
+    id: `rv-${revokeCount}`,
     agentId: AGENT_ID,
     client: CLIENT_ID,
     feedbackIndex: BigInt(index),
     feedbackHash: new Uint8Array(makeSealHash(index)),
     revokeCount: BigInt(revokeCount),
     slot: 200n + BigInt(revokeCount),
+    txIndex: 0,
+    eventOrdinal: 0,
+    txSignature: `rv-sig-${revokeCount}`,
     runningDigest: opts?.runningDigest ? new Uint8Array(opts.runningDigest) : null,
   };
 }
 
 function makeResponseRow(fbIndex: number, responseCount: number, opts?: { runningDigest?: Buffer | null }) {
   return {
+    id: `resp-${responseCount}`,
     responder: OWNER_ID,
     responseHash: new Uint8Array(makeSealHash(responseCount + 1000)),
+    sealHash: new Uint8Array(makeSealHash(fbIndex)),
     responseCount: BigInt(responseCount),
     slot: 300n + BigInt(responseCount),
+    txIndex: 0,
+    eventOrdinal: 0,
+    txSignature: `resp-sig-${responseCount}`,
     runningDigest: opts?.runningDigest ? new Uint8Array(opts.runningDigest) : null,
     feedback: {
       agentId: AGENT_ID,
@@ -874,6 +892,129 @@ describe("ReplayVerifier", () => {
     });
   });
 
+  describe("response/revoke chains include ORPHANED events when reconstructing on-chain digests", () => {
+    it("includes orphan feedback staging rows in feedback chain replay", async () => {
+      const refRows = [
+        { ...makeFeedbackRow(0, 0), status: "FINALIZED" },
+      ];
+      const orphanRows = [
+        {
+          id: "orphan-fb-2",
+          agentId: AGENT_ID,
+          client: CLIENT_ID,
+          feedbackIndex: 1n,
+          feedbackHash: Buffer.alloc(32, 0xaa),
+          createdAt: new Date("2024-01-01T00:00:01Z"),
+          slot: 2n,
+          txIndex: 0,
+          eventOrdinal: 0,
+          txSignature: "fb-orphan-sig",
+          runningDigest: null,
+        },
+      ];
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(refRows);
+      (prisma.orphanFeedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(orphanRows);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.orphanResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.feedback.valid).toBe(true);
+      expect(result.feedback.count).toBe(2);
+    });
+
+    it("uses response.sealHash and includes ORPHANED responses", async () => {
+      const refRows = [
+        { ...makeResponseRow(0, 0), status: "ORPHANED" },
+        { ...makeResponseRow(0, 1), status: "PENDING" },
+      ];
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.orphanFeedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(refRows)
+        .mockResolvedValueOnce([]);
+      (prisma.orphanResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.valid).toBe(true);
+      expect(result.response.count).toBe(2);
+      expect(prisma.feedbackResponse.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            feedback: { agentId: AGENT_ID },
+            responseCount: { gt: 0n },
+          }),
+        })
+      );
+    });
+
+    it("includes orphan response staging rows in response chain replay", async () => {
+      const refRows = [
+        { ...makeResponseRow(0, 0), status: "PENDING" },
+      ];
+      const orphanRows = [
+        {
+          id: "orphan-resp-2",
+          agentId: AGENT_ID,
+          client: CLIENT_ID,
+          feedbackIndex: 0n,
+          responder: OWNER_ID,
+          responseUri: "ipfs://resp-2",
+          responseHash: Buffer.alloc(32, 0xbb),
+          sealHash: Buffer.alloc(32, 0xaa),
+          runningDigest: null,
+          responseCount: 2n,
+          createdAt: new Date("2024-01-01T00:00:02Z"),
+          slot: 3n,
+          txIndex: 0,
+          eventOrdinal: 0,
+          txSignature: "resp-orphan-sig",
+        },
+      ];
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.orphanFeedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(refRows)
+        .mockResolvedValueOnce([]);
+      (prisma.orphanResponse.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(orphanRows)
+        .mockResolvedValueOnce([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.response.valid).toBe(true);
+      expect(result.response.count).toBe(2);
+    });
+
+    it("includes ORPHANED revocations in revoke chain replay", async () => {
+      const refRows = [
+        { ...makeRevocationRow(0, 0), status: "ORPHANED" },
+        { ...makeRevocationRow(0, 1), status: "PENDING" },
+      ];
+      (prisma.feedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.orphanFeedback.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.orphanResponse.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (prisma.revocation.findMany as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(refRows)
+        .mockResolvedValueOnce([]);
+
+      const result = await verifier.fullReplay(AGENT_ID);
+
+      expect(result.revoke.valid).toBe(true);
+      expect(result.revoke.count).toBe(2);
+      expect(prisma.revocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { agentId: AGENT_ID, revokeCount: { gt: 0n } },
+        })
+      );
+    });
+  });
+
   describe("revoke chain with valid running digest", () => {
     it("should validate correct running digest in revoke chain", async () => {
       // First pass: get correct digest
@@ -938,6 +1079,12 @@ describe("ReplayVerifier", () => {
       (prisma3.revocation.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       const incResult = await verifier3.incrementalVerify(AGENT_ID);
 
+      expect((prisma3.feedbackResponse.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+        where: {
+          feedback: { agentId: AGENT_ID },
+          responseCount: { gt: 2n },
+        },
+      });
       expect(incResult.valid).toBe(true);
       expect(incResult.response.count).toBe(3);
       expect(incResult.response.finalDigest).toBe(fullResult.response.finalDigest);
@@ -981,6 +1128,12 @@ describe("ReplayVerifier", () => {
         .mockResolvedValueOnce([]);
       const incResult = await verifier3.incrementalVerify(AGENT_ID);
 
+      expect((prisma3.revocation.findMany as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+        where: {
+          agentId: AGENT_ID,
+          revokeCount: { gt: 2n },
+        },
+      });
       expect(incResult.valid).toBe(true);
       expect(incResult.revoke.count).toBe(3);
       expect(incResult.revoke.finalDigest).toBe(fullResult.revoke.finalDigest);
@@ -1059,5 +1212,299 @@ describe("ReplayVerifier", () => {
       expect(result.revoke.mismatchAt).toBe(1);
       expect(result.revoke.count).toBe(3);
     });
+  });
+});
+
+describe("Pool replay verifier", () => {
+  it("includes orphan feedback and orphan response tables in checkpoint queries", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM revocations")) {
+        return { rows: [] };
+      }
+      if (sql.includes("orphan_feedbacks")) {
+        return {
+          rows: [{ event_count: "1", digest: "aa".repeat(32), created_at: "2026-03-13T00:00:00.000Z" }],
+        };
+      }
+      if (sql.includes("orphan_responses")) {
+        return {
+          rows: [{ event_count: "3", digest: "bb".repeat(32), created_at: "2026-03-13T00:00:00.000Z" }],
+        };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+
+    const checkpoints = await getLatestCheckpointsFromPool(pool, AGENT_ID);
+
+    expect(checkpoints.feedback?.eventCount).toBe(1);
+    expect(checkpoints.response?.eventCount).toBe(3);
+    const sqls = query.mock.calls.map(([sql]) => String(sql));
+    expect(sqls.some((sql) => sql.includes("orphan_feedbacks"))).toBe(true);
+    expect(sqls.some((sql) => sql.includes("orphan_responses"))).toBe(true);
+  });
+
+  it("does not exclude ORPHANED main feedback rows from pool checkpoint and replay queries", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("((event_count)::bigint % 1000) = 0")) {
+        return { rows: [] };
+      }
+      if (sql.includes("FROM combined") && sql.includes("feedback_index") && !sql.includes("response_count")) {
+        return {
+          rows: [{
+            client: CLIENT_ID,
+            feedback_index: "0",
+            feedback_hash: makeSealHash(0).toString("hex"),
+            slot: "100",
+            running_digest: null,
+          }],
+        };
+      }
+      if (sql.includes("response_count")) {
+        return { rows: [] };
+      }
+      if (sql.includes("FROM revocations")) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+    const verifier = new PoolReplayVerifier(pool);
+
+    await verifier.incrementalVerify(AGENT_ID);
+
+    const feedbackSql = query.mock.calls
+      .map(([sql]) => String(sql))
+      .filter((sql) => sql.includes("FROM feedbacks"));
+    expect(feedbackSql.length).toBeGreaterThan(0);
+    expect(feedbackSql.every((sql) => !sql.includes("status != 'ORPHANED'"))).toBe(true);
+  });
+
+  it("includes orphan feedbacks and orphan responses in replay data fetches", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("orphan_feedbacks")) {
+        return {
+          rows: [{
+            client: CLIENT_ID,
+            feedback_index: "0",
+            feedback_hash: makeSealHash(0).toString("hex"),
+            slot: "100",
+            running_digest: null,
+          }],
+        };
+      }
+      if (sql.includes("orphan_responses")) {
+        return {
+          rows: [{
+            client: CLIENT_ID,
+            feedback_index: "0",
+            responder: OWNER_ID,
+            response_hash: makeSealHash(1000).toString("hex"),
+            feedback_hash: makeSealHash(0).toString("hex"),
+            slot: "300",
+            running_digest: null,
+            response_count: "2",
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+
+    const feedbackPage = await fetchReplayDataFromPool(pool, AGENT_ID, "feedback", 0, 1, 10);
+    const responsePage = await fetchReplayDataFromPool(pool, AGENT_ID, "response", 2, 3, 10);
+
+    expect(feedbackPage.events).toHaveLength(1);
+    expect(responsePage.events).toHaveLength(1);
+    const sqls = query.mock.calls.map(([sql]) => String(sql));
+    expect(sqls.some((sql) => sql.includes("orphan_feedbacks"))).toBe(true);
+    expect(sqls.some((sql) => sql.includes("orphan_responses"))).toBe(true);
+  });
+
+  it("starts response and revoke replay at count 0 when fromCount is 0", async () => {
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("response_count")) {
+        expect(params?.[1]).toBe("0");
+        expect(params?.[2]).toBe("4");
+        return {
+          rows: [
+            {
+              client: CLIENT_ID,
+              feedback_index: "0",
+              responder: OWNER_ID,
+              response_hash: makeSealHash(1000).toString("hex"),
+              feedback_hash: makeSealHash(0).toString("hex"),
+              slot: "300",
+              running_digest: null,
+              response_count: "1",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "0",
+              responder: OWNER_ID,
+              response_hash: makeSealHash(1001).toString("hex"),
+              feedback_hash: makeSealHash(0).toString("hex"),
+              slot: "301",
+              running_digest: null,
+              response_count: "2",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "0",
+              responder: OWNER_ID,
+              response_hash: makeSealHash(1002).toString("hex"),
+              feedback_hash: makeSealHash(0).toString("hex"),
+              slot: "302",
+              running_digest: null,
+              response_count: "3",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "0",
+              responder: OWNER_ID,
+              response_hash: makeSealHash(1003).toString("hex"),
+              feedback_hash: makeSealHash(0).toString("hex"),
+              slot: "303",
+              running_digest: null,
+              response_count: "4",
+            },
+          ],
+        };
+      }
+      if (sql.includes("revoke_count")) {
+        expect(params?.[1]).toBe("0");
+        expect(params?.[2]).toBe("4");
+        return {
+          rows: [
+            {
+              client: CLIENT_ID,
+              feedback_index: "0",
+              feedback_hash: makeSealHash(0).toString("hex"),
+              slot: "400",
+              running_digest: null,
+              revoke_count: "1",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "1",
+              feedback_hash: makeSealHash(1).toString("hex"),
+              slot: "401",
+              running_digest: null,
+              revoke_count: "2",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "2",
+              feedback_hash: makeSealHash(2).toString("hex"),
+              slot: "402",
+              running_digest: null,
+              revoke_count: "3",
+            },
+            {
+              client: CLIENT_ID,
+              feedback_index: "3",
+              feedback_hash: makeSealHash(3).toString("hex"),
+              slot: "403",
+              running_digest: null,
+              revoke_count: "4",
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+
+    const responsePage = await fetchReplayDataFromPool(pool, AGENT_ID, "response", 0, undefined, 3);
+    const revokePage = await fetchReplayDataFromPool(pool, AGENT_ID, "revoke", 0, undefined, 3);
+
+    expect(responsePage.events).toHaveLength(3);
+    expect(responsePage.events[0]).toEqual(expect.objectContaining({ response_count: 1 }));
+    expect(responsePage.nextFromCount).toBe(4);
+    expect(responsePage.hasMore).toBe(true);
+    expect(revokePage.events).toHaveLength(3);
+    expect(revokePage.events[0]).toEqual(expect.objectContaining({ revoke_count: "1" }));
+    expect(revokePage.nextFromCount).toBe(4);
+    expect(revokePage.hasMore).toBe(true);
+  });
+
+  it("resumes pool response and revoke replay after the checkpointed count", async () => {
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("FROM feedback_responses") && sql.includes("running_digest IS NOT NULL")) {
+        return {
+          rows: [{ event_count: "2", digest: ZERO_DIGEST_HEX }],
+        };
+      }
+      if (sql.includes("FROM revocations") && sql.includes("running_digest IS NOT NULL")) {
+        if (sql.includes("revoke_count % 1000")) {
+          return { rows: [{ event_count: "2", digest: ZERO_DIGEST_HEX, created_at: "2026-03-15T00:00:00.000Z" }] };
+        }
+        return { rows: [] };
+      }
+      if (sql.includes("response_count")) {
+        expect(params?.[1]).toBe("3");
+        return { rows: [] };
+      }
+      if (sql.includes("revoke_count")) {
+        expect(params?.[1]).toBe("3");
+        return { rows: [] };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+    const verifier = new PoolReplayVerifier(pool);
+
+    const result = await verifier.incrementalVerify(AGENT_ID);
+
+    expect(result.response.count).toBe(2);
+    expect(result.revoke.count).toBe(2);
+  });
+
+  it("replays orphan feedback and orphan response rows in pool mode", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("((event_count)::bigint % 1000) = 0")) {
+        return { rows: [] };
+      }
+      if (sql.includes("FROM revocations")) {
+        return { rows: [] };
+      }
+      if (sql.includes("FROM combined") && sql.includes("feedback_index") && sql.includes("orphan_feedbacks")) {
+        return {
+          rows: [{
+            client: CLIENT_ID,
+            feedback_index: "0",
+            feedback_hash: makeSealHash(0).toString("hex"),
+            slot: "100",
+            running_digest: null,
+          }],
+        };
+      }
+      if (sql.includes("FROM combined") && sql.includes("response_count") && sql.includes("orphan_responses")) {
+        return {
+          rows: [{
+            client: CLIENT_ID,
+            feedback_index: "0",
+            responder: OWNER_ID,
+            response_hash: makeSealHash(1000).toString("hex"),
+            feedback_hash: makeSealHash(0).toString("hex"),
+            slot: "300",
+            running_digest: null,
+            response_count: "0",
+          }],
+        };
+      }
+      return { rows: [] };
+    });
+    const pool = { query } as unknown as import("pg").Pool;
+    const verifier = new PoolReplayVerifier(pool);
+
+    const result = await verifier.incrementalVerify(AGENT_ID);
+
+    expect(result.feedback.count).toBe(1);
+    expect(result.response.count).toBe(1);
+    expect(result.valid).toBe(true);
+    const sqls = query.mock.calls.map(([sql]) => String(sql));
+    expect(sqls.some((sql) => sql.includes("orphan_feedbacks"))).toBe(true);
+    expect(sqls.some((sql) => sql.includes("orphan_responses"))).toBe(true);
   });
 });

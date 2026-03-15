@@ -157,6 +157,46 @@ describe("OrphanFeedback flow (owner tests)", () => {
     expect(orphanFeedback.delete).toHaveBeenCalledWith({ where: { id: "ofb-1" } });
   });
 
+  it("agent registration after orphan feedback uses a transaction in non-atomic mode", async () => {
+    (prisma.agent.findUnique as any)
+      .mockResolvedValueOnce({ id: TEST_ASSET.toBase58(), creator: TEST_OWNER.toBase58() })
+      .mockResolvedValue({ id: TEST_ASSET.toBase58() });
+
+    orphanFeedback.findMany.mockResolvedValue([
+      {
+        id: "ofb-2",
+        agentId: TEST_ASSET.toBase58(),
+        client: TEST_CLIENT.toBase58(),
+        feedbackIndex: 0n,
+        value: "1000",
+        valueDecimals: 2,
+        score: 80,
+        tag1: "quality",
+        tag2: "speed",
+        endpoint: "/api/chat",
+        feedbackUri: "ipfs://feedback-0",
+        feedbackHash: Uint8Array.from(TEST_HASH),
+        runningDigest: Uint8Array.from(TEST_HASH),
+        atomEnabled: true,
+        newTrustTier: 0,
+        newQualityScore: 0,
+        newConfidence: 0,
+        newRiskScore: 0,
+        newDiversityRatio: 0,
+        createdAt: TEST_BLOCK_TIME,
+        slot: TEST_SLOT,
+        txSignature: TEST_SIGNATURE,
+        txIndex: 7,
+        eventOrdinal: 0,
+      },
+    ]);
+
+    await expect(handleEvent(prisma, makeAgentRegisteredEvent(), ctx)).resolves.toBeUndefined();
+
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(orphanFeedback.delete).toHaveBeenCalledWith({ where: { id: "ofb-2" } });
+  });
+
   it("reconciled feedback_id should be deterministic and gapless per agent", async () => {
     (prisma.agent.findUnique as any)
       .mockResolvedValueOnce(null)

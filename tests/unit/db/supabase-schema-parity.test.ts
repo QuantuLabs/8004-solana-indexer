@@ -23,6 +23,11 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("UNIQUE(asset, client_address, feedback_index)");
   });
 
+  it("defines feedback_responses seal_hash used by response verifier recovery", () => {
+    expect(schemaSql).toContain("CREATE TABLE feedback_responses (");
+    expect(schemaSql).toContain("seal_hash TEXT");
+  });
+
   it("defines orphan_responses staging table used for delayed response replay", () => {
     expect(schemaSql).toContain("DROP TABLE IF EXISTS orphan_responses CASCADE;");
     expect(schemaSql).toContain("CREATE TABLE orphan_responses (");
@@ -58,6 +63,7 @@ describe("supabase schema revocations bootstrap parity", () => {
       "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '')"
     );
     expect(schemaSql).toContain("'revocation:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(schemaSql).toContain("OR (TG_OP = 'UPDATE' AND OLD.status = 'ORPHANED')");
     expect(schemaSql).toContain(
       "NEW.agent_id := alloc_gapless_id('agent:global', COALESCE(NEW.created_at, NEW.updated_at, NOW()));"
     );
@@ -87,10 +93,24 @@ describe("supabase schema revocations bootstrap parity", () => {
   it("includes revocations in verification stats and RLS policy", () => {
     expect(schemaSql).toContain("'revocations' AS model");
     expect(schemaSql).toContain("FROM revocations");
+    expect(schemaSql).toContain("COUNT(*) FILTER (WHERE status = 'ORPHANED')");
+    expect(schemaSql).toContain("SELECT COUNT(*) FROM orphan_feedbacks");
+    expect(schemaSql).toContain("SELECT COUNT(*) FROM orphan_responses");
     expect(schemaSql).toContain("ALTER TABLE revocations ENABLE ROW LEVEL SECURITY;");
     expect(schemaSql).toContain('CREATE POLICY "Public read revocations" ON revocations FOR SELECT USING (true);');
     expect(schemaSql).toContain("GRANT SELECT ON global_stats TO anon;");
     expect(schemaSql).toContain("GRANT SELECT ON global_stats TO authenticated;");
+  });
+
+  it("grants leaderboard proxy objects to anon/authenticated roles", () => {
+    expect(schemaSql).toContain("GRANT SELECT ON leaderboard TO anon;");
+    expect(schemaSql).toContain("GRANT SELECT ON leaderboard TO authenticated;");
+    expect(schemaSql).toContain(
+      "GRANT EXECUTE ON FUNCTION get_leaderboard(TEXT, INT, INT, BIGINT) TO anon;"
+    );
+    expect(schemaSql).toContain(
+      "GRANT EXECUTE ON FUNCTION get_leaderboard(TEXT, INT, INT, BIGINT) TO authenticated;"
+    );
   });
 
   it("enforces non-orphan scoped IDs as non-null invariants", () => {
@@ -110,6 +130,30 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain(
       "(SELECT COUNT(*) FROM feedbacks WHERE status != 'ORPHANED') AS total_feedbacks"
     );
+    expect(schemaSql).toContain(
+      "(SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED' AND trust_tier = 4) AS platinum_agents"
+    );
+    expect(schemaSql).toContain(
+      "(SELECT COUNT(*) FROM agents WHERE status != 'ORPHANED' AND trust_tier = 3) AS gold_agents"
+    );
+    expect(schemaSql).toContain(
+      "(SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE status != 'ORPHANED' AND feedback_count > 0) AS avg_quality"
+    );
+  });
+
+  it("keeps leaderboard view semantics aligned with local REST ordering and orphan filtering", () => {
+    expect(schemaSql).toContain("CREATE OR REPLACE VIEW leaderboard");
+    expect(schemaSql).toContain("WHERE trust_tier >= 2");
+    expect(schemaSql).toContain("AND status != 'ORPHANED'");
+    expect(schemaSql).toContain("ORDER BY sort_key DESC, asset ASC;");
+  });
+
+  it("keeps collection_stats view semantics aligned with local REST shape", () => {
+    expect(schemaSql).toContain("CREATE OR REPLACE VIEW collection_stats");
+    expect(schemaSql).toContain("COUNT(a.asset) AS agent_count");
+    expect(schemaSql).toContain("COUNT(f.id) FILTER (WHERE f.status != 'ORPHANED') AS total_feedbacks");
+    expect(schemaSql).toContain("AVG(f.score) FILTER (WHERE f.status != 'ORPHANED') AS avg_score");
+    expect(schemaSql).toContain("LEFT JOIN feedbacks f ON a.asset = f.asset");
   });
 
   it("defines proxy schema objects used by agent0 REST clients", () => {

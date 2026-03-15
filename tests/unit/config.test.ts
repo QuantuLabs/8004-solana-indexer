@@ -44,6 +44,9 @@ describe("Config", () => {
       delete process.env.POSTGREST_TOKEN;
       delete process.env.MAX_SUPPORTED_TRANSACTION_VERSION;
       delete process.env.POLLER_BATCH_RPC_ENABLED;
+      delete process.env.POLLER_MAX_SIGNATURES_PER_CYCLE;
+      delete process.env.HISTORICAL_SCAN_MAX_PAGES_PER_PASS;
+      delete process.env.HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT;
       delete process.env.POLLER_RPC_CHUNK_SIZE;
       delete process.env.POLLER_RPC_CHUNK_CONCURRENCY;
       delete process.env.METRICS_ENDPOINT_ENABLED;
@@ -65,6 +68,9 @@ describe("Config", () => {
       expect(config.indexerMode).toBe("polling");
       expect(config.pollingInterval).toBe(15000);
       expect(config.batchSize).toBe(100);
+      expect(config.pollerMaxSignaturesPerCycle).toBe(500);
+      expect(config.historicalScanMaxPagesPerPass).toBe(10);
+      expect(config.historicalScanSignaturePageLimit).toBe(1000);
       expect(config.wsReconnectInterval).toBe(3000);
       expect(config.wsMaxRetries).toBe(5);
       expect(config.logLevel).toBe("info");
@@ -106,6 +112,9 @@ describe("Config", () => {
       process.env.INDEXER_STOP_SLOT = "123456999";
       process.env.MAX_SUPPORTED_TRANSACTION_VERSION = "1";
       process.env.POLLER_BATCH_RPC_ENABLED = "false";
+      process.env.POLLER_MAX_SIGNATURES_PER_CYCLE = "250";
+      process.env.HISTORICAL_SCAN_MAX_PAGES_PER_PASS = "12";
+      process.env.HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT = "750";
       process.env.POLLER_RPC_CHUNK_SIZE = "42";
       process.env.POLLER_RPC_CHUNK_CONCURRENCY = "7";
       process.env.METRICS_ENDPOINT_ENABLED = "true";
@@ -125,6 +134,9 @@ describe("Config", () => {
       expect(config.indexerMode).toBe("polling");
       expect(config.pollingInterval).toBe(10000);
       expect(config.batchSize).toBe(200);
+      expect(config.pollerMaxSignaturesPerCycle).toBe(250);
+      expect(config.historicalScanMaxPagesPerPass).toBe(12);
+      expect(config.historicalScanSignaturePageLimit).toBe(750);
       expect(config.wsReconnectInterval).toBe(5000);
       expect(config.wsMaxRetries).toBe(10);
       expect(config.logLevel).toBe("debug");
@@ -159,7 +171,7 @@ describe("Config", () => {
       expect(config.supabaseKey).toBe("alias-service-role-key");
     });
 
-    it("should prioritize SUPABASE_* over POSTGREST_* aliases when both are set", async () => {
+    it("should prioritize POSTGREST_* aliases over SUPABASE_* when both are set", async () => {
       process.env.SUPABASE_URL = "https://primary.supabase.co";
       process.env.SUPABASE_KEY = "primary-key";
       process.env.POSTGREST_URL = "https://alias.supabase.co";
@@ -167,8 +179,8 @@ describe("Config", () => {
 
       const { config } = await import("../../src/config.js");
 
-      expect(config.supabaseUrl).toBe("https://primary.supabase.co");
-      expect(config.supabaseKey).toBe("primary-key");
+      expect(config.supabaseUrl).toBe("https://alias.supabase.co");
+      expect(config.supabaseKey).toBe("alias-key");
     });
 
     it("should support websocket mode", async () => {

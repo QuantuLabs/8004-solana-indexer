@@ -25,6 +25,8 @@ import { config, ChainStatus } from "../config.js";
 import * as supabaseHandlers from "./supabase.js";
 import { trySaveLocalIndexerStateWithSql } from "./indexer-state-local.js";
 import { classifyRevocationStatus } from "./revocation-classification.js";
+import { classifyResponseStatus } from "./response-classification.js";
+import { shouldReplaceRevocationByEventOrder } from "./revocation-upsert-order.js";
 import { digestUri, serializeValue, toDeterministicUriStatus } from "../indexer/uriDigest.js";
 import { digestCollectionPointerDoc } from "../indexer/collectionDigest.js";
 import { compressForStorage } from "../utils/compression.js";
@@ -53,6 +55,7 @@ let localDerivedDigestsEnabled = process.env.NODE_ENV === "test";
 let localDerivedDigestsSuspendCount = 0;
 let localUriRecoveryCursor: string | null = null;
 let localCollectionRecoveryCursor: { col: string; creator: string } | null = null;
+let agentIdAssignmentTail: Promise<void> = Promise.resolve();
 let feedbackIdAssignmentTail: Promise<void> = Promise.resolve();
 let responseIdAssignmentTail: Promise<void> = Promise.resolve();
 let revocationIdAssignmentTail: Promise<void> = Promise.resolve();
@@ -74,6 +77,14 @@ async function withAssignmentLock<T>(
   } finally {
     release();
   }
+}
+
+async function withAgentIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
+  return withAssignmentLock(
+    () => agentIdAssignmentTail,
+    (tail) => { agentIdAssignmentTail = tail; },
+    task
+  );
 }
 
 async function withFeedbackIdAssignmentLock<T>(task: () => Promise<T>): Promise<T> {
@@ -143,14 +154,9 @@ INSERT INTO "CollectionPointer" (
   "lastSeenSlot",
   "lastSeenTxIndex",
   "lastSeenTxSignature",
-  "assetCount",
-  "collection_id"
+  "assetCount"
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (
-  SELECT COALESCE(MAX("collection_id"), 0) + 1
-  FROM "CollectionPointer"
-  WHERE "collection_id" IS NOT NULL
-))
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT("col", "creator") DO UPDATE SET
   "lastSeenAt" = CASE
     WHEN "CollectionPointer"."lastSeenSlot" IS NULL
@@ -215,22 +221,14 @@ ON CONFLICT("col", "creator") DO UPDATE SET
       )
     THEN excluded."lastSeenTxSignature"
     ELSE "CollectionPointer"."lastSeenTxSignature"
-  END,
-  "collection_id" = COALESCE(
-    "CollectionPointer"."collection_id",
-    (
-      SELECT COALESCE(MAX("collection_id"), 0) + 1
-      FROM "CollectionPointer"
-      WHERE "collection_id" IS NOT NULL
-    )
-  )
+  END
 `;
 
 function isMissingCollectionIdSchemaError(error: unknown): boolean {
   const maybe = error as { code?: unknown; message?: unknown } | null;
   const code = typeof maybe?.code === "string" ? maybe.code : "";
   const message = typeof maybe?.message === "string" ? maybe.message : String(error);
-  const missingSchemaPattern = /column .*collection_id|column .*lastSeenTxIndex|no such column: collection_id|no such column: lastSeenTxIndex|has no column named collection_id|has no column named lastSeenTxIndex|column "?collection_id"? does not exist|column "?lastSeenTxIndex"? does not exist|Unknown arg .*collectionId|Unknown arg .*lastSeenTxIndex/i;
+  const missingSchemaPattern = /column .*collection_id|column .*lastSeenTxIndex|column .*nextValue|no such column: collection_id|no such column: lastSeenTxIndex|no such column: nextValue|no such table: IdCounter|has no column named collection_id|has no column named lastSeenTxIndex|has no column named nextValue|column "?collection_id"? does not exist|column "?lastSeenTxIndex"? does not exist|column "?nextValue"? does not exist|Unknown arg .*collectionId|Unknown arg .*lastSeenTxIndex|IdCounter/i;
   if (code === "P2022") {
     return /collection_id|collectionId|lastSeenTxIndex|CollectionPointer/i.test(message);
   }
@@ -364,7 +362,7 @@ async function upsertCollectionPointerWithOptionalCollectionId(
       } else {
         logger.warn(
           { pointer, creator, error: error instanceof Error ? error.message : String(error) },
-          "db-side collection_id allocation failed; falling back to max-scan assignment"
+          "db-side collection_id upsert failed; falling back to Prisma upsert"
         );
       }
     }
@@ -376,7 +374,6 @@ async function upsertCollectionPointerWithOptionalCollectionId(
         const existingCollection = await collection.findUnique({
           where,
           select: {
-            collectionId: true,
             lastSeenSlot: true,
             lastSeenTxIndex: true,
             lastSeenTxSignature: true,
@@ -384,27 +381,11 @@ async function upsertCollectionPointerWithOptionalCollectionId(
         });
         const shouldUpdateLastSeen = shouldAdvanceCollectionPointerLastSeen(existingCollection, ctx);
         const monotonicUpdateBase = shouldUpdateLastSeen ? updateBase : {};
-        let assignedCollectionId: bigint | undefined;
-        if (!existingCollection || existingCollection.collectionId === null) {
-          const highestAssigned = await collection.findMany({
-            where: { collectionId: { not: null } },
-            select: { collectionId: true },
-            orderBy: { collectionId: "desc" },
-            take: 1,
-          });
-          assignedCollectionId = asBigInt(highestAssigned[0]?.collectionId) + 1n;
-        }
 
         await collection.upsert({
           where,
-          create: {
-            ...createBase,
-            collectionId: assignedCollectionId ?? null,
-          },
-          update: {
-            ...monotonicUpdateBase,
-            ...(assignedCollectionId !== undefined ? { collectionId: assignedCollectionId } : {}),
-          },
+          create: createBase,
+          update: monotonicUpdateBase,
         });
         return;
       } catch (error) {
@@ -1405,53 +1386,67 @@ async function handleAgentRegisteredCore(
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
   const collectionId = data.collection.toBase58();
-  const existingAgent = await client.agent.findUnique({
-    where: { id: assetId },
-    select: { creator: true },
-  });
-  const ownerBase58 = data.owner.toBase58();
-  const canonicalCreator = existingAgent
-    ? (() => {
-        if (!existingAgent.creator) {
-          throw new Error(`Invariant violation: missing creator for existing agent ${assetId}`);
-        }
-        return existingAgent.creator;
-      })()
-    : ownerBase58;
+  await withAgentIdAssignmentLock(async () => {
+    const existingAgent = await client.agent.findUnique({
+      where: { id: assetId },
+      select: { agentId: true, creator: true },
+    });
+    const ownerBase58 = data.owner.toBase58();
+    const canonicalCreator = existingAgent
+      ? (() => {
+          if (!existingAgent.creator) {
+            throw new Error(`Invariant violation: missing creator for existing agent ${assetId}`);
+          }
+          return existingAgent.creator;
+        })()
+      : ownerBase58;
 
-  await client.agent.upsert({
-    where: { id: assetId },
-    create: {
-      id: assetId,
-      owner: data.owner.toBase58(),
-      creator: canonicalCreator,
-      uri: agentUri,
-      nftName: "",
-      collection: collectionId,
-      collectionPointer: "",
-      colLocked: false,
-      parentLocked: false,
-      registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
-      atomEnabled: data.atomEnabled,
-      createdTxSignature: ctx.signature,
-      createdSlot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      agentId: null,
-      status: DEFAULT_STATUS,
-      createdAt: ctx.blockTime,
-      updatedAt: ctx.blockTime,
-    },
-    update: {
-      collection: collectionId,
-      registry: collectionId, // v0.6.0: registry = collection
-      atomEnabled: data.atomEnabled,
-      uri: agentUri,
-      creator: canonicalCreator,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      updatedAt: ctx.blockTime,
-    },
+    let assignedAgentId: bigint | undefined;
+    if (!existingAgent || existingAgent.agentId === null) {
+      const highestAssigned = await client.agent.findMany({
+        where: { agentId: { not: null } },
+        select: { agentId: true },
+        orderBy: { agentId: "desc" },
+        take: 1,
+      });
+      assignedAgentId = asBigInt(highestAssigned[0]?.agentId) + 1n;
+    }
+
+    await client.agent.upsert({
+      where: { id: assetId },
+      create: {
+        id: assetId,
+        owner: ownerBase58,
+        creator: canonicalCreator,
+        uri: agentUri,
+        nftName: "",
+        collection: collectionId,
+        collectionPointer: "",
+        colLocked: false,
+        parentLocked: false,
+        registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
+        atomEnabled: data.atomEnabled,
+        createdTxSignature: ctx.signature,
+        createdSlot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        agentId: assignedAgentId ?? null,
+        status: DEFAULT_STATUS,
+        createdAt: ctx.blockTime,
+        updatedAt: ctx.blockTime,
+      },
+      update: {
+        collection: collectionId,
+        registry: collectionId, // v0.6.0: registry = collection
+        atomEnabled: data.atomEnabled,
+        uri: agentUri,
+        creator: canonicalCreator,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        updatedAt: ctx.blockTime,
+        ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
+      },
+    });
   });
 
   logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
@@ -1500,14 +1495,13 @@ async function reconcileOrphanFeedbacks(
       { id: "asc" },
     ],
   }) as OrphanFeedbackRecord[];
-  const orphanFeedback = (prisma as any).orphanFeedback as {
-    delete(args: unknown): Promise<unknown>;
-  };
 
   for (const orphan of orphans) {
-    const replay = orphanFeedbackToEvent(orphan);
-    await handleNewFeedback(prisma, replay.data, replay.ctx);
-    await orphanFeedback.delete({ where: { id: orphan.id } });
+    await prisma.$transaction(async (tx) => {
+      const replay = orphanFeedbackToEvent(orphan);
+      await handleNewFeedbackTx(tx as PrismaTransactionClient, replay.data, replay.ctx);
+      await (tx as any).orphanFeedback.delete({ where: { id: orphan.id } });
+    });
   }
 
   if (orphans.length > 0) {
@@ -2231,6 +2225,8 @@ async function handleNewFeedbackTx(
         createdAt: ctx.blockTime,
       },
       update: {
+        feedbackHash: preserveHash(data.sealHash),
+        runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
         ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
       },
     });
@@ -2247,8 +2243,20 @@ async function handleNewFeedbackTx(
     ],
   });
   for (const orphan of orphans) {
-    const orphanSealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
-    const orphanResponseStatus = orphanSealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
+    const sealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
+    if (sealMismatch) {
+      logger.warn(
+        {
+          assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex.toString(),
+          responder: orphan.responder,
+        },
+        "Orphan response seal_hash mismatch with parent feedback during replay"
+      );
+    }
+
+    const orphanResponseStatus = classifyResponseStatus(true, sealMismatch);
     await withResponseIdAssignmentLock(async () => {
       const orphanTxSignature = orphan.txSignature ?? "";
       const existingResponse = await tx.feedbackResponse.findUnique({
@@ -2289,6 +2297,7 @@ async function handleNewFeedbackTx(
           responder: orphan.responder,
           responseUri: orphan.responseUri,
           responseHash: orphan.responseHash,
+          sealHash: orphan.sealHash,
           runningDigest: orphan.runningDigest,
           responseCount: orphan.responseCount,
           txSignature: orphan.txSignature,
@@ -2300,7 +2309,16 @@ async function handleNewFeedbackTx(
           createdAt: orphan.createdAt,
         },
         update: {
+          responseUri: orphan.responseUri,
+          responseHash: orphan.responseHash,
+          sealHash: orphan.sealHash,
+          runningDigest: orphan.runningDigest,
           responseCount: orphan.responseCount,
+          txSignature: orphan.txSignature,
+          slot: orphan.slot,
+          txIndex: orphan.txIndex,
+          eventOrdinal: orphan.eventOrdinal,
+          createdAt: orphan.createdAt,
           ...(orphanResponseStatus === "ORPHANED"
             ? { status: orphanResponseStatus }
             : assignedResponseId !== undefined
@@ -2328,8 +2346,7 @@ async function handleNewFeedbackTx(
   });
   if (
     orphanRevocation &&
-    orphanRevocation.status === "ORPHANED" &&
-    hashesMatch(orphanRevocation.feedbackHash, feedback.feedbackHash)
+    orphanRevocation.status === "ORPHANED"
   ) {
     await withRevocationIdAssignmentLock(async () => {
       let assignedRevocationId: bigint | undefined;
@@ -2453,6 +2470,8 @@ async function handleNewFeedback(
         createdAt: ctx.blockTime,
       },
       update: {
+        feedbackHash: preserveHash(data.sealHash),
+        runningDigest: Uint8Array.from(data.newFeedbackDigest) as Uint8Array<ArrayBuffer>,
         ...(assignedFeedbackId !== undefined ? { feedbackId: assignedFeedbackId } : {}),
       },
     });
@@ -2471,69 +2490,93 @@ async function handleNewFeedback(
   });
 
   for (const orphan of orphans) {
-    const orphanSealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
-    const orphanResponseStatus = orphanSealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
-    await withResponseIdAssignmentLock(async () => {
-      const orphanTxSignature = orphan.txSignature ?? "";
-      const existingResponse = await prisma.feedbackResponse.findUnique({
-        where: {
-          feedbackId_responder_txSignature: {
-            feedbackId: feedback.id,
-            responder: orphan.responder,
-            txSignature: orphanTxSignature,
-          },
-        },
-        select: { responseId: true },
-      });
-
-      let assignedResponseId: bigint | undefined;
-      if (
-        orphanResponseStatus !== "ORPHANED" &&
-        (!existingResponse || existingResponse.responseId === null)
-      ) {
-        const highestAssigned = await prisma.feedbackResponse.findMany({
-          where: { feedbackId: feedback.id, responseId: { not: null } },
-          select: { responseId: true },
-          orderBy: { responseId: "desc" },
-          take: 1,
-        });
-        assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
-      }
-
-      await prisma.feedbackResponse.upsert({
-        where: {
-          feedbackId_responder_txSignature: {
-            feedbackId: feedback.id,
-            responder: orphan.responder,
-            txSignature: orphanTxSignature,
-          },
-        },
-        create: {
-          feedbackId: feedback.id,
+    const sealMismatch = !hashesMatch(orphan.sealHash, feedback.feedbackHash);
+    if (sealMismatch) {
+      logger.warn(
+        {
+          assetId,
+          client: clientAddress,
+          feedbackIndex: data.feedbackIndex.toString(),
           responder: orphan.responder,
-          responseUri: orphan.responseUri,
-          responseHash: orphan.responseHash,
-          runningDigest: orphan.runningDigest,
-          responseCount: orphan.responseCount,
-          txSignature: orphan.txSignature,
-          slot: orphan.slot,
-          txIndex: orphan.txIndex,
-          eventOrdinal: orphan.eventOrdinal,
-          responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
-          status: orphanResponseStatus,
-          createdAt: orphan.createdAt,
         },
-        update: {
-          responseCount: orphan.responseCount,
-          ...(orphanResponseStatus === "ORPHANED"
-            ? { status: orphanResponseStatus }
-            : assignedResponseId !== undefined
-              ? { responseId: assignedResponseId, status: orphanResponseStatus }
-              : { status: orphanResponseStatus }),
-        },
+        "Orphan response seal_hash mismatch with parent feedback during replay"
+      );
+    }
+
+    const orphanResponseStatus = classifyResponseStatus(true, sealMismatch);
+    await prisma.$transaction(async (tx) => {
+      await withResponseIdAssignmentLock(async () => {
+        const orphanTxSignature = orphan.txSignature ?? "";
+        const existingResponse = await tx.feedbackResponse.findUnique({
+          where: {
+            feedbackId_responder_txSignature: {
+              feedbackId: feedback.id,
+              responder: orphan.responder,
+              txSignature: orphanTxSignature,
+            },
+          },
+          select: { responseId: true },
+        });
+
+        let assignedResponseId: bigint | undefined;
+        if (
+          orphanResponseStatus !== "ORPHANED" &&
+          (!existingResponse || existingResponse.responseId === null)
+        ) {
+          const highestAssigned = await tx.feedbackResponse.findMany({
+            where: { feedbackId: feedback.id, responseId: { not: null } },
+            select: { responseId: true },
+            orderBy: { responseId: "desc" },
+            take: 1,
+          });
+          assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+        }
+
+        await tx.feedbackResponse.upsert({
+          where: {
+            feedbackId_responder_txSignature: {
+              feedbackId: feedback.id,
+              responder: orphan.responder,
+              txSignature: orphanTxSignature,
+            },
+          },
+          create: {
+            feedbackId: feedback.id,
+            responder: orphan.responder,
+            responseUri: orphan.responseUri,
+            responseHash: orphan.responseHash,
+            sealHash: orphan.sealHash,
+            runningDigest: orphan.runningDigest,
+            responseCount: orphan.responseCount,
+            txSignature: orphan.txSignature,
+            slot: orphan.slot,
+            txIndex: orphan.txIndex,
+            eventOrdinal: orphan.eventOrdinal,
+            responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
+            status: orphanResponseStatus,
+            createdAt: orphan.createdAt,
+          },
+          update: {
+            responseUri: orphan.responseUri,
+            responseHash: orphan.responseHash,
+            sealHash: orphan.sealHash,
+            runningDigest: orphan.runningDigest,
+            responseCount: orphan.responseCount,
+            txSignature: orphan.txSignature,
+            slot: orphan.slot,
+            txIndex: orphan.txIndex,
+            eventOrdinal: orphan.eventOrdinal,
+            createdAt: orphan.createdAt,
+            ...(orphanResponseStatus === "ORPHANED"
+              ? { status: orphanResponseStatus }
+              : assignedResponseId !== undefined
+                ? { responseId: assignedResponseId, status: orphanResponseStatus }
+                : { status: orphanResponseStatus }),
+          },
+        });
+        await tx.orphanResponse.delete({ where: { id: orphan.id } });
       });
     });
-    await prisma.orphanResponse.delete({ where: { id: orphan.id } });
   }
 
   if (orphans.length > 0) {
@@ -2553,8 +2596,7 @@ async function handleNewFeedback(
   });
   if (
     orphanRevocation &&
-    orphanRevocation.status === "ORPHANED" &&
-    hashesMatch(orphanRevocation.feedbackHash, feedback.feedbackHash)
+    orphanRevocation.status === "ORPHANED"
   ) {
     await withRevocationIdAssignmentLock(async () => {
       let assignedRevocationId: bigint | undefined;
@@ -2632,30 +2674,21 @@ async function handleFeedbackRevokedTx(
     select: { feedbackHash: true },
   });
 
-  let sealMismatch = false;
+  const sealMismatch = feedback ? !hashesMatch(eventSealHash, feedback.feedbackHash) : false;
   if (!feedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
     );
-  } else if (!hashesMatch(eventSealHash, feedback.feedbackHash)) {
-    sealMismatch = true;
+  } else if (sealMismatch) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-      "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
+      "Revocation seal_hash mismatch with parent feedback"
     );
   }
 
-  // Parity with Supabase batch path:
-  // - missing feedback => ORPHANED
-  // - seal mismatch with existing feedback => warn, keep PENDING
-  const revokeStatus = classifyRevocationStatus(Boolean(feedback));
-  if (revokeStatus !== "ORPHANED") {
-    await tx.feedback.updateMany({
-      where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
-      data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
-    });
-  }
+  const revokeStatus = classifyRevocationStatus(Boolean(feedback), sealMismatch);
+  let appliedRevocation = false;
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await tx.revocation.findUnique({
       where: {
@@ -2665,8 +2698,46 @@ async function handleFeedbackRevokedTx(
           feedbackIndex: data.feedbackIndex,
         },
       },
-      select: { revocationId: true },
+      select: {
+        revocationId: true,
+        slot: true,
+        txIndex: true,
+        eventOrdinal: true,
+        txSignature: true,
+      },
     });
+
+    if (
+      existingRevocation
+      && !shouldReplaceRevocationByEventOrder(
+        {
+          slot: existingRevocation.slot,
+          txIndex: existingRevocation.txIndex,
+          eventOrdinal: existingRevocation.eventOrdinal,
+          txSignature: existingRevocation.txSignature,
+        },
+        {
+          slot: data.slot,
+          txIndex: ctx.txIndex ?? null,
+          eventOrdinal: ctx.eventOrdinal ?? null,
+          txSignature: ctx.signature,
+        }
+      )
+    ) {
+      logger.info(
+        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), signature: ctx.signature },
+        "Skipping stale revocation update in local mode"
+      );
+      return;
+    }
+
+    appliedRevocation = true;
+    if (revokeStatus !== "ORPHANED") {
+      await tx.feedback.updateMany({
+        where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+        data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
+      });
+    }
 
     let assignedRevocationId: bigint | undefined;
     if (revokeStatus !== "ORPHANED" && (!existingRevocation || existingRevocation.revocationId === null)) {
@@ -2720,7 +2791,7 @@ async function handleFeedbackRevokedTx(
     });
   });
 
-  if (revokeStatus !== "ORPHANED") {
+  if (revokeStatus !== "ORPHANED" && appliedRevocation) {
     await syncAgentFeedbackStatsTx(
       tx,
       assetId,
@@ -2758,30 +2829,21 @@ async function handleFeedbackRevoked(
     select: { feedbackHash: true },
   });
 
-  let sealMismatch = false;
+  const sealMismatch = feedback ? !hashesMatch(eventSealHash, feedback.feedbackHash) : false;
   if (!feedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
     );
-  } else if (!hashesMatch(eventSealHash, feedback.feedbackHash)) {
-    sealMismatch = true;
+  } else if (sealMismatch) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-      "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
+      "Revocation seal_hash mismatch with parent feedback"
     );
   }
 
-  // Parity with Supabase batch path:
-  // - missing feedback => ORPHANED
-  // - seal mismatch with existing feedback => warn, keep PENDING
-  const revokeStatus = classifyRevocationStatus(Boolean(feedback));
-  if (revokeStatus !== "ORPHANED") {
-    await prisma.feedback.updateMany({
-      where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
-      data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
-    });
-  }
+  const revokeStatus = classifyRevocationStatus(Boolean(feedback), sealMismatch);
+  let appliedRevocation = false;
   await withRevocationIdAssignmentLock(async () => {
     const existingRevocation = await prisma.revocation.findUnique({
       where: {
@@ -2791,8 +2853,46 @@ async function handleFeedbackRevoked(
           feedbackIndex: data.feedbackIndex,
         },
       },
-      select: { revocationId: true },
+      select: {
+        revocationId: true,
+        slot: true,
+        txIndex: true,
+        eventOrdinal: true,
+        txSignature: true,
+      },
     });
+
+    if (
+      existingRevocation
+      && !shouldReplaceRevocationByEventOrder(
+        {
+          slot: existingRevocation.slot,
+          txIndex: existingRevocation.txIndex,
+          eventOrdinal: existingRevocation.eventOrdinal,
+          txSignature: existingRevocation.txSignature,
+        },
+        {
+          slot: data.slot,
+          txIndex: ctx.txIndex ?? null,
+          eventOrdinal: ctx.eventOrdinal ?? null,
+          txSignature: ctx.signature,
+        }
+      )
+    ) {
+      logger.info(
+        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), signature: ctx.signature },
+        "Skipping stale revocation update in local mode"
+      );
+      return;
+    }
+
+    appliedRevocation = true;
+    if (revokeStatus !== "ORPHANED") {
+      await prisma.feedback.updateMany({
+        where: { agentId: assetId, client: clientAddress, feedbackIndex: data.feedbackIndex },
+        data: { revoked: true, revokedTxSignature: ctx.signature, revokedSlot: ctx.slot },
+      });
+    }
 
     let assignedRevocationId: bigint | undefined;
     if (revokeStatus !== "ORPHANED" && (!existingRevocation || existingRevocation.revocationId === null)) {
@@ -2846,7 +2946,7 @@ async function handleFeedbackRevoked(
     });
   });
 
-  if (revokeStatus !== "ORPHANED") {
+  if (revokeStatus !== "ORPHANED" && appliedRevocation) {
     await syncAgentFeedbackStats(
       prisma,
       assetId,
@@ -2930,14 +3030,13 @@ async function handleResponseAppendedTx(
 
   const eventSealHash = preserveHash(data.sealHash);
   const sealMismatch = !hashesMatch(eventSealHash, feedback.feedbackHash);
+  const responseStatus = classifyResponseStatus(true, sealMismatch);
   if (sealMismatch) {
     logger.warn(
-      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-      "seal_hash mismatch: response sealHash does not match stored feedbackHash"
+      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), responder },
+      "Response seal_hash mismatch with parent feedback"
     );
   }
-
-  const responseStatus = sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
 
   await withResponseIdAssignmentLock(async () => {
     const existingResponse = await tx.feedbackResponse.findUnique({
@@ -2975,6 +3074,7 @@ async function handleResponseAppendedTx(
         responder,
         responseUri: data.responseUri,
         responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
@@ -2987,10 +3087,47 @@ async function handleResponseAppendedTx(
       },
       update: {
         ...(responseStatus === "ORPHANED"
-          ? { status: responseStatus }
+          ? {
+            status: responseStatus,
+            responseUri: data.responseUri,
+            responseHash: preserveHash(data.responseHash),
+            sealHash: preserveHash(data.sealHash),
+            runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+            responseCount: data.newResponseCount,
+            txSignature: ctx.signature,
+            slot: ctx.slot,
+            txIndex: ctx.txIndex ?? null,
+            eventOrdinal: ctx.eventOrdinal ?? null,
+            createdAt: ctx.blockTime,
+          }
           : assignedResponseId !== undefined
-            ? { responseId: assignedResponseId, status: responseStatus }
-            : { status: responseStatus }),
+            ? {
+              responseId: assignedResponseId,
+              status: responseStatus,
+              responseUri: data.responseUri,
+              responseHash: preserveHash(data.responseHash),
+              sealHash: preserveHash(data.sealHash),
+              runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+              responseCount: data.newResponseCount,
+              txSignature: ctx.signature,
+              slot: ctx.slot,
+              txIndex: ctx.txIndex ?? null,
+              eventOrdinal: ctx.eventOrdinal ?? null,
+              createdAt: ctx.blockTime,
+            }
+            : {
+              status: responseStatus,
+              responseUri: data.responseUri,
+              responseHash: preserveHash(data.responseHash),
+              sealHash: preserveHash(data.sealHash),
+              runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+              responseCount: data.newResponseCount,
+              txSignature: ctx.signature,
+              slot: ctx.slot,
+              txIndex: ctx.txIndex ?? null,
+              eventOrdinal: ctx.eventOrdinal ?? null,
+              createdAt: ctx.blockTime,
+            }),
       },
     });
   });
@@ -3070,14 +3207,13 @@ async function handleResponseAppended(
 
   const eventSealHash = preserveHash(data.sealHash);
   const sealMismatch = !hashesMatch(eventSealHash, feedback.feedbackHash);
+  const responseStatus = classifyResponseStatus(true, sealMismatch);
   if (sealMismatch) {
     logger.warn(
-      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-      "seal_hash mismatch: response sealHash does not match stored feedbackHash"
+      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), responder },
+      "Response seal_hash mismatch with parent feedback"
     );
   }
-
-  const responseStatus = sealMismatch ? "ORPHANED" as const : DEFAULT_STATUS;
 
   await withResponseIdAssignmentLock(async () => {
     const existingResponse = await prisma.feedbackResponse.findUnique({
@@ -3115,6 +3251,7 @@ async function handleResponseAppended(
         responder,
         responseUri: data.responseUri,
         responseHash: preserveHash(data.responseHash),
+        sealHash: preserveHash(data.sealHash),
         runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
         responseCount: data.newResponseCount,
         txSignature: ctx.signature,
@@ -3127,10 +3264,47 @@ async function handleResponseAppended(
       },
       update: {
         ...(responseStatus === "ORPHANED"
-          ? { status: responseStatus }
+          ? {
+            status: responseStatus,
+            responseUri: data.responseUri,
+            responseHash: preserveHash(data.responseHash),
+            sealHash: preserveHash(data.sealHash),
+            runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+            responseCount: data.newResponseCount,
+            txSignature: ctx.signature,
+            slot: ctx.slot,
+            txIndex: ctx.txIndex ?? null,
+            eventOrdinal: ctx.eventOrdinal ?? null,
+            createdAt: ctx.blockTime,
+          }
           : assignedResponseId !== undefined
-            ? { responseId: assignedResponseId, status: responseStatus }
-            : { status: responseStatus }),
+            ? {
+              responseId: assignedResponseId,
+              status: responseStatus,
+              responseUri: data.responseUri,
+              responseHash: preserveHash(data.responseHash),
+              sealHash: preserveHash(data.sealHash),
+              runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+              responseCount: data.newResponseCount,
+              txSignature: ctx.signature,
+              slot: ctx.slot,
+              txIndex: ctx.txIndex ?? null,
+              eventOrdinal: ctx.eventOrdinal ?? null,
+              createdAt: ctx.blockTime,
+            }
+            : {
+              status: responseStatus,
+              responseUri: data.responseUri,
+              responseHash: preserveHash(data.responseHash),
+              sealHash: preserveHash(data.sealHash),
+              runningDigest: Uint8Array.from(data.newResponseDigest) as Uint8Array<ArrayBuffer>,
+              responseCount: data.newResponseCount,
+              txSignature: ctx.signature,
+              slot: ctx.slot,
+              txIndex: ctx.txIndex ?? null,
+              eventOrdinal: ctx.eventOrdinal ?? null,
+              createdAt: ctx.blockTime,
+            }),
       },
     });
   });

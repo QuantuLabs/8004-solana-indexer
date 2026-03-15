@@ -14,9 +14,14 @@ const bundleSql = readFileSync(
 describe("legacy SQLite v1.7.7 db-push upgrade bundle", () => {
   it("includes only the proven subset needed by the legacy shape", () => {
     expect(bundleSql).toContain('ALTER TABLE "CollectionPointer"\nADD COLUMN "collection_id" BIGINT;');
+    expect(bundleSql).toContain('ALTER TABLE "CollectionPointer"\nADD COLUMN "lastSeenTxIndex" INTEGER;');
+    expect(bundleSql).toContain('CREATE TABLE IF NOT EXISTS "IdCounter"');
+    expect(bundleSql).toContain('CREATE TRIGGER "CollectionPointer_assign_collection_id_after_insert"');
+    expect(bundleSql).toContain('CREATE TRIGGER "CollectionPointer_assign_collection_id_after_update"');
     expect(bundleSql).toContain('CREATE TABLE "OrphanFeedback"');
     expect(bundleSql).toContain('ALTER TABLE "IndexerState"\nADD COLUMN "lastTxIndex" INTEGER;');
     expect(bundleSql).toContain('ALTER TABLE "OrphanResponse" ADD COLUMN "sealHash" BLOB;');
+    expect(bundleSql).toContain('ALTER TABLE "FeedbackResponse"\nADD COLUMN "sealHash" BLOB;');
     expect(bundleSql).toContain('CREATE TABLE "new_Feedback"');
     expect(bundleSql).toContain('CREATE TRIGGER "IndexerState_monotonic_guard"');
   });

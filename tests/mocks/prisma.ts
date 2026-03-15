@@ -23,9 +23,6 @@ export function createMockPrismaClient(): PrismaClient {
       if (query.includes('SELECT COALESCE(MAX("agent_id"), 0) AS max_id FROM "Agent"')) {
         return [{ max_id: 0n }];
       }
-      if (query.includes('SELECT COALESCE(MAX("collection_id"), 0) AS max_id FROM "CollectionPointer"')) {
-        return [{ max_id: 0n }];
-      }
       return [];
     }),
     agent: {
@@ -62,6 +59,7 @@ export function createMockPrismaClient(): PrismaClient {
       findUnique: vi.fn(),
       findMany: vi.fn().mockResolvedValue([]),
       create: vi.fn(),
+      update: vi.fn(),
       upsert: vi.fn(),
     },
     validation: {
@@ -88,6 +86,12 @@ export function createMockPrismaClient(): PrismaClient {
     },
     indexerState: {
       findUnique: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      upsert: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    agentDigestCache: {
+      findMany: vi.fn().mockResolvedValue([]),
       upsert: vi.fn(),
     },
     eventLog: {
@@ -103,6 +107,8 @@ export function createMockPrismaClient(): PrismaClient {
     },
     orphanResponse: {
       findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       create: vi.fn(),
       upsert: vi.fn(),
       delete: vi.fn(),
@@ -110,6 +116,8 @@ export function createMockPrismaClient(): PrismaClient {
     },
     orphanFeedback: {
       findMany: vi.fn().mockResolvedValue([]),
+      findFirst: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       create: vi.fn(),
       upsert: vi.fn(),
       delete: vi.fn(),

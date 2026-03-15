@@ -7,6 +7,8 @@ vi.mock("../../../src/config.js", () => ({
     metadataIndexMode: "normal",
     validationIndexEnabled: true,
     maxSupportedTransactionVersion: 0,
+    pollerRpcChunkSize: 100,
+    pollerRpcChunkConcurrency: 3,
   },
 }));
 
@@ -44,6 +46,7 @@ vi.mock("../../../src/constants.js", () => ({
 }));
 
 import {
+  BatchRpcBackoffRequiredError,
   BatchRpcFetcher,
   EventBuffer,
   BatchEvent,
@@ -134,19 +137,26 @@ describe("BatchRpcFetcher", () => {
       expect(result.size).toBe(0);
     });
 
-    it("should fetch batch of transactions", async () => {
-      const tx = {
+    it("should fetch multiple transactions in batch mode", async () => {
+      const tx1 = {
         slot: 12345,
         blockTime: 1234567890,
         transaction: { signatures: ["sig1"] },
       };
-      mockConnection.getParsedTransactions.mockResolvedValue([tx]);
+      const tx2 = {
+        slot: 12346,
+        blockTime: 1234567891,
+        transaction: { signatures: ["sig2"] },
+      };
+      mockConnection.getParsedTransactions.mockResolvedValue([tx1, tx2]);
 
       const fetcher = new BatchRpcFetcher(mockConnection);
-      const result = await fetcher.fetchTransactions(["sig1"]);
+      const result = await fetcher.fetchTransactions(["sig1", "sig2"]);
 
-      expect(result.size).toBe(1);
-      expect(result.get("sig1")).toBe(tx);
+      expect(result.size).toBe(2);
+      expect(result.get("sig1")).toBe(tx1);
+      expect(result.get("sig2")).toBe(tx2);
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(1);
     });
 
     it("should refetch null transactions in batch individually", async () => {
@@ -282,15 +292,108 @@ describe("BatchRpcFetcher", () => {
       expect(mockConnection.getParsedTransactions.mock.calls[4][0]).toHaveLength(2);
       expect(fetcher.getStats().chunkSize).toBe(2);
     });
+
+    it("should fetch a single signature directly without using batch RPC", async () => {
+      const tx = { slot: 1, transaction: { signatures: ["sig1"] } };
+      mockConnection.getParsedTransaction.mockResolvedValue(tx);
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 1,
+        maxParallelChunks: 3,
+      });
+
+      const result = await fetcher.fetchTransactions(["sig1"]);
+
+      expect(result.get("sig1")).toBe(tx);
+      expect(mockConnection.getParsedTransactions).not.toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("sig1", {
+        maxSupportedTransactionVersion: 0,
+      });
+    });
+
+    it("should enter cooldown on overloaded individual single-signature fetches", async () => {
+      mockConnection.getParsedTransaction.mockRejectedValue(new Error("429 Too Many Requests"));
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 1,
+        maxParallelChunks: 3,
+      });
+
+      await expect(fetcher.fetchTransactions(["sig1"])).rejects.toBeInstanceOf(BatchRpcBackoffRequiredError);
+      expect(mockConnection.getParsedTransactions).not.toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(1);
+
+      await expect(fetcher.fetchTransactions(["sig1"])).rejects.toBeInstanceOf(BatchRpcBackoffRequiredError);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("should disable batch parsed RPC for the process when the provider rejects batch requests", async () => {
+      const sigs = ["sig1", "sig2"];
+      const tx1 = { slot: 1, transaction: { signatures: ["sig1"] } };
+      const tx2 = { slot: 1, transaction: { signatures: ["sig2"] } };
+
+      mockConnection.getParsedTransactions.mockRejectedValueOnce(
+        new Error('403 Forbidden: {"jsonrpc":"2.0","error":{"code":-32403,"message":"Batch requests are only available for paid plans. Please upgrade if you would like to gain access"}}')
+      );
+      mockConnection.getParsedTransaction
+        .mockResolvedValueOnce(tx1)
+        .mockResolvedValueOnce(tx2)
+        .mockResolvedValueOnce(tx1)
+        .mockResolvedValueOnce(tx2);
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 100,
+        maxParallelChunks: 3,
+      });
+
+      const first = await fetcher.fetchTransactions(sigs);
+      const second = await fetcher.fetchTransactions(sigs);
+
+      expect(first.get("sig1")).toBe(tx1);
+      expect(first.get("sig2")).toBe(tx2);
+      expect(second.get("sig1")).toBe(tx1);
+      expect(second.get("sig2")).toBe(tx2);
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(1);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(4);
+    });
+
+    it("should detect nested provider errors when deciding to disable batch RPC", async () => {
+      const sigs = ["sig1", "sig2"];
+      const tx1 = { slot: 1, transaction: { signatures: ["sig1"] } };
+      const tx2 = { slot: 1, transaction: { signatures: ["sig2"] } };
+
+      mockConnection.getParsedTransactions.mockRejectedValueOnce({
+        message: "403 Forbidden",
+        cause: {
+          code: -32403,
+          message: "Batch requests are only available for paid plans",
+        },
+      });
+      mockConnection.getParsedTransaction
+        .mockResolvedValueOnce(tx1)
+        .mockResolvedValueOnce(tx2);
+
+      const fetcher = new BatchRpcFetcher(mockConnection, {
+        chunkSize: 100,
+        maxParallelChunks: 3,
+      });
+
+      const result = await fetcher.fetchTransactions(sigs);
+
+      expect(result.get("sig1")).toBe(tx1);
+      expect(result.get("sig2")).toBe(tx2);
+      expect(mockConnection.getParsedTransactions).toHaveBeenCalledTimes(1);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe("getStats", () => {
     it("should return accurate stats", async () => {
       const fetcher = new BatchRpcFetcher(mockConnection);
-      mockConnection.getParsedTransactions.mockResolvedValue([]);
+      mockConnection.getParsedTransactions.mockResolvedValue([null, null]);
 
-      await fetcher.fetchTransactions(["sig1"]);
-      await fetcher.fetchTransactions(["sig2"]);
+      await fetcher.fetchTransactions(["sig1", "sig2"]);
+      await fetcher.fetchTransactions(["sig3", "sig4"]);
 
       const stats = fetcher.getStats();
       expect(stats.batchCount).toBe(2);
@@ -511,7 +614,7 @@ describe("EventBuffer", () => {
       expect(updateCall![1][6]).toBe(7);
     });
 
-    it("replays orphan response and revocation chains when agent registration replays orphan feedback", async () => {
+    it("replays orphan response and revocation chains when agent registration replays orphan feedback even if revocation seal_hash differs", async () => {
       const client = mockPool._client;
       const feedbackHash = "ab".repeat(32);
       client.query.mockImplementation((sql: string) => {
@@ -582,7 +685,7 @@ describe("EventBuffer", () => {
           return { rows: [], rowCount: 1 };
         }
         if (typeof sql === "string" && sql.includes("FROM revocations")) {
-          return { rows: [{ feedback_hash: feedbackHash, status: "ORPHANED" }], rowCount: 1 };
+          return { rows: [{ feedback_hash: "cd".repeat(32), status: "ORPHANED" }], rowCount: 1 };
         }
         if (typeof sql === "string" && sql.includes("UPDATE revocations")) {
           return { rows: [], rowCount: 1 };
@@ -759,10 +862,9 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("should skip duplicate feedback (rowCount 0)", async () => {
+    it("should repair duplicate feedback rows and refresh agent stats", async () => {
       const client = mockPool._client;
-      // First INSERT returns rowCount 0 (duplicate)
-      client.query.mockResolvedValue({ rows: [], rowCount: 0 });
+      client.query.mockResolvedValue({ rows: [], rowCount: 1 });
 
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
@@ -774,6 +876,14 @@ describe("EventBuffer", () => {
       );
       await buffer.flush();
 
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedbacks (id, feedback_id")
+      );
+      expect(insertCall?.[0]).toContain("ON CONFLICT (id) DO UPDATE SET");
+      const updateCalls = client.query.mock.calls.filter(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("UPDATE agents SET")
+      );
+      expect(updateCalls.length).toBeGreaterThan(0);
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
@@ -1030,7 +1140,7 @@ describe("EventBuffer", () => {
       );
       expect(insertCall).toBeDefined();
       expect(insertCall[1][7]).toBe("0".repeat(64));
-      expect(insertCall[1][15]).toBe("PENDING");
+      expect(insertCall[1][16]).toBe("PENDING");
     });
 
     it("should insert ValidationRequested event", async () => {
@@ -1594,16 +1704,13 @@ describe("EventBuffer", () => {
       expect(orphanInsertCalls).toHaveLength(1);
 
       expect(responseInsertCalls[0][1][1]).toBeNull();
-      expect(responseInsertCalls[0][1][15]).toBe("PENDING");
+      expect(responseInsertCalls[0][1][16]).toBe("PENDING");
       expect(responseInsertCalls[1][1][1]).toBeNull();
-      expect(responseInsertCalls[1][1][15]).toBe("PENDING");
+      expect(responseInsertCalls[1][1][16]).toBe("PENDING");
       expect(responseInsertCalls[2][1][1]).toBeNull();
-      expect(responseInsertCalls[2][1][15]).toBe("PENDING");
+      expect(responseInsertCalls[2][1][16]).toBe("PENDING");
       expect(responseInsertCalls[3][1][1]).toBeNull();
-      expect(responseInsertCalls[3][1][15]).toBe("ORPHANED");
-      expect(responseInsertCalls[4][1][1]).toBeNull();
-      expect(responseInsertCalls[4][1][15]).toBe("PENDING");
-
+      expect(responseInsertCalls[3][1][16]).toBe("PENDING");
       expect(orphanInsertCalls[0][1]).toContain("ab".repeat(32));
       expect(orphanInsertCalls[0][0]).toContain("ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE");
     });
@@ -1715,7 +1822,7 @@ describe("EventBuffer", () => {
       expect(orphanInsertIndex).toBeGreaterThan(-1);
       expect(responseInsertIndex).toBeGreaterThan(orphanInsertIndex);
       expect(orphanDeleteIndex).toBeGreaterThan(responseInsertIndex);
-      expect(client.query.mock.calls[responseInsertIndex][1][15]).toBe("PENDING");
+      expect(client.query.mock.calls[responseInsertIndex][1][16]).toBe("PENDING");
     });
   });
 
@@ -2053,8 +2160,12 @@ describe("EventBuffer", () => {
       const { createChildLogger } = await import("../../../src/logger.js");
       const mockLogger = (createChildLogger as any)();
       expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ asset: "asset1" }),
-        expect.stringContaining("seal_hash mismatch")
+        expect.objectContaining({
+          asset: "asset1",
+          client: "client1",
+          feedbackIndex: "0",
+        }),
+        "Revocation seal_hash mismatch with parent feedback",
       );
     });
 

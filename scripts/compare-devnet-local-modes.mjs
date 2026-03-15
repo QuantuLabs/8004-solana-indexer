@@ -14,6 +14,8 @@ const repoRoot = resolve(__dirname, "..");
 const REMOTE_BASE = process.env.REMOTE_BASE || "https://8004-indexer-dev.qnt.sh";
 const PAGE_LIMIT = parseInt(process.env.COMPARE_PAGE_LIMIT || "500", 10);
 const CUTOFF_MARGIN = parseInt(process.env.COMPARE_CUTOFF_MARGIN || "256", 10);
+const START_SLOT = parseInt(process.env.COMPARE_START_SLOT || "0", 10);
+const CUTOFF_SLOT_OVERRIDE = parseInt(process.env.COMPARE_CUTOFF_SLOT || "0", 10);
 const READY_TIMEOUT_MS = parseInt(process.env.COMPARE_READY_TIMEOUT_MS || "900000", 10);
 const CATCHUP_TIMEOUT_MS = parseInt(process.env.COMPARE_CATCHUP_TIMEOUT_MS || "900000", 10);
 const POLL_INTERVAL_MS = parseInt(process.env.COMPARE_POLL_INTERVAL_MS || "5000", 10);
@@ -88,6 +90,12 @@ function buildUrl(baseUrl, path, params = {}) {
     url.searchParams.set(key, String(value));
   }
   return url;
+}
+
+function isInSlotRange(value, startSlot, cutoffSlot) {
+  if (value === null || value === undefined || value === "") return false;
+  const slot = Number(value);
+  return Number.isFinite(slot) && slot >= startSlot && slot <= cutoffSlot;
 }
 
 async function hasUncoveredSignatureAtOrBelowCutoff(lastSignature, cutoffSlot) {
@@ -321,12 +329,10 @@ function normalizeAgentRemote(row) {
     parent_creator: row.parent_creator ?? null,
     parent_locked: Boolean(row.parent_locked),
     atom_enabled: Boolean(row.atom_enabled),
-    agent_id: asText(row.agent_id),
     block_slot: asNumber(row.block_slot) ?? 0,
     tx_index: asNumber(row.tx_index),
     event_ordinal: asNumber(row.event_ordinal),
     tx_signature: row.tx_signature ?? null,
-    status: row.status ?? null,
   };
 }
 
@@ -336,7 +342,6 @@ function normalizeFeedbackRemote(row) {
     asset: row.asset,
     client_address: row.client_address,
     feedback_index: asText(row.feedback_index),
-    feedback_id: asText(row.feedback_id),
     value: asText(row.value),
     value_decimals: asNumber(row.value_decimals) ?? 0,
     score: asNumber(row.score),
@@ -350,7 +355,6 @@ function normalizeFeedbackRemote(row) {
     tx_index: asNumber(row.tx_index),
     event_ordinal: asNumber(row.event_ordinal),
     tx_signature: row.tx_signature ?? null,
-    status: row.status ?? null,
   };
 }
 
@@ -361,7 +365,6 @@ function normalizeResponseRemote(row) {
     client_address: row.client_address,
     feedback_index: asText(row.feedback_index),
     responder: row.responder,
-    response_id: asText(row.response_id),
     response_uri: row.response_uri ?? null,
     response_hash: bytesToHex(row.response_hash),
     response_count: asText(row.response_count),
@@ -369,7 +372,6 @@ function normalizeResponseRemote(row) {
     tx_index: asNumber(row.tx_index),
     event_ordinal: asNumber(row.event_ordinal),
     tx_signature: row.tx_signature ?? null,
-    status: row.status ?? null,
   };
 }
 
@@ -379,7 +381,6 @@ function normalizeRevocationRemote(row) {
     asset: row.asset,
     client_address: row.client_address,
     feedback_index: asText(row.feedback_index),
-    revocation_id: asText(row.revocation_id),
     feedback_hash: bytesToHex(row.feedback_hash),
     slot: asNumber(row.slot) ?? 0,
     original_score: asNumber(row.original_score),
@@ -389,7 +390,6 @@ function normalizeRevocationRemote(row) {
     tx_signature: row.tx_signature ?? null,
     tx_index: asNumber(row.tx_index),
     event_ordinal: asNumber(row.event_ordinal),
-    status: row.status ?? null,
   };
 }
 
@@ -420,48 +420,47 @@ function normalizeMetadataRemote(row) {
     tx_index: asNumber(row.tx_index),
     event_ordinal: asNumber(row.event_ordinal),
     tx_signature: row.tx_signature ?? (blockSlot === 0 ? "uri_derived" : null),
-    status: row.status ?? null,
   };
 }
 
-async function fetchRemoteSnapshot(cutoffSlot) {
+async function fetchRemoteSnapshot(startSlot, cutoffSlot) {
   const [agentsRaw, feedbacksRaw, responsesRaw, revocationsRaw, collectionsRaw, metadataRaw] = await Promise.all([
     fetchPagedRemote("/rest/v1/agents", {
-      block_slot: `lte.${cutoffSlot}`,
-      status: "neq.ORPHANED",
+      block_slot: `gte.${startSlot}`,
+      and: `(block_slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeAgentRemote)),
     fetchPagedRemote("/rest/v1/feedbacks", {
-      block_slot: `lte.${cutoffSlot}`,
-      status: "neq.ORPHANED",
+      block_slot: `gte.${startSlot}`,
+      and: `(block_slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeFeedbackRemote)),
     fetchPagedRemote("/rest/v1/responses", {
-      block_slot: `lte.${cutoffSlot}`,
-      status: "neq.ORPHANED",
+      block_slot: `gte.${startSlot}`,
+      and: `(block_slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeResponseRemote)),
     fetchPagedRemote("/rest/v1/revocations", {
-      slot: `lte.${cutoffSlot}`,
-      status: "neq.ORPHANED",
+      slot: `gte.${startSlot}`,
+      and: `(slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeRevocationRemote)),
     fetchPagedRemote("/rest/v1/collections", {
-      first_seen_slot: `lte.${cutoffSlot}`,
-      last_seen_slot: `lte.${cutoffSlot}`,
+      first_seen_slot: `gte.${startSlot}`,
+      and: `(first_seen_slot.lte.${cutoffSlot},last_seen_slot.gte.${startSlot},last_seen_slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeCollectionRemote)),
     fetchPagedRemote("/rest/v1/metadata", {
-      block_slot: `lte.${cutoffSlot}`,
-      status: "neq.ORPHANED",
+      block_slot: `gte.${startSlot}`,
+      and: `(block_slot.lte.${cutoffSlot})`,
     }).then((rows) => rows.map(normalizeMetadataRemote)),
   ]);
 
-  const agents = agentsRaw.filter((row) => row.block_slot <= cutoffSlot);
-  const feedbacks = feedbacksRaw.filter((row) => row.block_slot <= cutoffSlot);
-  const responses = responsesRaw.filter((row) => row.block_slot <= cutoffSlot);
-  const revocations = revocationsRaw.filter((row) => row.slot <= cutoffSlot);
+  const agents = agentsRaw.filter((row) => isInSlotRange(row.block_slot, startSlot, cutoffSlot));
+  const feedbacks = feedbacksRaw.filter((row) => isInSlotRange(row.block_slot, startSlot, cutoffSlot));
+  const responses = responsesRaw.filter((row) => isInSlotRange(row.block_slot, startSlot, cutoffSlot));
+  const revocations = revocationsRaw.filter((row) => isInSlotRange(row.slot, startSlot, cutoffSlot));
   const collections = collectionsRaw.filter((row) => {
     const firstSeenSlot = Number(row.first_seen_slot ?? 0);
     const lastSeenSlot = Number(row.last_seen_slot ?? 0);
-    return firstSeenSlot <= cutoffSlot && lastSeenSlot <= cutoffSlot;
+    return firstSeenSlot >= startSlot && firstSeenSlot <= cutoffSlot && lastSeenSlot >= startSlot && lastSeenSlot <= cutoffSlot;
   });
-  const metadata = metadataRaw.filter((row) => row.block_slot <= cutoffSlot);
+  const metadata = metadataRaw.filter((row) => isInSlotRange(row.block_slot, startSlot, cutoffSlot));
 
   const trimmedCounts = {
     agents: agentsRaw.length - agents.length,
@@ -483,10 +482,10 @@ async function fetchRemoteSnapshot(cutoffSlot) {
   };
 }
 
-async function fetchStableRemoteSnapshot(cutoffSlot) {
+async function fetchStableRemoteSnapshot(startSlot, cutoffSlot) {
   let previous = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const snapshot = await fetchRemoteSnapshot(cutoffSlot);
+    const snapshot = await fetchRemoteSnapshot(startSlot, cutoffSlot);
     const fingerprint = JSON.stringify(snapshot);
     if (fingerprint === previous) {
       return snapshot;
@@ -494,7 +493,7 @@ async function fetchStableRemoteSnapshot(cutoffSlot) {
     previous = fingerprint;
     await sleep(POLL_INTERVAL_MS);
   }
-  return fetchRemoteSnapshot(cutoffSlot);
+  return fetchRemoteSnapshot(startSlot, cutoffSlot);
 }
 
 function normalizeAgentLocal(row) {
@@ -512,12 +511,10 @@ function normalizeAgentLocal(row) {
     parent_creator: row.parentCreator ?? null,
     parent_locked: Boolean(row.parentLocked),
     atom_enabled: Boolean(row.atomEnabled),
-    agent_id: row.agentId !== null && row.agentId !== undefined ? row.agentId.toString() : null,
     block_slot: row.createdSlot !== null && row.createdSlot !== undefined ? Number(row.createdSlot) : 0,
     tx_index: row.txIndex ?? null,
     event_ordinal: row.eventOrdinal ?? null,
     tx_signature: row.createdTxSignature ?? null,
-    status: row.status ?? null,
   };
 }
 
@@ -527,7 +524,6 @@ function normalizeFeedbackLocal(row) {
     asset: row.agentId,
     client_address: row.client,
     feedback_index: row.feedbackIndex.toString(),
-    feedback_id: row.feedbackId !== null && row.feedbackId !== undefined ? row.feedbackId.toString() : null,
     value: row.value,
     value_decimals: row.valueDecimals,
     score: row.score ?? null,
@@ -541,7 +537,28 @@ function normalizeFeedbackLocal(row) {
     tx_index: row.txIndex ?? null,
     event_ordinal: row.eventOrdinal ?? null,
     tx_signature: row.createdTxSignature ?? null,
-    status: row.status ?? null,
+  };
+}
+
+function normalizeOrphanFeedbackLocal(row) {
+  return {
+    key: `${row.agentId}|${row.client}|${row.feedbackIndex.toString()}`,
+    asset: row.agentId,
+    client_address: row.client,
+    feedback_index: row.feedbackIndex.toString(),
+    value: row.value,
+    value_decimals: row.valueDecimals,
+    score: row.score ?? null,
+    tag1: row.tag1 ?? null,
+    tag2: row.tag2 ?? null,
+    endpoint: row.endpoint ?? null,
+    feedback_uri: row.feedbackUri ?? null,
+    feedback_hash: bytesToHex(row.feedbackHash),
+    is_revoked: false,
+    block_slot: row.slot !== null && row.slot !== undefined ? Number(row.slot) : 0,
+    tx_index: row.txIndex ?? null,
+    event_ordinal: row.eventOrdinal ?? null,
+    tx_signature: row.txSignature ?? null,
   };
 }
 
@@ -553,7 +570,6 @@ function normalizeResponseLocal(row) {
     client_address: row.feedback.client,
     feedback_index: row.feedback.feedbackIndex.toString(),
     responder: row.responder,
-    response_id: row.responseId !== null && row.responseId !== undefined ? row.responseId.toString() : null,
     response_uri: row.responseUri ?? null,
     response_hash: bytesToHex(row.responseHash),
     response_count: row.responseCount !== null && row.responseCount !== undefined ? row.responseCount.toString() : null,
@@ -561,7 +577,24 @@ function normalizeResponseLocal(row) {
     tx_index: row.txIndex ?? null,
     event_ordinal: row.eventOrdinal ?? null,
     tx_signature: row.txSignature ?? null,
-    status: row.status ?? null,
+  };
+}
+
+function normalizeOrphanResponseLocal(row) {
+  const blockSlot = row.slot ?? 0n;
+  return {
+    key: `${row.agentId}|${row.client}|${row.feedbackIndex.toString()}|${row.responder}|${row.txSignature ?? ""}`,
+    asset: row.agentId,
+    client_address: row.client,
+    feedback_index: row.feedbackIndex.toString(),
+    responder: row.responder,
+    response_uri: row.responseUri ?? null,
+    response_hash: bytesToHex(row.responseHash),
+    response_count: row.responseCount !== null && row.responseCount !== undefined ? row.responseCount.toString() : null,
+    block_slot: Number(blockSlot),
+    tx_index: row.txIndex ?? null,
+    event_ordinal: row.eventOrdinal ?? null,
+    tx_signature: row.txSignature ?? null,
   };
 }
 
@@ -571,7 +604,6 @@ function normalizeRevocationLocal(row) {
     asset: row.agentId,
     client_address: row.client,
     feedback_index: row.feedbackIndex.toString(),
-    revocation_id: row.revocationId !== null && row.revocationId !== undefined ? row.revocationId.toString() : null,
     feedback_hash: bytesToHex(row.feedbackHash),
     slot: Number(row.slot),
     original_score: row.originalScore ?? null,
@@ -581,7 +613,6 @@ function normalizeRevocationLocal(row) {
     tx_signature: row.txSignature ?? null,
     tx_index: row.txIndex ?? null,
     event_ordinal: row.eventOrdinal ?? null,
-    status: row.status ?? null,
   };
 }
 
@@ -613,31 +644,35 @@ function normalizeMetadataLocal(row) {
     tx_index: row.txIndex ?? null,
     event_ordinal: row.eventOrdinal ?? null,
     tx_signature: row.txSignature ?? (blockSlot === 0 ? "uri_derived" : null),
-    status: row.status ?? null,
   };
 }
 
-async function fetchLocalSnapshot(dbPath, cutoffSlot) {
+async function fetchLocalSnapshot(dbPath, startSlot, cutoffSlot) {
   const prisma = createPrisma(dbPath);
   const cutoff = BigInt(cutoffSlot);
+  const start = BigInt(startSlot);
   await prisma.$connect();
 
   try {
-    const [agents, feedbacks, responses, revocations, collections, metadata] = await Promise.all([
+    const [agents, feedbacks, orphanFeedbacks, responses, orphanResponses, revocations, collections, metadata] =
+      await Promise.all([
       prisma.agent.findMany({
         where: {
-          status: { not: "ORPHANED" },
-          createdSlot: { lte: cutoff },
+          createdSlot: { gte: start, lte: cutoff },
         },
       }),
       prisma.feedback.findMany({
         where: {
-          status: { not: "ORPHANED" },
-          createdSlot: { lte: cutoff },
+          createdSlot: { gte: start, lte: cutoff },
+        },
+      }),
+      prisma.orphanFeedback.findMany({
+        where: {
+          slot: { gte: start, lte: cutoff },
         },
       }),
       prisma.feedbackResponse.findMany({
-        where: { status: { not: "ORPHANED" } },
+        where: {},
         include: {
           feedback: {
             select: {
@@ -649,24 +684,27 @@ async function fetchLocalSnapshot(dbPath, cutoffSlot) {
           },
         },
       }).then((rows) =>
-        rows.filter((row) => Number(row.slot ?? row.feedback.createdSlot ?? 0n) <= cutoffSlot)
+        rows.filter((row) => isInSlotRange(row.slot ?? row.feedback.createdSlot ?? 0n, startSlot, cutoffSlot))
       ),
+      prisma.orphanResponse.findMany({
+        where: {
+          slot: { gte: start, lte: cutoff },
+        },
+      }),
       prisma.revocation.findMany({
         where: {
-          status: { not: "ORPHANED" },
-          slot: { lte: cutoff },
+          slot: { gte: start, lte: cutoff },
         },
       }),
       prisma.collection.findMany({
         where: {
-          firstSeenSlot: { lte: cutoff },
-          lastSeenSlot: { lte: cutoff },
+          firstSeenSlot: { gte: start, lte: cutoff },
+          lastSeenSlot: { gte: start, lte: cutoff },
         },
       }),
       prisma.agentMetadata.findMany({
         where: {
-          status: { not: "ORPHANED" },
-          slot: { lte: cutoff },
+          slot: { gte: start, lte: cutoff },
         },
       }),
     ]);
@@ -674,16 +712,16 @@ async function fetchLocalSnapshot(dbPath, cutoffSlot) {
     const snapshotStats = {
       total_agents: agents.length,
       total_collections: collections.length,
-      total_feedbacks: feedbacks.length,
-      total_responses: responses.length,
+      total_feedbacks: feedbacks.length + orphanFeedbacks.length,
+      total_responses: responses.length + orphanResponses.length,
       total_revocations: revocations.length,
       total_metadata: metadata.length,
     };
 
     return {
       agents: agents.map(normalizeAgentLocal),
-      feedbacks: feedbacks.map(normalizeFeedbackLocal),
-      responses: responses.map(normalizeResponseLocal),
+      feedbacks: [...feedbacks.map(normalizeFeedbackLocal), ...orphanFeedbacks.map(normalizeOrphanFeedbackLocal)],
+      responses: [...responses.map(normalizeResponseLocal), ...orphanResponses.map(normalizeOrphanResponseLocal)],
       revocations: revocations.map(normalizeRevocationLocal),
       collections: collections.map(normalizeCollectionLocal),
       metadata: metadata.map(normalizeMetadataLocal),
@@ -737,11 +775,13 @@ function compareCategory(name, remoteRows, localRows) {
 async function main() {
   const connection = new Connection(rpcUrl, "confirmed");
   const currentSlot = await connection.getSlot();
-  const cutoffSlot = currentSlot - CUTOFF_MARGIN;
+  const cutoffSlot = CUTOFF_SLOT_OVERRIDE > 0 ? CUTOFF_SLOT_OVERRIDE : currentSlot - CUTOFF_MARGIN;
+  const startSlot = START_SLOT > 0 ? START_SLOT : 0;
 
   console.log("[compare-devnet-local-modes] comparison window", {
     rpcUrl,
     currentSlot,
+    startSlot,
     cutoffSlot,
     remoteBase: REMOTE_BASE,
   });
@@ -749,7 +789,7 @@ async function main() {
   await Promise.all(MODES.map((mode) => waitForReady(mode.baseUrl)));
   await Promise.all(MODES.map((mode) => waitForCatchup(mode, cutoffSlot)));
 
-  const remoteSnapshot = await fetchStableRemoteSnapshot(cutoffSlot);
+  const remoteSnapshot = await fetchStableRemoteSnapshot(startSlot, cutoffSlot);
   console.log("[compare-devnet-local-modes] frozen remote snapshot counts", {
     agents: remoteSnapshot.agents.length,
     feedbacks: remoteSnapshot.feedbacks.length,
@@ -765,7 +805,7 @@ async function main() {
   let failed = false;
 
   for (const mode of MODES) {
-    const localSnapshot = await fetchLocalSnapshot(mode.dbPath, cutoffSlot);
+    const localSnapshot = await fetchLocalSnapshot(mode.dbPath, startSlot, cutoffSlot);
     const results = [
       compareCategory("agents", remoteSnapshot.agents, localSnapshot.agents),
       compareCategory("feedbacks", remoteSnapshot.feedbacks, localSnapshot.feedbacks),

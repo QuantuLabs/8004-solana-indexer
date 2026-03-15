@@ -24,11 +24,12 @@ import cors from 'cors';
 import type { Pool } from 'pg';
 import { config } from '../config.js';
 import { renderIntegrityMetrics } from '../observability/integrity-metrics.js';
+import { VERIFICATION_STATS_SQL } from './verification-stats-sql.js';
 
 // GraphQL rate limiting constants
 const GRAPHQL_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const GRAPHQL_RATE_LIMIT_MAX_REQUESTS = parseInt(
-  process.env.GRAPHQL_RATE_LIMIT_MAX_REQUESTS || '30',
+  process.env.GRAPHQL_RATE_LIMIT_MAX_REQUESTS || '100',
   10
 );
 
@@ -47,10 +48,19 @@ const RATE_LIMIT_MAX_REQUESTS = parseInt(
   process.env.RATE_LIMIT_MAX_REQUESTS || '100',
   10
 ); // 100 requests per minute per IP (default)
-const REPLAY_RATE_LIMIT_WINDOW_MS = 30 * 1000; // 30 seconds
-const REPLAY_RATE_LIMIT_MAX_REQUESTS = 1; // 1 request per 30s per IP
+const REPLAY_RATE_LIMIT_WINDOW_MS = parseInt(
+  process.env.REPLAY_RATE_LIMIT_WINDOW_MS || '30000',
+  10
+); // 30 seconds
+const REPLAY_RATE_LIMIT_MAX_REQUESTS = parseInt(
+  process.env.REPLAY_RATE_LIMIT_MAX_REQUESTS || '1',
+  10
+); // 1 request per 30s per IP
 const REPLAY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minute cache for replay results
 const REPLAY_CACHE_MAX_SIZE = 50;
+const REST_PROXY_READY_CACHE_TTL_MS = 5 * 1000;
+const POOL_READY_CACHE_TTL_MS = 5 * 1000;
+const READY_DETAILS_CACHE_TTL_MS = 5 * 1000;
 const CIDV1_BASE32_REGEX = /^b[a-z2-7]{20,}$/;
 
 export interface ApiServerOptions {
@@ -58,6 +68,309 @@ export interface ApiServerOptions {
   pool?: Pool | null;
   port?: number;
   isReady?: () => boolean;
+  isCaughtUp?: () => boolean;
+  checkRestProxyReady?: () => Promise<boolean>;
+  checkPoolReady?: () => Promise<boolean>;
+}
+
+type ReadyStateSnapshot = {
+  mainSlot: number | null;
+  mainTxIndex: number | null;
+  counts: {
+    agents: number;
+    feedbacks: number;
+    responses: number;
+    revocations: number;
+    collections: number;
+  };
+  pending: {
+    agents: number;
+    feedbacks: number;
+    responses: number;
+    revocations: number;
+    metadata: number;
+    registries: number;
+    validations: number;
+  };
+  orphans: {
+    agents: number;
+    feedbacks: number;
+    responses: number;
+    revocations: number;
+    metadata: number;
+    registries: number;
+    validations: number;
+  };
+};
+
+type ReplayEventOrder = {
+  count: bigint;
+  slot: bigint | null;
+  txIndex: number | null;
+  eventOrdinal: number | null;
+  signature: string | null;
+  rowId: string;
+};
+
+function compareReplayEventOrder(left: ReplayEventOrder, right: ReplayEventOrder): number {
+  if (left.count !== right.count) return left.count < right.count ? -1 : 1;
+  const leftSlot = left.slot ?? -1n;
+  const rightSlot = right.slot ?? -1n;
+  if (leftSlot !== rightSlot) return leftSlot < rightSlot ? -1 : 1;
+  const leftTxIndex = left.txIndex ?? Number.MAX_SAFE_INTEGER;
+  const rightTxIndex = right.txIndex ?? Number.MAX_SAFE_INTEGER;
+  if (leftTxIndex !== rightTxIndex) return leftTxIndex - rightTxIndex;
+  const leftOrdinal = left.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+  const rightOrdinal = right.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+  if (leftOrdinal !== rightOrdinal) return leftOrdinal - rightOrdinal;
+  const leftSignature = left.signature ?? '';
+  const rightSignature = right.signature ?? '';
+  if (leftSignature !== rightSignature) return leftSignature.localeCompare(rightSignature);
+  return left.rowId.localeCompare(right.rowId);
+}
+
+type DerivedPrismaCheckpoint = {
+  chainType: ReplayChainType;
+  eventCount: bigint;
+  digest: string;
+  createdAt: string;
+};
+
+function digestBytesToHex(value: Uint8Array | null | undefined): string | null {
+  if (!value) return null;
+  return Buffer.from(value).toString('hex');
+}
+
+async function queryCheckpointsForPrisma(
+  prisma: PrismaClient,
+  agentId: string,
+  chainType: ReplayChainType,
+): Promise<DerivedPrismaCheckpoint[]> {
+  if (chainType === 'feedback') {
+    const [feedbacks, orphanFeedbacks] = await Promise.all([
+      prisma.feedback.findMany({
+        where: { agentId, runningDigest: { not: null } },
+        select: {
+          id: true,
+          feedbackIndex: true,
+          runningDigest: true,
+          createdAt: true,
+          createdSlot: true,
+          txIndex: true,
+          eventOrdinal: true,
+          createdTxSignature: true,
+        },
+      }),
+      prisma.orphanFeedback.findMany({
+        where: { agentId, runningDigest: { not: null } },
+        select: {
+          id: true,
+          feedbackIndex: true,
+          runningDigest: true,
+          createdAt: true,
+          slot: true,
+          txIndex: true,
+          eventOrdinal: true,
+          txSignature: true,
+        },
+      }),
+    ]);
+
+    return [
+      ...feedbacks.map((row) => ({
+        chainType,
+        eventCount: row.feedbackIndex + 1n,
+        digest: digestBytesToHex(row.runningDigest)!,
+        createdAt: row.createdAt.toISOString(),
+        order: {
+          count: row.feedbackIndex + 1n,
+          slot: row.createdSlot,
+          txIndex: row.txIndex,
+          eventOrdinal: row.eventOrdinal,
+          signature: row.createdTxSignature,
+          rowId: row.id,
+        },
+      })),
+      ...orphanFeedbacks.map((row) => ({
+        chainType,
+        eventCount: row.feedbackIndex + 1n,
+        digest: digestBytesToHex(row.runningDigest)!,
+        createdAt: row.createdAt.toISOString(),
+        order: {
+          count: row.feedbackIndex + 1n,
+          slot: row.slot,
+          txIndex: row.txIndex,
+          eventOrdinal: row.eventOrdinal,
+          signature: row.txSignature,
+          rowId: row.id,
+        },
+      })),
+    ]
+      .filter((row) => row.eventCount % 1000n === 0n)
+      .sort((left, right) => compareReplayEventOrder(left.order, right.order))
+      .map(({ chainType: checkpointChainType, eventCount, digest, createdAt }) => ({
+        chainType: checkpointChainType,
+        eventCount,
+        digest,
+        createdAt,
+      }));
+  }
+
+  if (chainType === 'response') {
+    const [responses, orphanResponses] = await Promise.all([
+      prisma.feedbackResponse.findMany({
+        where: { feedback: { agentId }, runningDigest: { not: null } },
+        select: {
+          id: true,
+          responseCount: true,
+          runningDigest: true,
+          createdAt: true,
+          slot: true,
+          txIndex: true,
+          eventOrdinal: true,
+          txSignature: true,
+        },
+      }),
+      prisma.orphanResponse.findMany({
+        where: { agentId, runningDigest: { not: null } },
+        select: {
+          id: true,
+          responseCount: true,
+          runningDigest: true,
+          createdAt: true,
+          slot: true,
+          txIndex: true,
+          eventOrdinal: true,
+          txSignature: true,
+        },
+      }),
+    ]);
+
+    return [
+      ...responses.map((row) => ({
+        chainType,
+        eventCount: row.responseCount ?? 0n,
+        digest: digestBytesToHex(row.runningDigest)!,
+        createdAt: row.createdAt.toISOString(),
+        order: {
+          count: row.responseCount ?? 0n,
+          slot: row.slot,
+          txIndex: row.txIndex,
+          eventOrdinal: row.eventOrdinal,
+          signature: row.txSignature,
+          rowId: row.id,
+        },
+      })),
+      ...orphanResponses.map((row) => ({
+        chainType,
+        eventCount: row.responseCount ?? 0n,
+        digest: digestBytesToHex(row.runningDigest)!,
+        createdAt: row.createdAt.toISOString(),
+        order: {
+          count: row.responseCount ?? 0n,
+          slot: row.slot,
+          txIndex: row.txIndex,
+          eventOrdinal: row.eventOrdinal,
+          signature: row.txSignature,
+          rowId: row.id,
+        },
+      })),
+    ]
+      .filter((row) => row.eventCount % 1000n === 0n)
+      .sort((left, right) => compareReplayEventOrder(left.order, right.order))
+      .map(({ chainType: checkpointChainType, eventCount, digest, createdAt }) => ({
+        chainType: checkpointChainType,
+        eventCount,
+        digest,
+        createdAt,
+      }));
+  }
+
+  const revocations = await prisma.revocation.findMany({
+    where: { agentId, runningDigest: { not: null } },
+    select: {
+      id: true,
+      revokeCount: true,
+      runningDigest: true,
+      createdAt: true,
+      slot: true,
+      txIndex: true,
+      eventOrdinal: true,
+      txSignature: true,
+    },
+  });
+
+  return revocations
+    .map((row) => ({
+      chainType,
+      eventCount: row.revokeCount,
+      digest: digestBytesToHex(row.runningDigest)!,
+      createdAt: row.createdAt.toISOString(),
+      order: {
+        count: row.revokeCount,
+        slot: row.slot,
+        txIndex: row.txIndex,
+        eventOrdinal: row.eventOrdinal,
+        signature: row.txSignature,
+        rowId: row.id,
+      },
+    }))
+    .filter((row) => row.eventCount % 1000n === 0n)
+    .sort((left, right) => compareReplayEventOrder(left.order, right.order))
+    .map(({ chainType: checkpointChainType, eventCount, digest, createdAt }) => ({
+      chainType: checkpointChainType,
+      eventCount,
+      digest,
+      createdAt,
+    }));
+}
+
+async function listCheckpointsFromPrisma(
+  prisma: PrismaClient,
+  agentId: string,
+  chainType?: ReplayChainType,
+): Promise<DerivedPrismaCheckpoint[]> {
+  if (chainType) {
+    return queryCheckpointsForPrisma(prisma, agentId, chainType);
+  }
+
+  const [feedback, response, revoke] = await Promise.all([
+    queryCheckpointsForPrisma(prisma, agentId, 'feedback'),
+    queryCheckpointsForPrisma(prisma, agentId, 'response'),
+    queryCheckpointsForPrisma(prisma, agentId, 'revoke'),
+  ]);
+
+  return [...feedback, ...response, ...revoke].sort((left, right) => {
+    if (left.eventCount !== right.eventCount) return left.eventCount < right.eventCount ? -1 : 1;
+    return left.chainType.localeCompare(right.chainType);
+  });
+}
+
+async function getLatestCheckpointsFromPrisma(
+  prisma: PrismaClient,
+  agentId: string,
+): Promise<{
+  feedback: Omit<DerivedPrismaCheckpoint, 'chainType'> | null;
+  response: Omit<DerivedPrismaCheckpoint, 'chainType'> | null;
+  revoke: Omit<DerivedPrismaCheckpoint, 'chainType'> | null;
+}> {
+  const [feedback, response, revoke] = await Promise.all([
+    queryCheckpointsForPrisma(prisma, agentId, 'feedback'),
+    queryCheckpointsForPrisma(prisma, agentId, 'response'),
+    queryCheckpointsForPrisma(prisma, agentId, 'revoke'),
+  ]);
+
+  const stripChain = (
+    entry: DerivedPrismaCheckpoint | undefined,
+  ): Omit<DerivedPrismaCheckpoint, 'chainType'> | null => (
+    entry ? { eventCount: entry.eventCount, digest: entry.digest, createdAt: entry.createdAt } : null
+  );
+
+  return {
+    feedback: stripChain(feedback[feedback.length - 1]),
+    response: stripChain(response[response.length - 1]),
+    revoke: stripChain(revoke[revoke.length - 1]),
+  };
 }
 
 // LRU cache for leaderboard (prevents unbounded memory growth + repeated queries)
@@ -572,6 +885,10 @@ type AgentApiRow = Pick<
   | 'eventOrdinal'
 >;
 
+type AgentFeedbackCountOverride = {
+  feedbackCount?: number | string | bigint | null;
+};
+
 function rot32(value: number, bits: number): number {
   return ((value << bits) | (value >>> (32 - bits))) >>> 0;
 }
@@ -614,17 +931,39 @@ function pgHashBytes(input: Buffer): number {
   }
 
   switch (len) {
-    case 11: c = (c + (input[offset + 10] << 24)) >>> 0;
-    case 10: c = (c + (input[offset + 9] << 16)) >>> 0;
-    case 9: c = (c + (input[offset + 8] << 8)) >>> 0;
-    case 8: b = (b + (input[offset + 7] << 24)) >>> 0;
-    case 7: b = (b + (input[offset + 6] << 16)) >>> 0;
-    case 6: b = (b + (input[offset + 5] << 8)) >>> 0;
-    case 5: b = (b + input[offset + 4]) >>> 0;
-    case 4: a = (a + (input[offset + 3] << 24)) >>> 0;
-    case 3: a = (a + (input[offset + 2] << 16)) >>> 0;
-    case 2: a = (a + (input[offset + 1] << 8)) >>> 0;
-    case 1: a = (a + input[offset + 0]) >>> 0;
+    case 11:
+      c = (c + (input[offset + 10] << 24)) >>> 0;
+      // falls through
+    case 10:
+      c = (c + (input[offset + 9] << 16)) >>> 0;
+      // falls through
+    case 9:
+      c = (c + (input[offset + 8] << 8)) >>> 0;
+      // falls through
+    case 8:
+      b = (b + (input[offset + 7] << 24)) >>> 0;
+      // falls through
+    case 7:
+      b = (b + (input[offset + 6] << 16)) >>> 0;
+      // falls through
+    case 6:
+      b = (b + (input[offset + 5] << 8)) >>> 0;
+      // falls through
+    case 5:
+      b = (b + input[offset + 4]) >>> 0;
+      // falls through
+    case 4:
+      a = (a + (input[offset + 3] << 24)) >>> 0;
+      // falls through
+    case 3:
+      a = (a + (input[offset + 2] << 16)) >>> 0;
+      // falls through
+    case 2:
+      a = (a + (input[offset + 1] << 8)) >>> 0;
+      // falls through
+    case 1:
+      a = (a + input[offset + 0]) >>> 0;
+      // falls through
     default:
       break;
   }
@@ -652,7 +991,19 @@ function computeLocalSortKey(agent: Pick<PrismaAgent, 'id' | 'trustTier' | 'qual
   ).toString();
 }
 
-function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
+function normalizeNullableText(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return value ?? null;
+  return value.length > 0 ? value : null;
+}
+
+function resolveAgentFeedbackCount(
+  baseCount: number | string | bigint | null | undefined,
+  overrideCount?: number | string | bigint | null,
+): number | null {
+  return numericValue(overrideCount) ?? numericValue(baseCount);
+}
+
+function mapAgentToApi(a: AgentApiRow, overrides?: AgentFeedbackCountOverride): Record<string, unknown> {
   return {
     asset: a.id,
     agent_id: a.agentId !== null ? a.agentId.toString() : null,
@@ -666,14 +1017,14 @@ function mapAgentToApi(a: AgentApiRow): Record<string, unknown> {
     parent_asset: a.parentAsset,
     parent_creator: a.parentCreator,
     parent_locked: a.parentLocked,
-    nft_name: a.nftName,
+    nft_name: normalizeNullableText(a.nftName),
     atom_enabled: a.atomEnabled,
     trust_tier: a.trustTier,
     quality_score: a.qualityScore,
     confidence: a.confidence,
     risk_score: a.riskScore,
     diversity_ratio: a.diversityRatio,
-    feedback_count: a.feedbackCount,
+    feedback_count: resolveAgentFeedbackCount(a.feedbackCount, overrides?.feedbackCount),
     raw_avg_score: a.rawAvgScore,
     sort_key: computeLocalSortKey(a),
     block_slot: a.createdSlot !== null ? Number(a.createdSlot) : 0,
@@ -824,6 +1175,57 @@ type PoolAgentApiRow = {
   sort_key: string | number | null;
 };
 
+async function loadLocalAgentDigestFeedbackCounts(
+  prisma: PrismaClient,
+  assetIds: string[],
+): Promise<Map<string, number>> {
+  const uniqueAssetIds = [...new Set(assetIds.filter((asset): asset is string => typeof asset === 'string' && asset.length > 0))];
+  if (uniqueAssetIds.length === 0) return new Map();
+
+  const model = (prisma as PrismaClient & {
+    agentDigestCache?: {
+      findMany?: (args: {
+        where: { agentId: { in: string[] } };
+        select: { agentId: true; feedbackCount: true };
+      }) => Promise<Array<{ agentId: string; feedbackCount: bigint | number | null }>>;
+    };
+  }).agentDigestCache;
+
+  if (!model?.findMany) return new Map();
+
+  const rows = await model.findMany({
+    where: { agentId: { in: uniqueAssetIds } },
+    select: { agentId: true, feedbackCount: true },
+  });
+
+  return new Map(
+    rows
+      .map((row) => [row.agentId, resolveAgentFeedbackCount(null, row.feedbackCount)])
+      .filter((entry): entry is [string, number] => entry[1] !== null),
+  );
+}
+
+async function loadPoolAgentDigestFeedbackCounts(
+  pool: Pool,
+  assetIds: string[],
+): Promise<Map<string, number>> {
+  const uniqueAssetIds = [...new Set(assetIds.filter((asset): asset is string => typeof asset === 'string' && asset.length > 0))];
+  if (uniqueAssetIds.length === 0) return new Map();
+
+  const { rows } = await pool.query<{ agent_id: string; feedback_count: string | number | null }>(
+    `SELECT agent_id, feedback_count::text AS feedback_count
+     FROM agent_digest_cache
+     WHERE agent_id = ANY($1::text[])`,
+    [uniqueAssetIds]
+  );
+
+  return new Map(
+    rows
+      .map((row) => [row.agent_id, resolveAgentFeedbackCount(null, row.feedback_count)])
+      .filter((entry): entry is [string, number] => entry[1] !== null),
+  );
+}
+
 type PoolAgentTreeNodeRow = {
   asset: string;
   parent_asset: string | null;
@@ -886,7 +1288,7 @@ function buildPoolStatusPredicate(
   return '';
 }
 
-function mapPoolAgentToApi(row: PoolAgentApiRow): Record<string, unknown> {
+function mapPoolAgentToApi(row: PoolAgentApiRow, overrides?: AgentFeedbackCountOverride): Record<string, unknown> {
   return {
     asset: row.asset,
     agent_id: row.agent_id !== null && row.agent_id !== undefined ? String(row.agent_id) : null,
@@ -900,14 +1302,14 @@ function mapPoolAgentToApi(row: PoolAgentApiRow): Record<string, unknown> {
     parent_asset: row.parent_asset,
     parent_creator: row.parent_creator,
     parent_locked: row.parent_locked,
-    nft_name: row.nft_name,
+    nft_name: normalizeNullableText(row.nft_name),
     atom_enabled: row.atom_enabled,
     trust_tier: numericValue(row.trust_tier),
     quality_score: numericValue(row.quality_score),
     confidence: numericValue(row.confidence),
     risk_score: numericValue(row.risk_score),
     diversity_ratio: numericValue(row.diversity_ratio),
-    feedback_count: numericValue(row.feedback_count),
+    feedback_count: resolveAgentFeedbackCount(row.feedback_count, overrides?.feedbackCount),
     raw_avg_score: numericValue(row.raw_avg_score),
     sort_key: row.sort_key !== null && row.sort_key !== undefined ? String(row.sort_key) : null,
     block_slot: numericValue(row.block_slot) ?? 0,
@@ -940,7 +1342,7 @@ function mapAgentToLeaderboardEntry(
     asset: agent.id,
     owner: agent.owner,
     collection: agent.collection,
-    nft_name: agent.nftName,
+    nft_name: normalizeNullableText(agent.nftName),
     agent_uri: agent.uri,
     trust_tier: agent.trustTier,
     quality_score: agent.qualityScore,
@@ -1029,16 +1431,15 @@ const PROXY_REQUEST_HEADER_BLOCKLIST = new Set([
 ]);
 
 function resolveSupabaseRestBaseUrl(): string | null {
+  const postgrestRaw = typeof process.env.POSTGREST_URL === 'string' ? process.env.POSTGREST_URL.trim() : '';
+  if (postgrestRaw) {
+    return postgrestRaw.replace(/\/+$/, '');
+  }
+
   const supabaseRaw = typeof process.env.SUPABASE_URL === 'string' ? process.env.SUPABASE_URL.trim() : '';
   if (supabaseRaw) {
     const normalized = supabaseRaw.replace(/\/+$/, '');
     return normalized.endsWith('/rest/v1') ? normalized : `${normalized}/rest/v1`;
-  }
-
-  // PostgREST alias points directly to a PostgREST base URL (no forced /rest/v1 suffix).
-  const postgrestRaw = typeof process.env.POSTGREST_URL === 'string' ? process.env.POSTGREST_URL.trim() : '';
-  if (postgrestRaw) {
-    return postgrestRaw.replace(/\/+$/, '');
   }
 
   if (!config.supabaseUrl) return null;
@@ -1070,9 +1471,10 @@ const REST_PROXY_PATH_ALLOWLIST = [
 
 const REST_PROXY_LOCAL_COMPAT_PATHS = [
   '/agent_reputation',
+  '/leaderboard',
+  '/collections',
   '/collection_pointers',
   '/collection_stats',
-  '/collections',
   '/collection_asset_count',
   '/collection_assets',
   '/checkpoints',
@@ -1124,7 +1526,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function normalizeAgentsProxyPayload(payload: Uint8Array, contentType: string | null): Uint8Array {
+async function normalizeAgentsProxyPayload(
+  payload: Uint8Array,
+  contentType: string | null,
+  pool?: Pool | null,
+): Promise<Uint8Array> {
   if (!contentType || !contentType.toLowerCase().includes('application/json')) {
     return payload;
   }
@@ -1132,18 +1538,44 @@ function normalizeAgentsProxyPayload(payload: Uint8Array, contentType: string | 
   try {
     const parsed: unknown = JSON.parse(Buffer.from(payload).toString('utf8'));
     let changed = false;
+    const rows = Array.isArray(parsed)
+      ? parsed.filter(isRecord)
+      : isRecord(parsed)
+        ? [parsed]
+        : [];
+    const assets = rows
+      .map((row) => (typeof row.asset === 'string' ? row.asset : null))
+      .filter((asset): asset is string => asset !== null);
+    const digestFeedbackCounts = pool
+      ? await loadPoolAgentDigestFeedbackCounts(pool, assets)
+      : new Map<string, number>();
 
     const normalizeRow = (row: Record<string, unknown>): void => {
-      if (!Object.prototype.hasOwnProperty.call(row, 'canonical_col')) return;
-      if (!Object.prototype.hasOwnProperty.call(row, 'collection_pointer')) {
+      if (Object.prototype.hasOwnProperty.call(row, 'canonical_col') && !Object.prototype.hasOwnProperty.call(row, 'collection_pointer')) {
         row.collection_pointer = row.canonical_col ?? null;
+        changed = true;
+      }
+      if (typeof row.asset === 'string') {
+        const feedbackCount = digestFeedbackCounts.get(row.asset);
+        const resolvedFeedbackCount = resolveAgentFeedbackCount(
+          row.feedback_count as number | string | bigint | null | undefined,
+          feedbackCount,
+        );
+        if (resolvedFeedbackCount !== null && row.feedback_count !== resolvedFeedbackCount) {
+          row.feedback_count = resolvedFeedbackCount;
+          changed = true;
+        }
+      }
+      const normalizedName = normalizeNullableText(typeof row.nft_name === 'string' ? row.nft_name : null);
+      if (row.nft_name !== normalizedName) {
+        row.nft_name = normalizedName;
         changed = true;
       }
     };
 
     if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (isRecord(item)) normalizeRow(item);
+      for (const item of rows) {
+        normalizeRow(item);
       }
       return changed ? Buffer.from(JSON.stringify(parsed)) : payload;
     }
@@ -1178,6 +1610,16 @@ function buildSupabaseProxyHeaders(req: Request): Headers {
     upstreamHeaders.set('authorization', `Bearer ${config.supabaseKey}`);
   }
 
+  return upstreamHeaders;
+}
+
+function buildSupabaseServiceHeaders(): Headers {
+  const upstreamHeaders = new Headers();
+  upstreamHeaders.set('accept', 'application/json');
+  if (config.supabaseKey) {
+    upstreamHeaders.set('apikey', config.supabaseKey);
+    upstreamHeaders.set('authorization', `Bearer ${config.supabaseKey}`);
+  }
   return upstreamHeaders;
 }
 
@@ -1250,7 +1692,6 @@ async function fetchFallbackGlobalStats(
     total_agents: totalAgents,
     total_feedbacks: totalFeedbacks,
     total_collections: totalCollections,
-    total_validations: 0,
     platinum_agents: 0,
     gold_agents: 0,
     avg_quality: null,
@@ -1299,8 +1740,280 @@ export function createApiServer(options: ApiServerOptions): Express {
   const prisma = options.prisma as PrismaClient;
   const app = express();
   const isReady = options.isReady ?? (() => true);
+  const isCaughtUp = options.isCaughtUp ?? (() => true);
   const graphqlState = {
     mounted: !graphqlEnabled || !options.pool,
+  };
+  const restProxyReadyState = {
+    lastCheckedAt: 0,
+    lastHealthy: !restProxyEnabled,
+    inFlight: null as Promise<boolean> | null,
+  };
+  const hasReadyStateBackend = !!prisma || !!(options.pool && typeof (options.pool as any).query === 'function');
+  const poolReadyState = {
+    lastCheckedAt: 0,
+    lastHealthy: true,
+    inFlight: null as Promise<boolean> | null,
+  };
+  const readyDetailsState = {
+    lastCheckedAt: 0,
+    lastValue: null as ReadyStateSnapshot | null,
+    inFlight: null as Promise<ReadyStateSnapshot | null> | null,
+  };
+  const checkRestProxyReady = options.checkRestProxyReady ?? (async (): Promise<boolean> => {
+    if (!restProxyEnabled || !supabaseRestBaseUrl) {
+      return true;
+    }
+    const now = Date.now();
+    if (now - restProxyReadyState.lastCheckedAt < REST_PROXY_READY_CACHE_TTL_MS) {
+      return restProxyReadyState.lastHealthy;
+    }
+    if (restProxyReadyState.inFlight) {
+      return await restProxyReadyState.inFlight;
+    }
+    restProxyReadyState.inFlight = (async () => {
+      try {
+        const headers = buildSupabaseServiceHeaders();
+        const [agentsResponse, leaderboardResponse] = await Promise.all([
+          fetch(
+            `${supabaseRestBaseUrl}/agents?select=asset&limit=1`,
+            { method: 'GET', headers },
+          ),
+          fetch(
+            `${supabaseRestBaseUrl}/leaderboard?select=asset&limit=1`,
+            { method: 'GET', headers },
+          ),
+        ]);
+        restProxyReadyState.lastHealthy = agentsResponse.ok && leaderboardResponse.ok;
+      } catch {
+        restProxyReadyState.lastHealthy = false;
+      } finally {
+        restProxyReadyState.lastCheckedAt = Date.now();
+        restProxyReadyState.inFlight = null;
+      }
+      return restProxyReadyState.lastHealthy;
+    })();
+    return await restProxyReadyState.inFlight;
+  });
+  const checkPoolReady = options.checkPoolReady ?? (async (): Promise<boolean> => {
+    const pool = options.pool as Pool | null | undefined;
+    if (!pool || typeof (pool as any).query !== 'function') {
+      return true;
+    }
+    const now = Date.now();
+    if (now - poolReadyState.lastCheckedAt < POOL_READY_CACHE_TTL_MS) {
+      return poolReadyState.lastHealthy;
+    }
+    if (poolReadyState.inFlight) {
+      return await poolReadyState.inFlight;
+    }
+    poolReadyState.inFlight = (async () => {
+      try {
+        await pool.query('SELECT 1');
+        poolReadyState.lastHealthy = true;
+      } catch (error) {
+        logger.debug({ error }, 'Failed to probe pool readiness');
+        poolReadyState.lastHealthy = false;
+      } finally {
+        poolReadyState.lastCheckedAt = Date.now();
+        poolReadyState.inFlight = null;
+      }
+      return poolReadyState.lastHealthy;
+    })();
+    return await poolReadyState.inFlight;
+  });
+
+  const loadReadyStateDetails = async (): Promise<ReadyStateSnapshot | null> => {
+    const now = Date.now();
+    if (now - readyDetailsState.lastCheckedAt < READY_DETAILS_CACHE_TTL_MS) {
+      return readyDetailsState.lastValue;
+    }
+    if (readyDetailsState.inFlight) {
+      return await readyDetailsState.inFlight;
+    }
+    readyDetailsState.inFlight = (async () => {
+      try {
+        if (prisma && typeof prisma.agent?.count === 'function') {
+          const [
+            mainState,
+            agents,
+            feedbacks,
+            responses,
+            revocations,
+            collections,
+            pendingAgents,
+            pendingFeedbacks,
+            pendingResponses,
+            pendingRevocations,
+            pendingMetadata,
+            pendingRegistries,
+            pendingValidations,
+            orphanAgents,
+            orphanFeedbacks,
+            orphanResponses,
+            orphanRevocations,
+            orphanMetadata,
+            orphanRegistries,
+            orphanValidations,
+            orphanFeedbackStaging,
+            orphanResponseStaging,
+          ] = await Promise.all([
+            prisma.indexerState.findUnique({
+              where: { id: 'main' },
+              select: { lastSlot: true, lastTxIndex: true },
+            }),
+            prisma.agent.count(),
+            prisma.feedback.count(),
+            prisma.feedbackResponse.count(),
+            prisma.revocation.count(),
+            prisma.collection.count(),
+            prisma.agent.count({ where: { status: 'PENDING' } }),
+            prisma.feedback.count({ where: { status: 'PENDING' } }),
+            prisma.feedbackResponse.count({ where: { status: 'PENDING' } }),
+            prisma.revocation.count({ where: { status: 'PENDING' } }),
+            prisma.agentMetadata.count({ where: { status: 'PENDING' } }),
+            prisma.registry.count({ where: { status: 'PENDING' } }),
+            typeof (prisma as any).validation?.count === 'function'
+              ? (prisma as any).validation.count({ where: { chainStatus: 'PENDING' } })
+              : Promise.resolve(0),
+            prisma.agent.count({ where: { status: 'ORPHANED' } }),
+            prisma.feedback.count({ where: { status: 'ORPHANED' } }),
+            prisma.feedbackResponse.count({ where: { status: 'ORPHANED' } }),
+            prisma.revocation.count({ where: { status: 'ORPHANED' } }),
+            prisma.agentMetadata.count({ where: { status: 'ORPHANED' } }),
+            prisma.registry.count({ where: { status: 'ORPHANED' } }),
+            typeof (prisma as any).validation?.count === 'function'
+              ? (prisma as any).validation.count({ where: { chainStatus: 'ORPHANED' } })
+              : Promise.resolve(0),
+            typeof (prisma as any).orphanFeedback?.count === 'function'
+              ? (prisma as any).orphanFeedback.count()
+              : Promise.resolve(0),
+            typeof (prisma as any).orphanResponse?.count === 'function'
+              ? (prisma as any).orphanResponse.count()
+              : Promise.resolve(0),
+          ]);
+
+          readyDetailsState.lastValue = {
+            mainSlot: mainState?.lastSlot != null ? Number(mainState.lastSlot) : null,
+            mainTxIndex: mainState?.lastTxIndex ?? null,
+            counts: { agents, feedbacks, responses, revocations, collections },
+            pending: {
+              agents: pendingAgents,
+              feedbacks: pendingFeedbacks,
+              responses: pendingResponses,
+              revocations: pendingRevocations,
+              metadata: pendingMetadata,
+              registries: pendingRegistries,
+              validations: pendingValidations,
+            },
+            orphans: {
+              agents: orphanAgents,
+              feedbacks: orphanFeedbacks + orphanFeedbackStaging,
+              responses: orphanResponses + orphanResponseStaging,
+              revocations: orphanRevocations,
+              metadata: orphanMetadata,
+              registries: orphanRegistries,
+              validations: orphanValidations,
+            },
+          };
+          return readyDetailsState.lastValue;
+        }
+
+        const pool = options.pool as Pool | null | undefined;
+        if (pool && typeof (pool as any).query === 'function') {
+          const { rows } = await pool.query<{
+            main_slot: string | null;
+            main_tx_index: number | null;
+            agents: string | number;
+            feedbacks: string | number;
+            responses: string | number;
+            revocations: string | number;
+            collections: string | number;
+            pending_feedbacks: string | number;
+            pending_responses: string | number;
+            pending_revocations: string | number;
+            pending_agents: string | number;
+            pending_metadata: string | number;
+            pending_registries: string | number;
+            pending_validations: string | number;
+            orphan_feedbacks: string | number;
+            orphan_responses: string | number;
+            orphan_revocations: string | number;
+            orphan_agents: string | number;
+            orphan_metadata: string | number;
+            orphan_registries: string | number;
+            orphan_validations: string | number;
+            staging_orphan_feedbacks: string | number;
+            staging_orphan_responses: string | number;
+          }>(
+            `SELECT
+               (SELECT last_slot::text FROM indexer_state WHERE id = 'main') AS main_slot,
+               (SELECT last_tx_index FROM indexer_state WHERE id = 'main') AS main_tx_index,
+               (SELECT COUNT(*) FROM agents) AS agents,
+               (SELECT COUNT(*) FROM feedbacks) AS feedbacks,
+               (SELECT COUNT(*) FROM feedback_responses) AS responses,
+               (SELECT COUNT(*) FROM revocations) AS revocations,
+               (SELECT COUNT(*) FROM collection_pointers) AS collections,
+               (SELECT COUNT(*) FROM agents WHERE status = 'PENDING') AS pending_agents,
+               (SELECT COUNT(*) FROM feedbacks WHERE status = 'PENDING') AS pending_feedbacks,
+               (SELECT COUNT(*) FROM feedback_responses WHERE status = 'PENDING') AS pending_responses,
+               (SELECT COUNT(*) FROM revocations WHERE status = 'PENDING') AS pending_revocations,
+               (SELECT COUNT(*) FROM metadata WHERE status = 'PENDING') AS pending_metadata,
+               (SELECT COUNT(*) FROM collections WHERE status = 'PENDING') AS pending_registries,
+               (SELECT COUNT(*) FROM validations WHERE chain_status = 'PENDING') AS pending_validations,
+               (SELECT COUNT(*) FROM agents WHERE status = 'ORPHANED') AS orphan_agents,
+               (SELECT COUNT(*) FROM feedbacks WHERE status = 'ORPHANED') AS orphan_feedbacks,
+               (SELECT COUNT(*) FROM feedback_responses WHERE status = 'ORPHANED') AS orphan_responses,
+               (SELECT COUNT(*) FROM revocations WHERE status = 'ORPHANED') AS orphan_revocations,
+               (SELECT COUNT(*) FROM metadata WHERE status = 'ORPHANED') AS orphan_metadata,
+               (SELECT COUNT(*) FROM collections WHERE status = 'ORPHANED') AS orphan_registries,
+               (SELECT COUNT(*) FROM validations WHERE chain_status = 'ORPHANED') AS orphan_validations,
+               (SELECT COUNT(*) FROM orphan_feedbacks) AS staging_orphan_feedbacks,
+               (SELECT COUNT(*) FROM orphan_responses) AS staging_orphan_responses`
+          );
+
+          const row = rows[0];
+          readyDetailsState.lastValue = {
+            mainSlot: row?.main_slot != null ? Number(row.main_slot) : null,
+            mainTxIndex: row?.main_tx_index ?? null,
+            counts: {
+              agents: Number(row?.agents ?? 0),
+              feedbacks: Number(row?.feedbacks ?? 0),
+              responses: Number(row?.responses ?? 0),
+              revocations: Number(row?.revocations ?? 0),
+              collections: Number(row?.collections ?? 0),
+            },
+            pending: {
+              agents: Number(row?.pending_agents ?? 0),
+              feedbacks: Number(row?.pending_feedbacks ?? 0),
+              responses: Number(row?.pending_responses ?? 0),
+              revocations: Number(row?.pending_revocations ?? 0),
+              metadata: Number(row?.pending_metadata ?? 0),
+              registries: Number(row?.pending_registries ?? 0),
+              validations: Number(row?.pending_validations ?? 0),
+            },
+            orphans: {
+              agents: Number(row?.orphan_agents ?? 0),
+              feedbacks: Number(row?.orphan_feedbacks ?? 0) + Number(row?.staging_orphan_feedbacks ?? 0),
+              responses: Number(row?.orphan_responses ?? 0) + Number(row?.staging_orphan_responses ?? 0),
+              revocations: Number(row?.orphan_revocations ?? 0),
+              metadata: Number(row?.orphan_metadata ?? 0),
+              registries: Number(row?.orphan_registries ?? 0),
+              validations: Number(row?.orphan_validations ?? 0),
+            },
+          };
+          return readyDetailsState.lastValue;
+        }
+      } catch (error) {
+        logger.debug({ error }, 'Failed to load /ready state details');
+      } finally {
+        readyDetailsState.lastCheckedAt = Date.now();
+        readyDetailsState.inFlight = null;
+      }
+      readyDetailsState.lastValue = null;
+      return null;
+    })();
+    return await readyDetailsState.inFlight;
   };
 
   const trustProxyRaw = process.env.TRUST_PROXY;
@@ -1349,12 +2062,40 @@ export function createApiServer(options: ApiServerOptions): Express {
     res.json({ status: 'ok' });
   });
 
-  app.get('/ready', (_req: Request, res: Response) => {
+  app.get('/ready', async (_req: Request, res: Response) => {
+    const details = await loadReadyStateDetails();
+    const base = {
+      phase: 'bootstrapping' as 'bootstrapping' | 'catching_up' | 'live',
+      state: details,
+    };
     if (!isReady() || !graphqlState.mounted) {
-      res.status(503).json({ status: 'starting' });
+      res.status(503).json({ status: 'starting', ...base });
       return;
     }
-    res.json({ status: 'ready' });
+    if (!(await checkRestProxyReady())) {
+      res.status(503).json({ status: 'starting', ...base });
+      return;
+    }
+    if (!(await checkPoolReady())) {
+      res.status(503).json({ status: 'starting', ...base });
+      return;
+    }
+    if (hasReadyStateBackend && !details) {
+      res.status(503).json({ status: 'starting', ...base });
+      return;
+    }
+    const hasBacklog = details
+      ? Object.values(details.pending).some((count) => count > 0)
+        || Object.values(details.orphans).some((count) => count > 0)
+      : true;
+    const phase = !details
+      ? 'catching_up'
+      : hasBacklog
+        ? 'catching_up'
+        : isCaughtUp()
+          ? 'live'
+          : 'catching_up';
+    res.json({ status: 'ready', phase, state: details });
   });
 
   if (config.metricsEndpointEnabled) {
@@ -1364,19 +2105,26 @@ export function createApiServer(options: ApiServerOptions): Express {
     });
   }
 
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    if (isReady() && graphqlState.mounted) {
-      next();
-      return;
-    }
-
+  app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (req.path === '/health' || req.path === '/ready' || req.path === '/metrics') {
       next();
       return;
     }
 
-    res.setHeader('Retry-After', '5');
-    res.status(503).json({ error: 'Indexer bootstrap in progress. Retry shortly.' });
+    if (!isReady() || !graphqlState.mounted) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ error: 'Indexer bootstrap in progress. Retry shortly.' });
+      return;
+    }
+
+    const isGraphqlRequest = req.path === '/graphql' || req.path === '/v2/graphql';
+    if (isGraphqlRequest && !(await checkPoolReady())) {
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({ error: 'Indexer bootstrap in progress. Retry shortly.' });
+      return;
+    }
+
+    next();
   });
 
   // Global rate limiting
@@ -1386,6 +2134,7 @@ export function createApiServer(options: ApiServerOptions): Express {
     message: { error: 'Too many requests, please try again later' },
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => req.path === '/graphql' || req.path === '/v2/graphql',
   });
   app.use(limiter);
 
@@ -1478,6 +2227,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         const upstreamPath = upstreamQuery ? `${upstreamPathname}?${upstreamQuery}` : upstreamPathname;
         const isVerificationStatsPath =
           upstreamPathname === '/stats/verification' || upstreamPathname === '/stats/verification/';
+        const isLocalLeaderboardIncludeOrphaned =
+          upstreamPathname === '/leaderboard' && safeQueryString(req.query.includeOrphaned) === 'true';
         if (isVerificationStatsPath) {
           if (method === 'OPTIONS') {
             res.status(204).end();
@@ -1487,6 +2238,10 @@ export function createApiServer(options: ApiServerOptions): Express {
             res.status(405).json({ error: 'REST proxy is read-only. Mutating methods are disabled.' });
             return;
           }
+          next();
+          return;
+        }
+        if (isLocalLeaderboardIncludeOrphaned) {
           next();
           return;
         }
@@ -1565,7 +2320,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         }
 
         if (upstreamPathname === '/agents') {
-          payload = normalizeAgentsProxyPayload(payload, upstreamRes.headers.get('content-type'));
+          payload = await normalizeAgentsProxyPayload(payload, upstreamRes.headers.get('content-type'), options.pool);
         }
         res.status(upstreamRes.status).send(payload);
       } catch (error) {
@@ -1678,7 +2433,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         skip: offset,
       });
 
-      const mapped = agents.map(mapAgentToApi);
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, agents.map((agent) => agent.id));
+      const mapped = agents.map((agent) => mapAgentToApi(agent, { feedbackCount: digestFeedbackCounts.get(agent.id) }));
 
       res.json(mapped);
     } catch (error) {
@@ -1722,8 +2478,8 @@ export function createApiServer(options: ApiServerOptions): Express {
            LIMIT $${params.length - 1}::int OFFSET $${params.length}::int`,
           params
         );
-
-        res.json(rows.map(mapPoolAgentToApi));
+        const digestFeedbackCounts = await loadPoolAgentDigestFeedbackCounts(options.pool, rows.map((row) => row.asset));
+        res.json(rows.map((row) => mapPoolAgentToApi(row, { feedbackCount: digestFeedbackCounts.get(row.asset) })));
         return;
       }
 
@@ -1752,8 +2508,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         take: limit,
         skip: offset,
       });
-
-      res.json(children.map(mapAgentToApi));
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, children.map((child) => child.id));
+      res.json(children.map((child) => mapAgentToApi(child, { feedbackCount: digestFeedbackCounts.get(child.id) })));
     } catch (error) {
       logger.error({ error }, 'Error fetching agent children');
       res.status(500).json({ error: 'Internal server error' });
@@ -1837,12 +2593,13 @@ export function createApiServer(options: ApiServerOptions): Express {
           [assets]
         );
         const byAsset = new Map(agentRows.map((row) => [row.asset, row]));
+        const digestFeedbackCounts = await loadPoolAgentDigestFeedbackCounts(options.pool, assets);
         res.json(
           rows.flatMap((row) => {
             const agent = byAsset.get(row.asset);
             if (!agent) return [];
             return [{
-              ...mapPoolAgentToApi(agent),
+              ...mapPoolAgentToApi(agent, { feedbackCount: digestFeedbackCounts.get(agent.asset) }),
               depth: row.depth,
               path: row.path,
             }];
@@ -1918,9 +2675,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       }
 
       const paged = orderedNodes.slice(offset, offset + limit);
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, paged.map((node) => node.id));
       res.json(
         paged.map((node) => ({
-          ...mapAgentToApi(node),
+          ...mapAgentToApi(node, { feedbackCount: digestFeedbackCounts.get(node.id) }),
           depth: depthByAsset.get(node.id) ?? 0,
           path: pathByAsset.get(node.id) ?? [node.id],
         }))
@@ -1998,9 +2756,10 @@ export function createApiServer(options: ApiServerOptions): Express {
           [assets]
         );
         const byAsset = new Map(agentRows.map((row) => [row.asset, row]));
+        const digestFeedbackCounts = await loadPoolAgentDigestFeedbackCounts(options.pool, assets);
         const ordered = rows.flatMap((row) => {
           const agent = byAsset.get(row.asset);
-          return agent ? [mapPoolAgentToApi(agent)] : [];
+          return agent ? [mapPoolAgentToApi(agent, { feedbackCount: digestFeedbackCounts.get(agent.asset) })] : [];
         });
         res.json(ordered.slice(offset, offset + limit));
         return;
@@ -2042,7 +2801,9 @@ export function createApiServer(options: ApiServerOptions): Express {
 
       const ordered = chain.reverse();
       const out = includeSelf ? ordered : ordered.slice(0, -1);
-      res.json(out.slice(offset, offset + limit).map(mapAgentToApi));
+      const paged = out.slice(offset, offset + limit);
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, paged.map((node) => node.id));
+      res.json(paged.map((node) => mapAgentToApi(node, { feedbackCount: digestFeedbackCounts.get(node.id) })));
     } catch (error) {
       logger.error({ error }, 'Error fetching agent lineage');
       res.status(500).json({ error: 'Internal server error' });
@@ -3166,7 +3927,8 @@ export function createApiServer(options: ApiServerOptions): Express {
         setContentRange(res, offset, agents.length, totalCount);
       }
 
-      res.json(agents.map(mapAgentToApi));
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, agents.map((agent) => agent.id));
+      res.json(agents.map((agent) => mapAgentToApi(agent, { feedbackCount: digestFeedbackCounts.get(agent.id) })));
     } catch (error) {
       logger.error({ error }, 'Error fetching collection assets');
       res.status(500).json({ error: 'Internal server error' });
@@ -3442,17 +4204,23 @@ export function createApiServer(options: ApiServerOptions): Express {
         };
 
         try {
-          const result = await options.pool.query<GlobalStatsRow>(
-            `SELECT total_agents, total_collections, total_feedbacks, platinum_agents, gold_agents, avg_quality
-             FROM global_stats
-             LIMIT 1`
-          );
+          const query = includeOrphaned
+            ? `SELECT
+                 (SELECT COUNT(*) FROM agents) AS total_agents,
+                 (SELECT COUNT(*) FROM collection_pointers) AS total_collections,
+                 (SELECT COUNT(*) FROM feedbacks) AS total_feedbacks,
+                 (SELECT COUNT(*) FROM agents WHERE trust_tier = 4) AS platinum_agents,
+                 (SELECT COUNT(*) FROM agents WHERE trust_tier = 3) AS gold_agents,
+                 (SELECT ROUND(AVG(quality_score), 0) FROM agents WHERE feedback_count > 0) AS avg_quality`
+            : `SELECT total_agents, total_collections, total_feedbacks, platinum_agents, gold_agents, avg_quality
+               FROM global_stats
+               LIMIT 1`;
+          const result = await options.pool.query<GlobalStatsRow>(query);
           const row = result.rows[0] ?? null;
           res.json([{
             total_agents: parseCount(row?.total_agents),
             total_feedbacks: parseCount(row?.total_feedbacks),
             total_collections: parseCount(row?.total_collections),
-            total_validations: 0,
             platinum_agents: parseCount(row?.platinum_agents),
             gold_agents: parseCount(row?.gold_agents),
             avg_quality: parseNullableNumber(row?.avg_quality),
@@ -3490,7 +4258,6 @@ export function createApiServer(options: ApiServerOptions): Express {
         total_agents: totalAgents,
         total_feedbacks: totalFeedbacks,
         total_collections: totalCollections,
-        total_validations: 0,
         platinum_agents: platinumAgents,
         gold_agents: goldAgents,
         avg_quality: avgQuality,
@@ -3506,11 +4273,26 @@ export function createApiServer(options: ApiServerOptions): Express {
   // GET /rest/v1/stats/verification - Verification status stats
   app.get('/rest/v1/stats/verification', async (_req: Request, res: Response) => {
     try {
-      const toStatusMap = (groups: { _count: number; status?: string; chainStatus?: string }[]) => {
+      const extractGroupCount = (value: unknown): number => {
+        if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+        if (!value || typeof value !== 'object') return 0;
+        const record = value as Record<string, unknown>;
+        if (typeof record._all === 'number' && Number.isFinite(record._all)) {
+          return record._all;
+        }
+        for (const candidate of Object.values(record)) {
+          if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return candidate;
+          }
+        }
+        return 0;
+      };
+
+      const toStatusMap = (groups: { _count: unknown; status?: string; chainStatus?: string }[]) => {
         const result: Record<string, number> = { PENDING: 0, FINALIZED: 0, ORPHANED: 0 };
         for (const g of groups) {
           const status = g.status || g.chainStatus || 'PENDING';
-          result[status] = g._count;
+          result[status] = extractGroupCount(g._count);
         }
         return result;
       };
@@ -3527,9 +4309,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           finalized_count: string | number | null;
           orphaned_count: string | number | null;
         };
-        const grouped = await options.pool.query<VerificationStatRow>(
-          `SELECT model, pending_count, finalized_count, orphaned_count FROM verification_stats`
-        );
+        const grouped = await options.pool.query<VerificationStatRow>(VERIFICATION_STATS_SQL);
 
         const parseCount = (value: string | number | null | undefined): number => {
           if (value === null || value === undefined) return 0;
@@ -3543,6 +4323,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           feedbacks: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+          validations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           feedback_responses: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
           revocations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         };
@@ -3562,27 +4343,43 @@ export function createApiServer(options: ApiServerOptions): Express {
           feedbacks: statusMaps.feedbacks,
           registries: statusMaps.registries,
           metadata: statusMaps.metadata,
+          validations: statusMaps.validations,
           feedback_responses: statusMaps.feedback_responses,
           revocations: statusMaps.revocations,
         });
         return;
       }
 
-      const [agents, feedbacks, registries, metadata, responses, revocations] = await Promise.all([
+      const [agents, feedbacks, registries, metadata, validations, responses, revocations, orphanFeedbackCount, orphanResponseCount] = await Promise.all([
         prisma.agent.groupBy({ by: ['status'], _count: true }),
         prisma.feedback.groupBy({ by: ['status'], _count: true }),
         prisma.registry.groupBy({ by: ['status'], _count: true }),
         prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
+        typeof (prisma as any).validation?.groupBy === 'function'
+          ? (prisma as any).validation.groupBy({ by: ['chainStatus'], _count: true })
+          : Promise.resolve([]),
         prisma.feedbackResponse.groupBy({ by: ['status'], _count: true }),
         prisma.revocation.groupBy({ by: ['status'], _count: true }),
+        typeof (prisma as any).orphanFeedback?.count === 'function'
+          ? (prisma as any).orphanFeedback.count()
+          : Promise.resolve(0),
+        typeof (prisma as any).orphanResponse?.count === 'function'
+          ? (prisma as any).orphanResponse.count()
+          : Promise.resolve(0),
       ]);
+
+      const feedbackStatuses = toStatusMap(feedbacks);
+      feedbackStatuses.ORPHANED += orphanFeedbackCount;
+      const responseStatuses = toStatusMap(responses);
+      responseStatuses.ORPHANED += orphanResponseCount;
 
       res.json({
         agents: toStatusMap(agents),
-        feedbacks: toStatusMap(feedbacks),
+        feedbacks: feedbackStatuses,
         registries: toStatusMap(registries),
         metadata: toStatusMap(metadata),
-        feedback_responses: toStatusMap(responses),
+        validations: toStatusMap(validations),
+        feedback_responses: responseStatuses,
         revocations: toStatusMap(revocations),
       });
     } catch (error) {
@@ -3777,7 +4574,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           asset: row.asset,
           owner: row.owner,
           collection: row.collection,
-          nft_name: row.nft_name,
+          nft_name: normalizeNullableText(row.nft_name),
           agent_uri: row.agent_uri,
           feedback_count: numericValue(row.feedback_count) ?? 0,
           avg_score: roundNullableScore(row.avg_score),
@@ -3850,7 +4647,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         asset: agent.id,
         owner: agent.owner,
         collection: agent.collection,
-        nft_name: agent.nftName,
+        nft_name: normalizeNullableText(agent.nftName),
         agent_uri: agent.uri,
         feedback_count: feedbackCount,
         avg_score: resolveAverageScore(feedbackCount, feedbackAgg._avg.score, agent.rawAvgScore),
@@ -3883,38 +4680,100 @@ export function createApiServer(options: ApiServerOptions): Express {
         return res.json(cached.slice(0, limit));
       }
 
-      const agents = await prisma.agent.findMany({
-        where: {
-          trustTier: { gte: 2 },
-          ...(collection ? { collection } : {}),
-          ...(includeOrphaned ? {} : { status: { not: 'ORPHANED' } }),
-        },
-        select: {
-          id: true,
-          owner: true,
-          collection: true,
-          nftName: true,
-          uri: true,
-          trustTier: true,
-          qualityScore: true,
-          confidence: true,
-          riskScore: true,
-          diversityRatio: true,
-          feedbackCount: true,
-        },
-      });
+      let withScores: LeaderboardEntry[];
+      if (prisma) {
+        const agents = await prisma.agent.findMany({
+          where: {
+            trustTier: { gte: 2 },
+            ...(collection ? { collection } : {}),
+            ...(includeOrphaned ? {} : { status: { not: 'ORPHANED' } }),
+          },
+          select: {
+            id: true,
+            owner: true,
+            collection: true,
+            nftName: true,
+            uri: true,
+            trustTier: true,
+            qualityScore: true,
+            confidence: true,
+            riskScore: true,
+            diversityRatio: true,
+            feedbackCount: true,
+          },
+        });
 
-      const withScores = agents
-        .map(mapAgentToLeaderboardEntry)
-        .sort((a, b) => {
-          const aKey = BigInt(a.sort_key);
-          const bKey = BigInt(b.sort_key);
-          if (aKey === bKey) {
-            return a.asset.localeCompare(b.asset);
-          }
-          return aKey > bKey ? -1 : 1;
-        })
-        .slice(0, LEADERBOARD_POOL_SIZE);
+        const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, agents.map((agent) => agent.id));
+        withScores = agents
+          .map((agent) => mapAgentToLeaderboardEntry({
+            ...agent,
+            feedbackCount: resolveAgentFeedbackCount(agent.feedbackCount, digestFeedbackCounts.get(agent.id)) ?? agent.feedbackCount,
+          }))
+          .sort((a, b) => {
+            const aKey = BigInt(a.sort_key);
+            const bKey = BigInt(b.sort_key);
+            if (aKey === bKey) {
+              return a.asset.localeCompare(b.asset);
+            }
+            return aKey > bKey ? -1 : 1;
+          })
+          .slice(0, LEADERBOARD_POOL_SIZE);
+      } else if (options.pool) {
+        const collectionParam = collection ? collectionPointerVariants(collection) : null;
+        const { rows } = await options.pool.query<{
+          asset: string;
+          owner: string;
+          collection: string | null;
+          nft_name: string | null;
+          agent_uri: string | null;
+          trust_tier: string | number | null;
+          quality_score: string | number | null;
+          confidence: string | number | null;
+          risk_score: string | number | null;
+          diversity_ratio: string | number | null;
+          feedback_count: string | number | null;
+          sort_key: string | number;
+        }>(
+          `SELECT
+             asset,
+             owner,
+             collection,
+             nft_name,
+             agent_uri,
+             trust_tier,
+             quality_score,
+             confidence,
+             risk_score,
+             diversity_ratio,
+             feedback_count,
+             sort_key
+           FROM agents
+           WHERE trust_tier >= 2
+             AND ($1::boolean OR status != 'ORPHANED')
+             AND ($2::text[] IS NULL OR collection = ANY($2::text[]))
+           ORDER BY sort_key DESC, asset ASC
+           LIMIT $3::int`,
+          [includeOrphaned, collectionParam, LEADERBOARD_POOL_SIZE],
+        );
+        const digestFeedbackCounts = await loadPoolAgentDigestFeedbackCounts(options.pool, rows.map((row) => row.asset));
+        withScores = rows.map((row) => ({
+          asset: row.asset,
+          owner: row.owner,
+          collection: row.collection,
+          nft_name: normalizeNullableText(row.nft_name),
+          agent_uri: row.agent_uri,
+          trust_tier: numericValue(row.trust_tier) ?? 0,
+          quality_score: numericValue(row.quality_score) ?? 0,
+          confidence: numericValue(row.confidence) ?? 0,
+          risk_score: numericValue(row.risk_score) ?? 0,
+          diversity_ratio: numericValue(row.diversity_ratio) ?? 0,
+          feedback_count: resolveAgentFeedbackCount(row.feedback_count, digestFeedbackCounts.get(row.asset)) ?? 0,
+          sort_key: String(row.sort_key),
+        }));
+      } else {
+        res.status(503).json({ error: 'leaderboard requires local Prisma backend or PostgreSQL pool' });
+        return;
+      }
 
       // Update LRU cache (TTL + max size handled automatically)
       leaderboardCache.set(cacheKey, withScores);
@@ -3937,6 +4796,7 @@ export function createApiServer(options: ApiServerOptions): Express {
       const collection = typeof body.p_collection === 'string' && body.p_collection.trim().length > 0
         ? body.p_collection.trim()
         : null;
+      const includeOrphaned = body.p_include_orphaned === true || body.p_include_orphaned === 'true';
       const cursorSortKey = typeof body.p_cursor_sort_key === 'string' && body.p_cursor_sort_key.trim().length > 0
         ? BigInt(body.p_cursor_sort_key)
         : body.p_cursor_sort_key === null || body.p_cursor_sort_key === undefined
@@ -3985,13 +4845,15 @@ export function createApiServer(options: ApiServerOptions): Express {
            FROM agents a
            WHERE a.trust_tier >= $1
              AND ($2::text IS NULL OR a.collection = $2)
-             AND ($3::bigint IS NULL OR a.sort_key < $3)
+             AND ($3::boolean OR a.status != 'ORPHANED')
+             AND ($4::bigint IS NULL OR a.sort_key < $4)
            ORDER BY a.sort_key DESC, a.asset ASC
-           LIMIT $4`,
-          [minTier, collection, cursorSortKey?.toString() ?? null, limit]
+           LIMIT $5`,
+          [minTier, collection, includeOrphaned, cursorSortKey?.toString() ?? null, limit]
         );
 
-        res.json(rows.rows.map(mapPoolAgentToApi));
+        const digestFeedbackCounts = await loadPoolAgentDigestFeedbackCounts(options.pool, rows.rows.map((row) => row.asset));
+        res.json(rows.rows.map((row) => mapPoolAgentToApi(row, { feedbackCount: digestFeedbackCounts.get(row.asset) })));
         return;
       }
 
@@ -3999,6 +4861,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         where: {
           trustTier: { gte: minTier },
           ...(collection ? { collection } : {}),
+          ...(includeOrphaned ? {} : { status: { not: 'ORPHANED' } }),
         },
         select: {
           id: true,
@@ -4034,9 +4897,10 @@ export function createApiServer(options: ApiServerOptions): Express {
         },
       });
 
+      const digestFeedbackCounts = await loadLocalAgentDigestFeedbackCounts(prisma, agents.map((agent) => agent.id));
       const rows: LocalLeaderboardRow[] = agents
         .map((agent) => ({
-          ...mapAgentToApi(agent),
+          ...mapAgentToApi(agent, { feedbackCount: digestFeedbackCounts.get(agent.id) }),
           sort_key: computeLocalSortKey(agent),
         }) as LocalLeaderboardRow)
         .filter((agent) => cursorSortKey === null || BigInt(String(agent.sort_key)) < cursorSortKey)
@@ -4165,7 +5029,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           asset: row.asset,
           owner: row.owner,
           collection: row.collection,
-          nft_name: row.nft_name,
+          nft_name: normalizeNullableText(row.nft_name),
           agent_uri: row.agent_uri,
           feedback_count: numericValue(row.feedback_count) ?? 0,
           avg_score: roundNullableScore(row.avg_score),
@@ -4278,7 +5142,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           asset: agent.id,
           owner: agent.owner,
           collection: agent.collection,
-          nft_name: agent.nftName,
+          nft_name: normalizeNullableText(agent.nftName),
           agent_uri: agent.uri,
           feedback_count: feedbackCount,
           avg_score: feedback?.avg_score ?? resolveAverageScore(feedbackCount, null, agent.rawAvgScore),
@@ -4303,15 +5167,14 @@ export function createApiServer(options: ApiServerOptions): Express {
       const offset = safePaginationOffset(req.query.offset);
       const chainTypeRaw = safeQueryString(req.query.chainType);
       const chainType = isReplayChainType(chainTypeRaw) ? chainTypeRaw : undefined;
+      if (chainTypeRaw && !chainType) {
+        res.json([]);
+        return;
+      }
 
       if (!prisma) {
         if (!options.pool) {
           res.status(503).json({ error: 'Checkpoint endpoints unavailable without supported database backend' });
-          return;
-        }
-
-        if (chainTypeRaw && !chainType) {
-          res.json([]);
           return;
         }
 
@@ -4328,22 +5191,14 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
 
-      const where: Prisma.HashChainCheckpointWhereInput = { agentId: asset };
-      if (chainType) where.chainType = chainType;
+      const checkpoints = await listCheckpointsFromPrisma(prisma, asset, chainType);
 
-      const checkpoints = await prisma.hashChainCheckpoint.findMany({
-        where,
-        orderBy: { eventCount: 'asc' },
-        take: limit,
-        skip: offset,
-      });
-
-      res.json(checkpoints.map(cp => ({
-        agent_id: cp.agentId,
+      res.json(checkpoints.slice(offset, offset + limit).map(cp => ({
+        agent_id: asset,
         chain_type: cp.chainType,
         event_count: checkpointEventCountToJson(cp.eventCount),
         digest: cp.digest,
-        created_at: cp.createdAt.toISOString(),
+        created_at: cp.createdAt,
       })));
     } catch (error) {
       logger.error({ error }, 'Error fetching checkpoints');
@@ -4379,19 +5234,12 @@ export function createApiServer(options: ApiServerOptions): Express {
         return;
       }
 
-      const [feedback, response, revoke] = await Promise.all(
-        ['feedback', 'response', 'revoke'].map(ct =>
-          prisma.hashChainCheckpoint.findFirst({
-            where: { agentId: asset, chainType: ct },
-            orderBy: { eventCount: 'desc' },
-          })
-        )
-      );
+      const { feedback, response, revoke } = await getLatestCheckpointsFromPrisma(prisma, asset);
 
       const fmt = (cp: typeof feedback) => cp ? {
         event_count: checkpointEventCountToJson(cp.eventCount),
         digest: cp.digest,
-        created_at: cp.createdAt.toISOString(),
+        created_at: cp.createdAt,
       } : null;
 
       res.json({ feedback: fmt(feedback), response: fmt(response), revoke: fmt(revoke) });
@@ -4469,77 +5317,170 @@ export function createApiServer(options: ApiServerOptions): Express {
       if (chainType === 'feedback') {
         const where: Prisma.FeedbackWhereInput = {
           agentId: asset,
-          status: { not: 'ORPHANED' },
           feedbackIndex: { gte: BigInt(fromCount) },
         };
         if (toCount !== undefined) {
           where.feedbackIndex = { gte: BigInt(fromCount), lt: BigInt(toCount) };
         }
 
-        const events = await prisma.feedback.findMany({
-          where,
-          orderBy: { feedbackIndex: 'asc' },
-          take: limit,
-        });
+        const fetchTake = limit + 1;
+        const [events, orphanEvents] = await Promise.all([
+          prisma.feedback.findMany({
+            where,
+            orderBy: { feedbackIndex: 'asc' },
+            take: fetchTake,
+          }),
+          typeof (prisma as any).orphanFeedback?.findMany === 'function'
+            ? (prisma as any).orphanFeedback.findMany({
+                where: {
+                  agentId: asset,
+                  feedbackIndex: toCount !== undefined
+                    ? { gte: BigInt(fromCount), lt: BigInt(toCount) }
+                    : { gte: BigInt(fromCount) },
+                },
+                orderBy: { feedbackIndex: 'asc' },
+                take: fetchTake,
+              })
+            : Promise.resolve([]),
+        ]);
+
+        const combined = [
+          ...events.map((f) => ({
+            order: {
+              count: BigInt(f.feedbackIndex),
+              slot: f.createdSlot ?? null,
+              txIndex: f.txIndex ?? null,
+              eventOrdinal: f.eventOrdinal ?? null,
+              signature: f.createdTxSignature ?? null,
+              rowId: f.id,
+            },
+            payload: {
+              asset: f.agentId,
+              client: f.client,
+              feedback_index: f.feedbackIndex.toString(),
+              feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
+              slot: f.createdSlot ? Number(f.createdSlot) : 0,
+              running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
+            },
+          })),
+          ...orphanEvents.map((f: any) => ({
+            order: {
+              count: BigInt(f.feedbackIndex),
+              slot: f.slot ?? null,
+              txIndex: f.txIndex ?? null,
+              eventOrdinal: f.eventOrdinal ?? null,
+              signature: f.txSignature ?? null,
+              rowId: f.id,
+            },
+            payload: {
+              asset: f.agentId,
+              client: f.client,
+              feedback_index: f.feedbackIndex.toString(),
+              feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
+              slot: f.slot ? Number(f.slot) : 0,
+              running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
+            },
+          })),
+        ].sort((left, right) => compareReplayEventOrder(left.order, right.order));
+        const limited = combined.slice(0, limit);
 
         res.json({
-          events: events.map(f => ({
-            asset: f.agentId,
-            client: f.client,
-            feedback_index: f.feedbackIndex.toString(),
-            feedback_hash: f.feedbackHash ? Buffer.from(f.feedbackHash).toString('hex') : null,
-            slot: f.createdSlot ? Number(f.createdSlot) : 0,
-            running_digest: f.runningDigest ? Buffer.from(f.runningDigest).toString('hex') : null,
-          })),
-          hasMore: events.length === limit,
-          nextFromCount: events.length > 0
-            ? Number(events[events.length - 1].feedbackIndex) + 1
+          events: limited.map((entry) => entry.payload),
+          hasMore: combined.length > limit,
+          nextFromCount: limited.length > 0
+            ? Number(limited[limited.length - 1].order.count) + 1
             : fromCount,
         });
       } else if (chainType === 'response') {
         const where: Prisma.FeedbackResponseWhereInput = {
-          status: { not: 'ORPHANED' },
           feedback: {
             agentId: asset,
-            status: { not: 'ORPHANED' },
           },
         };
         const rcFilter: { gte: bigint; lt?: bigint } = { gte: BigInt(fromCount) };
         if (toCount !== undefined) rcFilter.lt = BigInt(toCount);
         where.responseCount = rcFilter;
 
-        const events = await prisma.feedbackResponse.findMany({
-          where,
-          orderBy: { responseCount: 'asc' },
-          take: limit,
-          include: {
-            feedback: {
-              select: { agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
+        const fetchTake = limit + 1;
+        const [events, orphanEvents] = await Promise.all([
+          prisma.feedbackResponse.findMany({
+            where,
+            orderBy: { responseCount: 'asc' },
+            take: fetchTake,
+            include: {
+              feedback: {
+                select: { agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
+              },
             },
-          },
-        });
+          }),
+          typeof (prisma as any).orphanResponse?.findMany === 'function'
+            ? (prisma as any).orphanResponse.findMany({
+                where: {
+                  agentId: asset,
+                  responseCount: rcFilter,
+                },
+                orderBy: { responseCount: 'asc' },
+                take: fetchTake,
+              })
+            : Promise.resolve([]),
+        ]);
+
+        const combined = [
+          ...events.map((r) => ({
+            order: {
+              count: BigInt(r.responseCount ?? 0),
+              slot: r.slot ?? null,
+              txIndex: r.txIndex ?? null,
+              eventOrdinal: r.eventOrdinal ?? null,
+              signature: r.txSignature ?? null,
+              rowId: r.id,
+            },
+            payload: {
+              asset: r.feedback.agentId,
+              client: r.feedback.client,
+              feedback_index: r.feedback.feedbackIndex.toString(),
+              responder: r.responder,
+              response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
+              feedback_hash: r.sealHash ? Buffer.from(r.sealHash).toString('hex') : null,
+              slot: r.slot ? Number(r.slot) : 0,
+              running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+              response_count: r.responseCount != null ? Number(r.responseCount) : null,
+            },
+          })),
+          ...orphanEvents.map((r: any) => ({
+            order: {
+              count: BigInt(r.responseCount ?? 0),
+              slot: r.slot ?? null,
+              txIndex: r.txIndex ?? null,
+              eventOrdinal: r.eventOrdinal ?? null,
+              signature: r.txSignature ?? null,
+              rowId: r.id,
+            },
+            payload: {
+              asset: r.agentId,
+              client: r.client,
+              feedback_index: r.feedbackIndex.toString(),
+              responder: r.responder,
+              response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
+              feedback_hash: r.sealHash ? Buffer.from(r.sealHash).toString('hex') : null,
+              slot: r.slot ? Number(r.slot) : 0,
+              running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
+              response_count: r.responseCount != null ? Number(r.responseCount) : null,
+            },
+          })),
+        ].sort((left, right) => compareReplayEventOrder(left.order, right.order));
+        const limited = combined.slice(0, limit);
 
         res.json({
-          events: events.map(r => ({
-            asset: r.feedback.agentId,
-            client: r.feedback.client,
-            feedback_index: r.feedback.feedbackIndex.toString(),
-            responder: r.responder,
-            response_hash: r.responseHash ? Buffer.from(r.responseHash).toString('hex') : null,
-            feedback_hash: r.feedback.feedbackHash ? Buffer.from(r.feedback.feedbackHash).toString('hex') : null,
-            slot: r.slot ? Number(r.slot) : 0,
-            running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
-            response_count: r.responseCount != null ? Number(r.responseCount) : null,
-          })),
-          hasMore: events.length === limit,
-          nextFromCount: events.length > 0
-            ? Number(events[events.length - 1].responseCount ?? 0) + 1
+          events: limited.map((entry) => entry.payload),
+          hasMore: combined.length > limit,
+          nextFromCount: limited.length > 0
+            ? Number(limited[limited.length - 1].order.count) + 1
             : fromCount,
         });
       } else {
         const where: Prisma.RevocationWhereInput = {
           agentId: asset,
-          status: { not: 'ORPHANED' },
           revokeCount: { gte: BigInt(fromCount) },
         };
         if (toCount !== undefined) {
@@ -4549,11 +5490,11 @@ export function createApiServer(options: ApiServerOptions): Express {
         const events = await prisma.revocation.findMany({
           where,
           orderBy: { revokeCount: 'asc' },
-          take: limit,
+          take: limit + 1,
         });
 
         res.json({
-          events: events.map(r => ({
+          events: events.slice(0, limit).map(r => ({
             asset: r.agentId,
             client: r.client,
             feedback_index: r.feedbackIndex.toString(),
@@ -4562,9 +5503,9 @@ export function createApiServer(options: ApiServerOptions): Express {
             running_digest: r.runningDigest ? Buffer.from(r.runningDigest).toString('hex') : null,
             revoke_count: r.revokeCount.toString(),
           })),
-          hasMore: events.length === limit,
+          hasMore: events.length > limit,
           nextFromCount: events.length > 0
-            ? Number(events[events.length - 1].revokeCount) + 1
+            ? Number(events[Math.min(events.length, limit) - 1].revokeCount) + 1
             : fromCount,
         });
       }

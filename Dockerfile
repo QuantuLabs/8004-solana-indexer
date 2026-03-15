@@ -17,7 +17,7 @@ COPY prisma ./prisma
 RUN npx prisma generate
 COPY . .
 RUN npm run build
-RUN mkdir -p data && DATABASE_URL=file:./data/indexer.db npx prisma db push --skip-generate
+RUN mkdir -p data && DATABASE_URL=file:/app/data/indexer.db npx prisma db push --skip-generate
 RUN npm prune --omit=dev
 
 FROM deps AS test
@@ -39,7 +39,7 @@ LABEL org.opencontainers.image.title="8004 Solana Indexer" \
 WORKDIR /app
 ENV NODE_ENV=production \
     API_PORT=3001 \
-    DATABASE_URL=file:/app/prisma/data/indexer.db
+    DATABASE_URL=file:/app/data/indexer.db
 
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/dist ./dist

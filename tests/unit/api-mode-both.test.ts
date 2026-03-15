@@ -137,6 +137,7 @@ describe("API_MODE=both behavior", () => {
         feedbacks: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         metadata: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
+        validations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         feedback_responses: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
         revocations: { PENDING: 0, FINALIZED: 0, ORPHANED: 0 },
       });
@@ -648,6 +649,19 @@ describe("API_MODE=both behavior", () => {
     process.env.SUPABASE_URL = "https://proxy-test.supabase.co";
     process.env.SUPABASE_KEY = "service-role-key";
     const poolQuery = vi.fn().mockImplementation(async (query: string) => {
+      if (query.includes("SELECT") && query.includes("COUNT(*) FROM agents") && query.includes("COUNT(*) FROM feedbacks")) {
+        return {
+          rows: [{
+            total_agents: "10",
+            total_collections: "3",
+            total_feedbacks: "7",
+            platinum_agents: "1",
+            gold_agents: "2",
+            avg_quality: "84",
+          }],
+        };
+      }
+
       if (query.includes("FROM global_stats")) {
         return {
           rows: [{
@@ -661,13 +675,14 @@ describe("API_MODE=both behavior", () => {
         };
       }
 
-      if (query.includes("FROM verification_stats")) {
+      if (query.includes("FROM orphan_responses") && query.includes("FROM validations")) {
         return {
           rows: [
             { model: "agents", pending_count: "2", finalized_count: "8", orphaned_count: "0" },
             { model: "feedbacks", pending_count: "0", finalized_count: "5", orphaned_count: "0" },
             { model: "collections", pending_count: "0", finalized_count: "0", orphaned_count: "1" },
             { model: "metadata", pending_count: "3", finalized_count: "0", orphaned_count: "0" },
+            { model: "validations", pending_count: "6", finalized_count: "7", orphaned_count: "8" },
             { model: "feedback_responses", pending_count: "0", finalized_count: "4", orphaned_count: "0" },
             { model: "revocations", pending_count: "9", finalized_count: "9", orphaned_count: "9" },
           ],
@@ -759,6 +774,15 @@ describe("API_MODE=both behavior", () => {
         };
       }
 
+      if (query.includes("FROM agent_digest_cache")) {
+        return {
+          rows: [{
+            agent_id: "ProxyAgent11111111111111111111111111111111",
+            feedback_count: "5",
+          }],
+        };
+      }
+
       return { rows: [] };
     });
     const realFetch = globalThis.fetch;
@@ -810,7 +834,11 @@ describe("API_MODE=both behavior", () => {
 
       if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/")) {
         return new Response(
-          JSON.stringify([{ asset: "ProxyAgent11111111111111111111111111111111" }]),
+          JSON.stringify([{
+            asset: "ProxyAgent11111111111111111111111111111111",
+            nft_name: "",
+            feedback_count: "3",
+          }]),
           {
             status: 200,
             headers: {
@@ -838,7 +866,11 @@ describe("API_MODE=both behavior", () => {
       });
       expect(restRes.status).toBe(200);
       expect(restRes.headers.get("content-range")).toBe("items 0-0/1");
-      expect(await restRes.json()).toEqual([{ asset: "ProxyAgent11111111111111111111111111111111" }]);
+      await expect(restRes.json()).resolves.toEqual([{
+        asset: "ProxyAgent11111111111111111111111111111111",
+        nft_name: null,
+        feedback_count: 5,
+      }]);
 
       const pointerAliasRes = await fetch(
         `${baseUrl}/rest/v1/agents?limit=1&select=asset,canonical_col&includeOrphaned=true`
@@ -849,6 +881,8 @@ describe("API_MODE=both behavior", () => {
         asset: "ProxyAgent11111111111111111111111111111111",
         canonical_col: "c1:proxy",
         collection_pointer: "c1:proxy",
+        feedback_count: 5,
+        nft_name: null,
       }]);
 
       const upstreamCall = fetchSpy.mock.calls.find(([input]) => {
@@ -1315,7 +1349,6 @@ describe("API_MODE=both behavior", () => {
         total_agents: 10,
         total_feedbacks: 7,
         total_collections: 3,
-        total_validations: 0,
         platinum_agents: 1,
         gold_agents: 2,
         avg_quality: 84,
@@ -1341,7 +1374,6 @@ describe("API_MODE=both behavior", () => {
         total_agents: 10,
         total_feedbacks: 7,
         total_collections: 3,
-        total_validations: 0,
         platinum_agents: 1,
         gold_agents: 2,
         avg_quality: 84,
@@ -1357,6 +1389,9 @@ describe("API_MODE=both behavior", () => {
       expect(statsIncludeOrphanedUpstreamCall).toBeUndefined();
       expect(poolQuery.mock.calls.slice(statsIncludeOrphanedPoolCallStart).find(([query]) =>
         typeof query === "string" && query.includes("FROM global_stats")
+      )).toBeUndefined();
+      expect(poolQuery.mock.calls.slice(statsIncludeOrphanedPoolCallStart).find(([query]) =>
+        typeof query === "string" && query.includes("COUNT(*) FROM agents") && query.includes("COUNT(*) FROM feedbacks")
       )).toBeTruthy();
 
       const verificationCallStart = fetchSpy.mock.calls.length;
@@ -1368,6 +1403,7 @@ describe("API_MODE=both behavior", () => {
         feedbacks: { PENDING: 0, FINALIZED: 5, ORPHANED: 0 },
         registries: { PENDING: 0, FINALIZED: 0, ORPHANED: 1 },
         metadata: { PENDING: 3, FINALIZED: 0, ORPHANED: 0 },
+        validations: { PENDING: 6, FINALIZED: 7, ORPHANED: 8 },
         feedback_responses: { PENDING: 0, FINALIZED: 4, ORPHANED: 0 },
         revocations: { PENDING: 9, FINALIZED: 9, ORPHANED: 9 },
       });
@@ -1382,7 +1418,8 @@ describe("API_MODE=both behavior", () => {
       expect(verificationProxyCall).toBeUndefined();
       const verificationPoolCall = poolQuery.mock.calls.slice(verificationPoolCallStart).find(([query]) =>
         typeof query === "string"
-          && query.includes("FROM verification_stats")
+          && query.includes("FROM orphan_responses")
+          && query.includes("FROM validations")
       );
       expect(verificationPoolCall).toBeTruthy();
       const verificationSlashCallStart = fetchSpy.mock.calls.length;
@@ -1465,7 +1502,11 @@ describe("API_MODE=both behavior", () => {
         `${baseUrl}/rest/v1/collection_assets?collection=eq.Collection11111111111111111111111111111111&creator=eq.${creator}&limit=1`
       );
       expect(collectionAssetsRes.status).toBe(200);
-      expect(await collectionAssetsRes.json()).toEqual([{ asset: "ProxyAgent11111111111111111111111111111111" }]);
+      await expect(collectionAssetsRes.json()).resolves.toEqual([{
+        asset: "ProxyAgent11111111111111111111111111111111",
+        feedback_count: "3",
+        nft_name: "",
+      }]);
 
       const collectionCountStatusCallStart = fetchSpy.mock.calls.length;
       const collectionCountStatusRes = await fetch(
@@ -1517,28 +1558,22 @@ describe("API_MODE=both behavior", () => {
       const collectionAssetsStatusUrl = new URL(collectionAssetsStatusUrlRaw as string);
       expect(collectionAssetsStatusUrl.searchParams.get("status")).toBe("neq.ORPHANED");
 
-      const collectionCompatUpstreamCall = fetchSpy.mock.calls.find(([input]) => {
+      const collectionsCallStart = fetchSpy.mock.calls.length;
+      const collectionsRes = await fetch(
+        `${baseUrl}/rest/v1/collections?collection=eq.Collection11111111111111111111111111111111&limit=1`
+      );
+      expect(collectionsRes.status).toBe(200);
+      const collectionCompatUpstreamCall = fetchSpy.mock.calls.slice(collectionsCallStart).find(([input]) => {
         const url = typeof input === "string"
           ? input
           : input instanceof URL
             ? input.toString()
             : input?.url;
         return typeof url === "string"
-          && url.startsWith("https://proxy-test.supabase.co/rest/v1/agents?")
-          && url.includes("canonical_col=eq.Collection11111111111111111111111111111111");
+          && url.startsWith("https://proxy-test.supabase.co/rest/v1/collections?")
+          && url.includes("collection=eq.Collection11111111111111111111111111111111");
       });
-      expect(collectionCompatUpstreamCall).toBeTruthy();
-
-      const directCollectionCompatProxyCall = fetchSpy.mock.calls.find(([input]) => {
-        const url = typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input?.url;
-        return typeof url === "string"
-          && url.startsWith("https://proxy-test.supabase.co/rest/v1/collection_asset_count");
-      });
-      expect(directCollectionCompatProxyCall).toBeUndefined();
+      expect(collectionCompatUpstreamCall).toBeUndefined();
 
       const collectionStatsCallStart = fetchSpy.mock.calls.length;
       const collectionStatsRes = await fetch(
@@ -1557,7 +1592,6 @@ describe("API_MODE=both behavior", () => {
       expect(collectionStatsUpstreamCall).toBeUndefined();
 
       const agentReputationCallStart = fetchSpy.mock.calls.length;
-      const agentReputationPoolCallStart = poolQuery.mock.calls.length;
       const agentReputationRes = await fetch(
         `${baseUrl}/rest/v1/agent_reputation?asset=eq.ProxyAgent11111111111111111111111111111111`
       );
@@ -1584,9 +1618,10 @@ describe("API_MODE=both behavior", () => {
           && url.startsWith("https://proxy-test.supabase.co/rest/v1/agent_reputation?");
       });
       expect(agentReputationUpstreamCall).toBeUndefined();
-      expect(poolQuery.mock.calls.slice(agentReputationPoolCallStart).find(([query]) =>
+      const agentReputationPoolCall = poolQuery.mock.calls.slice(statsPoolCallStart).find(([query]) =>
         typeof query === "string" && query.includes("WHERE a.asset = $1")
-      )).toBeTruthy();
+      );
+      expect(agentReputationPoolCall).toBeTruthy();
 
       const collectionAgentsCallStart = fetchSpy.mock.calls.length;
       const collectionAgentsPoolCallStart = poolQuery.mock.calls.length;
@@ -1635,7 +1670,7 @@ describe("API_MODE=both behavior", () => {
           collection: "Collection11111111111111111111111111111111",
           collection_pointer: "c1:proxy",
           trust_tier: 3,
-          feedback_count: 3,
+          feedback_count: 5,
           sort_key: "3008601739624372",
         }),
       ]);
@@ -1653,6 +1688,12 @@ describe("API_MODE=both behavior", () => {
       expect(leaderboardRpcUpstreamCall).toBeUndefined();
       expect(poolQuery.mock.calls.slice(leaderboardRpcPoolCallStart).find(([query]) =>
         typeof query === "string" && query.includes("ORDER BY a.sort_key DESC, a.asset ASC")
+      )).toBeTruthy();
+      expect(poolQuery.mock.calls.slice(leaderboardRpcPoolCallStart).find(([query, params]) =>
+        typeof query === "string"
+          && query.includes("a.status != 'ORPHANED'")
+          && Array.isArray(params)
+          && params[2] === false
       )).toBeTruthy();
 
       const writeAttempt = await fetch(`${baseUrl}/rest/v1/agents`, {
@@ -1756,7 +1797,7 @@ describe("API_MODE=both behavior", () => {
       return realFetch(input, init);
     });
     const poolQuery = vi.fn(async (sql: string) => {
-      if (sql.includes("FROM feedbacks") && sql.includes("feedback_index >= $2::bigint")) {
+      if (sql.includes("FROM feedbacks") && sql.includes("FROM orphan_feedbacks") && sql.includes("feedback_index)::bigint >= $2::bigint")) {
         return {
           rows: [{
             client: "Client111111111111111111111111111111111",
@@ -1822,12 +1863,12 @@ describe("API_MODE=both behavior", () => {
       return realFetch(input, init);
     });
     const poolQuery = vi.fn(async (sql: string) => {
-      if (sql.includes("FROM feedbacks") && sql.includes("ORDER BY feedback_index ASC")) {
+      if (sql.includes("FROM feedbacks") && sql.includes("FROM orphan_feedbacks") && sql.includes("ORDER BY (event_count)::bigint ASC")) {
         return {
           rows: [{ event_count: "1000", digest: "11".repeat(32), created_at: new Date("2026-03-09T10:00:00.000Z") }],
         };
       }
-      if (sql.includes("FROM feedback_responses") && sql.includes("ORDER BY response_count ASC")) {
+      if (sql.includes("FROM feedback_responses") && sql.includes("FROM orphan_responses") && sql.includes("ORDER BY (event_count)::bigint ASC")) {
         return {
           rows: [{ event_count: "1000", digest: "22".repeat(32), created_at: new Date("2026-03-09T10:01:00.000Z") }],
         };
@@ -2269,6 +2310,145 @@ describe("API_MODE=both behavior", () => {
     }
   });
 
+  it("serves the real /rest/v1/leaderboard route locally in proxy mode", async () => {
+    process.env.POSTGREST_URL = "https://proxy-test.supabase.co";
+    process.env.POSTGREST_TOKEN = "alias-service-role-key";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/leaderboard")) {
+        return new Response(
+          JSON.stringify([{ asset: "ProxyLeaderboardAgent111111111111111111111111111" }]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "content-range": "items 0-0/1",
+            },
+          }
+        );
+      }
+
+      return realFetch(input, init);
+    });
+
+    const poolQuery = vi.fn(async () => ({
+      rows: [{
+        asset: "LocalLeaderboardAgent111111111111111111111111111",
+        owner: "LocalOwner11111111111111111111111111111111111",
+        collection: "Collection11111111111111111111111111111111",
+        nft_name: "Local Agent",
+        agent_uri: "https://example.com/local-agent.json",
+        trust_tier: 3,
+        quality_score: 80,
+        confidence: 90,
+        risk_score: 5,
+        diversity_ratio: 12,
+        feedback_count: "7",
+        sort_key: "3008601739624372",
+      }],
+    }));
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: poolQuery } as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/leaderboard?limit=1`);
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual([
+        expect.objectContaining({
+          asset: "LocalLeaderboardAgent111111111111111111111111111",
+          feedback_count: 7,
+        }),
+      ]);
+
+      const upstreamCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/leaderboard?");
+      });
+      expect(upstreamCall).toBeUndefined();
+      expect(poolQuery).toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it("serves /rest/v1/leaderboard locally in proxy mode when includeOrphaned=true", async () => {
+    process.env.POSTGREST_URL = "https://proxy-test.supabase.co";
+    process.env.POSTGREST_TOKEN = "alias-service-role-key";
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any, init?: any) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input?.url;
+
+      if (typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/leaderboard")) {
+        return new Response(JSON.stringify([{ asset: "unexpected-upstream" }]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      return realFetch(input, init);
+    });
+
+    const poolQuery = vi.fn(async () => ({
+      rows: [{
+        asset: "PoolLeaderboardAgent1111111111111111111111111111",
+        owner: "PoolOwner111111111111111111111111111111111111",
+        collection: "Collection11111111111111111111111111111111",
+        nft_name: "Pool Agent",
+        agent_uri: "https://example.com/pool-agent.json",
+        trust_tier: 3,
+        quality_score: 80,
+        confidence: 90,
+        risk_score: 5,
+        diversity_ratio: 12,
+        feedback_count: 3,
+        sort_key: "3008601739624372",
+      }],
+    }));
+
+    const { server, baseUrl } = await startServer({
+      prisma: null as any,
+      pool: { query: poolQuery } as any,
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/rest/v1/leaderboard?includeOrphaned=true&limit=1`);
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual([
+        expect.objectContaining({ asset: "PoolLeaderboardAgent1111111111111111111111111111" }),
+      ]);
+
+      const upstreamCall = fetchSpy.mock.calls.find(([input]) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input?.url;
+        return typeof url === "string" && url.startsWith("https://proxy-test.supabase.co/leaderboard");
+      });
+      expect(upstreamCall).toBeUndefined();
+      expect(poolQuery).toHaveBeenCalled();
+    } finally {
+      await stopServer(server);
+    }
+  });
+
   it("falls back to derived stats when /global_stats relation is missing in REST proxy mode", async () => {
     process.env.POSTGREST_URL = "https://proxy-test.supabase.co";
     process.env.POSTGREST_TOKEN = "alias-service-role-key";
@@ -2335,7 +2515,6 @@ describe("API_MODE=both behavior", () => {
         total_agents: 10,
         total_feedbacks: 7,
         total_collections: 3,
-        total_validations: 0,
         platinum_agents: 0,
         gold_agents: 0,
         avg_quality: null,
@@ -2415,18 +2594,6 @@ describe("API_MODE=both behavior", () => {
       );
       expect(collectionCountUrl.searchParams.get("registry_type")).toBeNull();
       expect(collectionCountUrl.searchParams.get("status")).toBeNull();
-
-      const validationCountCall = fetchSpy.mock.calls.find(([input]) => {
-        const url = typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : input?.url;
-        if (typeof url !== "string") return false;
-        const parsed = new URL(url);
-        return parsed.pathname === "/validations" && parsed.searchParams.get("select") === "id";
-      });
-      expect(validationCountCall).toBeUndefined();
 
       await waitForGraphqlMount(baseUrl);
       const gqlRes = await fetch(`${baseUrl}/v2/graphql`, {

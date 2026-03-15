@@ -28,5 +28,7 @@ services:
         "tests/unit/indexer/metadata-queue.test.ts",
         "tests/unit/indexer/processor.test.ts",
         "tests/unit/indexer/collection-metadata-queue.test.ts",
-        "tests/unit/api-parity-both.test.ts"
+        "tests/unit/api-parity-both.test.ts",
+        "tests/unit/api-mode-both.test.ts",
+        "tests/unit/index-entry.test.ts"
       ]

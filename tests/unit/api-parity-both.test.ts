@@ -66,6 +66,20 @@ function toUnixSeconds(value: string | Date): string {
   return String(Math.floor(ms / 1000));
 }
 
+function toCanonicalFeedbackId(asset: string, clientAddress: string, feedbackIndex: string | number | bigint): string {
+  return `${asset}:${clientAddress}:${feedbackIndex.toString()}`;
+}
+
+function toCanonicalResponseId(
+  asset: string,
+  clientAddress: string,
+  feedbackIndex: string | number | bigint,
+  responder: string,
+  txSignature: string,
+): string {
+  return `${asset}:${clientAddress}:${feedbackIndex.toString()}:${responder}:${txSignature}`;
+}
+
 function makePrismaStub() {
   return {
     agent: {
@@ -491,7 +505,7 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       }));
 
       const restFeedbacksCanonical = (restFeedbacksBody as Array<Record<string, any>>).map((row) => ({
-        id: row.id,
+        id: toCanonicalFeedbackId(ACTIVE_FEEDBACK.asset, row.client_address, row.feedback_index),
         clientAddress: row.client_address,
         feedbackIndex: row.feedback_index,
         value: row.value,
@@ -527,7 +541,13 @@ describe("REST/GraphQL parity in API_MODE=both", () => {
       });
 
       const restResponsesCanonical = (restResponsesBody as Array<Record<string, any>>).map((row) => ({
-        id: row.id,
+        id: toCanonicalResponseId(
+          ACTIVE_FEEDBACK.asset,
+          ACTIVE_FEEDBACK.clientAddress,
+          ACTIVE_FEEDBACK.feedbackIndex,
+          row.responder,
+          row.tx_signature,
+        ),
         responder: row.responder,
         responseUri: row.response_uri,
         responseHash: row.response_hash,

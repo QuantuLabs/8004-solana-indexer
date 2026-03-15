@@ -17,6 +17,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PublicKey } from "@solana/web3.js";
+import { config } from "../../../src/config.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
   createMockConnection,
@@ -42,7 +43,9 @@ vi.mock("../../../src/indexer/metadata-queue.js", () => ({
 vi.mock("../../../src/db/supabase.js", () => ({
   loadIndexerState: vi.fn().mockResolvedValue({ lastSignature: null, lastSlot: null }),
   saveIndexerState: vi.fn().mockResolvedValue(undefined),
-  getPool: vi.fn().mockReturnValue({}),
+  getPool: vi.fn().mockReturnValue({
+    query: vi.fn().mockResolvedValue({ rows: [] }),
+  }),
 }));
 
 // Mock handlers
@@ -53,13 +56,13 @@ vi.mock("../../../src/db/handlers.js", () => ({
 }));
 
 import { Poller } from "../../../src/indexer/poller.js";
-import { loadIndexerState, saveIndexerState } from "../../../src/db/supabase.js";
+import { BatchRpcBackoffRequiredError } from "../../../src/indexer/batch-processor.js";
+import { loadIndexerState, saveIndexerState, getPool } from "../../../src/db/supabase.js";
 import {
   handleEventAtomic,
   suspendLocalDerivedDigests,
   resumeLocalDerivedDigests,
 } from "../../../src/db/handlers.js";
-import { config } from "../../../src/config.js";
 import * as decoder from "../../../src/parser/decoder.js";
 
 /**
@@ -252,6 +255,20 @@ describe("Poller Coverage", () => {
   });
 
   describe("supabase mode (null prisma)", () => {
+    it("should surface loadIndexerState failures in supabase mode", async () => {
+      vi.mocked(loadIndexerState).mockRejectedValueOnce(new Error("supabase load failed"));
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      await expect((poller as any).loadState()).rejects.toThrow("supabase load failed");
+    });
+
     it("should load state from supabase when prisma is null", async () => {
       vi.mocked(loadIndexerState).mockResolvedValue({
         lastSignature: "supabase-sig-123",
@@ -316,6 +333,7 @@ describe("Poller Coverage", () => {
       });
 
       const backfillSpy = vi.spyOn(poller as any, "backfill");
+      const historicalCatchupSpy = vi.spyOn(poller as any, "catchUpHistoricalGap").mockResolvedValue(true);
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
 
       await poller.start();
@@ -330,6 +348,7 @@ describe("Poller Coverage", () => {
         expect.any(Date)
       );
       expect(backfillSpy).not.toHaveBeenCalled();
+      expect(historicalCatchupSpy).toHaveBeenCalledTimes(1);
     });
 
     it("should reject mismatched env bootstrap signature and slot", async () => {
@@ -433,6 +452,22 @@ describe("Poller Coverage", () => {
         expect.any(Date)
       );
     });
+
+    it("should surface saveIndexerState failures in supabase mode", async () => {
+      vi.mocked(saveIndexerState).mockRejectedValueOnce(new Error("supabase save failed"));
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+
+      await expect(
+        (poller as any).saveState("test-sig", 500n, undefined)
+      ).rejects.toThrow("supabase save failed");
+    });
   });
 
   describe("backfill", () => {
@@ -472,7 +507,7 @@ describe("Poller Coverage", () => {
       expect(mockConnection.getSignaturesForAddress).toHaveBeenCalled();
     });
 
-    it("should abort backfill after too many scan errors", async () => {
+    it("should pause backfill after too many scan errors without killing the poller", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -487,11 +522,11 @@ describe("Poller Coverage", () => {
       );
 
       // Call backfill directly to avoid the full start() flow
-      await expect((poller as any).backfill()).rejects.toThrow("Backfill scan failed after repeated RPC errors");
+      await expect((poller as any).backfill()).resolves.toBe(false);
 
       // Should have attempted multiple times (up to 5 scan errors)
       expect((mockConnection.getSignaturesForAddress as any).mock.calls.length).toBeGreaterThanOrEqual(5);
-      expect((poller as any).isRunning).toBe(false);
+      expect((poller as any).isRunning).toBe(true);
     }, 25000);
   });
 
@@ -1001,6 +1036,137 @@ describe("Poller Coverage", () => {
       expect(signatures).not.toContain("sig-below-stop-slot");
     });
 
+    it("should resolve a pagination anchor above INDEXER_STOP_SLOT before fetching the frontier", async () => {
+      const originalHistoricalScanSignaturePageLimit = (config as any).historicalScanSignaturePageLimit;
+      (config as any).indexerStopSlot = 150n;
+      (config as any).historicalScanSignaturePageLimit = 3;
+
+      try {
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 3,
+        });
+        (poller as any).isRunning = true;
+        (poller as any).lastSignature = "sig-start";
+        (poller as any).lastSlot = 100n;
+        (poller as any).lastTxIndex = 0;
+
+        const beforeArgs: Array<string | undefined> = [];
+        (mockConnection.getSignaturesForAddress as any).mockImplementation((_programId: unknown, options: { before?: string } = {}) => {
+          beforeArgs.push(options.before);
+          if (beforeArgs.length === 1) {
+            return Promise.resolve([
+              createMockSignatureInfo("sig-300", 300),
+              createMockSignatureInfo("sig-280", 280),
+              createMockSignatureInfo("sig-260", 260),
+            ]);
+          }
+          if (beforeArgs.length === 2) {
+            return Promise.resolve([
+              createMockSignatureInfo("sig-151", 151),
+              createMockSignatureInfo("sig-150", 150),
+              createMockSignatureInfo("sig-149", 149),
+            ]);
+          }
+          return Promise.resolve([
+            createMockSignatureInfo("sig-150", 150),
+            createMockSignatureInfo("sig-149", 149),
+            createMockSignatureInfo("sig-start", 100),
+          ]);
+        });
+        (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+          blockTime: 1234567890,
+          transactions: [
+            { transaction: { signatures: ["sig-start"] } },
+          ],
+        });
+
+        const result = await (poller as any).fetchSignatures();
+
+        expect(beforeArgs).toEqual([undefined, "sig-260", "sig-151", "sig-start"]);
+        expect(result.map((sig: any) => sig.signature)).toEqual(["sig-150", "sig-149"]);
+      } finally {
+        (config as any).historicalScanSignaturePageLimit = originalHistoricalScanSignaturePageLimit;
+      }
+    });
+
+    it("should defer and resume stop-slot anchor resolution across cycles after repeated provider overload", async () => {
+      const originalHistoricalScanSignaturePageLimit = (config as any).historicalScanSignaturePageLimit;
+      (config as any).indexerStopSlot = 150n;
+      (config as any).historicalScanSignaturePageLimit = 3;
+
+      try {
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 3,
+        });
+        (poller as any).isRunning = true;
+        (poller as any).lastSignature = "sig-start";
+        (poller as any).lastSlot = 100n;
+        (poller as any).lastTxIndex = 0;
+
+        const beforeArgs: Array<string | undefined> = [];
+        let callCount = 0;
+        (mockConnection.getSignaturesForAddress as any).mockImplementation((_programId: unknown, options: { before?: string } = {}) => {
+          beforeArgs.push(options.before);
+          callCount += 1;
+          if (callCount === 1) {
+            return Promise.resolve([
+              createMockSignatureInfo("sig-300", 300),
+              createMockSignatureInfo("sig-260", 260),
+              createMockSignatureInfo("sig-240", 240),
+            ]);
+          }
+          if (callCount <= 4) {
+            return Promise.reject(new Error("429 Too Many Requests"));
+          }
+          if (callCount === 5) {
+            return Promise.resolve([
+              createMockSignatureInfo("sig-151", 151),
+              createMockSignatureInfo("sig-150", 150),
+              createMockSignatureInfo("sig-149", 149),
+            ]);
+          }
+          return Promise.resolve([
+            createMockSignatureInfo("sig-150", 150),
+            createMockSignatureInfo("sig-149", 149),
+            createMockSignatureInfo("sig-start", 100),
+          ]);
+        });
+        (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+          blockTime: 1234567890,
+          transactions: [
+            { transaction: { signatures: ["sig-start"] } },
+          ],
+        });
+
+        const firstAttempt = await (poller as any).fetchSignatures();
+        expect(firstAttempt).toEqual([]);
+        expect((poller as any).stopSlotPaginationBeforeResolved).toBe(false);
+        expect((poller as any).stopSlotPaginationContinuation).toBe("sig-240");
+
+        const secondAttempt = await (poller as any).fetchSignatures();
+        expect(beforeArgs).toEqual([
+          undefined,
+          "sig-240",
+          "sig-240",
+          "sig-240",
+          "sig-240",
+          "sig-151",
+          "sig-start",
+        ]);
+        expect(secondAttempt.map((sig: any) => sig.signature)).toEqual(["sig-150", "sig-149"]);
+      } finally {
+        (config as any).historicalScanSignaturePageLimit = originalHistoricalScanSignaturePageLimit;
+      }
+    });
+
     it("should continue same-slot scan across next pages after stop signature", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -1276,7 +1442,8 @@ describe("Poller Coverage", () => {
       });
     });
 
-    it("should throw when transaction from RPC is null", async () => {
+    it("should retry transaction lookup when RPC temporarily returns null", async () => {
+      vi.useFakeTimers();
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -1286,11 +1453,17 @@ describe("Poller Coverage", () => {
       });
 
       const sig = createMockSignatureInfo();
-      (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
+      (mockConnection.getParsedTransaction as any)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(tx);
 
-      await expect((poller as any).processTransaction(sig, 0)).rejects.toThrow(
-        `Transaction not found for signature ${sig.signature}`
-      );
+      (poller as any).isRunning = true;
+      const promise = (poller as any).processTransaction(sig, 0);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(promise).resolves.toBeInstanceOf(Date);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
+      vi.useRealTimers();
     });
 
     it("should handle transaction without blockTime", async () => {
@@ -1355,6 +1528,11 @@ describe("Poller Coverage", () => {
 
       // handleEventAtomic called but no eventLog.create (no prisma)
       expect(handleEventAtomic).toHaveBeenCalled();
+      expect(handleEventAtomic).toHaveBeenCalledWith(
+        null,
+        expect.anything(),
+        expect.objectContaining({ skipCursorUpdate: true, txIndex: 0, eventOrdinal: 0 })
+      );
       expect(mockPrisma.eventLog.create).not.toHaveBeenCalled();
     });
   });
@@ -1381,7 +1559,8 @@ describe("Poller Coverage", () => {
       );
     });
 
-    it("should throw when fallback fetch still returns null", async () => {
+    it("should retry fallback fetch when transaction cache is missing and RPC returns null first", async () => {
+      vi.useFakeTimers();
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -1391,13 +1570,17 @@ describe("Poller Coverage", () => {
       });
 
       const sig = createMockSignatureInfo();
-      (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, []);
+      (mockConnection.getParsedTransaction as any)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(tx);
 
-      await expect((poller as any).processTransactionBatch(sig, 0, undefined)).rejects.toThrow(
-        `Transaction not found for signature ${sig.signature}`
-      );
-
-      expect(mockConnection.getParsedTransaction).toHaveBeenCalled();
+      (poller as any).isRunning = true;
+      const promise = (poller as any).processTransactionBatch(sig, 0, undefined);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(promise).resolves.toBeInstanceOf(Date);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
+      vi.useRealTimers();
     });
 
     it("should add events to eventBuffer when available", async () => {
@@ -1469,6 +1652,11 @@ describe("Poller Coverage", () => {
       await (poller as any).processTransactionBatch(sig, 0, tx);
 
       expect(handleEventAtomic).toHaveBeenCalled();
+      expect(handleEventAtomic).toHaveBeenCalledWith(
+        mockPrisma,
+        expect.anything(),
+        expect.objectContaining({ skipCursorUpdate: true, txIndex: 0, eventOrdinal: 0 })
+      );
     });
   });
 
@@ -1796,6 +1984,786 @@ describe("Poller Coverage", () => {
   });
 
   describe("backfill - Phase 2 and Phase 3 processing", () => {
+    it("should scan and replay historical gap pages oldest-first from an existing cursor", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      const fetchHistoricalGapPageSpy = vi
+        .spyOn(poller as any, "fetchHistoricalGapPage")
+        .mockImplementation(async (_stopSignature: string, beforeSignature?: string) => {
+          if (beforeSignature === undefined) {
+            return {
+              signatures: [
+                createMockSignatureInfo("newest-2", 300),
+                createMockSignatureInfo("newest-1", 200),
+              ],
+              nextBeforeSignature: "newest-1",
+            };
+          }
+          if (beforeSignature === "newest-1") {
+            return {
+              signatures: [
+                createMockSignatureInfo("oldest-2", 150),
+                createMockSignatureInfo("oldest-1", 100),
+              ],
+              nextBeforeSignature: "oldest-1",
+            };
+          }
+          if (beforeSignature === "oldest-1") {
+            return { signatures: [], nextBeforeSignature: undefined };
+          }
+          return { signatures: [], nextBeforeSignature: undefined };
+        });
+
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      await (poller as any).catchUpHistoricalGap();
+
+      expect(fetchHistoricalGapPageSpy.mock.calls.map((call) => call[1])).toEqual([
+        undefined,
+        "newest-1",
+        "oldest-1",
+      ]);
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(2);
+      expect(processSignatureBatchSpy.mock.calls[0][0].map((sig: any) => sig.signature)).toEqual([
+        "oldest-1",
+        "oldest-2",
+      ]);
+      expect(processSignatureBatchSpy.mock.calls[1][0].map((sig: any) => sig.signature)).toEqual([
+        "newest-1",
+        "newest-2",
+      ]);
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:0" },
+        create: {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: "newest-1",
+            signatures: [
+              { signature: "newest-2", slot: 300 },
+              { signature: "newest-1", slot: 200 },
+            ],
+          }),
+        },
+        update: {
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: "newest-1",
+            signatures: [
+              { signature: "newest-2", slot: 300 },
+              { signature: "newest-1", slot: 200 },
+            ],
+          }),
+        },
+      });
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:1" },
+        create: {
+          id: "historical-scan:cursor-stop:1",
+          lastSignature: "newest-1",
+          lastSlot: null,
+          lastTxIndex: 1,
+          source: JSON.stringify({
+            nextBeforeSignature: "oldest-1",
+            signatures: [
+              { signature: "oldest-2", slot: 150 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+        },
+        update: {
+          lastSignature: "newest-1",
+          lastSlot: null,
+          lastTxIndex: 1,
+          source: JSON.stringify({
+            nextBeforeSignature: "oldest-1",
+            signatures: [
+              { signature: "oldest-2", slot: 150 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+        },
+      });
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "historical-scan-state:cursor-stop" },
+        })
+      );
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledTimes(4);
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:1" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:0" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-progress:cursor-stop" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-state:cursor-stop" },
+      });
+    });
+
+    it("should resume replay from persisted historical scan pages without rescanning", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockPrisma.indexerState.findMany as any).mockResolvedValue([
+        {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: "newest-1",
+            signatures: [
+              { signature: "newest-2", slot: 300 },
+              { signature: "newest-1", slot: 200 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:00.000Z"),
+        },
+        {
+          id: "historical-scan:cursor-stop:1",
+          lastSignature: "newest-1",
+          lastSlot: null,
+          lastTxIndex: 1,
+          source: JSON.stringify({
+            nextBeforeSignature: null,
+            signatures: [
+              { signature: "oldest-2", slot: 150 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:01.000Z"),
+        },
+      ]);
+
+      const fetchHistoricalGapPageSpy = vi
+        .spyOn(poller as any, "fetchHistoricalGapPage")
+        .mockImplementation(async (_stopSignature: string, beforeSignature?: string) => {
+          if (beforeSignature === "newest-1") {
+            return {
+              signatures: [
+                createMockSignatureInfo("oldest-2", 150),
+                createMockSignatureInfo("oldest-1", 100),
+              ],
+              nextBeforeSignature: "oldest-1",
+            };
+          }
+          if (beforeSignature === undefined) {
+            return {
+              signatures: [
+                createMockSignatureInfo("newest-2", 300),
+                createMockSignatureInfo("newest-1", 200),
+              ],
+              nextBeforeSignature: "newest-1",
+            };
+          }
+          return { signatures: [], nextBeforeSignature: undefined };
+        });
+
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      await (poller as any).catchUpHistoricalGap();
+
+      expect(fetchHistoricalGapPageSpy).not.toHaveBeenCalled();
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(2);
+      expect(processSignatureBatchSpy.mock.calls[0][0].map((sig: any) => sig.signature)).toEqual([
+        "oldest-1",
+        "oldest-2",
+      ]);
+      expect(processSignatureBatchSpy.mock.calls[1][0].map((sig: any) => sig.signature)).toEqual([
+        "newest-1",
+        "newest-2",
+      ]);
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: "historical-scan-progress:cursor-stop" },
+      }));
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledTimes(4);
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:1" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:0" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-progress:cursor-stop" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-state:cursor-stop" },
+      });
+    });
+
+    it("should resume replay within a persisted page after the last committed signature", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockPrisma.indexerState.findMany as any).mockResolvedValue([
+        {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: null,
+            signatures: [
+              { signature: "oldest-3", slot: 150 },
+              { signature: "oldest-2", slot: 120 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:01.000Z"),
+        },
+      ]);
+      (mockPrisma.indexerState.findUnique as any).mockImplementation(async (args: any) => {
+        if (args?.where?.id === "historical-scan-state:cursor-stop") {
+          return {
+            source: JSON.stringify({ nextBeforeSignature: null, scanComplete: true }),
+          };
+        }
+        if (args?.where?.id === "historical-scan-progress:cursor-stop") {
+          return { lastTxIndex: 0, lastSignature: "oldest-2" };
+        }
+        return null;
+      });
+
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(1);
+
+      await (poller as any).catchUpHistoricalGap();
+
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(1);
+      expect(processSignatureBatchSpy.mock.calls[0][0].map((sig: any) => sig.signature)).toEqual([
+        "oldest-3",
+      ]);
+    });
+
+    it("should resume replay from persisted historical scan pages in pool mode without rescanning", async () => {
+      const mockPool = { query: vi.fn() };
+      vi.mocked(getPool).mockReturnValue(mockPool as any);
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      mockPool.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+        if (sql.includes("WHERE id LIKE $1")) {
+          return {
+            rows: [
+              {
+                id: "historical-scan:cursor-stop:0",
+                last_signature: null,
+                source: JSON.stringify({
+                  nextBeforeSignature: "newest-1",
+                  signatures: [
+                    { signature: "newest-2", slot: 300 },
+                    { signature: "newest-1", slot: 200 },
+                  ],
+                }),
+                last_tx_index: 0,
+              },
+              {
+                id: "historical-scan:cursor-stop:1",
+                last_signature: "newest-1",
+                source: JSON.stringify({
+                  nextBeforeSignature: null,
+                  signatures: [
+                    { signature: "oldest-2", slot: 150 },
+                    { signature: "oldest-1", slot: 100 },
+                  ],
+                }),
+                last_tx_index: 1,
+              },
+            ],
+          };
+        }
+        if (sql.includes("WHERE id = $1") && Array.isArray(params) && params[0] === "historical-scan-progress:cursor-stop") {
+          return { rows: [] };
+        }
+        if (sql.includes("DELETE FROM indexer_state WHERE id = $1")) {
+          return { rowCount: 1 };
+        }
+        if (sql.includes("INSERT INTO indexer_state")) {
+          return { rowCount: 1 };
+        }
+        return { rows: [] };
+      });
+
+      const fetchHistoricalGapPageSpy = vi
+        .spyOn(poller as any, "fetchHistoricalGapPage")
+        .mockResolvedValue({ signatures: [], nextBeforeSignature: undefined });
+
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      await (poller as any).catchUpHistoricalGap();
+
+      expect(fetchHistoricalGapPageSpy).not.toHaveBeenCalled();
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(2);
+      expect(processSignatureBatchSpy.mock.calls[0][0].map((sig: any) => sig.signature)).toEqual([
+        "oldest-1",
+        "oldest-2",
+      ]);
+      expect(processSignatureBatchSpy.mock.calls[1][0].map((sig: any) => sig.signature)).toEqual([
+        "newest-1",
+        "newest-2",
+      ]);
+      expect(mockPool.query.mock.calls.find(([sql]) => String(sql).includes("WHERE id LIKE $1"))).toBeTruthy();
+      expect(
+        mockPool.query.mock.calls.find(([, params]) => Array.isArray(params) && params[0] === "historical-scan:cursor-stop:1")
+      ).toBeTruthy();
+      expect(
+        mockPool.query.mock.calls.find(([, params]) => Array.isArray(params) && params[0] === "historical-scan:cursor-stop:0")
+      ).toBeTruthy();
+      expect(
+        mockPool.query.mock.calls.find(([, params]) => Array.isArray(params) && params[0] === "historical-scan-progress:cursor-stop")
+      ).toBeTruthy();
+      expect(
+        mockPool.query.mock.calls.find(([, params]) => Array.isArray(params) && params[0] === "historical-scan-state:cursor-stop")
+      ).toBeTruthy();
+    });
+
+    it("should pause bounded historical catch-up page scanning after repeated RPC errors without killing the poller", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockConnection.getSignaturesForAddress as any).mockRejectedValue(new Error("provider overloaded"));
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(false);
+      expect((poller as any).isRunning).toBe(true);
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "historical-scan-state:cursor-stop" },
+        })
+      );
+    });
+
+    it("should use historical scan signature page limit independently from replay batch size", async () => {
+      const originalHistoricalScanSignaturePageLimit = (config as any).historicalScanSignaturePageLimit;
+      (config as any).historicalScanSignaturePageLimit = 777;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 25,
+      });
+      (poller as any).isRunning = true;
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await (poller as any).fetchHistoricalGapPage("cursor-stop");
+
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
+        TEST_PROGRAM_ID,
+        expect.objectContaining({
+          limit: 777,
+          until: "cursor-stop",
+        })
+      );
+
+      (config as any).historicalScanSignaturePageLimit = originalHistoricalScanSignaturePageLimit;
+    });
+
+    it("should continue scanning when a historical page is fully filtered by failed signatures", async () => {
+      const originalMaxPages = (config as any).historicalScanMaxPagesPerPass;
+      (config as any).historicalScanMaxPagesPerPass = 1;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      const fetchHistoricalGapPageSpy = vi
+        .spyOn(poller as any, "fetchHistoricalGapPage")
+        .mockResolvedValueOnce({
+          signatures: [],
+          nextBeforeSignature: "older-page",
+          pageFilteredOut: true,
+        })
+        .mockResolvedValueOnce({
+          signatures: [
+            createMockSignatureInfo("oldest-2", 150),
+            createMockSignatureInfo("oldest-1", 100),
+          ],
+          nextBeforeSignature: undefined,
+        });
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(fetchHistoricalGapPageSpy).toHaveBeenCalledTimes(1);
+      expect(processSignatureBatchSpy).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "historical-scan-state:cursor-stop" },
+          create: expect.objectContaining({
+            source: JSON.stringify({
+              nextBeforeSignature: "older-page",
+              scanComplete: false,
+            }),
+          }),
+        })
+      );
+
+      (config as any).historicalScanMaxPagesPerPass = originalMaxPages;
+    });
+
+    it("should purge stale historical scan rows when replay progress is already fully complete", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockPrisma.indexerState.findMany as any).mockResolvedValue([
+        {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: null,
+            signatures: [{ signature: "oldest-1", slot: 100 }],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:00.000Z"),
+        },
+      ]);
+      (mockPrisma.indexerState.findUnique as any).mockImplementation(async (args: any) => {
+        if (args?.where?.id === "historical-scan-state:cursor-stop") {
+          return {
+            source: JSON.stringify({ nextBeforeSignature: null, scanComplete: true }),
+          };
+        }
+        if (args?.where?.id === "historical-scan-progress:cursor-stop") {
+          return { lastTxIndex: -1, lastSignature: null };
+        }
+        return null;
+      });
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(true);
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: {
+          id: {
+            startsWith: "historical-scan:cursor-stop:",
+          },
+        },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-progress:cursor-stop" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan-state:cursor-stop" },
+      });
+    });
+
+    it("should preserve the current historical page when replay stops before page completion", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockPrisma.indexerState.findMany as any).mockResolvedValue([
+        {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: null,
+            signatures: [
+              { signature: "oldest-2", slot: 150 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:00.000Z"),
+        },
+      ]);
+      (mockPrisma.indexerState.findUnique as any).mockImplementation(async (args: any) => {
+        if (args?.where?.id === "historical-scan-state:cursor-stop") {
+          return {
+            source: JSON.stringify({ nextBeforeSignature: null, scanComplete: true }),
+          };
+        }
+        return null;
+      });
+
+      vi.spyOn(poller as any, "processSignatureBatch").mockResolvedValue(1);
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(false);
+      expect(mockPrisma.indexerState.deleteMany).not.toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:0" },
+      });
+    });
+
+    it("should persist intra-page replay progress before pausing in pool mode", async () => {
+      const mockPool = { query: vi.fn() };
+      vi.mocked(getPool).mockReturnValue(mockPool as any);
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      mockPool.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+        if (sql.includes("WHERE id = $1") && Array.isArray(params) && params[0] === "historical-scan-state:cursor-stop") {
+          return { rows: [{ source: JSON.stringify({ nextBeforeSignature: null, scanComplete: true }) }] };
+        }
+        if (sql.includes("WHERE id = $1") && Array.isArray(params) && params[0] === "historical-scan-progress:cursor-stop") {
+          return { rows: [] };
+        }
+        if (sql.includes("WHERE id LIKE $1")) {
+          return {
+            rows: [{
+              id: "historical-scan:cursor-stop:0",
+              last_signature: null,
+              source: JSON.stringify({
+                nextBeforeSignature: null,
+                signatures: [
+                  { signature: "oldest-2", slot: 150 },
+                  { signature: "oldest-1", slot: 100 },
+                ],
+              }),
+              last_tx_index: 0,
+            }],
+          };
+        }
+        if (sql.includes("INSERT INTO indexer_state")) {
+          return { rowCount: 1 };
+        }
+        if (sql.includes("DELETE FROM indexer_state WHERE id = $1")) {
+          return { rowCount: 1 };
+        }
+        return { rows: [] };
+      });
+
+      vi.spyOn(poller as any, "processSignatureBatch").mockImplementation(
+        async (batch: any[], _processed: number, _total: number, onProcessed?: (sig: any) => Promise<void>) => {
+          await onProcessed?.(batch[0]);
+          return 1;
+        }
+      );
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(false);
+      expect(
+        mockPool.query.mock.calls.find(([, params]) =>
+          Array.isArray(params)
+          && params[0] === "historical-scan-progress:cursor-stop"
+          && params[1] === "oldest-1"
+          && params[2] === 0
+        )
+      ).toBeTruthy();
+      expect(
+        mockPool.query.mock.calls.find(([, params]) =>
+          Array.isArray(params) && params[0] === "historical-scan:cursor-stop:0"
+        )
+      ).toBeFalsy();
+    });
+
+    it("should cap historical scan work per pass and persist continuation state before replay", async () => {
+      const originalMaxPages = (config as any).historicalScanMaxPagesPerPass;
+      (config as any).historicalScanMaxPagesPerPass = 1;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      const fetchHistoricalGapPageSpy = vi
+        .spyOn(poller as any, "fetchHistoricalGapPage")
+        .mockResolvedValue({
+          signatures: [
+            createMockSignatureInfo("newest-2", 300),
+            createMockSignatureInfo("newest-1", 200),
+          ],
+          nextBeforeSignature: "newest-1",
+        });
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(false);
+      expect(fetchHistoricalGapPageSpy).toHaveBeenCalledTimes(1);
+      expect(processSignatureBatchSpy).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "historical-scan-state:cursor-stop" },
+          create: expect.objectContaining({
+            source: JSON.stringify({
+              nextBeforeSignature: "newest-1",
+              scanComplete: false,
+            }),
+          }),
+        })
+      );
+
+      (config as any).historicalScanMaxPagesPerPass = originalMaxPages;
+    });
+
+    it("should replay only a bounded number of persisted historical pages per pass once scan is complete", async () => {
+      const originalMaxPages = (config as any).historicalScanMaxPagesPerPass;
+      (config as any).historicalScanMaxPagesPerPass = 1;
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 2,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "cursor-stop";
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValueOnce({
+        source: JSON.stringify({
+          nextBeforeSignature: null,
+          scanComplete: true,
+        }),
+      });
+      (mockPrisma.indexerState.findMany as any).mockResolvedValue([
+        {
+          id: "historical-scan:cursor-stop:0",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: "newest-1",
+            signatures: [
+              { signature: "newest-2", slot: 300 },
+              { signature: "newest-1", slot: 200 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:00.000Z"),
+        },
+        {
+          id: "historical-scan:cursor-stop:1",
+          lastSignature: "newest-1",
+          lastSlot: null,
+          lastTxIndex: 1,
+          source: JSON.stringify({
+            nextBeforeSignature: null,
+            signatures: [
+              { signature: "oldest-2", slot: 150 },
+              { signature: "oldest-1", slot: 100 },
+            ],
+          }),
+          updatedAt: new Date("2026-03-12T00:00:01.000Z"),
+        },
+      ]);
+
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+
+      const result = await (poller as any).catchUpHistoricalGap();
+
+      expect(result).toBe(false);
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(1);
+      expect(processSignatureBatchSpy.mock.calls[0][0].map((sig: any) => sig.signature)).toEqual([
+        "oldest-1",
+        "oldest-2",
+      ]);
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "historical-scan-progress:cursor-stop" },
+          create: expect.objectContaining({
+            lastTxIndex: 0,
+          }),
+        })
+      );
+      expect(mockPrisma.indexerState.deleteMany).toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:1" },
+      });
+      expect(mockPrisma.indexerState.deleteMany).not.toHaveBeenCalledWith({
+        where: { id: "historical-scan:cursor-stop:0" },
+      });
+
+      (config as any).historicalScanMaxPagesPerPass = originalMaxPages;
+    });
+
     it("should stop backfill batches before processing slots above INDEXER_STOP_SLOT", async () => {
       (config as any).pollerBatchRpcEnabled = false;
       (config as any).indexerStopSlot = 100n;
@@ -1865,6 +2833,58 @@ describe("Poller Coverage", () => {
 
       // Phase 1 collected 2 checkpoints, Phase 2 should iterate them in reverse
       expect(callCount).toBeGreaterThanOrEqual(3);
+    });
+
+    it("should extend backfill checkpoints to the end of a split slot", async () => {
+      const originalHistoricalScanSignaturePageLimit = (config as any).historicalScanSignaturePageLimit;
+      (config as any).historicalScanSignaturePageLimit = 2;
+
+      try {
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 5000,
+          batchSize: 2,
+        });
+        (poller as any).isRunning = true;
+
+        let callCount = 0;
+        (mockConnection.getSignaturesForAddress as any).mockImplementation((_programId: any, opts: any) => {
+          callCount++;
+          if (callCount === 1) {
+            expect(opts.before).toBeUndefined();
+            return Promise.resolve([
+              createMockSignatureInfo("slot10-a", 10),
+              createMockSignatureInfo("slot10-b", 10),
+            ]);
+          }
+          if (callCount === 2) {
+            expect(opts.before).toBe("slot10-b");
+            return Promise.resolve([
+              createMockSignatureInfo("slot10-c", 10),
+              createMockSignatureInfo("slot9-a", 9),
+            ]);
+          }
+          if (callCount === 3) {
+            expect(opts.before).toBe("slot10-c");
+            return Promise.resolve([
+              createMockSignatureInfo("slot9-a", 9),
+            ]);
+          }
+          return Promise.resolve([]);
+        });
+
+        const fetchWindowSpy = vi.spyOn(poller as any, "fetchSignatureWindow").mockResolvedValue([]);
+
+        await (poller as any).backfill();
+
+        expect(fetchWindowSpy).toHaveBeenCalled();
+        expect(fetchWindowSpy.mock.calls.flat()).toContain("slot10-c");
+        expect(fetchWindowSpy.mock.calls.flat()).not.toContain("slot10-b");
+      } finally {
+        (config as any).historicalScanSignaturePageLimit = originalHistoricalScanSignaturePageLimit;
+      }
     });
 
     it("should process Phase 3 newest transactions before first checkpoint", async () => {
@@ -2019,6 +3039,49 @@ describe("Poller Coverage", () => {
   });
 
   describe("processSignatureBatch - error handling and progress logging", () => {
+    it("flushes cursor-only progress at the end of a successful batch in Supabase mode", async () => {
+      if ((config as any).dbMode !== "supabase") {
+        return;
+      }
+
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+
+      const sig = createMockSignatureInfo("cursor-only-batch", 601);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["cursor-only-batch"] } },
+        ],
+      });
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(
+        createMockParsedTransaction("cursor-only-batch", [
+          "Program log: no 8004 event here",
+        ])
+      );
+
+      const mockFlush = vi.fn().mockResolvedValue(undefined);
+      (poller as any).eventBuffer = {
+        size: 0,
+        noteCursor: vi.fn(),
+        flush: mockFlush,
+        drain: vi.fn(),
+        hasPendingCursor: vi.fn().mockReturnValue(true),
+        getStats: vi.fn().mockReturnValue({}),
+      };
+      (poller as any).batchFetcher = null;
+
+      const processed = await (poller as any).processSignatureBatch([sig], 0, 1);
+
+      expect(processed).toBe(1);
+      expect(mockFlush).toHaveBeenCalledTimes(1);
+    });
+
     it("should abort when getTxIndexMap throws unexpectedly", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -2063,12 +3126,12 @@ describe("Poller Coverage", () => {
       const sig = createMockSignatureInfo("fail-tx", 600);
 
       // Make processTransaction throw
-      (mockConnection.getParsedTransaction as any).mockRejectedValue(new Error("TX fetch failed"));
+      (mockConnection.getParsedTransaction as any).mockRejectedValue(new Error("Decoder failure"));
 
       // Null out batchFetcher so it goes through processTransaction path
       (poller as any).batchFetcher = null;
 
-      await expect((poller as any).processSignatureBatch([sig], 0, 1)).rejects.toThrow("TX fetch failed");
+      await expect((poller as any).processSignatureBatch([sig], 0, 1)).rejects.toThrow("Decoder failure");
       expect((poller as any).errorCount).toBe(1);
       expect((poller as any).isRunning).toBe(false);
     });
@@ -2211,6 +3274,45 @@ describe("Poller Coverage", () => {
       expect((poller as any).processedCount).toBeGreaterThanOrEqual(2);
     });
 
+    it("should halt the cycle and preserve the frontier when batch RPC enters provider cooldown", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 5000,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "prev-sig";
+
+      const sig1 = createMockSignatureInfo("live-sig-1", 900);
+      const sig2 = createMockSignatureInfo("live-sig-2", 901);
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        sig2,
+        sig1,
+        createMockSignatureInfo("prev-sig", 800),
+      ]);
+
+      (poller as any).batchFetcher = {
+        fetchTransactions: vi
+          .fn()
+          .mockRejectedValue(new BatchRpcBackoffRequiredError("cooldown", 2500)),
+        getStats: vi.fn().mockReturnValue({}),
+      };
+
+      const result = await (poller as any).processNewTransactions();
+
+      expect(result).toEqual({ fetchedCount: 0, haltedOnError: true });
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("prev-sig");
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
+      expect((poller as any).batchFetcher.fetchTransactions).toHaveBeenCalledWith([
+        "live-sig-1",
+        "live-sig-2",
+      ]);
+    });
+
     it("should abort live processing when tx_index is unresolved for a multi-tx slot", async () => {
       poller = new Poller({
         connection: mockConnection as any,
@@ -2298,7 +3400,7 @@ describe("Poller Coverage", () => {
           signature: "live-null-1",
           eventType: "PROCESSING_FAILED",
           processed: false,
-          error: expect.stringContaining("Transaction not found"),
+          error: expect.stringContaining("temporarily unavailable"),
         }),
       });
     });
@@ -2446,15 +3548,12 @@ describe("Poller Coverage", () => {
       (poller as any).batchFetcher = null;
       (mockConnection.getParsedTransaction as any).mockResolvedValue(createMockParsedTransaction(TEST_SIGNATURE, []));
 
-      await (poller as any).processNewTransactions();
+      const result = await (poller as any).processNewTransactions();
 
-      // The fetched frontier is still safe to process because continuation markers
-      // preserve the unresolved older gap for a later cycle.
-      expect((poller as any).processedCount).toBe(2);
-      expect((poller as any).lastSignature).toBe("partial-new-a");
-      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
-
-      // Continuation markers remain available for the unresolved older pages.
+      expect(result).toEqual({ fetchedCount: 0, haltedOnError: true });
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("cursor-before-partial");
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
       expect((poller as any).pendingContinuation).toBeTruthy();
       expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
     });
@@ -2481,43 +3580,84 @@ describe("Poller Coverage", () => {
       expect((poller as any).pendingContinuation).toBe("resume-from-here");
       expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
     });
-  });
 
-  describe("fetchSignatures - memory limit and continuation", () => {
-    it("should set pendingContinuation when allSignatures exceeds 100k", async () => {
+    it("should defer partial frontier processing when pagination boundary ordering remains unresolved", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
         programId: TEST_PROGRAM_ID,
-        pollingInterval: 100,
-        batchSize: 1000,
+        pollingInterval: 5000,
+        batchSize: 2,
       });
       (poller as any).isRunning = true;
-      (poller as any).lastSignature = "original-last-sig";
+      (poller as any).lastSignature = "cursor-before-partial";
 
-      // Create a large batch that exceeds the 100k limit
-      // We need to return batchSize signatures per call to keep paginating
-      let totalReturned = 0;
+      const sigNewA = createMockSignatureInfo("partial-boundary-a", 1300);
+      const sigNewB = createMockSignatureInfo("partial-boundary-b", 1299);
+
+      let sigCallCount = 0;
       (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
-        totalReturned += 1000;
-        if (totalReturned > 101000) {
-          // After exceeding 100k, this shouldn't be called
-          return Promise.resolve([]);
+        sigCallCount++;
+        if (sigCallCount === 1) {
+          return Promise.resolve([sigNewA, sigNewB]);
         }
-        // Return full batch to keep paginating
-        const sigs = Array.from({ length: 1000 }, (_, i) =>
-          createMockSignatureInfo(`large-gap-${totalReturned}-${i}`, 200000 - totalReturned - i)
-        );
-        return Promise.resolve(sigs);
+        return Promise.reject(new Error("Deterministic tx_index unavailable for pagination slot boundary 447787316"));
       });
 
-      const result = await (poller as any).fetchSignatures();
+      (poller as any).batchFetcher = null;
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(createMockParsedTransaction(TEST_SIGNATURE, []));
 
-      // Should have set pendingContinuation and pendingStopSignature
+      const result = await (poller as any).processNewTransactions();
+
+      expect(result).toEqual({ fetchedCount: 0, haltedOnError: false });
+      expect((poller as any).processedCount).toBe(0);
+      expect((poller as any).lastSignature).toBe("cursor-before-partial");
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
       expect((poller as any).pendingContinuation).toBeTruthy();
-      expect((poller as any).pendingStopSignature).toBe("original-last-sig");
-      expect(result.length).toBeGreaterThan(0);
-      expect(result.length).toBeLessThanOrEqual(101000);
+      expect((poller as any).pendingStopSignature).toBe("cursor-before-partial");
+    });
+  });
+
+  describe("fetchSignatures - memory limit and continuation", () => {
+    it("should retain the oldest slice when allSignatures exceeds the per-cycle cap", async () => {
+      const previousMaxSignaturesPerCycle = config.pollerMaxSignaturesPerCycle;
+      try {
+        config.pollerMaxSignaturesPerCycle = 100000;
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 1000,
+        });
+        (poller as any).isRunning = true;
+        (poller as any).lastSignature = "original-last-sig";
+
+        // Create a large batch that exceeds the 100k limit
+        // We need to return batchSize signatures per call to keep paginating
+        let totalReturned = 0;
+        (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+          totalReturned += 1000;
+          if (totalReturned > 101000) {
+            // After exceeding 100k, this shouldn't be called
+            return Promise.resolve([]);
+          }
+          // Return full batch to keep paginating
+          const sigs = Array.from({ length: 1000 }, (_, i) =>
+            createMockSignatureInfo(`large-gap-${totalReturned}-${i}`, 200000 - totalReturned - i)
+          );
+          return Promise.resolve(sigs);
+        });
+
+        const result = await (poller as any).fetchSignatures();
+
+        expect((poller as any).pendingContinuation).toBe(null);
+        expect((poller as any).pendingStopSignature).toBe(null);
+        expect(result.length).toBeGreaterThan(0);
+        expect(result.length).toBeLessThanOrEqual(100000);
+      } finally {
+        config.pollerMaxSignaturesPerCycle = previousMaxSignaturesPerCycle;
+      }
     });
 
     it("should clear pendingStopSignature when batch returns empty", async () => {
@@ -2559,6 +3699,13 @@ describe("Poller Coverage", () => {
       ];
 
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue(sigs);
+      vi.spyOn(poller as any, "getTxIndexMap").mockResolvedValue(
+        new Map([
+          ["good-sig-1", 3],
+          ["good-sig-2", 2],
+          ["stop-sig-filter", 1],
+        ])
+      );
 
       const result = await (poller as any).fetchSignatures();
 
@@ -2569,39 +3716,118 @@ describe("Poller Coverage", () => {
     });
 
     it("should log progress for large gaps (every 10000 sigs)", async () => {
+      const previousMaxSignaturesPerCycle = config.pollerMaxSignaturesPerCycle;
+      try {
+        config.pollerMaxSignaturesPerCycle = 10000;
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 5000,
+        });
+        (poller as any).isRunning = true;
+        (poller as any).lastSignature = "far-back-sig";
+
+        let callCount = 0;
+        (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
+          callCount++;
+          if (callCount <= 2) {
+            return Promise.resolve(
+              Array.from({ length: 5000 }, (_, i) =>
+                createMockSignatureInfo(`gap-${callCount}-${i}`, 50000 - callCount * 5000 - i)
+              )
+            );
+          }
+          if (callCount === 3) {
+            // Include the stop signature
+            return Promise.resolve([
+              createMockSignatureInfo("far-back-sig", 10000),
+            ]);
+          }
+          return Promise.resolve([]);
+        });
+
+        const result = await (poller as any).fetchSignatures();
+
+        // Should have accumulated 10000 sigs before hitting stop
+        expect(result.length).toBe(10000);
+      } finally {
+        config.pollerMaxSignaturesPerCycle = previousMaxSignaturesPerCycle;
+      }
+    });
+
+    it("should cap the fetched frontier per cycle by returning the oldest slice", async () => {
+      const previousMaxSignaturesPerCycle = config.pollerMaxSignaturesPerCycle;
+      try {
+        config.pollerMaxSignaturesPerCycle = 3;
+
+        poller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 2,
+        });
+        (poller as any).isRunning = true;
+        (poller as any).lastSignature = "older-stop";
+
+        (mockConnection.getSignaturesForAddress as any)
+          .mockResolvedValueOnce([
+            createMockSignatureInfo("sig-5", 500),
+            createMockSignatureInfo("sig-4", 499),
+          ])
+          .mockResolvedValueOnce([
+            createMockSignatureInfo("sig-3", 498),
+            createMockSignatureInfo("sig-2", 497),
+          ])
+          .mockResolvedValueOnce([
+            createMockSignatureInfo("sig-1", 496),
+            createMockSignatureInfo("older-stop", 495),
+          ]);
+        vi.spyOn(poller as any, "getTxIndexMap").mockResolvedValue(
+          new Map([
+            ["sig-1", 1],
+            ["sig-2", 2],
+            ["sig-3", 3],
+            ["sig-4", 4],
+            ["sig-5", 5],
+            ["older-stop", 0],
+          ])
+        );
+
+        const result = await (poller as any).fetchSignatures();
+
+        expect(result.map((entry: any) => entry.signature)).toEqual(["sig-3", "sig-2", "sig-1"]);
+        expect((poller as any).pendingContinuation).toBe(null);
+        expect((poller as any).pendingStopSignature).toBe(null);
+      } finally {
+        config.pollerMaxSignaturesPerCycle = previousMaxSignaturesPerCycle;
+      }
+    });
+
+    it("should reduce pagination pageLimit to 1 under provider overload", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
         programId: TEST_PROGRAM_ID,
         pollingInterval: 100,
-        batchSize: 5000,
+        batchSize: 50,
       });
       (poller as any).isRunning = true;
-      (poller as any).lastSignature = "far-back-sig";
+      (poller as any).lastSignature = "resume-stop";
 
-      let callCount = 0;
-      (mockConnection.getSignaturesForAddress as any).mockImplementation(() => {
-        callCount++;
-        if (callCount <= 2) {
-          return Promise.resolve(
-            Array.from({ length: 5000 }, (_, i) =>
-              createMockSignatureInfo(`gap-${callCount}-${i}`, 50000 - callCount * 5000 - i)
-            )
-          );
-        }
-        if (callCount === 3) {
-          // Include the stop signature
-          return Promise.resolve([
-            createMockSignatureInfo("far-back-sig", 10000),
-          ]);
-        }
-        return Promise.resolve([]);
-      });
+      (mockConnection.getSignaturesForAddress as any)
+        .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+        .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+        .mockResolvedValueOnce([createMockSignatureInfo("resume-stop", 100)]);
 
       const result = await (poller as any).fetchSignatures();
 
-      // Should have accumulated 10000 sigs before hitting stop
-      expect(result.length).toBe(10000);
+      expect(result).toEqual([]);
+      expect(mockConnection.getSignaturesForAddress.mock.calls[0][1].limit).toBe(50);
+      expect(mockConnection.getSignaturesForAddress.mock.calls[1][1].limit).toBe(25);
+      expect(mockConnection.getSignaturesForAddress.mock.calls[2][1].limit).toBe(12);
     });
 
     it("should not set pendingStopSignature again if already set", async () => {
@@ -2935,8 +4161,9 @@ describe("Poller Coverage", () => {
       // Start second time - should be a no-op
       await poller.start();
 
-      // loadState should only be called once (from first start)
-      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(1);
+      // Main cursor load plus historical-scan state/progress lookups may occur during startup,
+      // but a second start() while already running must not trigger a second polling cycle.
+      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(3);
     });
   });
 });

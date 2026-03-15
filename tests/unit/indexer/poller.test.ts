@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PublicKey } from "@solana/web3.js";
+import { config } from "../../../src/config.js";
 import { Poller } from "../../../src/indexer/poller.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
@@ -103,6 +104,198 @@ describe("Poller", () => {
       await poller.start();
 
       expect(mockPrisma.indexerState.findUnique).toHaveBeenCalled();
+    });
+
+    it("should retry historical catch-up after a retryable pause and resume from persisted cursor", async () => {
+      (config as any).indexerStartSignature = "cursor-stop";
+      const loadStateSpy = vi.spyOn(poller as any, "loadState").mockImplementation(async () => {
+        (poller as any).lastSignature = "cursor-stop";
+      });
+      const catchUpSpy = vi
+        .spyOn(poller as any, "catchUpHistoricalGap")
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      const waitSpy = vi.spyOn(poller as any, "waitForDelay").mockResolvedValue(true);
+
+      (poller as any).isRunning = true;
+      await (poller as any).initializeCursor();
+
+      expect(loadStateSpy).toHaveBeenCalledTimes(2);
+      expect(catchUpSpy).toHaveBeenCalledTimes(2);
+      expect(waitSpy).toHaveBeenCalledWith(100);
+      (config as any).indexerStartSignature = null;
+    });
+
+    it("should resume bounded historical catch-up after a paused backfill seeds a cursor", async () => {
+      let loadCalls = 0;
+      vi.spyOn(poller as any, "loadState").mockImplementation(async () => {
+        loadCalls += 1;
+        (poller as any).lastSignature = loadCalls >= 2 ? "cursor-after-backfill" : null;
+      });
+      const backfillSpy = vi.spyOn(poller as any, "backfill").mockResolvedValue(false);
+      const catchUpSpy = vi.spyOn(poller as any, "catchUpHistoricalGap").mockResolvedValue(true);
+      const waitSpy = vi.spyOn(poller as any, "waitForDelay").mockResolvedValue(true);
+
+      (poller as any).isRunning = true;
+      await (poller as any).initializeCursor();
+
+      expect(backfillSpy).toHaveBeenCalledTimes(1);
+      expect(catchUpSpy).toHaveBeenCalledTimes(1);
+      expect(waitSpy).toHaveBeenCalledWith(100);
+      expect((poller as any).pendingHistoricalResume).toBe(false);
+    });
+
+    it("should resume persisted historical scan pages even without INDEXER_START_SIGNATURE", async () => {
+      vi.spyOn(poller as any, "loadState").mockImplementation(async () => {
+        (poller as any).lastSignature = "current-main";
+      });
+      vi.spyOn(poller as any, "loadActiveHistoricalScanState").mockResolvedValue({
+        stopSignature: "persisted-stop",
+        pages: [
+          {
+            pageIndex: 0,
+            beforeSignature: null,
+            nextBeforeSignature: "older-page",
+            signatures: [
+              { signature: "sig-a", slot: 11, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+            ],
+          },
+        ],
+      });
+      const catchUpSpy = vi
+        .spyOn(poller as any, "catchUpHistoricalGap")
+        .mockResolvedValue(true);
+
+      (poller as any).isRunning = true;
+      await (poller as any).initializeCursor();
+
+      expect(catchUpSpy).toHaveBeenCalledWith(
+        "persisted-stop",
+        expect.arrayContaining([
+          expect.objectContaining({ pageIndex: 0, beforeSignature: null }),
+        ])
+      );
+    });
+
+    it("should not revive stale persisted historical scan pages when current main has no matching pages", async () => {
+      const persistedRow = {
+        id: "historical-scan:persisted-stop:3",
+        lastSignature: "older-before",
+        lastSlot: null,
+        lastTxIndex: 3,
+        source: JSON.stringify({
+          nextBeforeSignature: "older-next",
+          signatures: [
+            { signature: "sig-a", slot: 11, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+          ],
+        }),
+        updatedAt: new Date(),
+      } as any;
+      vi.spyOn(mockPrisma.indexerState, "findMany")
+        .mockResolvedValueOnce([persistedRow])
+        .mockResolvedValueOnce([persistedRow])
+        .mockResolvedValueOnce([persistedRow]);
+
+      const result = await (poller as any).loadActiveHistoricalScanState("current-main");
+
+      expect(result).toBeNull();
+    });
+
+    it("should skip already-consumed persisted pages using historical scan progress", async () => {
+      const persistedRows = [
+        {
+          id: "historical-scan:persisted-stop:0",
+          lastSignature: "before-0",
+          lastSlot: null,
+          lastTxIndex: 0,
+          source: JSON.stringify({
+            nextBeforeSignature: "before-1",
+            signatures: [
+              { signature: "sig-0", slot: 100, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+            ],
+          }),
+          updatedAt: new Date(),
+        },
+        {
+          id: "historical-scan:persisted-stop:1",
+          lastSignature: "before-1",
+          lastSlot: null,
+          lastTxIndex: 1,
+          source: JSON.stringify({
+            nextBeforeSignature: "before-2",
+            signatures: [
+              { signature: "sig-1", slot: 101, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+            ],
+          }),
+          updatedAt: new Date(),
+        },
+        {
+          id: "historical-scan:persisted-stop:2",
+          lastSignature: "before-2",
+          lastSlot: null,
+          lastTxIndex: 2,
+          source: JSON.stringify({
+            nextBeforeSignature: "before-3",
+            signatures: [
+              { signature: "sig-2", slot: 102, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+            ],
+          }),
+          updatedAt: new Date(),
+        },
+        {
+          id: "historical-scan:persisted-stop:3",
+          lastSignature: "before-3",
+          lastSlot: null,
+          lastTxIndex: 3,
+          source: JSON.stringify({
+            nextBeforeSignature: "before-4",
+            signatures: [
+              { signature: "sig-3", slot: 103, err: null, memo: null, blockTime: null, confirmationStatus: "confirmed" },
+            ],
+          }),
+          updatedAt: new Date(),
+        },
+      ] as any[];
+
+      vi.spyOn(mockPrisma.indexerState, "findMany")
+        .mockResolvedValueOnce([persistedRows[3]])
+        .mockResolvedValueOnce(persistedRows);
+      vi.spyOn(mockPrisma.indexerState, "findUnique").mockImplementation(async (args: any) => {
+        if (args?.where?.id === "historical-scan-state:current-main") {
+          return null as any;
+        }
+        if (args?.where?.id === "historical-scan-progress:persisted-stop") {
+          return { lastTxIndex: 1, lastSignature: null } as any;
+        }
+        return null as any;
+      });
+
+      const result = await (poller as any).loadActiveHistoricalScanState();
+
+      expect(result).toEqual({
+        stopSignature: "persisted-stop",
+        pages: [
+          expect.objectContaining({ pageIndex: 0, beforeSignature: "before-0" }),
+          expect.objectContaining({ pageIndex: 1, beforeSignature: "before-1" }),
+        ],
+      });
+      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledWith({
+        where: { id: "historical-scan-progress:persisted-stop" },
+        select: { lastTxIndex: true, lastSignature: true },
+      });
+    });
+
+    it("should return null when no persisted historical scan pages exist", async () => {
+      const loadHistoricalScanPagesSpy = vi
+        .spyOn(poller as any, "loadHistoricalScanPages")
+        .mockResolvedValue([]);
+      const prismaFindManySpy = vi.spyOn(mockPrisma.indexerState, "findMany");
+
+      const result = await (poller as any).loadActiveHistoricalScanState("current-main");
+
+      expect(result).toBeNull();
+      expect(loadHistoricalScanPagesSpy).toHaveBeenCalledWith("current-main");
+      expect(prismaFindManySpy).not.toHaveBeenCalled();
     });
   });
 
@@ -337,6 +530,7 @@ describe("Poller", () => {
     });
 
     it("should not advance cursor when transaction fetch returns null", async () => {
+      vi.useFakeTimers();
       const sig = createMockSignatureInfo();
 
       (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
@@ -348,8 +542,9 @@ describe("Poller", () => {
       (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
       (mockConnection.getParsedTransaction as any).mockResolvedValue(null);
 
-      await poller.start();
-      await new Promise((r) => setTimeout(r, 150));
+      const startPromise = poller.start();
+      await vi.advanceTimersByTimeAsync(8000);
+      await startPromise;
 
       expect(mockConnection.getSignaturesForAddress).toHaveBeenCalled();
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
@@ -357,9 +552,10 @@ describe("Poller", () => {
         data: expect.objectContaining({
           eventType: "PROCESSING_FAILED",
           processed: false,
-          error: expect.stringContaining("Transaction not found"),
+          error: expect.stringContaining("temporarily unavailable"),
         }),
       });
+      vi.useRealTimers();
     });
 
     it("should not advance cursor when program data logs fail to parse", async () => {

@@ -65,8 +65,16 @@ That is the supported `migration + restart` path. It is distinct from strict cro
    - `20260306164000_add_indexer_state_last_tx_index.sql`
    - `20260306210000_add_orphan_responses.sql`
    - `20260306223000_reorder_canonical_indexes.sql`
+   - `20260306230000_align_global_stats_collection_pointers.sql`
    - `20260307111500_deterministic_id_counter_timestamps.sql`
    - `20260307123000_backfill_legacy_orphan_responses.sql`
+   - `20260309190000_add_agent_reputation_proxy_objects.sql`
+   - `20260311173000_add_collection_pointer_last_seen_tx_index.sql`
+   - `20260312123000_align_proxy_views_and_leaderboard_grant.sql`
+   - `20260313193000_add_feedback_response_seal_hash.sql`
+   - `20260314150000_include_staging_orphans_in_verification_stats.sql`
+   - `20260315193000_add_validations_to_verification_stats.sql`
+   - `20260315195500_fix_recovered_orphan_agent_id_assignment.sql`
 3. Restart the indexer.
 4. Verify the cursor resumes from the existing `indexer_state`.
 
@@ -90,6 +98,9 @@ Important:
    - `20260306233000_add_missing_agent_runtime_columns_sqlite`
    - `20260306234500_sqlite_fix_feedback_value_text`
    - `20260307000500_fix_indexer_state_monotonic_guard_tx_index`
+   - `20260311173000_add_collection_pointer_last_seen_tx_index`
+   - `20260312110000_add_local_collection_id_counter`
+   - `20260313193000_add_feedback_response_seal_hash`
 3. If it comes from the known `v1.7.7` local/Docker `prisma db push` flow without that baseline, do not run a blind `prisma migrate deploy`. Apply the shipped legacy bundle against that same file:
    - `sqlite3 /path/to/indexer.db < prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql`
 4. That bundle is intentionally scoped to the proven `v1.7.7` db-push shape and already excludes the two duplicate-column migrations that fail on that legacy schema.
@@ -115,7 +126,7 @@ Important:
 
 - Container startup does not auto-run upgrade migrations for persisted databases.
 - The image build may prepare a fresh local SQLite schema for smoke/fresh init, but that is not a substitute for upgrading an existing persisted database.
-- The runtime image defaults local SQLite to `file:/app/prisma/data/indexer.db`; if you mount a different file, point both `DATABASE_URL` and your manual `prisma migrate deploy` command at that same file.
+- The runtime image defaults local SQLite to `file:/app/data/indexer.db`; if you mount a different file, point both `DATABASE_URL` and your manual `prisma migrate deploy` command at that same file.
 - If the persisted SQLite file matches the known `v1.7.7` Docker `db push` shape without `_prisma_migrations`, apply `prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql` with `sqlite3` against that same file, then restart.
 - If it does not match that proven shape, do not force a blind migrate; reindex into a fresh database unless you are deliberately doing a manual baseline.
 
@@ -128,8 +139,9 @@ Migration-only is the supported path when:
 - you apply the shipped migrations only,
 - you are not trying to rebuild an already-corrupted or historically incomplete dataset.
 
-Shipped upgrade migrations are intended to fill missing runtime data needed by the newer code without deliberately renumbering existing public IDs.
-Do not treat a successful in-place upgrade on a historically drifted database as proof that public sequential IDs will match a fresh rebuild row-for-row.
+Shipped upgrade migrations are intended to fill missing runtime data needed by the newer code without a full reindex.
+For local SQLite databases created by the affected drifted releases, the startup repair may deterministically rewrite `agents.agent_id` to the canonical order so the upgraded DB matches a fresh local/pool rebuild.
+Do not treat a successful in-place upgrade on a historically drifted database as proof that every legacy runtime/status field will match a fresh rebuild row-for-row.
 Do not treat a successful in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
 
 ## When reindex is required
@@ -150,7 +162,8 @@ Additional SQLite note:
 
 After upgrade:
 
-1. check `/health`,
+1. check `/health` for process liveness,
+2. check `/ready` for readiness and the current bootstrap/catch-up state (`status`, `phase`, `mainSlot`, pending/orphan counts when available),
 2. confirm `indexer_state` resumes from the existing cursor and continues to advance,
 3. validate representative reads on `agents`, `feedbacks`, `responses`, `revocations`, and `collections`,
 4. validate collection-scoped endpoints with `creator + collection`,
@@ -160,7 +173,7 @@ After upgrade:
 ## Sequential IDs and cross-engine comparisons
 
 - Public sequential IDs are part of the API surface.
-- Supported in-place upgrades are expected to preserve already assigned public IDs; upgrade migrations should fill missing IDs, not rewrite existing public IDs.
+- Supported in-place upgrades preserve canonical public IDs. For affected local SQLite drift, startup repair may rewrite previously wrong `agents.agent_id` values to their canonical order without requiring a reindex.
 - Strict PostgreSQL-vs-SQLite parity is a separate validation problem from in-place upgrade support.
 - If you need strict cross-engine parity, bootstrap each backend from the same canonical chain window and verify them at the same cutoff.
 

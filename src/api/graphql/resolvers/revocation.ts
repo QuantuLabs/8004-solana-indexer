@@ -7,7 +7,14 @@ function toUnixTimestamp(dateStr: string | null): string | null {
   return Number.isNaN(ms) ? null : String(Math.floor(ms / 1000));
 }
 
-function requireRevocationId(parent: RevocationRow): string {
+function requireCanonicalRevocationId(parent: RevocationRow): string {
+  if (!parent.asset || !parent.client_address || parent.feedback_index === null || parent.feedback_index === undefined) {
+    throw new Error(`Missing canonical revocation id fields for revocation row ${parent.id}`);
+  }
+  return `${parent.asset}:${parent.client_address}:${String(parent.feedback_index)}`;
+}
+
+function requireRevocationCursorId(parent: RevocationRow): string {
   if (!parent.revocation_id) {
     throw new Error(`Missing revocation_id for revocation row ${parent.id}`);
   }
@@ -17,11 +24,11 @@ function requireRevocationId(parent: RevocationRow): string {
 export const revocationResolvers = {
   Revocation: {
     id(parent: RevocationRow) {
-      return requireRevocationId(parent);
+      return requireCanonicalRevocationId(parent);
     },
     cursor(parent: RevocationRow) {
       return Buffer.from(
-        JSON.stringify({ created_at: parent.created_at, id: requireRevocationId(parent), row_id: parent.id }),
+        JSON.stringify({ created_at: parent.created_at, id: requireRevocationCursorId(parent), row_id: parent.id }),
         'utf-8'
       ).toString('base64');
     },

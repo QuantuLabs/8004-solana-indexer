@@ -15,6 +15,13 @@
 ALTER TABLE "CollectionPointer"
 ADD COLUMN "collection_id" BIGINT;
 
+-- 20260311173000_add_collection_pointer_last_seen_tx_index
+ALTER TABLE "CollectionPointer"
+ADD COLUMN "lastSeenTxIndex" INTEGER;
+
+ALTER TABLE "FeedbackResponse"
+ADD COLUMN "sealHash" BLOB;
+
 CREATE UNIQUE INDEX IF NOT EXISTS "CollectionPointer_collection_id_key"
 ON "CollectionPointer"("collection_id");
 
@@ -435,6 +442,77 @@ WHEN
 BEGIN
   SELECT RAISE(IGNORE);
 END;
+
+-- 20260312110000_add_local_collection_id_counter
+CREATE TABLE IF NOT EXISTS "IdCounter" (
+  "scope" TEXT NOT NULL PRIMARY KEY,
+  "nextValue" BIGINT NOT NULL,
+  "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO "IdCounter" ("scope", "nextValue", "updatedAt")
+VALUES (
+  'collection:global',
+  COALESCE((SELECT MAX("collection_id") FROM "CollectionPointer"), 0) + 1,
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT("scope") DO UPDATE SET
+  "nextValue" = CASE
+    WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."nextValue"
+    ELSE "IdCounter"."nextValue"
+  END,
+  "updatedAt" = CURRENT_TIMESTAMP;
+
+DROP TRIGGER IF EXISTS "CollectionPointer_assign_collection_id_after_insert";
+DROP TRIGGER IF EXISTS "CollectionPointer_assign_collection_id_after_update";
+
+CREATE TRIGGER "CollectionPointer_assign_collection_id_after_insert"
+AFTER INSERT ON "CollectionPointer"
+FOR EACH ROW
+WHEN NEW."collection_id" IS NULL
+BEGIN
+  INSERT INTO "IdCounter" ("scope", "nextValue", "updatedAt")
+  VALUES ('collection:global', 2, CURRENT_TIMESTAMP)
+  ON CONFLICT("scope") DO UPDATE SET
+    "nextValue" = "IdCounter"."nextValue" + 1,
+    "updatedAt" = CURRENT_TIMESTAMP;
+
+  UPDATE "CollectionPointer"
+  SET "collection_id" = (
+    SELECT "nextValue" - 1
+    FROM "IdCounter"
+    WHERE "scope" = 'collection:global'
+  )
+  WHERE "col" = NEW."col"
+    AND "creator" = NEW."creator"
+    AND "collection_id" IS NULL;
+END;
+
+CREATE TRIGGER "CollectionPointer_assign_collection_id_after_update"
+AFTER UPDATE ON "CollectionPointer"
+FOR EACH ROW
+WHEN NEW."collection_id" IS NULL
+BEGIN
+  INSERT INTO "IdCounter" ("scope", "nextValue", "updatedAt")
+  VALUES ('collection:global', 2, CURRENT_TIMESTAMP)
+  ON CONFLICT("scope") DO UPDATE SET
+    "nextValue" = "IdCounter"."nextValue" + 1,
+    "updatedAt" = CURRENT_TIMESTAMP;
+
+  UPDATE "CollectionPointer"
+  SET "collection_id" = (
+    SELECT "nextValue" - 1
+    FROM "IdCounter"
+    WHERE "scope" = 'collection:global'
+  )
+  WHERE "col" = NEW."col"
+    AND "creator" = NEW."creator"
+    AND "collection_id" IS NULL;
+END;
+
+UPDATE "CollectionPointer"
+SET "collection_id" = "collection_id"
+WHERE "collection_id" IS NULL;
 
 -- 20260305235500_add_orphan_feedback
 CREATE TABLE "OrphanFeedback" (

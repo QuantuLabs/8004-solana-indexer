@@ -127,7 +127,7 @@ type Agent {
   cursor: String!
   chainId: Int!
   # Sequential DB registration id from agents.agent_id (not asset-derived).
-  # Can be null in local mode until verifier/backfill assigns canonical IDs.
+  # Can still be null for legacy/orphan rows pending repair, but fresh local and pool ingest assign it at registration time.
   agentId: BigInt
   agentURI: String
   agentURIType: URIType
@@ -220,7 +220,6 @@ type Protocol {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
-  totalValidations: BigInt!
   tags: [String!]!
 }
 
@@ -228,7 +227,6 @@ type GlobalStats {
   id: ID!
   totalAgents: BigInt!
   totalFeedback: BigInt!
-  totalValidations: BigInt!
   totalCollections: BigInt!
   platinumAgents: BigInt!
   goldAgents: BigInt!
@@ -275,6 +273,7 @@ type VerificationStats {
   feedbacks: VerificationStatusCounts!
   registries: VerificationStatusCounts!
   metadata: VerificationStatusCounts!
+  validations: VerificationStatusCounts!
   feedbackResponses: VerificationStatusCounts!
   revocations: VerificationStatusCounts!
 }

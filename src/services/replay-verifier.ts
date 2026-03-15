@@ -247,22 +247,80 @@ export class ReplayVerifier {
     let valid = true;
     let mismatchAt: number | undefined;
     let checkpointsStored = 0;
+    const compareCanonical = <
+      T extends {
+        count: bigint;
+        slot: bigint;
+        txIndex: number | null;
+        eventOrdinal: number | null;
+        signature: string | null;
+        tiebreaker: string;
+      },
+    >(a: T, b: T): number => {
+      if (a.count !== b.count) return a.count < b.count ? -1 : 1;
+      if (a.slot !== b.slot) return a.slot < b.slot ? -1 : 1;
+      const aTxIndex = a.txIndex ?? -1;
+      const bTxIndex = b.txIndex ?? -1;
+      if (aTxIndex !== bTxIndex) return aTxIndex < bTxIndex ? -1 : 1;
+      const aOrdinal = a.eventOrdinal ?? -1;
+      const bOrdinal = b.eventOrdinal ?? -1;
+      if (aOrdinal !== bOrdinal) return aOrdinal < bOrdinal ? -1 : 1;
+      const aSig = a.signature ?? "";
+      const bSig = b.signature ?? "";
+      if (aSig !== bSig) return aSig < bSig ? -1 : 1;
+      return a.tiebreaker.localeCompare(b.tiebreaker);
+    };
 
     if (chainType === "feedback") {
       let lastIndex = startCount > 0 ? BigInt(startCount - 1) : -1n;
       while (true) {
-        const feedbacks = await this.prisma.feedback.findMany({
-          where: { agentId, feedbackIndex: { gt: lastIndex }, status: { not: "ORPHANED" } },
-          orderBy: { feedbackIndex: "asc" },
-          take: BATCH_SIZE,
-        });
-        if (feedbacks.length === 0) break;
+        const [feedbacks, orphanFeedbacks] = await Promise.all([
+          this.prisma.feedback.findMany({
+            where: { agentId, feedbackIndex: { gt: lastIndex } },
+            orderBy: { feedbackIndex: "asc" },
+            take: BATCH_SIZE,
+          }),
+          this.prisma.orphanFeedback.findMany({
+            where: { agentId, feedbackIndex: { gt: lastIndex } },
+            orderBy: { feedbackIndex: "asc" },
+            take: BATCH_SIZE,
+          }),
+        ]);
+        const combined = [
+          ...feedbacks.map((f) => ({
+            count: f.feedbackIndex,
+            slot: f.createdSlot ?? 0n,
+            txIndex: f.txIndex ?? null,
+            eventOrdinal: f.eventOrdinal ?? null,
+            signature: f.createdTxSignature ?? null,
+            tiebreaker: `feedback:${String((f as { id?: string }).id ?? "")}`,
+            agentId: f.agentId,
+            client: f.client,
+            feedbackIndex: f.feedbackIndex,
+            feedbackHash: f.feedbackHash,
+            runningDigest: f.runningDigest,
+          })),
+          ...orphanFeedbacks.map((f) => ({
+            count: f.feedbackIndex,
+            slot: f.slot ?? 0n,
+            txIndex: f.txIndex ?? null,
+            eventOrdinal: f.eventOrdinal ?? null,
+            signature: f.txSignature ?? null,
+            tiebreaker: `orphan:${String((f as { id?: string }).id ?? "")}`,
+            agentId: f.agentId,
+            client: f.client,
+            feedbackIndex: f.feedbackIndex,
+            feedbackHash: f.feedbackHash,
+            runningDigest: f.runningDigest,
+          })),
+        ].sort(compareCanonical).slice(0, BATCH_SIZE);
+        if (combined.length === 0) break;
 
-        for (const f of feedbacks) {
+        for (const f of combined) {
           const assetBuf = pubkeyToBuffer(f.agentId);
           const clientBuf = pubkeyToBuffer(f.client);
           const sealHash = hashBytesToBuffer(f.feedbackHash);
-          const slot = f.createdSlot ?? 0n;
+          const slot = f.slot;
 
           const leaf = computeFeedbackLeafV1(assetBuf, clientBuf, f.feedbackIndex, sealHash, slot);
           digest = chainHash(digest, DOMAIN_FEEDBACK, leaf);
@@ -282,37 +340,80 @@ export class ReplayVerifier {
             checkpointsStored++;
           }
         }
-        lastIndex = feedbacks[feedbacks.length - 1].feedbackIndex;
-        if (feedbacks.length < BATCH_SIZE) break;
+        lastIndex = combined[combined.length - 1].feedbackIndex;
+        if (combined.length < BATCH_SIZE) break;
       }
     } else if (chainType === "response") {
-      let lastResponseCount = startCount > 0 ? BigInt(startCount - 1) : -1n;
+      let lastResponseCount = startCount > 0 ? BigInt(startCount) : 0n;
       while (true) {
-        const responses = await this.prisma.feedbackResponse.findMany({
-          where: {
-            feedback: { agentId },
-            responseCount: { gt: lastResponseCount },
-            status: { not: "ORPHANED" },
-          },
-          orderBy: { responseCount: "asc" },
-          take: BATCH_SIZE,
-          include: {
-            feedback: {
-              select: { agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
+        const [responses, orphanResponses] = await Promise.all([
+          this.prisma.feedbackResponse.findMany({
+            where: {
+              feedback: { agentId },
+              responseCount: { gt: lastResponseCount },
             },
-          },
-        });
-        if (responses.length === 0) break;
+            orderBy: { responseCount: "asc" },
+            take: BATCH_SIZE,
+            include: {
+              feedback: {
+                select: { agentId: true, client: true, feedbackIndex: true },
+              },
+            },
+          }),
+          this.prisma.orphanResponse.findMany({
+            where: {
+              agentId,
+              responseCount: { gt: lastResponseCount },
+            },
+            orderBy: { responseCount: "asc" },
+            take: BATCH_SIZE,
+          }),
+        ]);
+        const combined = [
+          ...responses.map((r) => ({
+            count: r.responseCount ?? 0n,
+            slot: r.slot ?? 0n,
+            txIndex: r.txIndex ?? null,
+            eventOrdinal: r.eventOrdinal ?? null,
+            signature: r.txSignature ?? null,
+            tiebreaker: `response:${String((r as { id?: string }).id ?? "")}`,
+            agentId: r.feedback.agentId,
+            client: r.feedback.client,
+            feedbackIndex: r.feedback.feedbackIndex,
+            responder: r.responder,
+            responseHash: r.responseHash,
+            sealHash: r.sealHash,
+            runningDigest: r.runningDigest,
+            responseCount: r.responseCount ?? 0n,
+          })),
+          ...orphanResponses.map((r) => ({
+            count: r.responseCount ?? 0n,
+            slot: r.slot ?? 0n,
+            txIndex: r.txIndex ?? null,
+            eventOrdinal: r.eventOrdinal ?? null,
+            signature: r.txSignature ?? null,
+            tiebreaker: `orphan-response:${String((r as { id?: string }).id ?? "")}`,
+            agentId: r.agentId,
+            client: r.client,
+            feedbackIndex: r.feedbackIndex,
+            responder: r.responder,
+            responseHash: r.responseHash,
+            sealHash: r.sealHash,
+            runningDigest: r.runningDigest,
+            responseCount: r.responseCount ?? 0n,
+          })),
+        ].sort(compareCanonical).slice(0, BATCH_SIZE);
+        if (combined.length === 0) break;
 
-        for (const r of responses) {
-          const assetBuf = pubkeyToBuffer(r.feedback.agentId);
-          const clientBuf = pubkeyToBuffer(r.feedback.client);
+        for (const r of combined) {
+          const assetBuf = pubkeyToBuffer(r.agentId);
+          const clientBuf = pubkeyToBuffer(r.client);
           const responderBuf = pubkeyToBuffer(r.responder);
           const responseHash = hashBytesToBuffer(r.responseHash);
-          const feedbackHash = hashBytesToBuffer(r.feedback.feedbackHash);
+          const feedbackHash = hashBytesToBuffer(r.sealHash);
           const slot = r.slot ?? 0n;
 
-          const leaf = computeResponseLeaf(assetBuf, clientBuf, r.feedback.feedbackIndex, responderBuf, responseHash, feedbackHash, slot);
+          const leaf = computeResponseLeaf(assetBuf, clientBuf, r.feedbackIndex, responderBuf, responseHash, feedbackHash, slot);
           digest = chainHash(digest, DOMAIN_RESPONSE, leaf);
           count++;
 
@@ -330,14 +431,14 @@ export class ReplayVerifier {
             checkpointsStored++;
           }
         }
-        lastResponseCount = responses[responses.length - 1].responseCount ?? lastResponseCount;
-        if (responses.length < BATCH_SIZE) break;
+        lastResponseCount = combined[combined.length - 1].responseCount ?? lastResponseCount;
+        if (combined.length < BATCH_SIZE) break;
       }
     } else {
-      let lastRevokeCount = startCount > 0 ? BigInt(startCount - 1) : -1n;
+      let lastRevokeCount = startCount > 0 ? BigInt(startCount) : 0n;
       while (true) {
         const revocations = await this.prisma.revocation.findMany({
-          where: { agentId, revokeCount: { gt: lastRevokeCount }, status: { not: "ORPHANED" } },
+          where: { agentId, revokeCount: { gt: lastRevokeCount } },
           orderBy: { revokeCount: "asc" },
           take: BATCH_SIZE,
         });
@@ -402,19 +503,39 @@ async function fetchLatestCheckpointFromPool(
 
   if (chainType === "feedback") {
     const params = [agentId];
-    const targetSql = target !== null ? `AND (feedback_index + 1) <= $2::bigint` : "";
+    const targetSql = target !== null ? `AND (event_count)::bigint <= $2::bigint` : "";
     if (target !== null) params.push(target.toString());
     const { rows } = await pool.query<{ event_count: string; digest: string }>(
-      `SELECT
-         (feedback_index + 1)::text AS event_count,
-         encode(running_digest, 'hex') AS digest
-       FROM feedbacks
-       WHERE asset = $1
-         AND status != 'ORPHANED'
-         AND running_digest IS NOT NULL
-         AND ((feedback_index + 1) % 1000) = 0
+      `WITH combined AS (
+         SELECT
+           (feedback_index + 1)::text AS event_count,
+           encode(running_digest, 'hex') AS digest,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM feedbacks
+         WHERE asset = $1
+           AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT
+           (feedback_index + 1)::text AS event_count,
+           encode(running_digest, 'hex') AS digest,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM orphan_feedbacks
+         WHERE asset = $1
+           AND running_digest IS NOT NULL
+       )
+       SELECT event_count, digest
+       FROM combined
+       WHERE ((event_count)::bigint % 1000) = 0
          ${targetSql}
-       ORDER BY feedback_index DESC
+       ORDER BY (event_count)::bigint DESC, block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC
        LIMIT 1`,
       params,
     );
@@ -424,28 +545,31 @@ async function fetchLatestCheckpointFromPool(
 
   if (chainType === "response") {
     const params = [agentId];
-    const targetSql = target !== null ? `AND (response_count + 1) <= $2::bigint` : "";
+    const targetSql = target !== null ? `AND (event_count)::bigint <= $2::bigint` : "";
     if (target !== null) params.push(target.toString());
     const { rows } = await pool.query<{ event_count: string; digest: string }>(
-      `WITH ordered AS (
+      `WITH combined AS (
          SELECT
-           (ROW_NUMBER() OVER (
-             PARTITION BY asset
-             ORDER BY block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, id ASC
-           ) - 1)::bigint AS response_count,
+           response_count::text AS event_count,
            encode(running_digest, 'hex') AS digest
          FROM feedback_responses
          WHERE asset = $1
-           AND status != 'ORPHANED'
+           AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT
+           response_count::text AS event_count,
+           encode(running_digest, 'hex') AS digest
+         FROM orphan_responses
+         WHERE asset = $1
            AND running_digest IS NOT NULL
        )
        SELECT
-         (response_count + 1)::text AS event_count,
+         event_count,
          digest
-       FROM ordered
-       WHERE ((response_count + 1) % 1000) = 0
+       FROM combined
+       WHERE ((event_count)::bigint % 1000) = 0
          ${targetSql}
-       ORDER BY response_count DESC
+       ORDER BY (event_count)::bigint DESC
        LIMIT 1`,
       params,
     );
@@ -454,17 +578,16 @@ async function fetchLatestCheckpointFromPool(
   }
 
   const params = [agentId];
-  const targetSql = target !== null ? `AND (revoke_count + 1) <= $2::bigint` : "";
+  const targetSql = target !== null ? `AND revoke_count <= $2::bigint` : "";
   if (target !== null) params.push(target.toString());
   const { rows } = await pool.query<{ event_count: string; digest: string }>(
     `SELECT
-       (revoke_count + 1)::text AS event_count,
+       revoke_count::text AS event_count,
        encode(running_digest, 'hex') AS digest
      FROM revocations
      WHERE asset = $1
-       AND status != 'ORPHANED'
        AND running_digest IS NOT NULL
-       AND ((revoke_count + 1) % 1000) = 0
+       AND (revoke_count % 1000) = 0
        ${targetSql}
      ORDER BY revoke_count DESC
      LIMIT 1`,
@@ -481,16 +604,37 @@ async function queryCheckpointsForChain(
 ): Promise<DerivedCheckpoint[]> {
   if (chainType === "feedback") {
     const { rows } = await pool.query<{ event_count: string; digest: string; created_at: Date | string }>(
-      `SELECT
-         (feedback_index + 1)::text AS event_count,
-         encode(running_digest, 'hex') AS digest,
-         created_at
-       FROM feedbacks
-       WHERE asset = $1
-         AND status != 'ORPHANED'
-         AND running_digest IS NOT NULL
-         AND ((feedback_index + 1) % 1000) = 0
-       ORDER BY feedback_index ASC`,
+      `WITH combined AS (
+         SELECT
+           (feedback_index + 1)::text AS event_count,
+           encode(running_digest, 'hex') AS digest,
+           created_at,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM feedbacks
+         WHERE asset = $1
+           AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT
+           (feedback_index + 1)::text AS event_count,
+           encode(running_digest, 'hex') AS digest,
+           created_at,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM orphan_feedbacks
+         WHERE asset = $1
+           AND running_digest IS NOT NULL
+       )
+       SELECT event_count, digest, created_at
+       FROM combined
+       WHERE ((event_count)::bigint % 1000) = 0
+       ORDER BY (event_count)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC`,
       [agentId],
     );
     return rows.map((row) => ({
@@ -503,26 +647,30 @@ async function queryCheckpointsForChain(
 
   if (chainType === "response") {
     const { rows } = await pool.query<{ event_count: string; digest: string; created_at: Date | string }>(
-      `WITH ordered AS (
+      `WITH combined AS (
          SELECT
-           (ROW_NUMBER() OVER (
-             PARTITION BY asset
-             ORDER BY block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, id ASC
-           ) - 1)::bigint AS response_count,
+           response_count::text AS event_count,
            encode(running_digest, 'hex') AS digest,
            created_at
          FROM feedback_responses
          WHERE asset = $1
-           AND status != 'ORPHANED'
+           AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT
+           response_count::text AS event_count,
+           encode(running_digest, 'hex') AS digest,
+           created_at
+         FROM orphan_responses
+         WHERE asset = $1
            AND running_digest IS NOT NULL
        )
        SELECT
-         (response_count + 1)::text AS event_count,
+         event_count,
          digest,
          created_at
-       FROM ordered
-       WHERE ((response_count + 1) % 1000) = 0
-       ORDER BY response_count ASC`,
+       FROM combined
+       WHERE ((event_count)::bigint % 1000) = 0
+       ORDER BY (event_count)::bigint ASC`,
       [agentId],
     );
     return rows.map((row) => ({
@@ -535,14 +683,13 @@ async function queryCheckpointsForChain(
 
   const { rows } = await pool.query<{ event_count: string; digest: string; created_at: Date | string }>(
     `SELECT
-       (revoke_count + 1)::text AS event_count,
+       revoke_count::text AS event_count,
        encode(running_digest, 'hex') AS digest,
        created_at
-     FROM revocations
-     WHERE asset = $1
-       AND status != 'ORPHANED'
-       AND running_digest IS NOT NULL
-       AND ((revoke_count + 1) % 1000) = 0
+         FROM revocations
+         WHERE asset = $1
+           AND running_digest IS NOT NULL
+       AND (revoke_count % 1000) = 0
      ORDER BY revoke_count ASC`,
     [agentId],
   );
@@ -606,14 +753,18 @@ export async function fetchReplayDataFromPool(
   limit = BATCH_SIZE,
 ): Promise<ReplayDataPage> {
   const lowerBound = BigInt(fromCount);
-  const upperBound = toCount !== undefined ? BigInt(toCount) : lowerBound + BigInt(limit);
-
-  if (upperBound <= lowerBound) {
+  const normalizedLowerBound = lowerBound;
+  const explicitUpperBound = toCount !== undefined ? BigInt(toCount) : null;
+  const take = explicitUpperBound !== null
+    ? Math.max(0, Math.min(limit, Number(explicitUpperBound - normalizedLowerBound)))
+    : limit;
+  if (take === 0) {
     return { events: [], hasMore: false, nextFromCount: fromCount };
   }
+  const queryTake = take + 1;
+  const upperBound = explicitUpperBound ?? (normalizedLowerBound + BigInt(queryTake));
 
-  const take = Math.max(0, Math.min(limit, Number(upperBound - lowerBound)));
-  if (take === 0) {
+  if (upperBound <= normalizedLowerBound) {
     return { events: [], hasMore: false, nextFromCount: fromCount };
   }
 
@@ -625,23 +776,51 @@ export async function fetchReplayDataFromPool(
       slot: string;
       running_digest: string | null;
     }>(
-      `SELECT
-         client_address AS client,
-         feedback_index::text AS feedback_index,
+      `WITH combined AS (
+         SELECT
+           client_address AS client,
+           feedback_index::text AS feedback_index,
+           feedback_hash,
+           block_slot::text AS slot,
+           encode(running_digest, 'hex') AS running_digest,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM feedbacks
+         WHERE asset = $1
+         UNION ALL
+         SELECT
+           client_address AS client,
+           feedback_index::text AS feedback_index,
+           feedback_hash,
+           block_slot::text AS slot,
+           encode(running_digest, 'hex') AS running_digest,
+           block_slot,
+           tx_index,
+           event_ordinal,
+           tx_signature,
+           id::text AS row_id
+         FROM orphan_feedbacks
+         WHERE asset = $1
+       )
+       SELECT
+         client,
+         feedback_index,
          feedback_hash,
-         block_slot::text AS slot,
-         encode(running_digest, 'hex') AS running_digest
-       FROM feedbacks
-       WHERE asset = $1
-         AND status != 'ORPHANED'
-         AND feedback_index >= $2::bigint
-         AND feedback_index < $3::bigint
-       ORDER BY feedback_index ASC
+         slot,
+         running_digest
+       FROM combined
+       WHERE (feedback_index)::bigint >= $2::bigint
+         AND (feedback_index)::bigint < $3::bigint
+       ORDER BY (feedback_index)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
        LIMIT $4::int`,
-      [asset, lowerBound.toString(), upperBound.toString(), take],
+      [asset, normalizedLowerBound.toString(), upperBound.toString(), queryTake],
     );
 
-    const events = rows.map((row) => ({
+    const pageRows = rows.slice(0, take);
+    const events = pageRows.map((row) => ({
       asset,
       client: row.client,
       feedback_index: row.feedback_index,
@@ -649,11 +828,11 @@ export async function fetchReplayDataFromPool(
       slot: toNumberSafe(row.slot),
       running_digest: row.running_digest,
     }));
-    const last = rows.length > 0 ? toNumberSafe(rows[rows.length - 1]?.feedback_index) : fromCount;
+    const last = pageRows.length > 0 ? toNumberSafe(pageRows[pageRows.length - 1]?.feedback_index) : fromCount;
     return {
       events,
-      hasMore: rows.length === take,
-      nextFromCount: rows.length > 0 ? last + 1 : fromCount,
+      hasMore: rows.length > take,
+      nextFromCount: pageRows.length > 0 ? last + 1 : fromCount,
     };
   }
 
@@ -668,46 +847,60 @@ export async function fetchReplayDataFromPool(
       running_digest: string | null;
       response_count: string;
     }>(
-      `WITH ordered AS (
+      `WITH combined AS (
+	         SELECT
+	           fr.client_address AS client,
+	           fr.feedback_index::text AS feedback_index,
+	           fr.responder,
+	           fr.response_hash,
+	           fr.seal_hash AS feedback_hash,
+	           encode(fr.running_digest, 'hex') AS running_digest,
+	           fr.block_slot::text AS slot,
+	           fr.response_count::text AS response_count,
+	           fr.block_slot,
+	           fr.tx_index,
+	           fr.event_ordinal,
+	           fr.tx_signature,
+	           fr.id::text AS row_id
+           FROM feedback_responses fr
+           WHERE fr.asset = $1
+         UNION ALL
          SELECT
-           fr.asset,
-           fr.client_address AS client,
-           fr.feedback_index::text AS feedback_index,
-           fr.responder,
-           fr.response_hash,
-           encode(fr.running_digest, 'hex') AS running_digest,
-           fr.block_slot::text AS slot,
-           (ROW_NUMBER() OVER (
-             PARTITION BY fr.asset
-             ORDER BY fr.block_slot ASC, fr.tx_index ASC NULLS LAST, fr.event_ordinal ASC NULLS LAST, fr.tx_signature ASC NULLS LAST, fr.id ASC
-           ) - 1)::bigint::text AS response_count
-         FROM feedback_responses fr
-         WHERE fr.asset = $1
-           AND fr.status != 'ORPHANED'
-       )
-       SELECT
-         o.client,
-         o.feedback_index,
-         o.responder,
-         o.response_hash,
-         f.feedback_hash,
-         o.slot,
-         o.running_digest,
-         o.response_count
-       FROM ordered o
-       LEFT JOIN feedbacks f
-         ON f.asset = $1
-        AND f.client_address = o.client
-        AND f.feedback_index::text = o.feedback_index
-        AND f.status != 'ORPHANED'
-       WHERE (o.response_count)::bigint >= $2::bigint
-         AND (o.response_count)::bigint < $3::bigint
-       ORDER BY (o.response_count)::bigint ASC
+           o.client_address AS client,
+           o.feedback_index::text AS feedback_index,
+           o.responder,
+           o.response_hash,
+           o.seal_hash AS feedback_hash,
+           encode(o.running_digest, 'hex') AS running_digest,
+           o.block_slot::text AS slot,
+           o.response_count::text AS response_count,
+           o.block_slot,
+           o.tx_index,
+           o.event_ordinal,
+           o.tx_signature,
+           o.id::text AS row_id
+         FROM orphan_responses o
+         WHERE o.asset = $1
+         )
+         SELECT
+           client,
+           feedback_index,
+           responder,
+	         response_hash,
+	         feedback_hash,
+	         slot,
+	         running_digest,
+	         response_count
+	       FROM combined
+	       WHERE (response_count)::bigint >= $2::bigint
+	         AND (response_count)::bigint < $3::bigint
+       ORDER BY (response_count)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
        LIMIT $4::int`,
-      [asset, lowerBound.toString(), upperBound.toString(), take],
+      [asset, normalizedLowerBound.toString(), upperBound.toString(), queryTake],
     );
 
-    const events = rows.map((row) => ({
+    const pageRows = rows.slice(0, take);
+    const events = pageRows.map((row) => ({
       asset,
       client: row.client,
       feedback_index: row.feedback_index,
@@ -718,11 +911,11 @@ export async function fetchReplayDataFromPool(
       running_digest: row.running_digest,
       response_count: toNumberSafe(row.response_count),
     }));
-    const last = rows.length > 0 ? toNumberSafe(rows[rows.length - 1]?.response_count) : fromCount;
+    const last = pageRows.length > 0 ? toNumberSafe(pageRows[pageRows.length - 1]?.response_count) : fromCount;
     return {
       events,
-      hasMore: rows.length === take,
-      nextFromCount: rows.length > 0 ? last + 1 : fromCount,
+      hasMore: rows.length > take,
+      nextFromCount: pageRows.length > 0 ? last + 1 : fromCount,
     };
   }
 
@@ -741,17 +934,17 @@ export async function fetchReplayDataFromPool(
        slot::text AS slot,
        encode(running_digest, 'hex') AS running_digest,
        revoke_count::text AS revoke_count
-     FROM revocations
-     WHERE asset = $1
-       AND status != 'ORPHANED'
-       AND revoke_count >= $2::bigint
-       AND revoke_count < $3::bigint
+	     FROM revocations
+	     WHERE asset = $1
+	       AND revoke_count >= $2::bigint
+	       AND revoke_count < $3::bigint
      ORDER BY revoke_count ASC
      LIMIT $4::int`,
-    [asset, lowerBound.toString(), upperBound.toString(), take],
+    [asset, normalizedLowerBound.toString(), upperBound.toString(), queryTake],
   );
 
-  const events = rows.map((row) => ({
+  const pageRows = rows.slice(0, take);
+  const events = pageRows.map((row) => ({
     asset,
     client: row.client,
     feedback_index: row.feedback_index,
@@ -760,11 +953,11 @@ export async function fetchReplayDataFromPool(
     running_digest: row.running_digest,
     revoke_count: row.revoke_count,
   }));
-  const last = rows.length > 0 ? toNumberSafe(rows[rows.length - 1]?.revoke_count) : fromCount;
+  const last = pageRows.length > 0 ? toNumberSafe(pageRows[pageRows.length - 1]?.revoke_count) : fromCount;
   return {
     events,
-    hasMore: rows.length === take,
-    nextFromCount: rows.length > 0 ? last + 1 : fromCount,
+    hasMore: rows.length > take,
+    nextFromCount: pageRows.length > 0 ? last + 1 : fromCount,
   };
 }
 
@@ -814,17 +1007,44 @@ export class PoolReplayVerifier {
         slot: string;
         running_digest: string | null;
       }>(
-        `SELECT
-           client_address AS client,
-           feedback_index::text AS feedback_index,
+        `WITH combined AS (
+           SELECT
+             client_address AS client,
+             feedback_index::text AS feedback_index,
+             feedback_hash,
+             block_slot::text AS slot,
+             encode(running_digest, 'hex') AS running_digest,
+             block_slot,
+             tx_index,
+             event_ordinal,
+             tx_signature,
+             id::text AS row_id
+           FROM feedbacks
+           WHERE asset = $1
+           UNION ALL
+           SELECT
+             client_address AS client,
+             feedback_index::text AS feedback_index,
+             feedback_hash,
+             block_slot::text AS slot,
+             encode(running_digest, 'hex') AS running_digest,
+             block_slot,
+             tx_index,
+             event_ordinal,
+             tx_signature,
+             id::text AS row_id
+           FROM orphan_feedbacks
+           WHERE asset = $1
+         )
+         SELECT
+           client,
+           feedback_index,
            feedback_hash,
-           block_slot::text AS slot,
-           encode(running_digest, 'hex') AS running_digest
-         FROM feedbacks
-         WHERE asset = $1
-           AND status != 'ORPHANED'
-           AND feedback_index >= $2::bigint
-         ORDER BY feedback_index ASC
+           slot,
+           running_digest
+         FROM combined
+         WHERE (feedback_index)::bigint >= $2::bigint
+         ORDER BY (feedback_index)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
          LIMIT $3::int`,
         [agentId, nextIndex.toString(), BATCH_SIZE],
       );
@@ -877,7 +1097,7 @@ export class PoolReplayVerifier {
     let valid = true;
     let mismatchAt: number | undefined;
     let checkpointsStored = 0;
-    let nextCount = BigInt(count);
+    let nextCount = checkpoint ? BigInt(count + 1) : 0n;
 
     while (true) {
       const { rows } = await this.pool.query<{
@@ -890,40 +1110,53 @@ export class PoolReplayVerifier {
         running_digest: string | null;
         response_count: string;
       }>(
-        `WITH ordered AS (
-           SELECT
-             fr.asset,
-             fr.client_address AS client,
-             fr.feedback_index::text AS feedback_index,
-             fr.responder,
-             fr.response_hash,
-             encode(fr.running_digest, 'hex') AS running_digest,
-             fr.block_slot::text AS slot,
-             (ROW_NUMBER() OVER (
-               PARTITION BY fr.asset
-               ORDER BY fr.block_slot ASC, fr.tx_index ASC NULLS LAST, fr.event_ordinal ASC NULLS LAST, fr.tx_signature ASC NULLS LAST, fr.id ASC
-             ) - 1)::bigint::text AS response_count
-           FROM feedback_responses fr
-           WHERE fr.asset = $1
-             AND fr.status != 'ORPHANED'
-         )
+      `WITH combined AS (
          SELECT
-           o.client,
-           o.feedback_index,
+           fr.client_address AS client,
+           fr.feedback_index::text AS feedback_index,
+           fr.responder,
+           fr.response_hash,
+           fr.seal_hash AS feedback_hash,
+           encode(fr.running_digest, 'hex') AS running_digest,
+           fr.block_slot::text AS slot,
+           fr.response_count::text AS response_count,
+           fr.block_slot,
+           fr.tx_index,
+           fr.event_ordinal,
+           fr.tx_signature,
+           fr.id::text AS row_id
+         FROM feedback_responses fr
+         WHERE fr.asset = $1
+         UNION ALL
+         SELECT
+           o.client_address AS client,
+           o.feedback_index::text AS feedback_index,
            o.responder,
            o.response_hash,
-           f.feedback_hash,
-           o.slot,
-           o.running_digest,
-           o.response_count
-         FROM ordered o
-         LEFT JOIN feedbacks f
-           ON f.asset = $1
-          AND f.client_address = o.client
-          AND f.feedback_index::text = o.feedback_index
-          AND f.status != 'ORPHANED'
-         WHERE (o.response_count)::bigint >= $2::bigint
-         ORDER BY (o.response_count)::bigint ASC
+           o.seal_hash AS feedback_hash,
+           encode(o.running_digest, 'hex') AS running_digest,
+           o.block_slot::text AS slot,
+           o.response_count::text AS response_count,
+           o.block_slot,
+           o.tx_index,
+           o.event_ordinal,
+           o.tx_signature,
+           o.id::text AS row_id
+         FROM orphan_responses o
+         WHERE o.asset = $1
+         )
+         SELECT
+           client,
+           feedback_index,
+           responder,
+           response_hash,
+           feedback_hash,
+           slot,
+           running_digest,
+           response_count
+         FROM combined
+         WHERE (response_count)::bigint >= $2::bigint
+         ORDER BY (response_count)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
          LIMIT $3::int`,
         [agentId, nextCount.toString(), BATCH_SIZE],
       );
@@ -976,7 +1209,7 @@ export class PoolReplayVerifier {
     let valid = true;
     let mismatchAt: number | undefined;
     let checkpointsStored = 0;
-    let nextCount = BigInt(count);
+    let nextCount = checkpoint ? BigInt(count + 1) : 0n;
 
     while (true) {
       const { rows } = await this.pool.query<{
@@ -996,7 +1229,6 @@ export class PoolReplayVerifier {
            revoke_count::text AS revoke_count
          FROM revocations
          WHERE asset = $1
-           AND status != 'ORPHANED'
            AND revoke_count >= $2::bigint
          ORDER BY revoke_count ASC
          LIMIT $3::int`,

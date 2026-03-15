@@ -62,14 +62,26 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
   if (chain === 'FEEDBACK') {
     const [countRes, digestRes] = await Promise.all([
       ctx.pool.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM feedbacks WHERE asset = $1 AND status != 'ORPHANED'`,
+        `SELECT COALESCE(MAX(feedback_index) + 1, 0)::text AS count
+         FROM (
+           SELECT feedback_index FROM feedbacks WHERE asset = $1
+           UNION ALL
+           SELECT feedback_index FROM orphan_feedbacks WHERE asset = $1
+         ) combined`,
         [asset]
       ),
       ctx.pool.query<{ digest: string | null }>(
         `SELECT encode(running_digest, 'hex') AS digest
-         FROM feedbacks
-         WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
-         ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
+         FROM (
+           SELECT running_digest, block_slot, tx_index, event_ordinal, tx_signature, id::text AS row_id
+           FROM feedbacks
+           WHERE asset = $1 AND running_digest IS NOT NULL
+           UNION ALL
+           SELECT running_digest, block_slot, tx_index, event_ordinal, tx_signature, id::text AS row_id
+           FROM orphan_feedbacks
+           WHERE asset = $1 AND running_digest IS NOT NULL
+         ) combined
+         ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC
          LIMIT 1`,
         [asset]
       ),
@@ -84,14 +96,26 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
   if (chain === 'RESPONSE') {
     const [countRes, digestRes] = await Promise.all([
       ctx.pool.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM feedback_responses WHERE asset = $1 AND status != 'ORPHANED'`,
+        `SELECT COALESCE(MAX(response_count), 0)::text AS count
+         FROM (
+           SELECT response_count FROM feedback_responses WHERE asset = $1
+           UNION ALL
+           SELECT response_count FROM orphan_responses WHERE asset = $1
+         ) combined`,
         [asset]
       ),
       ctx.pool.query<{ digest: string | null }>(
         `SELECT encode(running_digest, 'hex') AS digest
-         FROM feedback_responses
-         WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
-         ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
+         FROM (
+           SELECT running_digest, block_slot, tx_index, event_ordinal, tx_signature, id::text AS row_id
+           FROM feedback_responses
+           WHERE asset = $1 AND running_digest IS NOT NULL
+           UNION ALL
+           SELECT running_digest, block_slot, tx_index, event_ordinal, tx_signature, id::text AS row_id
+           FROM orphan_responses
+           WHERE asset = $1 AND running_digest IS NOT NULL
+         ) combined
+         ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC
          LIMIT 1`,
         [asset]
       ),
@@ -105,13 +129,15 @@ async function fetchHead(ctx: GraphQLContext, asset: string, chain: HashChainTyp
 
   const [countRes, digestRes] = await Promise.all([
     ctx.pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM revocations WHERE asset = $1 AND status != 'ORPHANED'`,
+      `SELECT COALESCE(MAX(revoke_count), 0)::text AS count
+       FROM revocations
+       WHERE asset = $1`,
       [asset]
     ),
     ctx.pool.query<{ digest: string | null }>(
       `SELECT encode(running_digest, 'hex') AS digest
        FROM revocations
-       WHERE asset = $1 AND status != 'ORPHANED' AND running_digest IS NOT NULL
+       WHERE asset = $1 AND running_digest IS NOT NULL
        ORDER BY revoke_count DESC
        LIMIT 1`,
       [asset]
@@ -135,11 +161,16 @@ async function fetchLatestCheckpoint(
          feedback_index::text AS feedback_index,
          encode(running_digest, 'hex') AS digest,
          ${epochSecondsExpr('created_at')} AS created_at
-       FROM feedbacks
-       WHERE asset = $1
-         AND status != 'ORPHANED'
-         AND running_digest IS NOT NULL
-         AND ((feedback_index + 1) % 1000) = 0
+       FROM (
+         SELECT feedback_index, running_digest, created_at
+         FROM feedbacks
+         WHERE asset = $1 AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT feedback_index, running_digest, created_at
+         FROM orphan_feedbacks
+         WHERE asset = $1 AND running_digest IS NOT NULL
+       ) combined
+       WHERE ((feedback_index + 1) % 1000) = 0
        ORDER BY feedback_index DESC
        LIMIT 1`,
       [asset]
@@ -154,22 +185,20 @@ async function fetchLatestCheckpoint(
 
   if (chain === 'RESPONSE') {
     const { rows } = await ctx.pool.query<{ response_count: string; digest: string; created_at: string }>(
-      `WITH ordered AS (
-         SELECT
-           (ROW_NUMBER() OVER (
-             PARTITION BY asset
-             ORDER BY block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, id ASC
-           ) - 1)::bigint AS response_count,
-           encode(running_digest, 'hex') AS digest,
-           ${epochSecondsExpr('created_at')} AS created_at
+      `SELECT
+         response_count::text AS response_count,
+         encode(running_digest, 'hex') AS digest,
+         ${epochSecondsExpr('created_at')} AS created_at
+       FROM (
+         SELECT response_count, running_digest, created_at
          FROM feedback_responses
-         WHERE asset = $1
-           AND status != 'ORPHANED'
-           AND running_digest IS NOT NULL
-       )
-       SELECT response_count::text AS response_count, digest, created_at
-       FROM ordered
-       WHERE ((response_count + 1) % 1000) = 0
+         WHERE asset = $1 AND running_digest IS NOT NULL
+         UNION ALL
+         SELECT response_count, running_digest, created_at
+         FROM orphan_responses
+         WHERE asset = $1 AND running_digest IS NOT NULL
+       ) combined
+       WHERE (response_count % 1000) = 0
        ORDER BY response_count DESC
        LIMIT 1`,
       [asset]
@@ -177,7 +206,7 @@ async function fetchLatestCheckpoint(
 
     const row = rows[0];
     if (!row) return null;
-    const eventCount = (BigInt(row.response_count) + 1n).toString();
+    const eventCount = BigInt(row.response_count).toString();
 
     return { eventCount, digest: row.digest, createdAt: row.created_at };
   }
@@ -189,9 +218,8 @@ async function fetchLatestCheckpoint(
        ${epochSecondsExpr('created_at')} AS created_at
      FROM revocations
      WHERE asset = $1
-       AND status != 'ORPHANED'
        AND running_digest IS NOT NULL
-       AND ((revoke_count + 1) % 1000) = 0
+       AND (revoke_count % 1000) = 0
      ORDER BY revoke_count DESC
      LIMIT 1`,
     [asset]
@@ -199,13 +227,17 @@ async function fetchLatestCheckpoint(
 
   const row = rows[0];
   if (!row) return null;
-  const eventCount = (BigInt(row.revoke_count) + 1n).toString();
+  const eventCount = BigInt(row.revoke_count).toString();
 
   return { eventCount, digest: row.digest, createdAt: row.created_at };
 }
 
 function emptyReplayPage(fromCount: bigint) {
   return { events: [] as HashChainReplayEvent[], hasMore: false, nextFromCount: fromCount.toString() };
+}
+
+function normalizeReplayFromCount(_chainType: HashChainType, fromCount: bigint): bigint {
+  return fromCount;
 }
 
 export const hashChainResolvers = {
@@ -264,14 +296,16 @@ export const hashChainResolvers = {
       if (toCount != null) assertNonNegative('toCount', toCount);
 
       const first = clampReplayFirst(args.first);
-      const effectiveTo = toCount ?? (fromCount + BigInt(first));
+      const replayFromCount = normalizeReplayFromCount(chainType, fromCount);
+      const queryTake = first + 1;
+      const effectiveTo = toCount ?? (replayFromCount + BigInt(queryTake));
 
-      if (effectiveTo <= fromCount) {
+      if (effectiveTo <= replayFromCount) {
         return emptyReplayPage(fromCount);
       }
 
       let take = first;
-      const diff = effectiveTo - fromCount;
+      const diff = effectiveTo - replayFromCount;
       if (diff < BigInt(take)) {
         take = Number(diff);
       }
@@ -287,23 +321,50 @@ export const hashChainResolvers = {
           slot: string;
           running_digest: string | null;
         }>(
-          `SELECT
-             client_address AS client,
-             feedback_index::text AS feedback_index,
+          `WITH combined AS (
+             SELECT
+               client_address AS client,
+               feedback_index::text AS feedback_index,
+               feedback_hash,
+               block_slot::text AS slot,
+               encode(running_digest, 'hex') AS running_digest,
+               block_slot,
+               tx_index,
+               event_ordinal,
+               tx_signature,
+               id::text AS row_id
+             FROM feedbacks
+             WHERE asset = $1
+             UNION ALL
+             SELECT
+               client_address AS client,
+               feedback_index::text AS feedback_index,
+               feedback_hash,
+               block_slot::text AS slot,
+               encode(running_digest, 'hex') AS running_digest,
+               block_slot,
+               tx_index,
+               event_ordinal,
+               tx_signature,
+               id::text AS row_id
+             FROM orphan_feedbacks
+             WHERE asset = $1
+           )
+           SELECT
+             client,
+             feedback_index,
              feedback_hash,
-             block_slot::text AS slot,
-             encode(running_digest, 'hex') AS running_digest
-           FROM feedbacks
-           WHERE asset = $1
-             AND status != 'ORPHANED'
-             AND feedback_index >= $2::bigint
-             AND feedback_index < $3::bigint
-           ORDER BY feedback_index ASC
+             slot,
+             running_digest
+           FROM combined
+           WHERE (feedback_index)::bigint >= $2::bigint
+             AND (feedback_index)::bigint < $3::bigint
+           ORDER BY (feedback_index)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
            LIMIT $4::int`,
-          [asset, fromCount.toString(), effectiveTo.toString(), take]
+          [asset, replayFromCount.toString(), effectiveTo.toString(), queryTake]
         );
 
-        const events: HashChainReplayEvent[] = rows.map((r) => ({
+        const events: HashChainReplayEvent[] = rows.slice(0, take).map((r) => ({
           asset,
           client: r.client,
           feedbackIndex: r.feedback_index,
@@ -321,7 +382,7 @@ export const hashChainResolvers = {
 
         return {
           events,
-          hasMore: events.length === take,
+          hasMore: rows.length > take,
           nextFromCount,
         };
       }
@@ -337,46 +398,59 @@ export const hashChainResolvers = {
           running_digest: string | null;
           response_count: string;
         }>(
-          `WITH ordered AS (
+          `WITH combined AS (
              SELECT
-               fr.asset,
                fr.client_address AS client,
                fr.feedback_index::text AS feedback_index,
                fr.responder,
                fr.response_hash,
+               fr.seal_hash AS feedback_hash,
                encode(fr.running_digest, 'hex') AS running_digest,
                fr.block_slot::text AS slot,
-               (ROW_NUMBER() OVER (
-                 PARTITION BY fr.asset
-                 ORDER BY fr.block_slot ASC, fr.tx_index ASC NULLS LAST, fr.event_ordinal ASC NULLS LAST, fr.tx_signature ASC NULLS LAST, fr.id ASC
-               ) - 1)::bigint::text AS response_count
+               fr.response_count::text AS response_count,
+               fr.block_slot,
+               fr.tx_index,
+               fr.event_ordinal,
+               fr.tx_signature,
+               fr.id::text AS row_id
              FROM feedback_responses fr
              WHERE fr.asset = $1
-               AND fr.status != 'ORPHANED'
+             UNION ALL
+             SELECT
+               o.client_address AS client,
+               o.feedback_index::text AS feedback_index,
+               o.responder,
+               o.response_hash,
+               o.seal_hash AS feedback_hash,
+               encode(o.running_digest, 'hex') AS running_digest,
+               o.block_slot::text AS slot,
+               o.response_count::text AS response_count,
+               o.block_slot,
+               o.tx_index,
+               o.event_ordinal,
+               o.tx_signature,
+               o.id::text AS row_id
+             FROM orphan_responses o
+             WHERE o.asset = $1
            )
            SELECT
-             o.client,
-             o.feedback_index,
-             o.responder,
-             o.response_hash,
-             f.feedback_hash,
-             o.slot,
-             o.running_digest,
-             o.response_count
-           FROM ordered o
-           LEFT JOIN feedbacks f
-             ON f.asset = $1
-            AND f.client_address = o.client
-            AND f.feedback_index::text = o.feedback_index
-            AND f.status != 'ORPHANED'
-           WHERE (o.response_count)::bigint >= $2::bigint
-             AND (o.response_count)::bigint < $3::bigint
-           ORDER BY (o.response_count)::bigint ASC
+             client,
+             feedback_index,
+             responder,
+             response_hash,
+             feedback_hash,
+             slot,
+             running_digest,
+             response_count
+           FROM combined
+           WHERE (response_count)::bigint >= $2::bigint
+             AND (response_count)::bigint < $3::bigint
+           ORDER BY (response_count)::bigint ASC, block_slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, row_id ASC
            LIMIT $4::int`,
-          [asset, fromCount.toString(), effectiveTo.toString(), take]
+          [asset, replayFromCount.toString(), effectiveTo.toString(), queryTake]
         );
 
-        const events: HashChainReplayEvent[] = rows.map((r) => ({
+        const events: HashChainReplayEvent[] = rows.slice(0, take).map((r) => ({
           asset,
           client: r.client,
           feedbackIndex: r.feedback_index,
@@ -394,7 +468,7 @@ export const hashChainResolvers = {
 
         return {
           events,
-          hasMore: events.length === take,
+          hasMore: rows.length > take,
           nextFromCount,
         };
       }
@@ -416,15 +490,14 @@ export const hashChainResolvers = {
            revoke_count::text AS revoke_count
          FROM revocations
          WHERE asset = $1
-           AND status != 'ORPHANED'
            AND revoke_count >= $2::bigint
            AND revoke_count < $3::bigint
-         ORDER BY revoke_count ASC
+         ORDER BY revoke_count ASC, slot ASC, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC NULLS LAST, id ASC
          LIMIT $4::int`,
-        [asset, fromCount.toString(), effectiveTo.toString(), take]
+        [asset, replayFromCount.toString(), effectiveTo.toString(), queryTake]
       );
 
-      const events: HashChainReplayEvent[] = rows.map((r) => ({
+      const events: HashChainReplayEvent[] = rows.slice(0, take).map((r) => ({
         asset,
         client: r.client,
         feedbackIndex: r.feedback_index,
@@ -442,7 +515,7 @@ export const hashChainResolvers = {
 
       return {
         events,
-        hasMore: events.length === take,
+        hasMore: rows.length > take,
         nextFromCount,
       };
     },

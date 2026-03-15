@@ -24,7 +24,6 @@ export default defineConfig({
       reportsDirectory: "./coverage",
       include: ["src/**/*.ts"],
       exclude: [
-        "src/index.ts", // Entry point - tested in e2e
         "src/**/index.ts", // Barrel files (re-exports only)
         "src/**/*.d.ts",
       ],

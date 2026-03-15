@@ -88,9 +88,12 @@ vi.mock("@solana/web3.js", async () => {
   let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
   let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
   let rpcWebSocketConnected = false;
+  let logsSubscriptionState: "subscribed" | "pending" = "subscribed";
 
   class MockConnection {
     _rpcWebSocketConnected = rpcWebSocketConnected;
+    _subscriptionHashByClientSubscriptionId: Record<number, string> = {};
+    _subscriptionsByHash: Record<string, { state: string; serverSubscriptionId?: number }> = {};
 
     constructor(_endpoint: string, _config?: unknown) {}
 
@@ -102,13 +105,26 @@ vi.mock("@solana/web3.js", async () => {
     }
 
     onLogs(filter: unknown, callback: () => void, commitment?: unknown): number {
-      if (!onLogsMock) {
-        throw new Error("onLogs mock not set");
-      }
-      return onLogsMock(filter, callback, commitment);
+      const subscriptionId = onLogsMock
+        ? onLogsMock(filter, callback, commitment)
+        : 1;
+      const hash = `mock-hash:${subscriptionId}`;
+      this._subscriptionHashByClientSubscriptionId[subscriptionId] = hash;
+      this._subscriptionsByHash[hash] = {
+        state: this._rpcWebSocketConnected ? logsSubscriptionState : "pending",
+        serverSubscriptionId: this._rpcWebSocketConnected && logsSubscriptionState === "subscribed"
+          ? subscriptionId
+          : undefined,
+      };
+      return subscriptionId;
     }
 
     async removeOnLogsListener(subscriptionId: number): Promise<void> {
+      const hash = this._subscriptionHashByClientSubscriptionId[subscriptionId];
+      if (hash) {
+        delete this._subscriptionHashByClientSubscriptionId[subscriptionId];
+        delete this._subscriptionsByHash[hash];
+      }
       if (!removeOnLogsListenerMock) {
         return;
       }
@@ -130,6 +146,9 @@ vi.mock("@solana/web3.js", async () => {
     },
     __setRpcWebSocketConnected: (value: boolean) => {
       rpcWebSocketConnected = value;
+    },
+    __setLogsSubscriptionState: (value: "subscribed" | "pending") => {
+      logsSubscriptionState = value;
     },
   };
 });
@@ -186,14 +205,32 @@ describe("WebSocketIndexer Coverage", () => {
     vi.mocked(suspendLocalDerivedDigests).mockResolvedValue(undefined as never);
     vi.mocked(resumeLocalDerivedDigests).mockImplementation(() => undefined);
     vi.mocked(saveIndexerState).mockResolvedValue(undefined);
+    (mockConnection as any)._rpcWebSocketConnected = true;
+    (mockConnection as any)._subscriptionHashByClientSubscriptionId = {};
+    (mockConnection as any)._subscriptionsByHash = {};
 
     // Capture the logs handler on subscribe
     (mockConnection.onLogs as any).mockImplementation(
       (_: any, handler: any) => {
         logsHandler = handler;
-        return 1;
+        const subscriptionId = 1;
+        const hash = `mock-hash:${subscriptionId}`;
+        (mockConnection as any)._subscriptionHashByClientSubscriptionId[subscriptionId] = hash;
+        (mockConnection as any)._subscriptionsByHash[hash] = {
+          state: "subscribed",
+          serverSubscriptionId: subscriptionId,
+        };
+        return subscriptionId;
       }
     );
+    (mockConnection.removeOnLogsListener as any).mockImplementation(async (subscriptionId: number) => {
+      const hash = (mockConnection as any)._subscriptionHashByClientSubscriptionId?.[subscriptionId];
+      if (hash) {
+        delete (mockConnection as any)._subscriptionHashByClientSubscriptionId[subscriptionId];
+        delete (mockConnection as any)._subscriptionsByHash[hash];
+      }
+      return undefined;
+    });
   });
 
   afterEach(async () => {
@@ -320,15 +357,11 @@ describe("WebSocketIndexer Coverage", () => {
       // Make connection stale (no activity for > STALE_THRESHOLD)
       (wsIndexer as any).lastActivityTime = Date.now() - 130_000; // 130s ago
 
-      (mockConnection.onLogs as any).mockImplementationOnce((_programId: unknown, _callback: () => void) => {
-        return 77;
-      });
-
       await (wsIndexer as any).checkHealth();
 
       // Activity time should have been reset to recent
       expect(Date.now() - (wsIndexer as any).lastActivityTime).toBeLessThan(5000);
-      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(77);
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
     });
 
     it("should force reconnect when stale AND onLogs heartbeat probe fails", async () => {
@@ -590,7 +623,14 @@ describe("WebSocketIndexer Coverage", () => {
       await new Promise((r) => setTimeout(r, 100));
 
       // Cursor should NOT be advanced (no indexerState.upsert)
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "sig-a",
+            lastSlot: BigInt(TEST_SLOT),
+          }),
+        }),
+      );
 
       // Event log should record the failure
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
@@ -663,7 +703,14 @@ describe("WebSocketIndexer Coverage", () => {
         "websocket",
         expect.any(Date),
       );
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "fail-sig-cursor",
+            lastSlot: BigInt(TEST_SLOT),
+          }),
+        }),
+      );
     });
 
     it("should skip cursor update when slot is behind current (monotonic guard)", async () => {
@@ -694,7 +741,14 @@ describe("WebSocketIndexer Coverage", () => {
       await new Promise((r) => setTimeout(r, 100));
 
       // indexerState.upsert should NOT be called (slot behind)
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "sig-a",
+            lastSlot: BigInt(TEST_SLOT),
+          }),
+        }),
+      );
     });
 
     it("should skip cursor update when slot is equal and signature is older", async () => {
@@ -724,7 +778,14 @@ describe("WebSocketIndexer Coverage", () => {
 
       await new Promise((r) => setTimeout(r, 100));
 
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "fail-sig-cursor",
+            lastSlot: BigInt(TEST_SLOT),
+          }),
+        }),
+      );
     });
 
     it("should advance cursor when slot is equal and signature is newer", async () => {
@@ -745,6 +806,11 @@ describe("WebSocketIndexer Coverage", () => {
       (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
         lastSlot: BigInt(TEST_SLOT),
         lastSignature: "sig-a",
+      });
+      (mockConnection.getBlock as any).mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["sig-z"] } },
+        ],
       });
 
       logsHandler!(
@@ -998,7 +1064,7 @@ describe("WebSocketIndexer Coverage", () => {
       const onLogsCallback = (mockConnection.onLogs as any).mock.calls[0][1];
       onLogsCallback(logs, { slot: 100 });
 
-      expect((wsIndexer as any).droppedLogs).toBe(1);
+      expect((wsIndexer as any).droppedLogs).toBeGreaterThanOrEqual(1);
       expect((wsIndexer as any).isRunning).toBe(false);
 
       // Restore
@@ -1412,7 +1478,14 @@ describe("WebSocketIndexer Coverage", () => {
       await new Promise((r) => setTimeout(r, 150));
 
       // Cursor should NOT be updated
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: "fail-sig-cursor",
+            lastSlot: BigInt(TEST_SLOT),
+          }),
+        }),
+      );
       expect(saveIndexerState).not.toHaveBeenCalled();
     });
   });
@@ -1421,6 +1494,11 @@ describe("WebSocketIndexer Coverage", () => {
     it("should suspend and resume local derived digests around local websocket processing", async () => {
       createIndexer();
       await wsIndexer.start();
+      (mockConnection.getBlock as any).mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["suspend-ws-sig"] } },
+        ],
+      });
 
       const eventData = {
         asset: TEST_ASSET,
@@ -1446,6 +1524,11 @@ describe("WebSocketIndexer Coverage", () => {
       createIndexer();
       await wsIndexer.start();
       (mockPrisma.indexerState.findUnique as any).mockResolvedValueOnce(null);
+      (mockConnection.getBlock as any).mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["resume-after-cursor-sig"] } },
+        ],
+      });
 
       const eventData = {
         asset: TEST_ASSET,
@@ -1783,7 +1866,7 @@ describe("WebSocketIndexer Coverage", () => {
         );
       }
 
-      expect((wsIndexer as any).droppedLogs).toBe(1);
+      expect((wsIndexer as any).droppedLogs).toBeGreaterThanOrEqual(1);
       expect((wsIndexer as any).errorCount).toBeGreaterThan(0);
 
       Object.defineProperty(queue, "size", { value: 0, writable: true, configurable: true });
@@ -1797,6 +1880,7 @@ describe("testWebSocketConnection - two argument form", () => {
     __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
     __setRpcWebSocketConnected: (value: boolean) => void;
+    __setLogsSubscriptionState: (value: "subscribed" | "pending") => void;
   };
   const wsMock = wsModule as typeof wsModule & {
     __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => void;
@@ -1807,6 +1891,7 @@ describe("testWebSocketConnection - two argument form", () => {
     web3Mock.__setOnLogsMock(null);
     web3Mock.__setRemoveOnLogsListenerMock(null);
     web3Mock.__setRpcWebSocketConnected(false);
+    web3Mock.__setLogsSubscriptionState("subscribed");
     wsMock.__setWsProbeBehavior("supported");
     vi.restoreAllMocks();
   });

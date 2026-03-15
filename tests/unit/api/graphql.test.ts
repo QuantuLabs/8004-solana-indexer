@@ -490,7 +490,7 @@ describe('Feedback Field Resolvers', () => {
 });
 
 describe('Resolver ID Invariants', () => {
-  it('throws when Feedback.feedback_id is null', () => {
+  it('builds canonical Feedback.id and still requires feedback_id for the cursor', () => {
     const parent = {
       id: 'fb-row-1',
       feedback_id: null,
@@ -500,11 +500,11 @@ describe('Resolver ID Invariants', () => {
       created_at: '2025-01-01T00:00:00Z',
     } as any;
 
-    expect(() => feedbackResolvers.Feedback.id(parent)).toThrow('Missing feedback_id');
+    expect(feedbackResolvers.Feedback.id(parent)).toBe('asset1:client1:42');
     expect(() => feedbackResolvers.Feedback.cursor(parent)).toThrow('Missing feedback_id');
   });
 
-  it('throws when FeedbackResponse.response_id is null', () => {
+  it('builds canonical FeedbackResponse.id and still requires response_id for the cursor', () => {
     const parent = {
       id: 'resp-row-1',
       response_id: null,
@@ -517,11 +517,11 @@ describe('Resolver ID Invariants', () => {
       created_at: '2025-01-01T00:00:00Z',
     } as any;
 
-    expect(() => responseResolvers.FeedbackResponse.id(parent)).toThrow('Missing response_id');
+    expect(responseResolvers.FeedbackResponse.id(parent)).toBe('asset1:client1:42:responder1:sig-abc');
     expect(() => responseResolvers.FeedbackResponse.cursor(parent)).toThrow('Missing response_id');
   });
 
-  it('throws when Revocation.revocation_id is null', () => {
+  it('builds canonical Revocation.id and still requires revocation_id for the cursor', () => {
     const parent = {
       id: 'rev-row-1',
       revocation_id: null,
@@ -531,7 +531,7 @@ describe('Resolver ID Invariants', () => {
       created_at: '2025-01-01T00:00:00Z',
     } as any;
 
-    expect(() => revocationResolvers.Revocation.id(parent)).toThrow('Missing revocation_id');
+    expect(revocationResolvers.Revocation.id(parent)).toBe('asset1:client1:42');
     expect(() => revocationResolvers.Revocation.cursor(parent)).toThrow('Missing revocation_id');
   });
 });
@@ -995,7 +995,6 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '10',
         total_feedback: '20',
-        total_validations: '0',
         total_collections: '4',
         platinum_agents: '1',
         gold_agents: '2',
@@ -1017,7 +1016,6 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     expect(first.id).toBe('global-devnet');
     expect(first.totalAgents).toBe('10');
-    expect(first.totalValidations).toBe('0');
     expect(first.totalCollections).toBe('4');
     expect(first.platinumAgents).toBe('1');
     expect(first.goldAgents).toBe('2');
@@ -1037,7 +1035,6 @@ describe('Query Aggregated Stats Cache', () => {
         rows: [{
           total_agents: '328',
           total_feedback: '301',
-          total_validations: '0',
           total_collections: '0',
           platinum_agents: '11',
           gold_agents: '22',
@@ -1049,7 +1046,6 @@ describe('Query Aggregated Stats Cache', () => {
         rows: [{
           total_agents: '329',
           total_feedback: '301',
-          total_validations: '0',
           total_collections: '0',
           platinum_agents: '11',
           gold_agents: '22',
@@ -1086,7 +1082,6 @@ describe('Query Aggregated Stats Cache', () => {
         // Example: active rows have agent_id values [1, 3], so count=2 while max(agent_id)=3.
         total_agents: '2',
         total_feedback: '9',
-        total_validations: '0',
         total_collections: '1',
         platinum_agents: '0',
         gold_agents: '1',
@@ -1108,7 +1103,6 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     const [sql] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain("(SELECT COUNT(*)::text FROM agents WHERE status != 'ORPHANED') AS total_agents");
-    expect(sql).toContain("(SELECT COUNT(*)::text FROM validations WHERE chain_status != 'ORPHANED') AS total_validations");
     expect(sql).toContain('FROM collection_pointers');
     expect(sql).not.toContain('MAX(agent_id)');
   });
@@ -1118,7 +1112,6 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '1',
         total_feedback: '2',
-        total_validations: '0',
         total_collections: '7',
         platinum_agents: '0',
         gold_agents: '0',
@@ -1147,7 +1140,6 @@ describe('Query Aggregated Stats Cache', () => {
       rows: [{
         total_agents: '10',
         total_feedback: '20',
-        total_validations: '0',
         total_collections: '4',
         platinum_agents: '1',
         gold_agents: '2',
@@ -1168,7 +1160,7 @@ describe('Query Aggregated Stats Cache', () => {
     const zeroFirst = await queryResolvers.Query.protocols({}, { first: 0, skip: 0 }, ctx);
 
     expect(all).toHaveLength(1);
-    expect(all[0]).toMatchObject({ totalValidations: '0' });
+    expect(all[0]).toMatchObject({ totalFeedback: '20' });
     expect(skipped).toEqual([]);
     expect(zeroFirst).toEqual([]);
     expect(query).toHaveBeenCalledTimes(1);
@@ -1218,6 +1210,37 @@ describe('Query Aggregated Stats Cache', () => {
     });
   });
 
+  it('normalizes empty agentReputation nft_name to null', async () => {
+    const query = vi.fn().mockResolvedValue({
+      rows: [{
+        asset: 'Agent111',
+        owner: 'Owner111',
+        collection: 'c1:bafy-test',
+        nft_name: '',
+        agent_uri: 'https://example.com/a.json',
+        feedback_count: '3',
+        avg_score: '82',
+        positive_count: '2',
+        negative_count: '1',
+        validation_count: '4',
+      }],
+    });
+
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.agentReputation({}, { asset: 'Agent111' }, ctx);
+
+    expect(result).toEqual(expect.objectContaining({
+      asset: 'Agent111',
+      nftName: null,
+    }));
+  });
+
   it('returns leaderboard entries using pool ordering semantics', async () => {
     const query = vi.fn().mockResolvedValue({
       rows: [{
@@ -1252,6 +1275,8 @@ describe('Query Aggregated Stats Cache', () => {
     expect(query).toHaveBeenCalledTimes(1);
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain('FROM agents');
+    expect(sql).toContain('LEFT JOIN agent_digest_cache');
+    expect(sql).toContain("COALESCE(adc.feedback_count::text, a.feedback_count::text, '0') AS feedback_count");
     expect(sql).toContain('trust_tier >= 2');
     expect(sql).toContain('collection = ANY($2::text[])');
     expect(params).toEqual([false, ['c1:bafy-test'], 5]);
@@ -1271,6 +1296,27 @@ describe('Query Aggregated Stats Cache', () => {
         sortKey: '3008601739624372',
       },
     ]);
+  });
+
+  it('passes includeOrphaned=true through the leaderboard resolver', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.leaderboard(
+      {},
+      { first: 5, includeOrphaned: true },
+      ctx
+    );
+
+    expect(result).toEqual([]);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM agents');
+    expect(params).toEqual([true, null, 5]);
   });
 
   it('returns verificationStats grouped by model', async () => {
@@ -1297,6 +1343,7 @@ describe('Query Aggregated Stats Cache', () => {
       feedbacks: { pending: 0, finalized: 0, orphaned: 0 },
       registries: { pending: 7, finalized: 8, orphaned: 9 },
       metadata: { pending: 0, finalized: 0, orphaned: 0 },
+      validations: { pending: 0, finalized: 0, orphaned: 0 },
       feedbackResponses: { pending: 4, finalized: 5, orphaned: 6 },
       revocations: { pending: 0, finalized: 0, orphaned: 0 },
     });
@@ -1658,6 +1705,158 @@ describe('Collection And Tree Queries', () => {
     });
     expect(query).not.toHaveBeenCalled();
     expect(prime).not.toHaveBeenCalled();
+  });
+
+  it('lists agent metadata while excluding URI-derived keys', async () => {
+    const row = {
+      id: 'row-1',
+      asset: 'Agent111',
+      key: 'profile',
+      value: Buffer.from('plain-metadata'),
+      immutable: false,
+      status: 'FINALIZED',
+      updated_at: '2026-02-25T12:00:00.000Z',
+      tx_signature: 'sig-meta-1',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentMetadatas(
+      {},
+      { first: 5, skip: 1, where: { agent: 'Agent111' } },
+      ctx
+    );
+
+    expect(rows).toEqual([row]);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM metadata');
+    expect(sql).toContain("key NOT LIKE '\\_uri:%' ESCAPE '\\'");
+    expect(sql).toContain('ORDER BY asset, key');
+    expect(params.at(-2)).toBe(5);
+    expect(params.at(-1)).toBe(1);
+  });
+
+  it('resolves agentStats through the dataloader and returns null for invalid ids', async () => {
+    const load = vi.fn().mockResolvedValue({
+      id: 'Agent111',
+      totalFeedback: '5',
+      averageFeedbackValue: '80',
+      lastActivity: '1700000000',
+    });
+    const ctx = {
+      pool: null,
+      prisma: null,
+      loaders: { agentStatsByAgent: { load } },
+      networkMode: 'devnet',
+    } as any;
+
+    const result = await queryResolvers.Query.agentStats({}, { id: 'Agent111' }, ctx);
+    const invalid = await queryResolvers.Query.agentStats({}, { id: 'sol:bad:format' }, ctx);
+
+    expect(result).toEqual({
+      id: 'Agent111',
+      totalFeedback: '5',
+      averageFeedbackValue: '80',
+      lastActivity: '1700000000',
+    });
+    expect(invalid).toBeNull();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledWith('Agent111');
+  });
+
+  it('searches agents with escaped wildcard input and primes the dataloader', async () => {
+    const row = {
+      asset: 'Agent111',
+      owner: 'Owner111',
+      creator: 'Creator111',
+      agent_uri: 'ipfs://agent-111',
+      agent_wallet: null,
+      collection: 'Collection111',
+      collection_pointer: 'c1:bafy-test',
+      col_locked: true,
+      parent_asset: null,
+      parent_creator: null,
+      parent_locked: false,
+      nft_name: '50%_agent',
+      atom_enabled: true,
+      trust_tier: null,
+      quality_score: null,
+      confidence: null,
+      risk_score: null,
+      diversity_ratio: null,
+      sort_key: null,
+      status: 'FINALIZED',
+      verified_at: null,
+      created_at: '2026-02-25T12:00:00.000Z',
+      updated_at: '2026-02-25T12:00:00.000Z',
+      created_tx_signature: null,
+      created_slot: null,
+      feedback_digest: null,
+      response_digest: null,
+      revoke_digest: null,
+      feedback_count: '0',
+      response_count: '0',
+      revoke_count: '0',
+    };
+    const query = vi.fn().mockResolvedValue({ rows: [row] });
+    const prime = vi.fn();
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: { agentById: { prime } },
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentSearch(
+      {},
+      { query: '50%_agent', first: 9999 },
+      ctx
+    );
+
+    expect(rows).toEqual([row]);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM agents a');
+    expect(sql).toContain('nft_name ILIKE $1 ESCAPE');
+    expect(params).toEqual(['%50\\%\\_agent%', MAX_FIRST]);
+    expect(prime).toHaveBeenCalledWith('Agent111', row);
+  });
+
+  it('lists agent registration files with canonical agent filtering and rejects invalid ids', async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [{ asset: 'Agent111' }] });
+    const ctx = {
+      pool: { query },
+      prisma: null,
+      loaders: {},
+      networkMode: 'devnet',
+    } as any;
+
+    const rows = await queryResolvers.Query.agentRegistrationFiles(
+      {},
+      { first: 7, skip: 2, where: { agent: 'Agent111' } },
+      ctx
+    );
+    const invalid = await queryResolvers.Query.agentRegistrationFiles(
+      {},
+      { where: { agent: 'sol:bad:format' } },
+      ctx
+    );
+
+    expect(rows).toEqual([{ _asset: 'Agent111' }]);
+    expect(invalid).toEqual([]);
+    expect(query).toHaveBeenCalledTimes(1);
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM metadata m');
+    expect(sql).toContain("m.key LIKE '\\_uri:%' ESCAPE '\\'");
+    expect(sql).toContain('m.asset = $1::text');
+    expect(sql).toContain('LIMIT $2::int OFFSET $3::int');
+    expect(params).toEqual(['Agent111', 7, 2]);
   });
 
   it('loads direct children and primes dataloader', async () => {

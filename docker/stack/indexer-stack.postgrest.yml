@@ -1,7 +1,7 @@
 services:
   indexer:
     environment:
-      API_MODE: ${API_MODE:-both}
+      API_MODE: both
       POSTGREST_URL: ${POSTGREST_URL:-http://postgrest:3000}
       POSTGREST_TOKEN: ${POSTGREST_TOKEN:?set POSTGREST_TOKEN}
     depends_on:

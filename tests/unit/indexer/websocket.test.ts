@@ -74,9 +74,12 @@ vi.mock("@solana/web3.js", async () => {
   let onLogsMock: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null = null;
   let removeOnLogsListenerMock: ((subscriptionId: number) => Promise<void>) | null = null;
   let rpcWebSocketConnected = false;
+  let logsSubscriptionState: "subscribed" | "pending" = "subscribed";
 
   class MockConnection {
     _rpcWebSocketConnected = rpcWebSocketConnected;
+    _subscriptionHashByClientSubscriptionId: Record<number, string> = {};
+    _subscriptionsByHash: Record<string, { state: string; serverSubscriptionId?: number }> = {};
 
     constructor(_endpoint: string, _config?: unknown) {}
 
@@ -88,13 +91,26 @@ vi.mock("@solana/web3.js", async () => {
     }
 
     onLogs(filter: unknown, callback: () => void, commitment?: unknown): number {
-      if (!onLogsMock) {
-        throw new Error("onLogs mock not set");
-      }
-      return onLogsMock(filter, callback, commitment);
+      const subscriptionId = onLogsMock
+        ? onLogsMock(filter, callback, commitment)
+        : 1;
+      const hash = `mock-hash:${subscriptionId}`;
+      this._subscriptionHashByClientSubscriptionId[subscriptionId] = hash;
+      this._subscriptionsByHash[hash] = {
+        state: this._rpcWebSocketConnected ? logsSubscriptionState : "pending",
+        serverSubscriptionId: this._rpcWebSocketConnected && logsSubscriptionState === "subscribed"
+          ? subscriptionId
+          : undefined,
+      };
+      return subscriptionId;
     }
 
     async removeOnLogsListener(subscriptionId: number): Promise<void> {
+      const hash = this._subscriptionHashByClientSubscriptionId[subscriptionId];
+      if (hash) {
+        delete this._subscriptionHashByClientSubscriptionId[subscriptionId];
+        delete this._subscriptionsByHash[hash];
+      }
       if (!removeOnLogsListenerMock) {
         return;
       }
@@ -117,11 +133,26 @@ vi.mock("@solana/web3.js", async () => {
     __setRpcWebSocketConnected: (value: boolean) => {
       rpcWebSocketConnected = value;
     },
+    __setLogsSubscriptionState: (value: "subscribed" | "pending") => {
+      logsSubscriptionState = value;
+    },
   };
 });
 
+vi.mock("../../../src/db/supabase.js", () => ({
+  saveIndexerState: vi.fn().mockResolvedValue(undefined),
+  loadIndexerStateSnapshot: vi.fn().mockResolvedValue(null),
+  restoreIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
+  clearIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
+}));
+
 import * as web3 from "@solana/web3.js";
 import * as wsModule from "ws";
+import {
+  clearIndexerStateSnapshot,
+  loadIndexerStateSnapshot,
+  restoreIndexerStateSnapshot,
+} from "../../../src/db/supabase.js";
 import {
   WebSocketIndexer,
   testWebSocketConnection,
@@ -160,6 +191,7 @@ describe("WebSocketIndexer", () => {
 
   afterEach(async () => {
     await wsIndexer.stop();
+    vi.clearAllMocks();
   });
 
   describe("constructor", () => {
@@ -171,6 +203,10 @@ describe("WebSocketIndexer", () => {
       });
 
       expect(defaultIndexer).toBeDefined();
+    });
+
+    it("uses a single in-flight tx handler to keep cursor advancement prefix-safe", () => {
+      expect(((wsIndexer as any).logQueue).concurrency).toBe(1);
     });
   });
 
@@ -191,6 +227,142 @@ describe("WebSocketIndexer", () => {
 
       expect(mockConnection.onLogs).toHaveBeenCalledTimes(1);
     });
+
+    it("should resume queue processing after stop followed by start on the same instance", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      await wsIndexer.start();
+      await wsIndexer.stop();
+      await wsIndexer.start();
+
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmRestartSafe",
+      });
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await ((wsIndexer as any).logQueue).onIdle();
+
+      expect(mockPrisma.agent.upsert).toHaveBeenCalled();
+    });
+
+    it("should reset retry budget across stop and restart on the same instance", async () => {
+      (wsIndexer as any).retryCount = 2;
+      await wsIndexer.stop();
+      expect((wsIndexer as any).retryCount).toBe(0);
+
+      (wsIndexer as any).retryCount = 3;
+      (mockConnection.onLogs as any).mockReturnValueOnce(2);
+      await wsIndexer.start();
+      expect((wsIndexer as any).retryCount).toBe(0);
+    });
+
+    it("should ignore a stale in-flight health check from the previous run after restart", async () => {
+      let slotResolve: ((value: number) => void) | null = null;
+      const removeCalls: number[] = [];
+      let subscriptionId = 0;
+
+      (mockConnection.onLogs as any).mockImplementation((_programId: any, _handler: any) => {
+        subscriptionId += 1;
+        return subscriptionId;
+      });
+
+      (mockConnection.getSlot as any).mockImplementation(
+        () => new Promise<number>((resolve) => {
+          slotResolve = resolve;
+        })
+      );
+
+      (mockConnection.removeOnLogsListener as any).mockImplementation(async (id: number) => {
+        removeCalls.push(id);
+      });
+
+      await wsIndexer.start();
+      (wsIndexer as any).lastActivityTime = 0;
+      const staleHealthCheck = (wsIndexer as any).checkHealth();
+
+      await wsIndexer.stop();
+      await wsIndexer.start();
+
+      slotResolve?.(123);
+      await staleHealthCheck;
+
+      expect(removeCalls).toEqual([1]);
+      expect((wsIndexer as any).subscriptionId).toBe(2);
+    });
+
+    it("should ignore a stale reconnect from the previous run after restart", async () => {
+      vi.useFakeTimers();
+      let subscriptionId = 0;
+
+      (mockConnection.onLogs as any).mockImplementation((_programId: any, _handler: any) => {
+        subscriptionId += 1;
+        return subscriptionId;
+      });
+
+      await wsIndexer.start();
+      const staleReconnect = (wsIndexer as any).reconnect();
+
+      await wsIndexer.stop();
+      await wsIndexer.start();
+
+      await vi.advanceTimersByTimeAsync(150);
+      await staleReconnect;
+
+      expect(mockConnection.onLogs).toHaveBeenCalledTimes(2);
+      expect((wsIndexer as any).subscriptionId).toBe(2);
+      vi.useRealTimers();
+    });
+
+    it("should discard the previous run safe cursor if the next startup snapshot read fails", async () => {
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce({
+          lastSignature: "safe-signature",
+          lastSlot: 41n,
+          lastTxIndex: 2,
+          source: "poller",
+          updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+        })
+        .mockRejectedValueOnce(new Error("snapshot read failed"));
+
+      await wsIndexer.start();
+      await wsIndexer.stop();
+      await wsIndexer.start();
+
+      let releaseWork!: () => void;
+      ((wsIndexer as any).logQueue).add(
+        () => new Promise<void>((resolve) => {
+          releaseWork = () => resolve();
+        })
+      );
+      for (let i = 0; i < 20 && !releaseWork; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      const stopPromise = wsIndexer.stop();
+      releaseWork();
+      await stopPromise;
+
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: null,
+            lastSlot: null,
+            lastTxIndex: null,
+          }),
+        })
+      );
+    });
   });
 
   describe("stop", () => {
@@ -204,6 +376,296 @@ describe("WebSocketIndexer", () => {
     it("should handle stop when not started", async () => {
       await wsIndexer.stop();
       expect(mockConnection.removeOnLogsListener).not.toHaveBeenCalled();
+    });
+
+    it("should clear queued logs while allowing running work to drain", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      const releases: Array<() => void> = [];
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      ((wsIndexer as any).logQueue).concurrency = 1;
+      (mockConnection.getBlock as any).mockImplementation(
+        () => new Promise((resolve) => {
+          releases.push(() => resolve({
+            blockTime: 123,
+            transactions: [{ transaction: { signatures: [TEST_SIGNATURE] } }],
+          }));
+        })
+      );
+
+      await wsIndexer.start();
+
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmQueued",
+      });
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+      logsHandler!({ signature: `${TEST_SIGNATURE}2`, err: null, logs }, { slot: Number(TEST_SLOT) });
+
+      const stopPromise = wsIndexer.stop();
+      releases.shift()?.();
+      await stopPromise;
+
+      expect(wsIndexer.getStats().droppedLogs).toBeGreaterThanOrEqual(1);
+    });
+
+    it("should freeze cursor advancement during shutdown so drained work cannot advance main", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      let releaseBlock!: () => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      (mockConnection.getBlock as any).mockImplementation(
+        () => new Promise((resolve) => {
+          releaseBlock = () => resolve({
+            blockTime: 123,
+            transactions: [{ transaction: { signatures: [TEST_SIGNATURE] } }],
+          });
+        })
+      );
+
+      await wsIndexer.start();
+
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmStopFreeze",
+      });
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+      const stopPromise = wsIndexer.stop();
+      releaseBlock();
+      await stopPromise;
+
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "main" },
+          update: expect.objectContaining({
+            lastSignature: null,
+            lastSlot: null,
+            lastTxIndex: null,
+          }),
+        })
+      );
+    });
+
+    it("should not advance the cursor if shutdown starts while the state read is still in flight", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      let resolveFindUnique!: (value: any) => void;
+      const findUniquePromise = new Promise((resolve) => {
+        resolveFindUnique = resolve;
+      });
+      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
+
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      (mockConnection.getBlock as any).mockResolvedValue({
+        blockTime: 123,
+        transactions: [{ transaction: { signatures: [TEST_SIGNATURE] } }],
+      });
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce({
+          lastSignature: "safe-signature",
+          lastSlot: 41n,
+          lastTxIndex: 2,
+          source: "poller",
+          updatedAt: safeUpdatedAt,
+        })
+        .mockImplementation(() => findUniquePromise as any);
+
+      await wsIndexer.start();
+
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmLateStop",
+      });
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const stopPromise = wsIndexer.stop();
+      resolveFindUnique({ lastSlot: TEST_SLOT, lastTxIndex: 0, lastSignature: "old-signature" });
+      await stopPromise;
+
+      const advancedToInFlightSignature = mockPrisma.indexerState.upsert.mock.calls.some(([args]) => (
+        args?.update?.lastSignature === TEST_SIGNATURE || args?.create?.lastSignature === TEST_SIGNATURE
+      ));
+      expect(advancedToInFlightSignature).toBe(false);
+    });
+
+    it("should restore the last safe cursor if shutdown starts while the local SQL cursor write is in flight", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      let releaseSqlWrite!: () => void;
+      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
+      const previousDatabaseUrl = process.env.DATABASE_URL;
+      process.env.DATABASE_URL = "file:/tmp/websocket-fast-path-test.db";
+
+      try {
+        (mockConnection.onLogs as any).mockImplementation(
+          (_: any, handler: any) => {
+            logsHandler = handler;
+            return 1;
+          }
+        );
+        (mockConnection.getBlock as any).mockResolvedValue({
+          blockTime: 123,
+          transactions: [{ transaction: { signatures: [TEST_SIGNATURE] } }],
+        });
+        mockPrisma.indexerState.findUnique
+          .mockResolvedValueOnce({
+            lastSignature: "safe-signature",
+            lastSlot: 41n,
+            lastTxIndex: 2,
+            source: "poller",
+            updatedAt: safeUpdatedAt,
+          })
+          .mockResolvedValueOnce({
+            lastSignature: "safe-signature",
+            lastSlot: 41n,
+            lastTxIndex: 2,
+          } as any);
+        mockPrisma.$executeRawUnsafe.mockImplementation(
+          () => new Promise((resolve) => {
+            releaseSqlWrite = () => resolve(1);
+          })
+        );
+
+        await wsIndexer.start();
+
+        const logs = createEventLogs("AgentRegistered", {
+          asset: TEST_ASSET,
+          collection: TEST_COLLECTION,
+          owner: TEST_OWNER,
+          atomEnabled: true,
+          agentUri: "ipfs://QmSqlLateStop",
+        });
+
+        logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+        for (let i = 0; i < 20 && !releaseSqlWrite; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(typeof releaseSqlWrite).toBe("function");
+
+        const stopPromise = wsIndexer.stop();
+        releaseSqlWrite();
+        await stopPromise;
+
+        expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: "main" },
+            update: expect.objectContaining({
+              lastSignature: "safe-signature",
+              lastSlot: 41n,
+              lastTxIndex: 2,
+              source: "poller",
+              updatedAt: safeUpdatedAt,
+            }),
+          })
+        );
+      } finally {
+        if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = previousDatabaseUrl;
+      }
+    });
+
+    it("should restore the last safe cursor if shutdown starts while the Supabase cursor write is in flight", async () => {
+      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
+      vi.mocked(loadIndexerStateSnapshot).mockResolvedValueOnce({
+        lastSignature: "safe-signature",
+        lastSlot: 41n,
+        lastTxIndex: 2,
+        source: "poller",
+        updatedAt: safeUpdatedAt,
+      });
+
+      const supabaseIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+      });
+
+      try {
+        await supabaseIndexer.start();
+        let releaseWork!: () => void;
+        ((supabaseIndexer as any).logQueue).add(
+          () => new Promise<void>((resolve) => {
+            releaseWork = () => resolve();
+          })
+        );
+        for (let i = 0; i < 20 && !releaseWork; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(typeof releaseWork).toBe("function");
+        const stopPromise = supabaseIndexer.stop();
+        releaseWork();
+        await stopPromise;
+
+        expect(restoreIndexerStateSnapshot).toHaveBeenCalledWith(
+          "safe-signature",
+          41n,
+          2,
+          "poller",
+          safeUpdatedAt,
+        );
+      } finally {
+        await supabaseIndexer.stop();
+      }
+    });
+
+    it("should clear the Supabase cursor on shutdown when no safe snapshot exists yet", async () => {
+      vi.mocked(loadIndexerStateSnapshot).mockResolvedValueOnce(null);
+
+      const supabaseIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+      });
+
+      try {
+        await supabaseIndexer.start();
+        let releaseWork!: () => void;
+        ((supabaseIndexer as any).logQueue).add(
+          () => new Promise<void>((resolve) => {
+            releaseWork = () => resolve();
+          })
+        );
+        for (let i = 0; i < 20 && !releaseWork; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(typeof releaseWork).toBe("function");
+
+        const stopPromise = supabaseIndexer.stop();
+        releaseWork();
+        await stopPromise;
+
+        expect(clearIndexerStateSnapshot).toHaveBeenCalledTimes(1);
+      } finally {
+        await supabaseIndexer.stop();
+      }
     });
   });
 
@@ -339,6 +801,49 @@ describe("WebSocketIndexer", () => {
 
       // Should have called agent.upsert from handler
       expect(mockPrisma.agent.upsert).toHaveBeenCalled();
+    });
+
+    it("should enter fail-safe stop and avoid writes when tx_index cannot be resolved", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmTxIndexFail",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+      (mockConnection.getBlock as any).mockRejectedValue(new Error("getBlock failed"));
+
+      await wsIndexer.start();
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "main" },
+          update: expect.objectContaining({
+            lastSignature: null,
+            lastSlot: null,
+            lastTxIndex: null,
+          }),
+        })
+      );
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
+      expect(wsIndexer.isActive()).toBe(false);
     });
 
     it("should handle errors during event processing", async () => {
@@ -576,12 +1081,13 @@ describe("WebSocketIndexer", () => {
   });
 });
 
-describe("testWebSocketConnection", () => {
+  describe("testWebSocketConnection", () => {
   const web3Mock = web3 as typeof web3 & {
     __setGetSlotMock: (fn: (() => Promise<number>) | null) => void;
     __setOnLogsMock: (fn: ((filter: unknown, callback: () => void, commitment?: unknown) => number) | null) => void;
     __setRemoveOnLogsListenerMock: (fn: ((subscriptionId: number) => Promise<void>) | null) => void;
     __setRpcWebSocketConnected: (value: boolean) => void;
+    __setLogsSubscriptionState: (value: "subscribed" | "pending") => void;
   };
   const wsMock = wsModule as typeof wsModule & {
     __setWsProbeBehavior: (value: "supported" | "unsupported" | "timeout" | "error") => void;
@@ -667,6 +1173,23 @@ describe("testWebSocketConnection", () => {
     expect(result).toBe(false);
     expect(removeSpy).toHaveBeenCalledWith(9);
   });
+
+  it("should return false when transport connects but subscription never becomes server-subscribed", async () => {
+    web3Mock.__setGetSlotMock(async () => 123);
+    web3Mock.__setRpcWebSocketConnected(true);
+    web3Mock.__setLogsSubscriptionState("pending");
+    web3Mock.__setOnLogsMock(() => 7);
+    wsMock.__setWsProbeBehavior("supported");
+
+    const result = await testWebSocketConnection(
+      "https://rpc.example",
+      "wss://rpc.example",
+      TEST_PROGRAM_ID.toBase58(),
+    );
+
+    expect(result).toBe(false);
+    web3Mock.__setLogsSubscriptionState("subscribed");
+  });
 });
 
 describe("WebSocketIndexer provider compatibility", () => {
@@ -693,6 +1216,26 @@ describe("WebSocketIndexer provider compatibility", () => {
       prisma: localPrisma,
       programId: TEST_PROGRAM_ID,
       wsUrl: "wss://unsupported.provider.example",
+      reconnectInterval: 100,
+      maxRetries: 3,
+    });
+
+    await localIndexer.start();
+
+    expect(localConnection.onLogs).not.toHaveBeenCalled();
+    expect(localIndexer.isActive()).toBe(false);
+
+    await localIndexer.stop();
+  });
+
+  it("should not subscribe when the configured RPC provider cannot confirm logsSubscribe support", async () => {
+    wsMock.__setWsProbeBehavior("error");
+
+    const localIndexer = new WebSocketIndexer({
+      connection: localConnection as any,
+      prisma: localPrisma,
+      programId: TEST_PROGRAM_ID,
+      wsUrl: "wss://flaky.provider.example",
       reconnectInterval: 100,
       maxRetries: 3,
     });

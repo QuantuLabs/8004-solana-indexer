@@ -26,7 +26,14 @@ function normalizeValue(raw: string, decimals: number): string {
   return isNeg ? `-${result}` : result;
 }
 
-function requireFeedbackId(parent: FeedbackRow): string {
+function requireCanonicalFeedbackId(parent: FeedbackRow): string {
+  if (!parent.asset || !parent.client_address || parent.feedback_index === null || parent.feedback_index === undefined) {
+    throw new Error(`Missing canonical feedback id fields for feedback row ${parent.id}`);
+  }
+  return `${parent.asset}:${parent.client_address}:${String(parent.feedback_index)}`;
+}
+
+function requireFeedbackCursorId(parent: FeedbackRow): string {
   if (!parent.feedback_id) {
     throw new Error(`Missing feedback_id for feedback row ${parent.id}`);
   }
@@ -36,7 +43,7 @@ function requireFeedbackId(parent: FeedbackRow): string {
 export const feedbackResolvers = {
   Feedback: {
     id(parent: FeedbackRow) {
-      return requireFeedbackId(parent);
+      return requireCanonicalFeedbackId(parent);
     },
     cursor(parent: FeedbackRow) {
       // Opaque cursor used by Query.feedbacks(after: ...)
@@ -46,7 +53,7 @@ export const feedbackResolvers = {
           asset: parent.asset,
           client_address: parent.client_address,
           feedback_index: parent.feedback_index,
-          id: requireFeedbackId(parent),
+          id: requireFeedbackCursorId(parent),
         }),
         'utf-8'
       ).toString('base64');

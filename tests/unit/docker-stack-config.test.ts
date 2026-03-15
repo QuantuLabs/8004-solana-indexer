@@ -5,20 +5,27 @@ const stackContent = readFileSync(
   new URL("../../docker/stack/indexer-stack.yml", import.meta.url),
   "utf8"
 );
+const dockerfileContent = readFileSync(
+  new URL("../../Dockerfile", import.meta.url),
+  "utf8"
+);
 
 describe("Docker Stack Config", () => {
   it("propagates runtime env vars that affect the indexer container", () => {
     for (const pattern of [
       "DB_MODE: ${DB_MODE:?set DB_MODE}",
-      "API_MODE: ${API_MODE:?set API_MODE}",
+      "API_MODE: ${API_MODE:-both}",
       "API_PORT: ${API_PORT:-3001}",
       "RPC_URL: ${RPC_URL:-}",
       "WS_URL: ${WS_URL:-}",
       "MAX_SUPPORTED_TRANSACTION_VERSION: ${MAX_SUPPORTED_TRANSACTION_VERSION:-0}",
-      "GRAPHQL_RATE_LIMIT_MAX_REQUESTS: ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS:-30}",
+      "GRAPHQL_RATE_LIMIT_MAX_REQUESTS: ${GRAPHQL_RATE_LIMIT_MAX_REQUESTS:-100}",
       "RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}",
       "INDEXER_MODE: ${INDEXER_MODE:-polling}",
       "POLLER_BATCH_RPC_ENABLED: ${POLLER_BATCH_RPC_ENABLED:-true}",
+      "POLLER_MAX_SIGNATURES_PER_CYCLE: ${POLLER_MAX_SIGNATURES_PER_CYCLE:-500}",
+      "HISTORICAL_SCAN_MAX_PAGES_PER_PASS: ${HISTORICAL_SCAN_MAX_PAGES_PER_PASS:-10}",
+      "HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT: ${HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT:-1000}",
       "POLLER_RPC_CHUNK_SIZE: ${POLLER_RPC_CHUNK_SIZE:-100}",
       "POLLER_RPC_CHUNK_CONCURRENCY: ${POLLER_RPC_CHUNK_CONCURRENCY:-3}",
       "INDEXER_STOP_SLOT: ${INDEXER_STOP_SLOT:-}",
@@ -46,5 +53,10 @@ describe("Docker Stack Config", () => {
     expect(stackContent).toContain('- "${API_PORT:-3001}:${API_PORT:-3001}"');
     expect(stackContent).toContain("API_PORT: ${API_PORT:-3001}");
     expect(stackContent).toContain("127.0.0.1:${API_PORT:-3001}/ready");
+  });
+
+  it("persists the default SQLite database under the mounted /app/data volume", () => {
+    expect(stackContent).toContain("DATABASE_URL: ${DATABASE_URL:-file:/app/data/indexer.db}");
+    expect(dockerfileContent).toContain("DATABASE_URL=file:/app/data/indexer.db");
   });
 });

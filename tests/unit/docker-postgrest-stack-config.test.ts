@@ -7,6 +7,10 @@ const stackContent = readFileSync(
 );
 
 describe("Docker PostgREST Overlay Config", () => {
+  it("forces API_MODE=both for the overlayed indexer", () => {
+    expect(stackContent).toContain("API_MODE: both");
+  });
+
   it("waits for postgrest health before starting the indexer", () => {
     expect(stackContent).toContain("postgrest:");
     expect(stackContent).toContain("condition: service_healthy");

@@ -90,8 +90,8 @@ function isLikelyUnreliableHistoricalRpc(rpcUrl: string): boolean {
 const resolvedSolanaNetwork = parseSolanaNetwork(process.env.SOLANA_NETWORK);
 const resolvedIpfsGatewayBase = parseIpfsGatewayBase(process.env.IPFS_GATEWAY_BASE);
 const resolvedUriDigestTrustedHosts = parseUriDigestTrustedHosts(process.env.URI_DIGEST_TRUSTED_HOSTS);
-const resolvedSupabaseUrl = resolvePreferredEnv("SUPABASE_URL", "POSTGREST_URL");
-const resolvedSupabaseKey = resolvePreferredEnv("SUPABASE_KEY", "POSTGREST_TOKEN");
+const resolvedSupabaseUrl = resolvePreferredEnv("POSTGREST_URL", "SUPABASE_URL");
+const resolvedSupabaseKey = resolvePreferredEnv("POSTGREST_TOKEN", "SUPABASE_KEY");
 
 function parseDbMode(value: string | undefined): DbMode {
   const mode = value || "local";
@@ -277,8 +277,8 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL || "file:./data/indexer.db",
 
   // Supabase (production)
-  supabaseUrl: resolvedSupabaseUrl, // SUPABASE_URL preferred, POSTGREST_URL supported as alias
-  supabaseKey: resolvedSupabaseKey, // SUPABASE_KEY preferred, POSTGREST_TOKEN supported as alias
+  supabaseUrl: resolvedSupabaseUrl, // POSTGREST_URL preferred when explicitly set, otherwise SUPABASE_URL
+  supabaseKey: resolvedSupabaseKey, // POSTGREST_TOKEN preferred when explicitly set, otherwise SUPABASE_KEY
   supabaseDsn: process.env.SUPABASE_DSN, // PostgreSQL DSN for direct pg connection
   supabaseSslVerify: process.env.SUPABASE_SSL_VERIFY !== "false", // default: verify SSL certs
 
@@ -311,10 +311,18 @@ export const config = {
   // Polling config
   pollingInterval: parseInt(process.env.POLLING_INTERVAL || "15000", 10),
   batchSize: parseInt(process.env.BATCH_SIZE || "100", 10),
+  pollerMaxSignaturesPerCycle: parsePositiveInt(process.env.POLLER_MAX_SIGNATURES_PER_CYCLE, 500),
   pollerBatchRpcEnabled: parseBoolean(process.env.POLLER_BATCH_RPC_ENABLED, true),
   // Batch RPC pressure knobs for the classic poller (getParsedTransactions chunking)
   pollerRpcChunkSize: parsePositiveInt(process.env.POLLER_RPC_CHUNK_SIZE, 100),
   pollerRpcChunkConcurrency: parsePositiveInt(process.env.POLLER_RPC_CHUNK_CONCURRENCY, 3),
+  // Historical catch-up scans pages newest->oldest; cap each scan/replay pass to keep progress incremental.
+  historicalScanMaxPagesPerPass: parsePositiveInt(process.env.HISTORICAL_SCAN_MAX_PAGES_PER_PASS, 10),
+  // Historical scan can use a larger signature page size than replay batching to reduce pure discovery overhead.
+  historicalScanSignaturePageLimit: parsePositiveInt(
+    process.env.HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT,
+    1000
+  ),
   // Optional bootstrap cursor used only when no persisted indexer state exists.
   indexerStartSignature: parseOptionalString(process.env.INDEXER_START_SIGNATURE),
   indexerStartSlot: parseOptionalStartSlot(process.env.INDEXER_START_SLOT),

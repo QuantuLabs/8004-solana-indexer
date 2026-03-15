@@ -16,7 +16,11 @@ import {
 import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import { loadIndexerState, saveIndexerState, getPool } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
-import { BatchRpcFetcher, EventBuffer } from "./batch-processor.js";
+import {
+  BatchRpcBackoffRequiredError,
+  BatchRpcFetcher,
+  EventBuffer,
+} from "./batch-processor.js";
 import { resolveEventBlockTime } from "./block-time.js";
 import { metadataQueue } from "./metadata-queue.js";
 
@@ -181,6 +185,214 @@ function isMissingCollectionIdSchemaError(error: unknown): boolean {
   return missingSchemaPattern.test(message);
 }
 
+function isProviderOverloadedError(error: unknown): boolean {
+  const maybe = error as {
+    code?: unknown;
+    status?: unknown;
+    message?: unknown;
+    response?: { status?: unknown };
+  } | null;
+
+  const statusish = [maybe?.code, maybe?.status, maybe?.response?.status];
+  if (statusish.some((value) => value === 429 || value === 502 || value === 503 || value === 504)) {
+    return true;
+  }
+
+  const message = typeof maybe?.message === "string" ? maybe.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes("429") ||
+    message.includes("too many requests") ||
+    message.includes("rate limit") ||
+    message.includes("502") ||
+    message.includes("503") ||
+    message.includes("504") ||
+    message.includes("bad gateway") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout") ||
+    message.includes("cloudflare") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("socket hang up") ||
+    message.includes("econnreset") ||
+    message.includes("fetch failed")
+  );
+}
+
+function isDeterministicPaginationBoundaryError(error: unknown): boolean {
+  const message = toErrorMessage(error);
+  return /Deterministic tx_index unavailable for pagination (slot boundary|stop slot)/i.test(message);
+}
+
+class RetryableTransactionFetchError extends Error {
+  readonly signature: string;
+  readonly slot: number;
+
+  constructor(signature: string, slot: number) {
+    super(`Transaction temporarily unavailable for signature ${signature}`);
+    this.name = "RetryableTransactionFetchError";
+    this.signature = signature;
+    this.slot = slot;
+  }
+}
+
+function isRetryableTransactionFetchError(error: unknown): error is RetryableTransactionFetchError {
+  return error instanceof RetryableTransactionFetchError;
+}
+
+const HISTORICAL_SCAN_ROW_PREFIX = "historical-scan:";
+const HISTORICAL_SCAN_PROGRESS_ROW_PREFIX = "historical-scan-progress:";
+const HISTORICAL_SCAN_STATE_ROW_PREFIX = "historical-scan-state:";
+
+interface HistoricalScanPageState {
+  pageIndex: number;
+  beforeSignature: string | null;
+  nextBeforeSignature: string | null;
+  signatures: ConfirmedSignatureInfo[] | null;
+}
+
+interface HistoricalScanState {
+  nextBeforeSignature: string | null;
+  scanComplete: boolean;
+}
+
+function historicalScanRowId(stopSignature: string, pageIndex: number): string {
+  return `${HISTORICAL_SCAN_ROW_PREFIX}${stopSignature}:${pageIndex}`;
+}
+
+function historicalScanRowPrefix(stopSignature: string): string {
+  return `${HISTORICAL_SCAN_ROW_PREFIX}${stopSignature}:`;
+}
+
+function historicalScanProgressRowId(stopSignature: string): string {
+  return `${HISTORICAL_SCAN_PROGRESS_ROW_PREFIX}${stopSignature}`;
+}
+
+function historicalScanStateRowId(stopSignature: string): string {
+  return `${HISTORICAL_SCAN_STATE_ROW_PREFIX}${stopSignature}`;
+}
+
+function parseHistoricalScanStateStopSignature(id: string): string | null {
+  if (!id.startsWith(HISTORICAL_SCAN_STATE_ROW_PREFIX)) return null;
+  const suffix = id.slice(HISTORICAL_SCAN_STATE_ROW_PREFIX.length);
+  return suffix.length > 0 ? suffix : null;
+}
+
+function parseHistoricalScanStopSignature(id: string): string | null {
+  if (!id.startsWith(HISTORICAL_SCAN_ROW_PREFIX)) return null;
+  const suffix = id.slice(HISTORICAL_SCAN_ROW_PREFIX.length);
+  const separator = suffix.lastIndexOf(":");
+  if (separator <= 0) return null;
+  return suffix.slice(0, separator);
+}
+
+function parseHistoricalScanPageIndex(id: string, stopSignature: string): number | null {
+  const prefix = historicalScanRowPrefix(stopSignature);
+  if (!id.startsWith(prefix)) return null;
+  const value = Number.parseInt(id.slice(prefix.length), 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function serializeHistoricalScanStatePayload(
+  nextBeforeSignature: string | null,
+  scanComplete: boolean
+): string {
+  return JSON.stringify({
+    nextBeforeSignature,
+    scanComplete,
+  });
+}
+
+function parseHistoricalScanStatePayload(
+  rawSource: string | null | undefined
+): HistoricalScanState {
+  if (!rawSource) {
+    return {
+      nextBeforeSignature: null,
+      scanComplete: false,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(rawSource) as {
+      nextBeforeSignature?: unknown;
+      scanComplete?: unknown;
+    };
+    return {
+      nextBeforeSignature:
+        typeof parsed.nextBeforeSignature === "string" && parsed.nextBeforeSignature.length > 0
+          ? parsed.nextBeforeSignature
+          : null,
+      scanComplete: parsed.scanComplete === true,
+    };
+  } catch {
+    return {
+      nextBeforeSignature: rawSource,
+      scanComplete: false,
+    };
+  }
+}
+
+function serializeHistoricalScanPagePayload(
+  nextBeforeSignature: string | null,
+  signatures: ConfirmedSignatureInfo[]
+): string {
+  return JSON.stringify({
+    nextBeforeSignature,
+    signatures: signatures.map((signature) => ({
+      signature: signature.signature,
+      slot: signature.slot,
+    })),
+  });
+}
+
+function parseHistoricalScanPagePayload(
+  rawSource: string | null | undefined
+): { nextBeforeSignature: string | null; signatures: ConfirmedSignatureInfo[] | null } {
+  if (!rawSource) {
+    return { nextBeforeSignature: null, signatures: null };
+  }
+
+  try {
+    const parsed = JSON.parse(rawSource) as {
+      nextBeforeSignature?: unknown;
+      signatures?: Array<{ signature?: unknown; slot?: unknown }>;
+    };
+    const nextBeforeSignature =
+      typeof parsed.nextBeforeSignature === "string" && parsed.nextBeforeSignature.length > 0
+        ? parsed.nextBeforeSignature
+        : null;
+    const signatures = Array.isArray(parsed.signatures)
+      ? parsed.signatures.reduce<ConfirmedSignatureInfo[]>((acc, entry) => {
+          const signature = typeof entry?.signature === "string" ? entry.signature : null;
+          const slot = typeof entry?.slot === "number" ? entry.slot : null;
+          if (!signature || slot === null || !Number.isFinite(slot)) {
+            return acc;
+          }
+          acc.push({
+            signature,
+            slot,
+            err: null,
+            memo: null,
+            blockTime: null,
+            confirmationStatus: "confirmed",
+          });
+          return acc;
+        }, [])
+      : null;
+
+    return {
+      nextBeforeSignature,
+      signatures: signatures && signatures.length > 0 ? signatures : null,
+    };
+  } catch {
+    return {
+      nextBeforeSignature: rawSource || null,
+      signatures: null,
+    };
+  }
+}
+
+
 export class Poller {
   private connection: Connection;
   private prisma: PrismaClient | null;
@@ -207,6 +419,11 @@ export class Poller {
   private runPromise: Promise<void> | null = null;
   private pollDelayTimeout: ReturnType<typeof setTimeout> | null = null;
   private pollDelayResolve: ((cancelled?: boolean) => void) | null = null;
+  private stopSlotPaginationBefore: string | null = null;
+  private stopSlotPaginationBeforeResolved = false;
+  private stopSlotPaginationContinuation: string | null = null;
+  private pendingHistoricalResume = false;
+  private hasReachedLiveFrontier = false;
 
   // Batch processing components (Supabase mode only)
   private useBatchRpc: boolean;
@@ -274,6 +491,65 @@ export class Poller {
     });
   }
 
+  private async fetchParsedTransactionWithRetry(
+    signature: string,
+    slot: number
+  ): Promise<ParsedTransactionWithMeta> {
+    const maxRetries = 5;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const tx = await this.connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        });
+        if (tx) {
+          return tx;
+        }
+
+        if (attempt < maxRetries) {
+          logger.warn(
+            { signature, slot, attempt, maxRetries },
+            "Transaction lookup returned null; retrying before pausing historical replay"
+          );
+        }
+      } catch (error) {
+        if (!isProviderOverloadedError(error)) {
+          throw error;
+        }
+
+        if (attempt < maxRetries) {
+          logger.warn(
+            {
+              signature,
+              slot,
+              attempt,
+              maxRetries,
+              err: error instanceof Error ? error : undefined,
+              error: toErrorDetails(error),
+            },
+            "Provider overloaded while fetching transaction; retrying"
+          );
+        }
+      }
+
+      if (attempt >= maxRetries) {
+        break;
+      }
+
+      if (!this.isRunning) {
+        break;
+      }
+
+      const retryDelayMs = Math.min(5000, 500 * (2 ** (attempt - 1)));
+      const shouldRetry = await this.waitForDelay(retryDelayMs);
+      if (!shouldRetry) {
+        break;
+      }
+    }
+
+    throw new RetryableTransactionFetchError(signature, slot);
+  }
+
   private stopBeforeNewerSlot(slot: number | bigint, phase: "backfill" | "polling"): boolean {
     if (this.stopSlot === null) return false;
     const nextSlot = typeof slot === "bigint" ? slot : BigInt(slot);
@@ -291,6 +567,127 @@ export class Poller {
     return true;
   }
 
+  private async resolveStopSlotPaginationBefore(): Promise<string | null> {
+    if (this.stopSlot === null) return null;
+    if (this.stopSlotPaginationBeforeResolved) {
+      return this.stopSlotPaginationBefore;
+    }
+
+    let beforeSignature: string | undefined = this.stopSlotPaginationContinuation || undefined;
+    let retryCount = 0;
+    let pageLimit = config.historicalScanSignaturePageLimit;
+    const defaultMinPageLimit = Math.max(1, Math.min(25, this.batchSize));
+    let minPageLimit = defaultMinPageLimit;
+
+    while (this.isRunning) {
+      try {
+        const options: { limit: number; before?: string } = { limit: pageLimit };
+        if (beforeSignature) options.before = beforeSignature;
+
+        const batch = await this.connection.getSignaturesForAddress(this.programId, options);
+
+        if (batch.length === 0) {
+          this.stopSlotPaginationContinuation = null;
+          this.stopSlotPaginationBefore = beforeSignature ?? null;
+          this.stopSlotPaginationBeforeResolved = true;
+          logger.info(
+            {
+              stopSlot: this.stopSlot.toString(),
+              beforeSignature: this.stopSlotPaginationBefore,
+            },
+            "Resolved empty pagination anchor for INDEXER_STOP_SLOT window"
+          );
+          return this.stopSlotPaginationBefore;
+        }
+
+        const firstWithinWindow = batch.findIndex((sig) => BigInt(sig.slot) <= this.stopSlot!);
+        if (firstWithinWindow >= 0) {
+          const anchor = firstWithinWindow === 0 ? null : batch[firstWithinWindow - 1].signature;
+          this.stopSlotPaginationContinuation = null;
+          this.stopSlotPaginationBefore = anchor;
+          this.stopSlotPaginationBeforeResolved = true;
+          logger.info(
+            {
+              stopSlot: this.stopSlot.toString(),
+              beforeSignature: anchor,
+            },
+            anchor
+              ? "Resolved pagination anchor just above INDEXER_STOP_SLOT"
+              : "Current pagination tip is already within INDEXER_STOP_SLOT window"
+          );
+          return anchor;
+        }
+
+        beforeSignature = batch[batch.length - 1]?.signature;
+        this.stopSlotPaginationContinuation = beforeSignature ?? null;
+        if (!beforeSignature) {
+          this.stopSlotPaginationContinuation = null;
+          this.stopSlotPaginationBefore = null;
+          this.stopSlotPaginationBeforeResolved = true;
+          return null;
+        }
+
+        retryCount = 0;
+        minPageLimit = defaultMinPageLimit;
+        pageLimit = config.historicalScanSignaturePageLimit;
+
+        if (batch.length >= pageLimit) {
+          if (!(await this.waitForDelay(100))) break;
+        } else {
+          this.stopSlotPaginationContinuation = null;
+          this.stopSlotPaginationBefore = beforeSignature;
+          this.stopSlotPaginationBeforeResolved = true;
+          logger.info(
+            {
+              stopSlot: this.stopSlot.toString(),
+              beforeSignature,
+            },
+            "Resolved pagination anchor after exhausting signatures above INDEXER_STOP_SLOT"
+          );
+          return beforeSignature;
+        }
+      } catch (error) {
+        retryCount++;
+        if (isProviderOverloadedError(error)) {
+          minPageLimit = 1;
+        }
+        pageLimit = Math.max(minPageLimit, Math.floor(pageLimit / 2));
+        logger.warn(
+          {
+            retryCount,
+            pageLimit,
+            beforeSignature,
+            stopSlot: this.stopSlot.toString(),
+            err: error instanceof Error ? error : undefined,
+            error: toErrorDetails(error),
+          },
+          "Error while resolving pagination anchor for INDEXER_STOP_SLOT"
+        );
+
+        if (retryCount >= 3) {
+          logger.warn(
+            {
+              beforeSignature,
+              stopSlot: this.stopSlot.toString(),
+              err: error instanceof Error ? error : undefined,
+              error: toErrorDetails(error),
+            },
+            "Deferring stop-slot anchor resolution to the next cycle after repeated failures"
+          );
+          this.stopSlotPaginationContinuation = beforeSignature ?? this.stopSlotPaginationContinuation;
+          return null;
+        }
+
+        const retryDelayMs = isProviderOverloadedError(error)
+          ? Math.min(30000, 1000 * (2 ** retryCount))
+          : 500 * retryCount;
+        if (!(await this.waitForDelay(retryDelayMs))) break;
+      }
+    }
+
+    return null;
+  }
+
   async start(): Promise<void> {
     if (this.isRunning) {
       logger.warn("Poller already running");
@@ -298,6 +695,7 @@ export class Poller {
     }
 
     this.isRunning = true;
+    this.hasReachedLiveFrontier = false;
     logger.info({ programId: this.programId.toBase58() }, "Starting poller");
 
     try {
@@ -321,6 +719,7 @@ export class Poller {
     }
 
     this.isRunning = true;
+    this.hasReachedLiveFrontier = false;
     this.suppressEventLogWrites = Boolean(options?.suppressEventLogWrites);
     logger.info({ programId: this.programId.toBase58() }, "Bootstrapping poller catch-up");
 
@@ -355,12 +754,43 @@ export class Poller {
   }
 
   private async initializeCursor(): Promise<void> {
-    await this.loadState();
+    while (this.isRunning) {
+      await this.loadState();
+      const activeHistoricalScan = await this.loadActiveHistoricalScanState(this.lastSignature);
 
-    // If no saved state, do backfill first
-    if (!this.lastSignature) {
-      logger.info("No saved state - starting backfill from beginning");
-      await this.backfill();
+      if (activeHistoricalScan) {
+        const historicalCatchUpComplete = await this.catchUpHistoricalGap(
+          activeHistoricalScan.stopSignature,
+          activeHistoricalScan.pages
+        );
+        if (historicalCatchUpComplete) {
+          this.pendingHistoricalResume = false;
+          return;
+        }
+        this.pendingHistoricalResume = true;
+      } else if (!this.lastSignature) {
+        logger.info("No saved state - starting backfill from beginning");
+        const backfillComplete = await this.backfill();
+        if (backfillComplete) {
+          this.pendingHistoricalResume = false;
+          return;
+        }
+        this.pendingHistoricalResume = true;
+      } else if (config.indexerStartSignature || this.pendingHistoricalResume) {
+        const historicalCatchUpComplete = await this.catchUpHistoricalGap();
+        if (historicalCatchUpComplete) {
+          this.pendingHistoricalResume = false;
+          return;
+        }
+        this.pendingHistoricalResume = true;
+      } else {
+        return;
+      }
+
+      const shouldRetry = await this.waitForDelay(this.pollingInterval);
+      if (!shouldRetry) {
+        return;
+      }
     }
   }
 
@@ -369,7 +799,7 @@ export class Poller {
    * Uses streaming approach to avoid OOM - fetches and processes in batches
    * Processes oldest-to-newest within each batch for correct ordering
    */
-  private async backfill(): Promise<void> {
+  private async backfill(): Promise<boolean> {
     logger.info("Starting historical backfill with streaming batches...");
 
     // First, find the oldest signature by paginating to the end
@@ -385,7 +815,7 @@ export class Poller {
       try {
         const signatures = await this.connection.getSignaturesForAddress(
           this.programId,
-          { limit: this.batchSize, before: beforeSignature }
+          { limit: config.historicalScanSignaturePageLimit, before: beforeSignature }
         );
 
         if (signatures.length === 0) break;
@@ -393,12 +823,14 @@ export class Poller {
         const validSigs = signatures.filter((sig) => sig.err === null);
         totalEstimate += validSigs.length;
 
-        // Save checkpoint every batch
-        if (validSigs.length > 0) {
-          checkpoints.push(validSigs[validSigs.length - 1].signature);
+        const slotAwareCheckpoint = await this.resolveBackfillCheckpoint(signatures);
+        totalEstimate += slotAwareCheckpoint.extraValidCount;
+
+        if (slotAwareCheckpoint.checkpointSignature) {
+          checkpoints.push(slotAwareCheckpoint.checkpointSignature);
         }
 
-        beforeSignature = signatures[signatures.length - 1].signature;
+        beforeSignature = slotAwareCheckpoint.nextBeforeSignature;
 
         if (signatures.length < this.batchSize) break;
 
@@ -413,9 +845,11 @@ export class Poller {
 
         // Retry with exponential backoff
         if (scanErrors >= 5) {
-          this.isRunning = false;
-          logger.fatal("Too many scan errors during backfill scan; aborting startup to avoid partial history gaps");
-          throw new Error("Backfill scan failed after repeated RPC errors");
+          logger.error(
+            { beforeSignature, scanErrors },
+            "Too many scan errors during backfill scan; pausing startup catch-up and retrying later"
+          );
+          return false;
         }
         if (!(await this.waitForDelay(1000 * scanErrors))) break;
       }
@@ -437,7 +871,23 @@ export class Poller {
       if (windowSigs.length === 0) continue;
 
       // Process this batch (already in chronological order)
-      processed += await this.processSignatureBatch(windowSigs, processed, totalEstimate);
+      try {
+        processed += await this.processSignatureBatch(windowSigs, processed, totalEstimate);
+      } catch (error) {
+        if (isRetryableTransactionFetchError(error)) {
+          logger.warn(
+            {
+              signature: error.signature,
+              slot: error.slot,
+              processed,
+              total: totalEstimate,
+            },
+            "Backfill paused on retryable transaction fetch gap; will resume from persisted cursor"
+          );
+          return false;
+        }
+        throw error;
+      }
 
       logger.info({ processed, total: totalEstimate, checkpoint: i }, "Backfill checkpoint processed");
     }
@@ -446,11 +896,896 @@ export class Poller {
     if (checkpoints.length > 0 && this.isRunning) {
       const newestSigs = await this.fetchSignatureWindow(undefined, checkpoints[0]);
       if (newestSigs.length > 0) {
-        processed += await this.processSignatureBatch(newestSigs, processed, totalEstimate);
+        try {
+          processed += await this.processSignatureBatch(newestSigs, processed, totalEstimate);
+        } catch (error) {
+          if (isRetryableTransactionFetchError(error)) {
+            logger.warn(
+              {
+                signature: error.signature,
+                slot: error.slot,
+                processed,
+                total: totalEstimate,
+              },
+              "Backfill paused on retryable transaction fetch gap; will resume from persisted cursor"
+            );
+            return false;
+          }
+          throw error;
+        }
       }
     }
 
     logger.info({ processed }, "Backfill finished, switching to live polling");
+    return true;
+  }
+
+  /**
+   * Catch up from an existing cursor using a bounded historical scan.
+   * This avoids reusing the live newest-first paginator for large historical gaps.
+   */
+  private async catchUpHistoricalGap(
+    stopSignatureOverride?: string,
+    persistedPagesOverride?: HistoricalScanPageState[]
+  ): Promise<boolean> {
+    const stopSignature = stopSignatureOverride ?? this.lastSignature;
+    if (!stopSignature) return true;
+
+    const persistedPages = persistedPagesOverride ?? (await this.loadHistoricalScanPages(stopSignature));
+    const pageStates: HistoricalScanPageState[] = [...persistedPages];
+    const persistedScanState = await this.loadHistoricalScanState(stopSignature);
+    let scanComplete = persistedScanState?.scanComplete ?? false;
+    let beforeSignature: string | undefined =
+      persistedScanState?.nextBeforeSignature ?? undefined;
+
+    if (!persistedScanState && pageStates.length > 0) {
+      const lastPersistedPage = pageStates[pageStates.length - 1];
+      beforeSignature = lastPersistedPage.nextBeforeSignature ?? undefined;
+      scanComplete = beforeSignature === undefined;
+    }
+
+    if (!persistedScanState && pageStates.length === 0 && this.stopSlot !== null) {
+      beforeSignature = (await this.resolveStopSlotPaginationBefore()) || undefined;
+      if (!beforeSignature && !this.stopSlotPaginationBeforeResolved) {
+        logger.info(
+          {
+            stopSlot: this.stopSlot.toString(),
+            continuationPoint: this.stopSlotPaginationContinuation,
+          },
+          "Historical catch-up is waiting for stop-slot pagination anchor"
+        );
+        return false;
+      }
+    }
+
+    if (pageStates.length > 0 || persistedScanState) {
+      logger.info(
+        {
+          stopSignature,
+          persistedPages: pageStates.length,
+          scanComplete,
+          resumeBeforeSignature: beforeSignature ?? null,
+        },
+        scanComplete
+          ? "Resuming fully scanned historical catch-up from persisted state"
+          : "Resuming bounded historical catch-up from persisted scan state"
+      );
+    }
+
+    logger.info(
+      {
+        stopSignature,
+        stopSlot: this.stopSlot?.toString() ?? null,
+      },
+      "Starting bounded historical catch-up from existing cursor"
+    );
+
+    const maxPagesPerPass = Math.max(1, config.historicalScanMaxPagesPerPass);
+    let totalEstimate = 0;
+
+    if (!scanComplete) {
+      let pagesScannedThisPass = 0;
+      while (this.isRunning && pagesScannedThisPass < maxPagesPerPass) {
+        const pageInputBefore = beforeSignature;
+        const page = await this.fetchHistoricalGapPage(stopSignature, pageInputBefore);
+        if (page.paused) {
+          await this.saveHistoricalScanState(stopSignature, pageInputBefore ?? null, false);
+          return false;
+        }
+        if (page.signatures.length === 0) {
+          if (page.pageFilteredOut && page.nextBeforeSignature) {
+            pagesScannedThisPass += 1;
+            beforeSignature = page.nextBeforeSignature;
+            if (!(await this.waitForDelay(100))) break;
+            continue;
+          }
+          scanComplete = true;
+          beforeSignature = undefined;
+          break;
+        }
+
+        await this.saveHistoricalScanPage(
+          stopSignature,
+          pageStates.length,
+          pageInputBefore ?? null,
+          page.nextBeforeSignature ?? null,
+          page.signatures
+        );
+
+        pageStates.push({
+          pageIndex: pageStates.length,
+          beforeSignature: pageInputBefore ?? null,
+          nextBeforeSignature: page.nextBeforeSignature ?? null,
+          signatures: page.signatures,
+        });
+        totalEstimate += page.signatures.length;
+        pagesScannedThisPass += 1;
+
+        if (!page.nextBeforeSignature) {
+          scanComplete = true;
+          beforeSignature = undefined;
+          break;
+        }
+        beforeSignature = page.nextBeforeSignature;
+
+        if (!(await this.waitForDelay(100))) break;
+      }
+
+      await this.saveHistoricalScanState(stopSignature, beforeSignature ?? null, scanComplete);
+      if (!scanComplete) {
+        logger.info(
+          {
+            stopSignature,
+            scannedPagesThisPass: Math.min(maxPagesPerPass, pageStates.length),
+            persistedPages: pageStates.length,
+            nextBeforeSignature: beforeSignature ?? null,
+          },
+          "Historical catch-up scan pass complete; replay will continue after scan reaches a safe boundary"
+        );
+        return false;
+      }
+    }
+
+    if (pageStates.length === 0) {
+      await this.clearHistoricalScanState(stopSignature);
+      logger.info({ stopSignature }, "No historical gap detected from existing cursor");
+      return true;
+    }
+
+    let processed = 0;
+    const progressState = await this.loadHistoricalScanProgress(stopSignature);
+    if (progressState?.nextPageIndex !== undefined && progressState.nextPageIndex < 0) {
+      await this.clearHistoricalScanPages(stopSignature);
+      await this.clearHistoricalScanProgress(stopSignature);
+      await this.clearHistoricalScanState(stopSignature);
+      logger.info({ stopSignature }, "Historical catch-up namespace already fully replayed; cleared stale persisted pages");
+      return true;
+    }
+    const startPageIndex = progressState?.nextPageIndex ?? (pageStates.length - 1);
+    const lastPageIndexToReplay = Math.max(-1, startPageIndex - maxPagesPerPass);
+    for (let i = startPageIndex; i > lastPageIndexToReplay && this.isRunning; i--) {
+      const pageState = pageStates[i];
+      const persistedChronological =
+        pageState.signatures && pageState.signatures.length > 0
+          ? [...pageState.signatures].reverse()
+          : null;
+      let chronological = persistedChronological;
+      if (!chronological) {
+        const page = await this.fetchHistoricalGapPage(
+          stopSignature,
+          pageState.beforeSignature ?? undefined
+        );
+        if (page.signatures.length === 0) {
+          throw new Error(
+            `Historical catch-up page replay returned no signatures for persisted page ${pageState.pageIndex}`
+          );
+        }
+        chronological = [...page.signatures].reverse();
+      }
+      const resumeAfterSignature =
+        progressState?.nextPageIndex === i ? progressState.lastProcessedSignature : null;
+      const resumeOffset = resumeAfterSignature
+        ? chronological.findIndex((sig) => sig.signature === resumeAfterSignature)
+        : -1;
+      const replayBatch =
+        resumeOffset >= 0 ? chronological.slice(resumeOffset + 1) : chronological;
+      let lastReplayedSignature: string | null = null;
+      try {
+        const replayedCount = await this.processSignatureBatch(
+          replayBatch,
+          processed,
+          totalEstimate,
+          async (sig) => {
+            lastReplayedSignature = sig.signature;
+            if (!USE_BATCH_DB) {
+              await this.saveHistoricalScanProgress(stopSignature, i, sig.signature);
+            }
+          }
+        );
+        processed += replayedCount;
+        if (replayedCount < replayBatch.length) {
+          if (USE_BATCH_DB && lastReplayedSignature) {
+            await this.saveHistoricalScanProgress(stopSignature, i, lastReplayedSignature);
+          }
+          logger.info(
+            {
+              processed,
+              replayedCount,
+              replayBatchSize: replayBatch.length,
+              stopSignature,
+              pageIndex: i,
+            },
+            "Historical catch-up page replay paused before page completion; preserving page for resume"
+          );
+          return false;
+        }
+      } catch (error) {
+        if (isRetryableTransactionFetchError(error)) {
+          if (USE_BATCH_DB && lastReplayedSignature) {
+            await this.saveHistoricalScanProgress(stopSignature, i, lastReplayedSignature);
+          }
+          logger.warn(
+            {
+              signature: error.signature,
+              slot: error.slot,
+              processed,
+              total: totalEstimate,
+            },
+            "Historical catch-up paused on retryable transaction fetch gap; will resume from persisted cursor"
+          );
+          return false;
+        }
+        throw error;
+      }
+      await this.saveHistoricalScanProgress(stopSignature, i - 1, null);
+      await this.clearHistoricalScanPage(stopSignature, pageState.pageIndex);
+      logger.info(
+        {
+          processed,
+          total: totalEstimate,
+          page: pageStates.length - i,
+          pageCount: pageStates.length,
+        },
+        "Historical catch-up page processed"
+      );
+    }
+
+    if (lastPageIndexToReplay >= 0) {
+      logger.info(
+        {
+          processed,
+          total: totalEstimate,
+          nextPageIndex: lastPageIndexToReplay,
+          stopSignature,
+        },
+        "Historical catch-up replay pass complete; more persisted pages remain"
+      );
+      return false;
+    }
+
+    await this.clearHistoricalScanProgress(stopSignature);
+    await this.clearHistoricalScanState(stopSignature);
+    logger.info({ processed, total: totalEstimate }, "Historical catch-up finished, switching to live polling");
+    return true;
+  }
+
+  private async loadHistoricalScanPages(stopSignature: string): Promise<HistoricalScanPageState[]> {
+    const prefix = historicalScanRowPrefix(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      const result = await db.query(
+        `SELECT id, last_signature, source, last_tx_index
+           FROM indexer_state
+          WHERE id LIKE $1
+          ORDER BY last_tx_index ASC NULLS LAST, id ASC`,
+        [`${prefix}%`]
+      );
+      return result.rows
+        .map((row) => {
+          const pageIndex = parseHistoricalScanPageIndex(String(row.id), stopSignature);
+          if (pageIndex === null) return null;
+          return {
+            pageIndex,
+            beforeSignature: row.last_signature ?? null,
+            ...parseHistoricalScanPagePayload(row.source ? String(row.source) : null),
+          };
+        })
+        .filter((row): row is HistoricalScanPageState => row !== null);
+    }
+
+    const rows = await this.prisma.indexerState.findMany({
+      where: {
+        id: {
+          startsWith: prefix,
+        },
+      },
+      orderBy: {
+        lastTxIndex: "asc",
+      },
+    });
+
+    return rows
+      .map((row) => {
+        const pageIndex = parseHistoricalScanPageIndex(row.id, stopSignature);
+        if (pageIndex === null) return null;
+        return {
+          pageIndex,
+          beforeSignature: row.lastSignature ?? null,
+          ...parseHistoricalScanPagePayload(row.source ?? null),
+        };
+      })
+      .filter((row): row is HistoricalScanPageState => row !== null);
+  }
+
+  private async loadHistoricalScanState(stopSignature: string): Promise<HistoricalScanState | null> {
+    const id = historicalScanStateRowId(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      const result = await db.query(
+        `SELECT source
+           FROM indexer_state
+          WHERE id = $1
+          LIMIT 1`,
+        [id]
+      );
+      const source = result.rows[0]?.source;
+      if (source === null || source === undefined) {
+        return null;
+      }
+      return parseHistoricalScanStatePayload(String(source));
+    }
+
+    const row = await this.prisma.indexerState.findUnique({
+      where: { id },
+      select: { source: true },
+    });
+    if (!row?.source) {
+      return null;
+    }
+    return parseHistoricalScanStatePayload(row.source);
+  }
+
+  private async loadActiveHistoricalScanState(
+    currentStopSignature?: string | null
+  ): Promise<{ stopSignature: string; pages: HistoricalScanPageState[] } | null> {
+    if (currentStopSignature) {
+      const currentState = await this.loadHistoricalScanState(currentStopSignature);
+      const currentPages = await this.filterHistoricalScanPagesByProgress(
+        currentStopSignature,
+        await this.loadHistoricalScanPages(currentStopSignature)
+      );
+      if (currentPages.length > 0 || currentState) {
+        return { stopSignature: currentStopSignature, pages: currentPages };
+      }
+      return null;
+    }
+
+    if (!this.prisma) {
+      const db = getPool();
+      const result = await db.query(
+        `SELECT id
+           FROM indexer_state
+          WHERE id LIKE $1
+          ORDER BY updated_at DESC, last_tx_index DESC NULLS LAST, id DESC
+          LIMIT 1`,
+        [`${HISTORICAL_SCAN_ROW_PREFIX}%`]
+      );
+      const stopSignature = result.rows[0]?.id
+        ? parseHistoricalScanStopSignature(String(result.rows[0].id))
+        : null;
+      if (stopSignature) {
+        return {
+          stopSignature,
+          pages: await this.filterHistoricalScanPagesByProgress(
+            stopSignature,
+            await this.loadHistoricalScanPages(stopSignature)
+          ),
+        };
+      }
+      const stateResult = await db.query(
+        `SELECT id
+           FROM indexer_state
+          WHERE id LIKE $1
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1`,
+        [`${HISTORICAL_SCAN_STATE_ROW_PREFIX}%`]
+      );
+      const stateStopSignature = stateResult.rows[0]?.id
+        ? parseHistoricalScanStateStopSignature(String(stateResult.rows[0].id))
+        : null;
+      if (!stateStopSignature) {
+        return null;
+      }
+      return {
+        stopSignature: stateStopSignature,
+        pages: await this.filterHistoricalScanPagesByProgress(
+          stateStopSignature,
+          await this.loadHistoricalScanPages(stateStopSignature)
+        ),
+      };
+    }
+
+    const rows = await this.prisma.indexerState.findMany({
+      where: {
+        id: {
+          startsWith: HISTORICAL_SCAN_ROW_PREFIX,
+        },
+      },
+      orderBy: [
+        { updatedAt: "desc" },
+        { lastTxIndex: "desc" },
+        { id: "desc" },
+      ],
+      take: 1,
+    });
+    const stopSignature = rows[0]?.id ? parseHistoricalScanStopSignature(rows[0].id) : null;
+    if (stopSignature) {
+      return {
+        stopSignature,
+        pages: await this.filterHistoricalScanPagesByProgress(
+          stopSignature,
+          await this.loadHistoricalScanPages(stopSignature)
+        ),
+      };
+    }
+    const stateRows = await this.prisma.indexerState.findMany({
+      where: {
+        id: {
+          startsWith: HISTORICAL_SCAN_STATE_ROW_PREFIX,
+        },
+      },
+      orderBy: [
+        { updatedAt: "desc" },
+        { id: "desc" },
+      ],
+      take: 1,
+    });
+    const stateStopSignature = stateRows[0]?.id
+      ? parseHistoricalScanStateStopSignature(stateRows[0].id)
+      : null;
+    if (!stateStopSignature) {
+      return null;
+    }
+    return {
+      stopSignature: stateStopSignature,
+      pages: await this.filterHistoricalScanPagesByProgress(
+        stateStopSignature,
+        await this.loadHistoricalScanPages(stateStopSignature)
+      ),
+    };
+  }
+
+  private async filterHistoricalScanPagesByProgress(
+    stopSignature: string,
+    pages: HistoricalScanPageState[]
+  ): Promise<HistoricalScanPageState[]> {
+    const progress = await this.loadHistoricalScanProgress(stopSignature);
+    if (!progress) return pages;
+    return pages.filter((page) => page.pageIndex <= progress.nextPageIndex);
+  }
+
+  private async saveHistoricalScanPage(
+    stopSignature: string,
+    pageIndex: number,
+    beforeSignature: string | null,
+    nextBeforeSignature: string | null,
+    signatures: ConfirmedSignatureInfo[]
+  ): Promise<void> {
+    const id = historicalScanRowId(stopSignature, pageIndex);
+    const serializedSource = serializeHistoricalScanPagePayload(nextBeforeSignature, signatures);
+
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(
+        `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+         VALUES ($1, $2, NULL, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET
+           last_signature = EXCLUDED.last_signature,
+           last_slot = NULL,
+           last_tx_index = EXCLUDED.last_tx_index,
+           source = EXCLUDED.source,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          id,
+          beforeSignature,
+          pageIndex,
+          serializedSource,
+          new Date().toISOString(),
+        ]
+      );
+      return;
+    }
+
+    await this.prisma.indexerState.upsert({
+      where: { id },
+      create: {
+        id,
+        lastSignature: beforeSignature,
+        lastSlot: null,
+        lastTxIndex: pageIndex,
+        source: serializedSource,
+      },
+      update: {
+        lastSignature: beforeSignature,
+        lastSlot: null,
+        lastTxIndex: pageIndex,
+        source: serializedSource,
+      },
+    });
+  }
+
+  private async saveHistoricalScanState(
+    stopSignature: string,
+    nextBeforeSignature: string | null,
+    scanComplete: boolean
+  ): Promise<void> {
+    const id = historicalScanStateRowId(stopSignature);
+    const serializedSource = serializeHistoricalScanStatePayload(
+      nextBeforeSignature,
+      scanComplete
+    );
+
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(
+        `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+         VALUES ($1, NULL, NULL, NULL, $2, $3)
+         ON CONFLICT (id) DO UPDATE SET
+           last_signature = EXCLUDED.last_signature,
+           last_slot = EXCLUDED.last_slot,
+           last_tx_index = EXCLUDED.last_tx_index,
+           source = EXCLUDED.source,
+           updated_at = EXCLUDED.updated_at`,
+        [id, serializedSource, new Date().toISOString()]
+      );
+      return;
+    }
+
+    await this.prisma.indexerState.upsert({
+      where: { id },
+      create: {
+        id,
+        lastSignature: null,
+        lastSlot: null,
+        lastTxIndex: null,
+        source: serializedSource,
+      },
+      update: {
+        lastSignature: null,
+        lastSlot: null,
+        lastTxIndex: null,
+        source: serializedSource,
+      },
+    });
+  }
+
+  private async clearHistoricalScanPage(stopSignature: string, pageIndex: number): Promise<void> {
+    const id = historicalScanRowId(stopSignature, pageIndex);
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(`DELETE FROM indexer_state WHERE id = $1`, [id]);
+      return;
+    }
+
+    await this.prisma.indexerState.deleteMany({
+      where: { id },
+    });
+  }
+
+  private async clearHistoricalScanPages(stopSignature: string): Promise<void> {
+    const prefix = `${HISTORICAL_SCAN_ROW_PREFIX}${stopSignature}:`;
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(`DELETE FROM indexer_state WHERE id LIKE $1`, [`${prefix}%`]);
+      return;
+    }
+
+    await this.prisma.indexerState.deleteMany({
+      where: {
+        id: {
+          startsWith: prefix,
+        },
+      },
+    });
+  }
+
+  private async clearHistoricalScanState(stopSignature: string): Promise<void> {
+    const id = historicalScanStateRowId(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(`DELETE FROM indexer_state WHERE id = $1`, [id]);
+      return;
+    }
+
+    await this.prisma.indexerState.deleteMany({
+      where: { id },
+    });
+  }
+
+  private async loadHistoricalScanProgress(
+    stopSignature: string
+  ): Promise<{ nextPageIndex: number; lastProcessedSignature: string | null } | null> {
+    const id = historicalScanProgressRowId(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      const result = await db.query(
+        `SELECT last_tx_index, last_signature
+           FROM indexer_state
+          WHERE id = $1
+          LIMIT 1`,
+        [id]
+      );
+      const nextPageIndex = result.rows[0]?.last_tx_index;
+      if (nextPageIndex === null || nextPageIndex === undefined) {
+        return null;
+      }
+      return {
+        nextPageIndex: Number(nextPageIndex),
+        lastProcessedSignature: result.rows[0]?.last_signature ?? null,
+      };
+    }
+
+    const row = await this.prisma.indexerState.findUnique({
+      where: { id },
+      select: { lastTxIndex: true, lastSignature: true },
+    });
+    if (row?.lastTxIndex === null || row?.lastTxIndex === undefined) {
+      return null;
+    }
+    return {
+      nextPageIndex: row.lastTxIndex,
+      lastProcessedSignature: row.lastSignature ?? null,
+    };
+  }
+
+  private async saveHistoricalScanProgress(
+    stopSignature: string,
+    nextPageIndex: number,
+    lastProcessedSignature: string | null = null
+  ): Promise<void> {
+    const id = historicalScanProgressRowId(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(
+        `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+         VALUES ($1, $2, NULL, $3, NULL, $4)
+         ON CONFLICT (id) DO UPDATE SET
+           last_signature = EXCLUDED.last_signature,
+           last_slot = EXCLUDED.last_slot,
+           last_tx_index = EXCLUDED.last_tx_index,
+           source = EXCLUDED.source,
+           updated_at = EXCLUDED.updated_at`,
+        [id, lastProcessedSignature, nextPageIndex, new Date().toISOString()]
+      );
+      return;
+    }
+
+    await this.prisma.indexerState.upsert({
+      where: { id },
+      create: {
+        id,
+        lastSignature: lastProcessedSignature,
+        lastSlot: null,
+        lastTxIndex: nextPageIndex,
+        source: "historical-scan-progress",
+      },
+      update: {
+        lastSignature: lastProcessedSignature,
+        lastSlot: null,
+        lastTxIndex: nextPageIndex,
+        source: "historical-scan-progress",
+      },
+    });
+  }
+
+  private async clearHistoricalScanProgress(stopSignature: string): Promise<void> {
+    const id = historicalScanProgressRowId(stopSignature);
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(`DELETE FROM indexer_state WHERE id = $1`, [id]);
+      return;
+    }
+
+    await this.prisma.indexerState.deleteMany({
+      where: { id },
+    });
+  }
+
+  private async fetchHistoricalGapPage(
+    stopSignature: string,
+    beforeSignature?: string
+  ): Promise<{
+    signatures: ConfirmedSignatureInfo[];
+    nextBeforeSignature: string | undefined;
+    paused?: boolean;
+    pageFilteredOut?: boolean;
+  }> {
+    let retryCount = 0;
+    let pageLimit = config.historicalScanSignaturePageLimit;
+    const defaultMinPageLimit = Math.max(1, Math.min(25, config.historicalScanSignaturePageLimit));
+    let minPageLimit = defaultMinPageLimit;
+
+    while (this.isRunning) {
+      try {
+        const options: { limit: number; before?: string; until: string } = {
+          limit: pageLimit,
+          until: stopSignature,
+        };
+        if (beforeSignature) {
+          options.before = beforeSignature;
+        }
+
+        let batch = await this.connection.getSignaturesForAddress(this.programId, options);
+        if (batch.length === 0) {
+          return { signatures: [], nextBeforeSignature: undefined };
+        }
+
+        const stopIndex = batch.findIndex((sig) => sig.signature === stopSignature);
+        if (stopIndex >= 0) {
+          batch = batch.slice(0, stopIndex);
+        }
+
+        const page: ConfirmedSignatureInfo[] = [];
+        const seen = new Set<string>();
+        const pushUniqueSignature = (entry: ConfirmedSignatureInfo): void => {
+          if (entry.err !== null) return;
+          if (entry.signature === stopSignature) return;
+          if (seen.has(entry.signature)) return;
+          seen.add(entry.signature);
+          page.push(entry);
+        };
+
+        for (const entry of batch) {
+          pushUniqueSignature(entry);
+        }
+
+        if (batch.length === 0) {
+          return { signatures: page, nextBeforeSignature: undefined };
+        }
+
+        let nextBeforeSignature = batch[batch.length - 1].signature;
+        const boundarySlot = batch[batch.length - 1].slot;
+
+        if (batch.length >= pageLimit) {
+          while (this.isRunning && nextBeforeSignature) {
+            const continuation = await this.connection.getSignaturesForAddress(
+              this.programId,
+              { limit: pageLimit, before: nextBeforeSignature, until: stopSignature }
+            );
+
+            if (continuation.length === 0) break;
+
+            const continuationStopIndex = continuation.findIndex(
+              (sig) => sig.signature === stopSignature
+            );
+            const effectiveContinuation = continuationStopIndex >= 0
+              ? continuation.slice(0, continuationStopIndex)
+              : continuation;
+
+            let sawBoundarySlot = false;
+            for (const candidate of effectiveContinuation) {
+              if (candidate.slot !== boundarySlot) break;
+              sawBoundarySlot = true;
+              nextBeforeSignature = candidate.signature;
+              pushUniqueSignature(candidate);
+            }
+
+            if (!sawBoundarySlot) break;
+            if (continuationStopIndex >= 0) break;
+            if (continuation.length < pageLimit) break;
+            if (!(await this.waitForDelay(100))) break;
+          }
+        }
+
+        return {
+          signatures: page,
+          nextBeforeSignature:
+            batch.length < pageLimit || stopIndex >= 0 ? undefined : nextBeforeSignature,
+          pageFilteredOut: page.length === 0 && batch.length > 0,
+        };
+      } catch (error) {
+        retryCount++;
+        if (isProviderOverloadedError(error)) {
+          minPageLimit = 1;
+        }
+        pageLimit = Math.max(minPageLimit, Math.floor(pageLimit / 2));
+        logger.warn(
+          {
+            retryCount,
+            pageLimit,
+            beforeSignature,
+            stopSignature,
+            err: error instanceof Error ? error : undefined,
+            error: toErrorDetails(error),
+          },
+          "Error while scanning bounded historical catch-up page"
+        );
+
+        if (retryCount >= 5) {
+          logger.error(
+            {
+              beforeSignature,
+              stopSignature,
+              err: error instanceof Error ? error : undefined,
+              error: toErrorDetails(error),
+            },
+            "Historical catch-up page scan hit repeated RPC errors; pausing startup catch-up and retrying later"
+          );
+          return {
+            signatures: [],
+            nextBeforeSignature: beforeSignature,
+            paused: true,
+          };
+        }
+
+        const retryDelayMs = isProviderOverloadedError(error)
+          ? Math.min(30000, 1000 * (2 ** retryCount))
+          : 500 * retryCount;
+        if (!(await this.waitForDelay(retryDelayMs))) break;
+      }
+    }
+
+    return { signatures: [], nextBeforeSignature: undefined };
+  }
+
+  private async resolveBackfillCheckpoint(
+    signatures: ConfirmedSignatureInfo[]
+  ): Promise<{
+    checkpointSignature: string | null;
+    nextBeforeSignature: string | undefined;
+    extraValidCount: number;
+  }> {
+    if (signatures.length === 0) {
+      return {
+        checkpointSignature: null,
+        nextBeforeSignature: undefined,
+        extraValidCount: 0,
+      };
+    }
+
+    const boundarySlot = signatures[signatures.length - 1].slot;
+    let checkpointSignature: string | null = null;
+    for (let i = signatures.length - 1; i >= 0; i--) {
+      const candidate = signatures[i];
+      if (candidate.slot !== boundarySlot) break;
+      if (candidate.err === null) {
+        checkpointSignature = candidate.signature;
+      }
+    }
+
+    let nextBeforeSignature = signatures[signatures.length - 1].signature;
+    let extraValidCount = 0;
+
+      if (signatures.length < config.historicalScanSignaturePageLimit) {
+        return { checkpointSignature, nextBeforeSignature, extraValidCount };
+      }
+
+    while (this.isRunning && nextBeforeSignature) {
+      const continuation = await this.connection.getSignaturesForAddress(
+        this.programId,
+        { limit: config.historicalScanSignaturePageLimit, before: nextBeforeSignature }
+      );
+
+      if (continuation.length === 0) break;
+
+      let consumedBoundarySlot = false;
+      for (const candidate of continuation) {
+        if (candidate.slot !== boundarySlot) {
+          return { checkpointSignature, nextBeforeSignature, extraValidCount };
+        }
+        consumedBoundarySlot = true;
+        nextBeforeSignature = candidate.signature;
+        if (candidate.err === null) {
+          checkpointSignature = candidate.signature;
+          extraValidCount++;
+        }
+      }
+
+      if (!consumedBoundarySlot || continuation.length < config.historicalScanSignaturePageLimit) break;
+      if (!(await this.waitForDelay(100))) break;
+    }
+
+    return { checkpointSignature, nextBeforeSignature, extraValidCount };
   }
 
   /**
@@ -515,7 +1850,8 @@ export class Poller {
   private async processSignatureBatch(
     signatures: ConfirmedSignatureInfo[],
     previousCount: number,
-    totalEstimate: number
+    totalEstimate: number,
+    onTransactionProcessed?: (sig: ConfirmedSignatureInfo) => Promise<void>
   ): Promise<number> {
     const startTime = Date.now();
 
@@ -591,6 +1927,9 @@ export class Poller {
           if (!USE_BATCH_DB) {
             await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
           }
+          if (onTransactionProcessed) {
+            await onTransactionProcessed(sig);
+          }
           processed++;
           this.processedCount++;
 
@@ -606,6 +1945,20 @@ export class Poller {
           }
         } catch (error) {
           this.errorCount++;
+          if (isRetryableTransactionFetchError(error)) {
+            if (USE_BATCH_DB && this.eventBuffer && (this.eventBuffer.size > 0 || this.eventBuffer.hasPendingCursor())) {
+              await this.eventBuffer.flush();
+            }
+            logger.warn(
+              {
+                error: error.message,
+                signature: error.signature,
+                slot: error.slot,
+              },
+              "Backfill paused on retryable transaction fetch gap"
+            );
+            throw error;
+          }
           this.isRunning = false;
           if (isMissingCollectionIdSchemaError(error)) {
             logger.fatal(
@@ -632,7 +1985,7 @@ export class Poller {
     if (USE_BATCH_DB && this.eventBuffer) {
       if (!this.isRunning) {
         await this.eventBuffer.drain();
-      } else if (this.eventBuffer.size > 0) {
+      } else if (this.eventBuffer.size > 0 || this.eventBuffer.hasPendingCursor()) {
         await this.eventBuffer.flush();
       }
     }
@@ -691,6 +2044,7 @@ export class Poller {
       lastSignature: this.lastSignature?.slice(0, 16) + '...'
     }, "Stopping poller");
     this.isRunning = false;
+    this.hasReachedLiveFrontier = false;
     if (this.pollDelayTimeout) {
       clearTimeout(this.pollDelayTimeout);
       this.pollDelayTimeout = null;
@@ -730,6 +2084,10 @@ export class Poller {
       processedCount: this.processedCount,
       errorCount: this.errorCount,
     };
+  }
+
+  isCaughtUp(): boolean {
+    return this.hasReachedLiveFrontier;
   }
 
   private logNoSavedCursorWarning(source: "local" | "supabase"): void {
@@ -1021,6 +2379,7 @@ export class Poller {
 
       if (signatures.length === 0) {
         if (this.hadPaginationPartial) {
+          this.hasReachedLiveFrontier = false;
           logger.warn(
             {
               pendingContinuation: this.pendingContinuation,
@@ -1030,10 +2389,12 @@ export class Poller {
           );
           return { fetchedCount: 0, haltedOnError: true };
         }
+        this.hasReachedLiveFrontier = !this.pendingContinuation;
         logger.debug("No new transactions");
         return { fetchedCount: 0, haltedOnError: false };
       }
 
+      this.hasReachedLiveFrontier = false;
       if (this.hadPaginationPartial) {
         logger.warn(
           {
@@ -1041,8 +2402,9 @@ export class Poller {
             pendingContinuation: this.pendingContinuation,
             pendingStopSignature: this.pendingStopSignature,
           },
-          "Processing retry-exhausted partial pagination frontier with continuation preserved"
+          "Skipping retry-exhausted partial pagination frontier until older gap is resolved"
         );
+        return { fetchedCount: 0, haltedOnError: true };
       }
 
       logger.info({ count: signatures.length, batchRpc: this.useBatchRpc, batchDb: USE_BATCH_DB }, "Processing transactions");
@@ -1054,7 +2416,21 @@ export class Poller {
       let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
       if (this.useBatchRpc && this.batchFetcher && reversed.length > 1) {
         const sigList = reversed.map(s => s.signature);
-        txCache = await this.batchFetcher.fetchTransactions(sigList);
+        try {
+          txCache = await this.batchFetcher.fetchTransactions(sigList);
+        } catch (error) {
+          if (error instanceof BatchRpcBackoffRequiredError) {
+            logger.warn(
+              {
+                requested: sigList.length,
+                retryAfterMs: error.retryAfterMs,
+              },
+              "Batch RPC fetch entered cooldown; halting cycle for retry"
+            );
+            return { fetchedCount: 0, haltedOnError: true };
+          }
+          throw error;
+        }
         logger.debug({ requested: sigList.length, fetched: txCache.size }, "Live poll batch RPC fetch");
       }
 
@@ -1184,17 +2560,37 @@ export class Poller {
       const seenSignatures = new Set<string>();
       // Resume from continuation point if we hit memory limit in previous cycle
       let beforeSignature: string | undefined = this.pendingContinuation || undefined;
+      if (!beforeSignature && this.stopSlot !== null) {
+        beforeSignature = (await this.resolveStopSlotPaginationBefore()) || undefined;
+        if (!beforeSignature && !this.stopSlotPaginationBeforeResolved) {
+          logger.info(
+            {
+              stopSlot: this.stopSlot.toString(),
+              continuationPoint: this.stopSlotPaginationContinuation,
+            },
+            "Stop-slot pagination anchor is not ready yet; deferring fetch to next cycle"
+          );
+          return [];
+        }
+      }
       // Use pendingStopSignature if resuming, otherwise use lastSignature
       const stopSignature = this.pendingStopSignature || this.lastSignature;
       let retryCount = 0;
       let pageLimit = this.batchSize;
-      const minPageLimit = Math.max(1, Math.min(25, this.batchSize));
+      const defaultMinPageLimit = Math.max(1, Math.min(25, this.batchSize));
+      let minPageLimit = defaultMinPageLimit;
+      const maxSignaturesPerCycle = Math.max(this.batchSize, config.pollerMaxSignaturesPerCycle);
 
       const pushUniqueSignature = (entry: ConfirmedSignatureInfo): void => {
         if (entry.err !== null) return;
         if (seenSignatures.has(entry.signature)) return;
         seenSignatures.add(entry.signature);
         allSignatures.push(entry);
+      };
+      const retainOldestHistoricalSlice = (): void => {
+        if (allSignatures.length <= maxSignaturesPerCycle) return;
+        const overflow = allSignatures.length - maxSignaturesPerCycle;
+        allSignatures.splice(0, overflow);
       };
 
       if (this.pendingContinuation) {
@@ -1315,6 +2711,7 @@ export class Poller {
                 );
                 throw error;
               }
+              retainOldestHistoricalSlice();
               this.pendingStopSignature = null;
               return allSignatures;
             }
@@ -1429,6 +2826,7 @@ export class Poller {
                 },
                 "RPC pagination crossed below saved slot without returning stop signature; stopping at slot boundary"
               );
+              retainOldestHistoricalSlice();
               this.pendingStopSignature = null;
               return allSignatures;
             }
@@ -1442,20 +2840,20 @@ export class Poller {
             logger.info({ count: allSignatures.length }, "Large gap being processed, continuing pagination...");
           }
 
-          // Memory safety: limit max signatures to process in one poll cycle
-          if (allSignatures.length > 100000) {
-            logger.warn({
-              count: allSignatures.length,
-              continuationPoint: beforeSignature,
-              stopSignature: stopSignature
-            }, "Large gap detected, will continue from checkpoint in next cycle");
-            // Store continuation point and original stop signature
-            this.pendingContinuation = beforeSignature!;
-            // Only set pendingStopSignature if not already set (first time hitting limit)
-            if (!this.pendingStopSignature) {
-              this.pendingStopSignature = this.lastSignature;
-            }
-            break;
+          // Integrity-first historical catch-up:
+          // keep scanning to the stop boundary, but retain only the OLDEST slice
+          // of the frontier for this cycle so replay order remains globally monotonic.
+          if (allSignatures.length > maxSignaturesPerCycle) {
+            retainOldestHistoricalSlice();
+            logger.warn(
+              {
+                count: allSignatures.length,
+                maxSignaturesPerCycle,
+                beforeSignature,
+                stopSignature,
+              },
+              "Per-cycle signature cap reached; retaining oldest historical slice for deterministic replay"
+            );
           }
 
           // Small delay to avoid rate limiting during pagination
@@ -1468,9 +2866,13 @@ export class Poller {
           }
 
           retryCount = 0; // Reset on success
+          minPageLimit = defaultMinPageLimit;
           pageLimit = this.batchSize;
         } catch (innerError) {
           retryCount++;
+          if (isProviderOverloadedError(innerError)) {
+            minPageLimit = 1;
+          }
           pageLimit = Math.max(minPageLimit, Math.floor(pageLimit / 2));
           logger.warn(
             {
@@ -1493,6 +2895,24 @@ export class Poller {
                 this.pendingStopSignature = stopSignature;
               }
             }
+            if (isDeterministicPaginationBoundaryError(innerError)) {
+              this.hadPaginationPartial = false;
+              logger.error(
+                {
+                  retryCount,
+                  pageLimit,
+                  beforeSignature,
+                  stopSignature,
+                  collectedSignatures: allSignatures.length,
+                  pendingContinuation: this.pendingContinuation,
+                  pendingStopSignature: this.pendingStopSignature,
+                  err: innerError instanceof Error ? innerError : undefined,
+                  error: toErrorDetails(innerError),
+                },
+                "Too many pagination boundary ordering errors, deferring frontier until deterministic ordering is available"
+              );
+              return [];
+            }
             logger.error(
               {
                 retryCount,
@@ -1509,7 +2929,10 @@ export class Poller {
             );
             break;
           }
-          if (!(await this.waitForDelay(500 * retryCount))) break;
+          const retryDelayMs = isProviderOverloadedError(innerError)
+            ? Math.min(30000, 1000 * (2 ** retryCount))
+            : 500 * retryCount;
+          if (!(await this.waitForDelay(retryDelayMs))) break;
         }
       }
 
@@ -1521,13 +2944,7 @@ export class Poller {
   }
 
   private async processTransaction(sig: ConfirmedSignatureInfo, txIndex?: number): Promise<Date> {
-    const tx = await this.connection.getParsedTransaction(sig.signature, {
-      maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
-    });
-
-    if (!tx) {
-      throw new Error(`Transaction not found for signature ${sig.signature}`);
-    }
+    const tx = await this.fetchParsedTransactionWithRetry(sig.signature, sig.slot);
 
     const blockTime = resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot);
     const parsed = parseTransaction(tx);
@@ -1559,6 +2976,7 @@ export class Poller {
         blockTime,
         txIndex,
         eventOrdinal,
+        skipCursorUpdate: true,
       };
 
       await handleEventAtomic(this.prisma, typedEvent, ctx);
@@ -1593,13 +3011,7 @@ export class Poller {
     if (!tx) {
       // Fallback to individual fetch if not in cache
       logger.debug({ signature: sig.signature }, "Transaction not in batch cache, fetching individually");
-      tx = await this.connection.getParsedTransaction(sig.signature, {
-        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
-      }) ?? undefined;
-    }
-
-    if (!tx) {
-      throw new Error(`Transaction not found for signature ${sig.signature}`);
+      tx = await this.fetchParsedTransactionWithRetry(sig.signature, sig.slot);
     }
 
     const blockTime = resolveEventBlockTime(sig.blockTime ?? tx.blockTime ?? undefined, sig.slot);
@@ -1632,6 +3044,7 @@ export class Poller {
         blockTime,
         txIndex,
         eventOrdinal,
+        skipCursorUpdate: true,
       };
 
       // Add to event buffer instead of direct DB write

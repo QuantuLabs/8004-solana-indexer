@@ -14,6 +14,7 @@ import { PrismaClient } from "@prisma/client";
 import { Pool } from "pg";
 import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
+import { parseTransaction, toTypedEvent } from "../parser/decoder.js";
 import {
   incrementVerifyCycles,
   setLastVerifiedSlot,
@@ -30,6 +31,37 @@ import {
 } from "../utils/pda.js";
 
 const logger = createChildLogger("verifier");
+
+function isZeroHashBytes(hash: Uint8Array | Buffer): boolean {
+  for (let i = 0; i < hash.length; i++) {
+    if (hash[i] !== 0) return false;
+  }
+  return true;
+}
+
+function hashesMatchBytes(
+  left: Uint8Array | Buffer | null | undefined,
+  right: Uint8Array | Buffer | null | undefined,
+): boolean {
+  const leftEmpty = !left || isZeroHashBytes(left);
+  const rightEmpty = !right || isZeroHashBytes(right);
+  if (leftEmpty && rightEmpty) return true;
+  if (leftEmpty || rightEmpty) return false;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function hashesMatchHex(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  const leftBytes = left ? Buffer.from(left, "hex") : null;
+  const rightBytes = right ? Buffer.from(right, "hex") : null;
+  return hashesMatchBytes(leftBytes, rightBytes);
+}
 
 // Borsh deserialization for AgentAccount (simplified - extract digest triplets)
 
@@ -107,7 +139,6 @@ export class DataVerifier {
     lastRunAt: null,
     lastRunDurationMs: 0,
   };
-  private cycleCount = 0;
   // Per-cycle cache for on-chain digests (cleared each cycle)
   private digestCache = new Map<string, OnChainDigests | null>();
   // Persist each agent digest cache at most once per cycle.
@@ -193,6 +224,7 @@ export class DataVerifier {
         : 0n;
       this.currentCutoffSlot = cutoffSlot;
       setLastVerifiedSlot(cutoffSlot);
+      await this.backfillMissingResponseSealHashes();
 
       // Verify in parallel for better performance
       this.persistedDigestAgents.clear();
@@ -206,10 +238,15 @@ export class DataVerifier {
         this.verifyRevocations(cutoffSlot),
       ]);
 
-      // Periodically attempt to recover incorrectly orphaned records
-      this.cycleCount++;
-      if (config.verifyRecoveryCycles > 0 && this.cycleCount % config.verifyRecoveryCycles === 0) {
-        await this.recoverOrphaned();
+      if (config.verifyRecoveryCycles > 0) {
+        const recovered = await this.recoverOrphaned();
+        if (recovered > 0) {
+          await Promise.all([
+            this.verifyFeedbacks(cutoffSlot),
+            this.verifyFeedbackResponses(cutoffSlot),
+            this.verifyRevocations(cutoffSlot),
+          ]);
+        }
       }
 
       const duration = Date.now() - startTime;
@@ -669,10 +706,10 @@ export class DataVerifier {
   // ORPHANED Recovery (re-check previously orphaned records)
   // =========================================================================
 
-  private async recoverOrphaned(): Promise<void> {
-    if (!this.isRunning) return;
+  private async recoverOrphaned(): Promise<number> {
+    if (!this.isRunning) return 0;
 
-    const batchSize = config.verifyRecoveryBatchSize;
+    const batchSize = Math.max(config.verifyRecoveryBatchSize, config.verifyBatchSize);
     const recoveredBefore = this.stats.orphansRecovered;
 
     // Recover orphaned agents
@@ -753,7 +790,7 @@ export class DataVerifier {
       const rows = await this.prisma.revocation.findMany({
         where: { status: "ORPHANED" },
         take: batchSize,
-        select: { id: true, agentId: true, client: true, feedbackIndex: true },
+        select: { id: true, agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
       });
       orphanedRevocations = await Promise.all(
         rows.map(async rev => ({
@@ -762,13 +799,17 @@ export class DataVerifier {
           feedbackRecoverable: await this.hasRecoverableFeedbackParent(
             rev.agentId,
             rev.client,
-            rev.feedbackIndex
+            rev.feedbackIndex,
           ),
         }))
       );
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT r.id, r.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+        `SELECT r.id,
+                r.asset AS "agentId",
+                COALESCE(f.status, 'ORPHANED') AS "feedbackStatus",
+                r.feedback_hash AS "revocationFeedbackHash",
+                f.feedback_hash AS "feedbackHash"
          FROM revocations r
          LEFT JOIN feedbacks f ON f.asset = r.asset AND f.client_address = r.client_address AND f.feedback_index = r.feedback_index
          WHERE r.status = 'ORPHANED'
@@ -801,25 +842,32 @@ export class DataVerifier {
     }
 
     // Recover orphaned responses
-    let orphanedResponses: Array<{ id: string; agentId: string; feedbackOrphaned: boolean }> = [];
+    let orphanedResponses: Array<{ id: string; agentId: string; feedbackRecoverable: boolean }> = [];
     if (this.prisma) {
       const rows = await this.prisma.feedbackResponse.findMany({
-        where: { status: "ORPHANED", responseId: { not: null } },
+        where: { status: "ORPHANED" },
         take: batchSize,
-        include: { feedback: { select: { agentId: true, status: true } } },
+        select: {
+          id: true,
+          sealHash: true,
+          feedback: { select: { agentId: true, status: true, feedbackHash: true } },
+        },
       });
       orphanedResponses = rows.map(r => ({
-        id: r.id,
-        agentId: r.feedback.agentId,
-        feedbackOrphaned: r.feedback.status === "ORPHANED",
+          id: r.id,
+          agentId: r.feedback.agentId,
+          feedbackRecoverable: r.feedback.status !== "ORPHANED",
       }));
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT fr.id, fr.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+        `SELECT fr.id,
+                fr.asset AS "agentId",
+                COALESCE(f.status, 'ORPHANED') AS "feedbackStatus",
+                fr.seal_hash AS "responseSealHash",
+                f.feedback_hash AS "feedbackHash"
          FROM feedback_responses fr
          LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
          WHERE fr.status = 'ORPHANED'
-           AND fr.response_id IS NOT NULL
          LIMIT $1`,
         [batchSize]
       );
@@ -828,7 +876,7 @@ export class DataVerifier {
         return {
           id: r.id,
           agentId: r.agentId,
-          feedbackOrphaned: feedbackStatus === "ORPHANED",
+          feedbackRecoverable: feedbackStatus !== "ORPHANED",
         };
       });
     }
@@ -840,7 +888,7 @@ export class DataVerifier {
 
       for (const resp of orphanedResponses) {
         const exists = existsMap.get(resp.agentId);
-        if (exists === true && !resp.feedbackOrphaned) {
+        if (exists === true && resp.feedbackRecoverable) {
           await this.batchUpdateStatus('feedback_responses', 'id', [resp.id], 'PENDING', now);
           this.stats.orphansRecovered++;
           logger.info({ responseId: resp.id, agentId: resp.agentId }, "Recovered orphaned response → PENDING");
@@ -852,12 +900,15 @@ export class DataVerifier {
     if (total > 0) {
       logger.info({ checked: total, recovered: this.stats.orphansRecovered - recoveredBefore }, "Orphan recovery cycle complete");
     }
+
+    return this.stats.orphansRecovered - recoveredBefore;
   }
 
   private async hasRecoverableFeedbackParent(
     agentId: string,
     client: string,
-    feedbackIndex: bigint
+    feedbackIndex: bigint,
+    feedbackHash?: Uint8Array | null,
   ): Promise<boolean> {
     if (!this.prisma) return false;
 
@@ -868,10 +919,129 @@ export class DataVerifier {
         feedbackIndex,
         status: { not: "ORPHANED" },
       },
-      select: { id: true },
+      select: { id: true, feedbackHash: true },
     });
 
-    return parent !== null;
+    if (!parent) return false;
+    void feedbackHash;
+    return true;
+  }
+
+  private async backfillMissingResponseSealHashes(): Promise<void> {
+    type MissingSealRow = {
+      id: string;
+      txSignature: string;
+      eventOrdinal: number;
+    };
+
+    let rows: MissingSealRow[] = [];
+
+    if (this.prisma) {
+      rows = await this.prisma.feedbackResponse.findMany({
+        where: {
+          sealHash: null,
+          txSignature: { not: null },
+          eventOrdinal: { not: null },
+        },
+        orderBy: [
+          { slot: { sort: "asc", nulls: "last" } },
+          { txIndex: { sort: "asc", nulls: "last" } },
+          { eventOrdinal: { sort: "asc", nulls: "last" } },
+          { txSignature: "asc" },
+        ],
+        take: config.verifyBatchSize,
+        select: { id: true, txSignature: true, eventOrdinal: true },
+      }) as MissingSealRow[];
+    } else if (this.pool) {
+      const result = await this.pool.query<MissingSealRow>(
+        `SELECT id, tx_signature AS "txSignature", event_ordinal AS "eventOrdinal"
+         FROM feedback_responses
+         WHERE seal_hash IS NULL
+           AND tx_signature IS NOT NULL
+           AND event_ordinal IS NOT NULL
+         ORDER BY block_slot ASC NULLS LAST, tx_index ASC NULLS LAST, event_ordinal ASC NULLS LAST, tx_signature ASC
+         LIMIT $1`,
+        [config.verifyBatchSize]
+      );
+      rows = result.rows;
+    } else {
+      return;
+    }
+
+    if (rows.length === 0) {
+      return;
+    }
+
+    const rowsBySignature = new Map<string, MissingSealRow[]>();
+    for (const row of rows) {
+      const existing = rowsBySignature.get(row.txSignature) ?? [];
+      existing.push(row);
+      rowsBySignature.set(row.txSignature, existing);
+    }
+
+    const updates: Array<{ id: string; sealHash: Buffer }> = [];
+    const signatures = Array.from(rowsBySignature.keys());
+    const fetchConcurrency = 10;
+
+    for (let i = 0; i < signatures.length; i += fetchConcurrency) {
+      const batch = signatures.slice(i, i + fetchConcurrency);
+      await Promise.all(
+        batch.map(async (signature) => {
+          const tx = await this.connection.getParsedTransaction(signature, {
+            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+            commitment: "confirmed",
+          });
+          if (!tx) {
+            return;
+          }
+
+          const parsed = parseTransaction(tx);
+          if (!parsed) {
+            return;
+          }
+
+          for (const row of rowsBySignature.get(signature) ?? []) {
+            const rawEvent = parsed.events[row.eventOrdinal];
+            if (!rawEvent) {
+              continue;
+            }
+            const typed = toTypedEvent(rawEvent);
+            if (!typed || typed.type !== "ResponseAppended") {
+              continue;
+            }
+            updates.push({ id: row.id, sealHash: Buffer.from(typed.data.sealHash) });
+          }
+        })
+      );
+    }
+
+    if (updates.length === 0) {
+      return;
+    }
+
+    if (this.prisma) {
+      await Promise.all(
+        updates.map(({ id, sealHash }) =>
+          this.prisma!.feedbackResponse.update({
+            where: { id },
+            data: { sealHash: Uint8Array.from(sealHash) as Uint8Array<ArrayBuffer> },
+          })
+        )
+      );
+    } else if (this.pool) {
+      await Promise.all(
+        updates.map(({ id, sealHash }) =>
+          this.pool!.query(
+            `UPDATE feedback_responses
+             SET seal_hash = $2
+             WHERE id = $1 AND seal_hash IS NULL`,
+            [id, sealHash.toString("hex")]
+          )
+        )
+      );
+    }
+
+    logger.info({ rowsRequested: rows.length, rowsUpdated: updates.length }, "Backfilled missing response seal hashes");
   }
 
   // =========================================================================
@@ -956,22 +1126,31 @@ export class DataVerifier {
    * Verify feedback responses using hash-chain digests + existence checks.
    */
   private async verifyFeedbackResponses(cutoffSlot: bigint): Promise<void> {
-    let pending: Array<{ id: string; agentId: string; feedbackOrphaned: boolean }>;
+    let pending: Array<{ id: string; agentId: string; feedbackOrphaned: boolean; sealMismatch: boolean }>;
 
     if (this.prisma) {
       const rows = await this.prisma.feedbackResponse.findMany({
         where: { status: "PENDING", slot: { lte: cutoffSlot } },
         take: config.verifyBatchSize,
-        include: { feedback: { select: { agentId: true, status: true } } },
+        select: {
+          id: true,
+          sealHash: true,
+          feedback: { select: { agentId: true, status: true, feedbackHash: true } },
+        },
       });
       pending = rows.map(r => ({
         id: r.id,
         agentId: r.feedback.agentId,
         feedbackOrphaned: r.feedback.status === "ORPHANED",
+        sealMismatch: !hashesMatchBytes(r.sealHash, r.feedback.feedbackHash),
       }));
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT fr.id, fr.asset AS "agentId", COALESCE(f.status, 'ORPHANED') AS "feedbackStatus"
+        `SELECT fr.id,
+                fr.asset AS "agentId",
+                COALESCE(f.status, 'ORPHANED') AS "feedbackStatus",
+                fr.seal_hash AS "responseSealHash",
+                f.feedback_hash AS "feedbackHash"
          FROM feedback_responses fr
          LEFT JOIN feedbacks f ON f.asset = fr.asset AND f.client_address = fr.client_address AND f.feedback_index = fr.feedback_index
          WHERE fr.status = 'PENDING' AND fr.block_slot <= $1
@@ -982,6 +1161,8 @@ export class DataVerifier {
         id: r.id,
         agentId: r.agentId,
         feedbackOrphaned: r.feedbackStatus === "ORPHANED",
+        sealMismatch: r.feedbackStatus !== "ORPHANED"
+          && !hashesMatchHex(r.responseSealHash, r.feedbackHash),
       }));
     } else {
       return;
@@ -1030,6 +1211,10 @@ export class DataVerifier {
           continue;
         }
 
+        if (valid.some((row) => row.agentId === agentId && row.sealMismatch)) {
+          logger.warn({ agentId, count: ids.length }, "Responses have seal_hash mismatch with parent feedback");
+        }
+
         // Hash-chain verification for response chain
         const digestOk = await this.checkDigestMatch(agentId, 'response');
 
@@ -1047,21 +1232,61 @@ export class DataVerifier {
    * Verify revocations using hash-chain digests + existence checks.
    */
   private async verifyRevocations(cutoffSlot: bigint): Promise<void> {
-    let pending: Array<{ id: string; agentId: string }>;
+    let pending: Array<{ id: string; agentId: string; feedbackOrphaned: boolean; sealMismatch: boolean }>;
 
     if (this.prisma) {
       const rows = await this.prisma.revocation.findMany({
         where: { status: "PENDING", slot: { lte: cutoffSlot } },
         take: config.verifyBatchSize,
-        select: { id: true, agentId: true },
+        select: { id: true, agentId: true, client: true, feedbackIndex: true, feedbackHash: true },
       });
-      pending = rows;
+      const parents = rows.length === 0
+        ? []
+        : ((await this.prisma.feedback.findMany({
+            where: {
+              OR: rows.map((row) => ({
+                agentId: row.agentId,
+                client: row.client,
+                feedbackIndex: row.feedbackIndex,
+              })),
+            },
+            select: { agentId: true, client: true, feedbackIndex: true, status: true, feedbackHash: true },
+          })) ?? []);
+      const parentByKey = new Map(
+        parents.map((parent) => [
+          `${parent.agentId}:${parent.client}:${parent.feedbackIndex.toString()}`,
+          parent,
+        ]),
+      );
+      pending = rows.map((row) => {
+        const parent = parentByKey.get(`${row.agentId}:${row.client}:${row.feedbackIndex.toString()}`);
+        return {
+          id: row.id,
+          agentId: row.agentId,
+          feedbackOrphaned: !parent || parent.status === "ORPHANED",
+          sealMismatch: !!parent && !hashesMatchBytes(row.feedbackHash, parent.feedbackHash),
+        };
+      });
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT id, asset AS "agentId" FROM revocations WHERE status = 'PENDING' AND slot <= $1 LIMIT $2`,
+        `SELECT r.id,
+                r.asset AS "agentId",
+                COALESCE(f.status, 'ORPHANED') AS "feedbackStatus",
+                r.feedback_hash AS "revocationFeedbackHash",
+                f.feedback_hash AS "feedbackHash"
+         FROM revocations r
+         LEFT JOIN feedbacks f ON f.asset = r.asset AND f.client_address = r.client_address AND f.feedback_index = r.feedback_index
+         WHERE r.status = 'PENDING' AND r.slot <= $1
+         LIMIT $2`,
         [cutoffSlot.toString(), config.verifyBatchSize]
       );
-      pending = result.rows;
+      pending = result.rows.map((r: any) => ({
+        id: r.id,
+        agentId: r.agentId,
+        feedbackOrphaned: r.feedbackStatus === "ORPHANED",
+        sealMismatch: r.feedbackStatus !== "ORPHANED"
+          && !hashesMatchHex(r.revocationFeedbackHash, r.feedbackHash),
+      }));
     } else {
       return;
     }
@@ -1070,8 +1295,17 @@ export class DataVerifier {
 
     logger.debug({ count: pending.length }, "Verifying revocations");
 
+    const now = new Date();
+    const orphaned = pending.filter(r => r.feedbackOrphaned);
+    const valid = pending.filter(r => !r.feedbackOrphaned);
+
+    if (orphaned.length > 0) {
+      await this.batchUpdateStatus('revocations', 'id', orphaned.map(r => r.id), 'ORPHANED', now);
+      this.stats.revocationsOrphaned += orphaned.length;
+    }
+
     const byAgent = new Map<string, string[]>();
-    for (const r of pending) {
+    for (const r of valid) {
       const arr = byAgent.get(r.agentId) || [];
       arr.push(r.id);
       byAgent.set(r.agentId, arr);
@@ -1079,8 +1313,6 @@ export class DataVerifier {
 
     const agentIds = [...byAgent.keys()];
     const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
-
-    const now = new Date();
 
     for (const [agentId, ids] of byAgent) {
       if (!this.isRunning) break;
@@ -1097,6 +1329,10 @@ export class DataVerifier {
         this.stats.revocationsOrphaned += ids.length;
         logger.warn({ agentId, count: ids.length }, "Revocations orphaned - agent not found");
         continue;
+      }
+
+      if (valid.some((row) => row.agentId === agentId && row.sealMismatch)) {
+        logger.warn({ agentId, count: ids.length }, "Revocations have seal_hash mismatch with parent feedback");
       }
 
       // Hash-chain verification for revoke chain
@@ -1472,10 +1708,36 @@ export class DataVerifier {
     };
 
     if (this.prisma) {
-      const notOrphaned = { not: 'ORPHANED' };
-      const [lastFb, fbCount, lastResp, respCount, lastRev, revCount] = await Promise.all([
+      const compareChainHead = <
+        T extends {
+          slot: bigint;
+          txIndex: number | null;
+          eventOrdinal: number | null;
+          signature: string | null;
+          tiebreaker: string;
+        },
+      >(
+        left: T | null,
+        right: T | null,
+      ): T | null => {
+        if (!left) return right;
+        if (!right) return left;
+        if (left.slot !== right.slot) return left.slot > right.slot ? left : right;
+        const leftTxIndex = left.txIndex ?? -1;
+        const rightTxIndex = right.txIndex ?? -1;
+        if (leftTxIndex !== rightTxIndex) return leftTxIndex > rightTxIndex ? left : right;
+        const leftOrdinal = left.eventOrdinal ?? -1;
+        const rightOrdinal = right.eventOrdinal ?? -1;
+        if (leftOrdinal !== rightOrdinal) return leftOrdinal > rightOrdinal ? left : right;
+        const leftSignature = left.signature ?? "";
+        const rightSignature = right.signature ?? "";
+        if (leftSignature !== rightSignature) return leftSignature > rightSignature ? left : right;
+        return left.tiebreaker >= right.tiebreaker ? left : right;
+      };
+
+      const [lastFb, orphanFbHead, fbCount, orphanFbCount, lastResp, lastOrphanResp, respCount, orphanRespCount, lastRev, revCount] = await Promise.all([
         this.prisma.feedback.findFirst({
-          where: { agentId, runningDigest: { not: null }, status: notOrphaned },
+          where: { agentId, runningDigest: { not: null } },
           orderBy: [
             { createdSlot: { sort: 'desc', nulls: 'last' } },
             { txIndex: { sort: 'desc', nulls: 'last' } },
@@ -1483,11 +1745,10 @@ export class DataVerifier {
             { createdTxSignature: { sort: 'desc', nulls: 'last' } },
             { id: 'desc' },
           ],
-          select: { runningDigest: true, createdTxSignature: true, createdSlot: true },
+          select: { runningDigest: true, createdTxSignature: true, createdSlot: true, txIndex: true, eventOrdinal: true, feedbackIndex: true, id: true },
         }),
-        this.prisma.feedback.count({ where: { agentId, status: notOrphaned } }),
-        this.prisma.feedbackResponse.findFirst({
-          where: { feedback: { agentId }, runningDigest: { not: null }, status: notOrphaned },
+        this.prisma.orphanFeedback.findFirst({
+          where: { agentId, runningDigest: { not: null } },
           orderBy: [
             { slot: { sort: 'desc', nulls: 'last' } },
             { txIndex: { sort: 'desc', nulls: 'last' } },
@@ -1495,60 +1756,155 @@ export class DataVerifier {
             { txSignature: { sort: 'desc', nulls: 'last' } },
             { id: 'desc' },
           ],
-          select: { runningDigest: true, txSignature: true, slot: true },
+          select: { runningDigest: true, txSignature: true, slot: true, txIndex: true, eventOrdinal: true, feedbackIndex: true, id: true },
         }),
-        this.prisma.feedbackResponse.count({ where: { feedback: { agentId }, status: notOrphaned } }),
+        this.prisma.feedback.count({ where: { agentId } }),
+        this.prisma.orphanFeedback.count({ where: { agentId } }),
+        this.prisma.feedbackResponse.findFirst({
+          where: { feedback: { agentId }, runningDigest: { not: null } },
+          orderBy: [
+            { slot: { sort: 'desc', nulls: 'last' } },
+            { txIndex: { sort: 'desc', nulls: 'last' } },
+            { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { txSignature: { sort: 'desc', nulls: 'last' } },
+            { id: 'desc' },
+          ],
+          select: { runningDigest: true, txSignature: true, slot: true, txIndex: true, eventOrdinal: true, responseCount: true, id: true },
+        }),
+        this.prisma.orphanResponse.findFirst({
+          where: { agentId, runningDigest: { not: null } },
+          orderBy: [
+            { slot: { sort: 'desc', nulls: 'last' } },
+            { txIndex: { sort: 'desc', nulls: 'last' } },
+            { eventOrdinal: { sort: 'desc', nulls: 'last' } },
+            { txSignature: { sort: 'desc', nulls: 'last' } },
+            { id: 'desc' },
+          ],
+          select: { runningDigest: true, txSignature: true, slot: true, txIndex: true, eventOrdinal: true, responseCount: true, id: true },
+        }),
+        this.prisma.feedbackResponse.count({ where: { feedback: { agentId } } }),
+        this.prisma.orphanResponse.count({ where: { agentId } }),
         this.prisma.revocation.findFirst({
-          where: { agentId, runningDigest: { not: null }, status: notOrphaned },
+          where: { agentId, runningDigest: { not: null } },
           orderBy: { revokeCount: 'desc' },
-          select: { runningDigest: true, txSignature: true, slot: true },
+          select: { runningDigest: true, txSignature: true, slot: true, revokeCount: true },
         }),
-        this.prisma.revocation.count({ where: { agentId, status: notOrphaned } }),
+        this.prisma.revocation.count({ where: { agentId } }),
       ]);
 
+      const feedbackHead = compareChainHead(
+        lastFb
+          ? {
+              slot: BigInt(lastFb.createdSlot ?? 0),
+              txIndex: lastFb.txIndex ?? null,
+              eventOrdinal: lastFb.eventOrdinal ?? null,
+              signature: lastFb.createdTxSignature ?? null,
+              tiebreaker: String(lastFb.id ?? ""),
+              runningDigest: lastFb.runningDigest,
+              count:
+                lastFb.feedbackIndex !== undefined && lastFb.feedbackIndex !== null
+                  ? BigInt(lastFb.feedbackIndex) + 1n
+                  : BigInt(fbCount + orphanFbCount),
+            }
+          : null,
+        orphanFbHead
+          ? {
+              slot: BigInt(orphanFbHead.slot ?? 0),
+              txIndex: orphanFbHead.txIndex ?? null,
+              eventOrdinal: orphanFbHead.eventOrdinal ?? null,
+              signature: orphanFbHead.txSignature ?? null,
+              tiebreaker: String(orphanFbHead.id ?? ""),
+              runningDigest: orphanFbHead.runningDigest,
+              count:
+                orphanFbHead.feedbackIndex !== undefined && orphanFbHead.feedbackIndex !== null
+                  ? BigInt(orphanFbHead.feedbackIndex) + 1n
+                  : BigInt(fbCount + orphanFbCount),
+            }
+          : null,
+      );
+
+      const responseHead = compareChainHead(
+        lastResp
+          ? {
+              slot: BigInt(lastResp.slot ?? 0),
+              txIndex: lastResp.txIndex ?? null,
+              eventOrdinal: lastResp.eventOrdinal ?? null,
+              signature: lastResp.txSignature ?? null,
+              tiebreaker: String(lastResp.id ?? ""),
+              runningDigest: lastResp.runningDigest,
+              count: BigInt(lastResp.responseCount ?? respCount + orphanRespCount),
+            }
+          : null,
+        lastOrphanResp
+          ? {
+              slot: BigInt(lastOrphanResp.slot ?? 0),
+              txIndex: lastOrphanResp.txIndex ?? null,
+              eventOrdinal: lastOrphanResp.eventOrdinal ?? null,
+              signature: lastOrphanResp.txSignature ?? null,
+              tiebreaker: String(lastOrphanResp.id ?? ""),
+              runningDigest: lastOrphanResp.runningDigest,
+              count: BigInt(lastOrphanResp.responseCount ?? respCount + orphanRespCount),
+            }
+          : null,
+      );
+
       return {
-        feedbackDigest: lastFb?.runningDigest ? Buffer.from(lastFb.runningDigest) : null,
-        feedbackCount: BigInt(fbCount),
-        feedbackSignature: lastFb?.createdTxSignature ?? null,
-        feedbackSlot: BigInt(lastFb?.createdSlot ?? 0),
-        responseDigest: lastResp?.runningDigest ? Buffer.from(lastResp.runningDigest) : null,
-        responseCount: BigInt(respCount),
-        responseSignature: lastResp?.txSignature ?? null,
-        responseSlot: BigInt(lastResp?.slot ?? 0),
+        feedbackDigest: feedbackHead?.runningDigest ? Buffer.from(feedbackHead.runningDigest) : null,
+        feedbackCount: feedbackHead?.count ?? BigInt(fbCount + orphanFbCount),
+        feedbackSignature: feedbackHead?.signature ?? null,
+        feedbackSlot: feedbackHead?.slot ?? 0n,
+        responseDigest: responseHead?.runningDigest ? Buffer.from(responseHead.runningDigest) : null,
+        responseCount: responseHead?.count ?? BigInt(respCount + orphanRespCount),
+        responseSignature: responseHead?.signature ?? null,
+        responseSlot: responseHead?.slot ?? 0n,
         revokeDigest: lastRev?.runningDigest ? Buffer.from(lastRev.runningDigest) : null,
-        revokeCount: BigInt(revCount),
+        revokeCount: BigInt(lastRev?.revokeCount ?? revCount),
         revokeSignature: lastRev?.txSignature ?? null,
         revokeSlot: BigInt(lastRev?.slot ?? 0),
       };
     } else if (this.pool) {
       const [fbRes, fbCnt, respRes, respCnt, revRes, revCnt] = await Promise.all([
         this.pool.query(
-          `SELECT running_digest, tx_signature, block_slot
-           FROM feedbacks
-           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
+          `SELECT running_digest, tx_signature, block_slot, feedback_index
+           FROM (
+             SELECT running_digest, tx_signature, block_slot, tx_index, event_ordinal, id::text AS row_id, feedback_index
+             FROM feedbacks
+             WHERE asset = $1 AND running_digest IS NOT NULL
+             UNION ALL
+             SELECT running_digest, tx_signature, block_slot, tx_index, event_ordinal, id::text AS row_id, feedback_index
+             FROM orphan_feedbacks
+             WHERE asset = $1 AND running_digest IS NOT NULL
+           ) combined
+           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC
            LIMIT 1`,
           [agentId]
         ),
-        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedbacks WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+        this.pool.query(`SELECT (COALESCE((SELECT COUNT(*) FROM feedbacks WHERE asset = $1), 0) + COALESCE((SELECT COUNT(*) FROM orphan_feedbacks WHERE asset = $1), 0))::bigint AS cnt`, [agentId]),
         this.pool.query(
-          `SELECT running_digest, tx_signature, block_slot
-           FROM feedback_responses
-           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
-           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, id DESC
+          `SELECT running_digest, tx_signature, block_slot, response_count
+           FROM (
+             SELECT running_digest, tx_signature, block_slot, tx_index, event_ordinal, id::text AS row_id, response_count
+             FROM feedback_responses
+             WHERE asset = $1 AND running_digest IS NOT NULL
+             UNION ALL
+             SELECT running_digest, tx_signature, block_slot, tx_index, event_ordinal, id::text AS row_id, response_count
+             FROM orphan_responses
+             WHERE asset = $1 AND running_digest IS NOT NULL
+           ) combined
+           ORDER BY block_slot DESC NULLS LAST, tx_index DESC NULLS LAST, event_ordinal DESC NULLS LAST, tx_signature DESC NULLS LAST, row_id DESC
            LIMIT 1`,
           [agentId]
         ),
-        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM feedback_responses WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+        this.pool.query(`SELECT (COALESCE((SELECT COUNT(*) FROM feedback_responses WHERE asset = $1), 0) + COALESCE((SELECT COUNT(*) FROM orphan_responses WHERE asset = $1), 0))::bigint AS cnt`, [agentId]),
         this.pool.query(
-          `SELECT running_digest, tx_signature, slot
+          `SELECT running_digest, tx_signature, slot, revoke_count
            FROM revocations
-           WHERE asset = $1 AND running_digest IS NOT NULL AND status != 'ORPHANED'
+           WHERE asset = $1 AND running_digest IS NOT NULL
            ORDER BY revoke_count DESC
            LIMIT 1`,
           [agentId]
         ),
-        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM revocations WHERE asset = $1 AND status != 'ORPHANED'`, [agentId]),
+        this.pool.query(`SELECT COUNT(*)::bigint AS cnt FROM revocations WHERE asset = $1`, [agentId]),
       ]);
 
       const toBuffer = (val: unknown): Buffer | null => {
@@ -1568,18 +1924,27 @@ export class DataVerifier {
         if (typeof val === 'string' && /^-?\d+$/.test(val)) return BigInt(val);
         return 0n;
       };
+      const toBigIntSafe = (val: unknown): bigint | null => {
+        if (typeof val === 'bigint') return val;
+        if (typeof val === 'number' && Number.isFinite(val)) return BigInt(Math.trunc(val));
+        if (typeof val === 'string' && /^-?\d+$/.test(val)) return BigInt(val);
+        return null;
+      };
 
       return {
         feedbackDigest: toBuffer(fbRes.rows[0]?.running_digest),
-        feedbackCount: BigInt(fbCnt.rows[0]?.cnt ?? 0),
+        feedbackCount: (() => {
+          const idx = toBigIntSafe(fbRes.rows[0]?.feedback_index);
+          return idx !== null ? idx + 1n : BigInt(fbCnt.rows[0]?.cnt ?? 0);
+        })(),
         feedbackSignature: (fbRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
         feedbackSlot: toSlot(fbRes.rows[0]?.block_slot),
         responseDigest: toBuffer(respRes.rows[0]?.running_digest),
-        responseCount: BigInt(respCnt.rows[0]?.cnt ?? 0),
+        responseCount: BigInt(respRes.rows[0]?.response_count ?? respCnt.rows[0]?.cnt ?? 0),
         responseSignature: (respRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
         responseSlot: toSlot(respRes.rows[0]?.block_slot),
         revokeDigest: toBuffer(revRes.rows[0]?.running_digest),
-        revokeCount: BigInt(revCnt.rows[0]?.cnt ?? 0),
+        revokeCount: BigInt(revRes.rows[0]?.revoke_count ?? revCnt.rows[0]?.cnt ?? 0),
         revokeSignature: (revRes.rows[0]?.tx_signature as string | null | undefined) ?? null,
         revokeSlot: toSlot(revRes.rows[0]?.slot),
       };
@@ -1631,9 +1996,9 @@ export class DataVerifier {
     return (maxRes.rows[0]?.max_id ? BigInt(maxRes.rows[0].max_id) : 0n) + 1n;
   }
 
-  private async getNextFeedbackIdPrisma(agentId: string): Promise<bigint> {
-    if (!this.prisma) return 1n;
-    const last = await this.prisma.feedback.findFirst({
+  private async getNextFeedbackIdPrisma(agentId: string, prismaClient: any = this.prisma): Promise<bigint> {
+    if (!prismaClient) return 1n;
+    const last = await prismaClient.feedback.findFirst({
       where: {
         agentId,
         feedbackId: { not: null },
@@ -1790,13 +2155,34 @@ export class DataVerifier {
     if (ids.length === 0) return;
 
     if (this.prisma) {
-      const modelMap: Record<string, any> = {
-        'feedbacks': this.prisma.feedback,
-        'feedback_responses': this.prisma.feedbackResponse,
-        'revocations': this.prisma.revocation,
+      const modelKeyMap: Record<string, 'feedback' | 'feedbackResponse' | 'revocation'> = {
+        'feedbacks': 'feedback',
+        'feedback_responses': 'feedbackResponse',
+        'revocations': 'revocation',
       };
-      const model = modelMap[table];
+      const modelKey = modelKeyMap[table];
+      const model = modelKey ? (this.prisma as any)[modelKey] : null;
+      const needsIdBackfill = status !== 'ORPHANED'
+        && (table === 'feedbacks' || table === 'feedback_responses' || table === 'revocations');
       if (model) {
+        if (needsIdBackfill && typeof (this.prisma as any).$transaction === 'function') {
+          await (this.prisma as any).$transaction(async (tx: any) => {
+            await tx[modelKey].updateMany({
+              where: { id: { in: ids } },
+              data: { status, verifiedAt },
+            });
+            if (table === 'feedbacks') {
+              await this.backfillFeedbackIds(ids, tx);
+            }
+            if (table === 'revocations') {
+              await this.backfillRevocationIds(ids, tx);
+            }
+            if (table === 'feedback_responses') {
+              await this.backfillResponseIds(ids, tx);
+            }
+          });
+          return;
+        }
         await model.updateMany({
           where: { id: { in: ids } },
           data: { status, verifiedAt },
@@ -1826,11 +2212,11 @@ export class DataVerifier {
     }
   }
 
-  private async backfillFeedbackIds(ids: string[]): Promise<void> {
+  private async backfillFeedbackIds(ids: string[], prismaClient: any = this.prisma): Promise<void> {
     if (ids.length === 0) return;
 
-    if (this.prisma) {
-      const pending = await this.prisma.feedback.findMany({
+    if (prismaClient) {
+      const pending: any[] = await prismaClient.feedback.findMany({
         where: {
           id: { in: ids },
           status: { not: 'ORPHANED' },
@@ -1849,7 +2235,7 @@ export class DataVerifier {
       });
       if (pending.length === 0) return;
 
-      pending.sort((a, b) => {
+      pending.sort((a: any, b: any) => {
         if (a.agentId !== b.agentId) return a.agentId.localeCompare(b.agentId);
 
         const aCreatedSlot = a.createdSlot ?? BigInt("9223372036854775807");
@@ -1878,13 +2264,13 @@ export class DataVerifier {
       for (const row of pending) {
         let next = nextByAgent.get(row.agentId);
         if (next === undefined) {
-          next = await this.getNextFeedbackIdPrisma(row.agentId);
+          next = await this.getNextFeedbackIdPrisma(row.agentId, prismaClient);
         }
         let retries = 0;
         while (true) {
           const candidate = next;
           try {
-            const updated = await this.prisma.feedback.updateMany({
+            const updated = await prismaClient.feedback.updateMany({
               where: {
                 id: row.id,
                 status: { not: 'ORPHANED' },
@@ -1893,7 +2279,7 @@ export class DataVerifier {
               data: { feedbackId: candidate },
             });
             if (updated.count === 0) {
-              nextByAgent.set(row.agentId, await this.getNextFeedbackIdPrisma(row.agentId));
+              nextByAgent.set(row.agentId, await this.getNextFeedbackIdPrisma(row.agentId, prismaClient));
               break;
             }
             nextByAgent.set(row.agentId, candidate + 1n);
@@ -1904,7 +2290,7 @@ export class DataVerifier {
               && retries < DataVerifier.AGENT_ID_BACKFILL_MAX_RETRIES
             ) {
               retries += 1;
-              next = await this.getNextFeedbackIdPrisma(row.agentId);
+              next = await this.getNextFeedbackIdPrisma(row.agentId, prismaClient);
               continue;
             }
             throw error;
@@ -1968,11 +2354,11 @@ export class DataVerifier {
     }
   }
 
-  private async backfillResponseIds(ids: string[]): Promise<void> {
+  private async backfillResponseIds(ids: string[], prismaClient: any = this.prisma): Promise<void> {
     if (ids.length === 0) return;
 
-    if (this.prisma) {
-      const pending = await this.prisma.feedbackResponse.findMany({
+    if (prismaClient) {
+      const pending: any[] = await prismaClient.feedbackResponse.findMany({
         where: {
           id: { in: ids },
           status: { not: 'ORPHANED' },
@@ -1990,7 +2376,7 @@ export class DataVerifier {
       });
       if (pending.length === 0) return;
 
-      pending.sort((a, b) => {
+      pending.sort((a: any, b: any) => {
         if (a.feedbackId !== b.feedbackId) return a.feedbackId.localeCompare(b.feedbackId);
 
         const aResponseCount = a.responseCount ?? BigInt("9223372036854775807");
@@ -2021,7 +2407,7 @@ export class DataVerifier {
         const scope = row.feedbackId;
         let next = nextByFeedback.get(scope);
         if (next === undefined) {
-          const last = await this.prisma.feedbackResponse.findFirst({
+          const last = await prismaClient.feedbackResponse.findFirst({
             where: {
               feedbackId: row.feedbackId,
               responseId: { not: null },
@@ -2031,16 +2417,17 @@ export class DataVerifier {
           });
           next = (last?.responseId ?? 0n) + 1n;
         }
+        const candidate = next ?? 1n;
 
-        await this.prisma.feedbackResponse.updateMany({
+        await prismaClient.feedbackResponse.updateMany({
           where: {
             id: row.id,
             status: { not: 'ORPHANED' },
             responseId: null,
           },
-          data: { responseId: next },
+          data: { responseId: candidate },
         });
-        nextByFeedback.set(scope, next + 1n);
+        nextByFeedback.set(scope, candidate + 1n);
       }
       return;
     }
@@ -2095,11 +2482,11 @@ export class DataVerifier {
     }
   }
 
-  private async backfillRevocationIds(ids: string[]): Promise<void> {
+  private async backfillRevocationIds(ids: string[], prismaClient: any = this.prisma): Promise<void> {
     if (ids.length === 0) return;
 
-    if (this.prisma) {
-      const pending = await this.prisma.revocation.findMany({
+    if (prismaClient) {
+      const pending: any[] = await prismaClient.revocation.findMany({
         where: {
           id: { in: ids },
           status: { not: 'ORPHANED' },
@@ -2117,7 +2504,7 @@ export class DataVerifier {
       });
       if (pending.length === 0) return;
 
-      pending.sort((a, b) => {
+      pending.sort((a: any, b: any) => {
         if (a.agentId !== b.agentId) return a.agentId.localeCompare(b.agentId);
 
         if (a.revokeCount !== b.revokeCount) return a.revokeCount < b.revokeCount ? -1 : 1;
@@ -2143,23 +2530,24 @@ export class DataVerifier {
       for (const row of pending) {
         let next = nextByAgent.get(row.agentId);
         if (next === undefined) {
-          const last = await this.prisma.revocation.findFirst({
+          const last = await prismaClient.revocation.findFirst({
             where: { agentId: row.agentId, revocationId: { not: null } },
             select: { revocationId: true },
             orderBy: { revocationId: 'desc' },
           });
           next = (last?.revocationId ?? 0n) + 1n;
         }
+        const candidate = next ?? 1n;
 
-        await this.prisma.revocation.updateMany({
+        await prismaClient.revocation.updateMany({
           where: {
             id: row.id,
             status: { not: 'ORPHANED' },
             revocationId: null,
           },
-          data: { revocationId: next },
+          data: { revocationId: candidate },
         });
-        nextByAgent.set(row.agentId, next + 1n);
+        nextByAgent.set(row.agentId, candidate + 1n);
       }
       return;
     }

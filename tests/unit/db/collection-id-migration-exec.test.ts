@@ -77,6 +77,39 @@ describe("collection_id migration execution", () => {
       applyMigration(dbPath, "prisma/migrations/20260304120000_add_agent_sequential_id/migration.sql");
       applyMigration(dbPath, "prisma/migrations/20260305113000_backfill_collection_sequential_id/migration.sql");
       applyMigration(dbPath, "prisma/migrations/20260305143000_add_indexer_state_monotonic_guard/migration.sql");
+      applyMigration(dbPath, "prisma/migrations/20260311173000_add_collection_pointer_last_seen_tx_index/migration.sql");
+      runSql(
+        dbPath,
+        `UPDATE "CollectionPointer" SET "collection_id" = NULL WHERE "col" = 'c1:gamma' AND "creator" = 'creator-d';`
+      );
+      applyMigration(dbPath, "prisma/migrations/20260312110000_add_local_collection_id_counter/migration.sql");
+
+      runSql(
+        dbPath,
+        `
+        INSERT INTO "CollectionPointer" (
+          "col", "creator", "firstSeenAsset", "firstSeenAt", "firstSeenSlot", "firstSeenTxSignature",
+          "lastSeenAt", "lastSeenSlot", "lastSeenTxSignature", "assetCount"
+        ) VALUES (
+          'c1:delta', 'creator-e', 'asset-5', CURRENT_TIMESTAMP, 104, 'sig-104',
+          CURRENT_TIMESTAMP, 104, 'sig-104', 1
+        );
+        `
+      );
+      runSql(
+        dbPath,
+        `
+        INSERT INTO "CollectionPointer" (
+          "col", "creator", "firstSeenAsset", "firstSeenAt", "firstSeenSlot", "firstSeenTxSignature",
+          "lastSeenAt", "lastSeenSlot", "lastSeenTxSignature", "assetCount"
+        ) VALUES (
+          'c1:delta', 'creator-e', 'asset-5', CURRENT_TIMESTAMP, 105, 'sig-105',
+          CURRENT_TIMESTAMP, 105, 'sig-105', 2
+        )
+        ON CONFLICT("col", "creator") DO UPDATE SET
+          "assetCount" = excluded."assetCount";
+        `
+      );
 
       const nullCount = Number(
         runSql(dbPath, `SELECT COUNT(*) FROM "CollectionPointer" WHERE "collection_id" IS NULL;`)
@@ -100,10 +133,40 @@ describe("collection_id migration execution", () => {
         dbPath,
         `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='IndexerState_monotonic_guard';`
       );
+      const collectionIdTriggerCount = Number(
+        runSql(
+          dbPath,
+          `
+          SELECT COUNT(*)
+          FROM sqlite_master
+          WHERE type='trigger'
+            AND name IN (
+              'CollectionPointer_assign_collection_id_after_insert',
+              'CollectionPointer_assign_collection_id_after_update'
+            );
+          `
+        )
+      );
+      const counterSeed = runSql(
+        dbPath,
+        `SELECT "nextValue" FROM "IdCounter" WHERE "scope" = 'collection:global';`
+      );
+      const newCollectionId = runSql(
+        dbPath,
+        `SELECT "collection_id" FROM "CollectionPointer" WHERE "col" = 'c1:delta' AND "creator" = 'creator-e';`
+      );
+      const repairedCollectionId = runSql(
+        dbPath,
+        `SELECT "collection_id" FROM "CollectionPointer" WHERE "col" = 'c1:gamma' AND "creator" = 'creator-d';`
+      );
 
       expect(nullCount).toBe(0);
       expect(dupCount).toBe(0);
       expect(Number(triggerPresent)).toBe(1);
+      expect(collectionIdTriggerCount).toBe(2);
+      expect(Number(counterSeed)).toBeGreaterThan(0);
+      expect(Number(newCollectionId)).toBeGreaterThan(0);
+      expect(Number(repairedCollectionId)).toBeGreaterThan(0);
     } finally {
       if (existsSync(dir)) {
         rmSync(dir, { recursive: true, force: true });

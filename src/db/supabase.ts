@@ -28,6 +28,7 @@ import { createChildLogger } from "../logger.js";
 import { config, ChainStatus } from "../config.js";
 import { DEFAULT_PUBKEY } from "../constants.js";
 import { classifyRevocationStatus } from "./revocation-classification.js";
+import { classifyResponseStatus } from "./response-classification.js";
 import { REVOCATION_CONFLICT_UPDATE_WHERE_SQL } from "./revocation-upsert-order.js";
 import type { PoolClient } from "pg";
 
@@ -271,15 +272,22 @@ async function replayOrphanResponsesForFeedback(
   }
 
   for (const row of pending.rows) {
-    const responseStatus = hashesMatchHex(row.seal_hash ?? null, feedbackHash)
-      ? DEFAULT_STATUS
-      : "ORPHANED";
+    const sealMismatch = !hashesMatchHex(row.seal_hash ?? null, feedbackHash);
+    if (sealMismatch) {
+      logger.warn(
+        { assetId, clientAddress, feedbackIndex: feedbackIndex.toString(), responder: row.responder },
+        "Orphan response seal_hash mismatch with parent feedback during replay"
+      );
+    }
+
+    const responseStatus = classifyResponseStatus(true, sealMismatch);
     await db.query(
-      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (id) DO UPDATE SET
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
+         seal_hash = EXCLUDED.seal_hash,
          running_digest = EXCLUDED.running_digest,
          response_count = EXCLUDED.response_count,
          block_slot = EXCLUDED.block_slot,
@@ -297,6 +305,7 @@ async function replayOrphanResponsesForFeedback(
         row.responder,
         row.response_uri,
         row.response_hash,
+        row.seal_hash,
         row.running_digest,
         row.response_count?.toString?.() ?? row.response_count ?? "0",
         row.block_slot?.toString?.() ?? row.block_slot,
@@ -321,7 +330,7 @@ async function reconcileOrphanRevocationForFeedback(
   assetId: string,
   clientAddress: string,
   feedbackIndex: bigint,
-  feedbackHash: string | null
+  _feedbackHash: string | null
 ): Promise<void> {
   const existing = await db.query(
     `SELECT feedback_hash, status
@@ -338,7 +347,7 @@ async function reconcileOrphanRevocationForFeedback(
   if (!row) {
     return;
   }
-  if (row.status !== "ORPHANED" || !hashesMatchHex(row.feedback_hash ?? null, feedbackHash)) {
+  if (row.status !== "ORPHANED") {
     return;
   }
 
@@ -386,7 +395,9 @@ async function replayOrphanFeedbacksForAsset(
       `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-       ON CONFLICT (id) DO NOTHING`,
+       ON CONFLICT (id) DO UPDATE SET
+         feedback_hash = EXCLUDED.feedback_hash,
+         running_digest = EXCLUDED.running_digest`,
       [
         row.id,
         null,
@@ -492,6 +503,24 @@ function logStatsIfNeeded(): void {
 }
 
 type SqlQueryClient = Pick<Pool, "query"> | Pick<PoolClient, "query">;
+
+async function runWithDedicatedTransaction<T>(
+  work: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const db = getPool();
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 async function recomputeCollectionPointerAssetCount(
   db: SqlQueryClient,
@@ -1237,7 +1266,9 @@ async function handleNewFeedbackTx(
     `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
        running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-     ON CONFLICT (id) DO NOTHING`,
+     ON CONFLICT (id) DO UPDATE SET
+       feedback_hash = EXCLUDED.feedback_hash,
+       running_digest = EXCLUDED.running_digest`,
     [
       id, null, assetId, clientAddress, data.feedbackIndex.toString(),
       data.value.toString(), data.valueDecimals, data.score,
@@ -1246,50 +1277,49 @@ async function handleNewFeedbackTx(
       false, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS
     ]
   );
-  if (insertResult.rowCount === 0) {
-    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
+  if (insertResult.rowCount !== 1) {
+    logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
+  }
+  const baseUpdate = `
+    feedback_count = COALESCE((
+      SELECT COUNT(*)::int
+      FROM feedbacks
+      WHERE asset = $2 AND NOT is_revoked
+    ), 0),
+    raw_avg_score = COALESCE((
+      SELECT ROUND(AVG(score))::smallint
+      FROM feedbacks
+      WHERE asset = $2 AND NOT is_revoked
+    ), 0),
+    updated_at = $1
+  `;
+  if (data.atomEnabled) {
+    await client.query(
+      `UPDATE agents SET
+         trust_tier = $3,
+         quality_score = $4,
+         confidence = $5,
+         risk_score = $6,
+         diversity_ratio = $7,
+         ${baseUpdate}
+       WHERE asset = $2`,
+      [
+        ctx.blockTime.toISOString(),
+        assetId,
+        data.newTrustTier,
+        data.newQualityScore,
+        data.newConfidence,
+        data.newRiskScore,
+        data.newDiversityRatio,
+      ]
+    );
   } else {
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
-    if (data.atomEnabled) {
-      await client.query(
-        `UPDATE agents SET
-           trust_tier = $3,
-           quality_score = $4,
-           confidence = $5,
-           risk_score = $6,
-           diversity_ratio = $7,
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [
-          ctx.blockTime.toISOString(),
-          assetId,
-          data.newTrustTier,
-          data.newQualityScore,
-          data.newConfidence,
-          data.newRiskScore,
-          data.newDiversityRatio,
-        ]
-      );
-    } else {
-      await client.query(
-        `UPDATE agents SET
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId]
-      );
-    }
+    await client.query(
+      `UPDATE agents SET
+         ${baseUpdate}
+       WHERE asset = $2`,
+      [ctx.blockTime.toISOString(), assetId]
+    );
   }
   await replayOrphanResponsesForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
   await reconcileOrphanRevocationForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
@@ -1305,39 +1335,33 @@ async function handleFeedbackRevokedTx(
   const clientAddress = data.clientAddress.toBase58();
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
-  // Check feedback exists and validate seal_hash
+  // Check feedback exists
   const feedbackCheck = await client.query(
     `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
     [id]
   );
   const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
-  let sealMismatch = false;
+  const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+  const revokeSealHash = data.sealHash
+    ? Buffer.from(data.sealHash).toString("hex")
+    : null;
+  const sealMismatch = hasFeedback && !hashesMatchHex(revokeSealHash, feedbackHash);
   if (!hasFeedback) {
     logger.warn(
       { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
       "Feedback not found for revocation (orphan revoke)"
     );
-  } else {
-    const storedHash = feedbackCheck.rows[0].feedback_hash;
-    const eventHash = data.sealHash
-      ? Buffer.from(data.sealHash).toString("hex")
-      : null;
-    if (!hashesMatchHex(storedHash, eventHash)) {
-      sealMismatch = true;
-      logger.warn(
-        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-        "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
-      );
-    }
+  } else if (sealMismatch) {
+    logger.warn(
+      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+      "Revocation seal_hash mismatch with parent feedback"
+    );
   }
 
-  const revokeStatus = classifyRevocationStatus(hasFeedback);
+  const revokeStatus = classifyRevocationStatus(hasFeedback, sealMismatch);
   const isOrphan = revokeStatus === "ORPHANED";
   const revokeDigest = data.newRevokeDigest
     ? Buffer.from(data.newRevokeDigest)
-    : null;
-  const revokeSealHash = data.sealHash
-    ? Buffer.from(data.sealHash).toString("hex")
     : null;
   const revokeId = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
   const revokeResult = await client.query(
@@ -1402,7 +1426,7 @@ async function handleFeedbackRevokedTx(
       );
     }
   }
-  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan, sealMismatch }, "Feedback revoked");
+  logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
 }
 
 async function handleResponseAppendedTx(
@@ -1435,25 +1459,25 @@ async function handleResponseAppendedTx(
     return;
   }
 
-  // Validate seal_hash matches stored feedback_hash
-  const storedHash = feedbackCheck.rows[0].feedback_hash;
   const eventHash = data.sealHash
     ? Buffer.from(data.sealHash).toString("hex")
     : null;
-  const sealMismatch = !hashesMatchHex(storedHash, eventHash);
+  const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+  const sealMismatch = !hashesMatchHex(eventHash, feedbackHash);
+  const responseStatus = classifyResponseStatus(true, sealMismatch);
   if (sealMismatch) {
     logger.warn(
-      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-      "seal_hash mismatch: response sealHash does not match stored feedbackHash"
+      { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), responder },
+      "Response seal_hash mismatch with parent feedback"
     );
   }
-  const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
   await client.query(
-    `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      ON CONFLICT (id) DO UPDATE SET
        response_uri = EXCLUDED.response_uri,
        response_hash = EXCLUDED.response_hash,
+       seal_hash = EXCLUDED.seal_hash,
        running_digest = EXCLUDED.running_digest,
        response_count = EXCLUDED.response_count,
        block_slot = EXCLUDED.block_slot,
@@ -1462,7 +1486,7 @@ async function handleResponseAppendedTx(
        tx_signature = EXCLUDED.tx_signature,
        status = EXCLUDED.status`,
     [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-     responseHash, responseRunningDigest, data.newResponseCount.toString(),
+     responseHash, eventHash, responseRunningDigest, data.newResponseCount.toString(),
      ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
   );
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
@@ -1534,9 +1558,21 @@ async function handleAgentRegistered(
   const collection = data.collection.toBase58();
   const agentUri = data.agentUri || null;
 
-  await ensureCollection(collection);
-
   try {
+    await ensureCollection(collection);
+    const orphanFeedbackExists = await db.query(
+      `SELECT 1
+       FROM orphan_feedbacks
+       WHERE asset = $1
+       LIMIT 1`,
+      [assetId],
+    );
+    if ((orphanFeedbackExists.rowCount ?? orphanFeedbackExists.rows.length) > 0) {
+      await runWithDedicatedTransaction(async (client) => {
+        await handleAgentRegisteredTx(client, data, ctx);
+      });
+      return;
+    }
     await db.query(
       `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
@@ -1974,6 +2010,21 @@ async function handleNewFeedback(
       );
       return;
     }
+    const orphanResponseExists = await db.query(
+      `SELECT 1
+       FROM orphan_responses
+       WHERE asset = $1
+         AND client_address = $2
+         AND feedback_index = $3
+       LIMIT 1`,
+      [assetId, clientAddress, data.feedbackIndex.toString()],
+    );
+    if ((orphanResponseExists.rowCount ?? orphanResponseExists.rows.length) > 0) {
+      await runWithDedicatedTransaction(async (client) => {
+        await handleNewFeedbackTx(client, data, ctx);
+      });
+      return;
+    }
     const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
     const feedbackHash = data.sealHash
@@ -1988,7 +2039,9 @@ async function handleNewFeedback(
       `INSERT INTO feedbacks (id, feedback_id, asset, client_address, feedback_index, value, value_decimals, score, tag1, tag2, endpoint, feedback_uri, feedback_hash,
          running_digest, is_revoked, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-       ON CONFLICT (id) DO NOTHING`,
+       ON CONFLICT (id) DO UPDATE SET
+         feedback_hash = EXCLUDED.feedback_hash,
+         running_digest = EXCLUDED.running_digest`,
       [
         id, null, assetId, clientAddress, data.feedbackIndex.toString(),
         data.value.toString(), data.valueDecimals, data.score,
@@ -1998,51 +2051,50 @@ async function handleNewFeedback(
       ]
     );
 
-    if (insertResult.rowCount === 0) {
-      logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString() }, "Duplicate feedback ignored");
-    } else {
-      const baseUpdate = `
-        feedback_count = COALESCE((
-          SELECT COUNT(*)::int
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        raw_avg_score = COALESCE((
-          SELECT ROUND(AVG(score))::smallint
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        updated_at = $1
-      `;
+    if (insertResult.rowCount !== 1) {
+      logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
+    }
+    const baseUpdate = `
+      feedback_count = COALESCE((
+        SELECT COUNT(*)::int
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      raw_avg_score = COALESCE((
+        SELECT ROUND(AVG(score))::smallint
+        FROM feedbacks
+        WHERE asset = $2 AND NOT is_revoked
+      ), 0),
+      updated_at = $1
+    `;
 
-      if (data.atomEnabled) {
-        await db.query(
-          `UPDATE agents SET
-             trust_tier = $3,
-             quality_score = $4,
-             confidence = $5,
-             risk_score = $6,
-             diversity_ratio = $7,
-             ${baseUpdate}
-           WHERE asset = $2`,
-          [
-            ctx.blockTime.toISOString(),
-            assetId,
-            data.newTrustTier,
-            data.newQualityScore,
-            data.newConfidence,
-            data.newRiskScore,
-            data.newDiversityRatio,
-          ]
-        );
-      } else {
-        await db.query(
-          `UPDATE agents SET
-             ${baseUpdate}
-           WHERE asset = $2`,
-          [ctx.blockTime.toISOString(), assetId]
-        );
-      }
+    if (data.atomEnabled) {
+      await db.query(
+        `UPDATE agents SET
+           trust_tier = $3,
+           quality_score = $4,
+           confidence = $5,
+           risk_score = $6,
+           diversity_ratio = $7,
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [
+          ctx.blockTime.toISOString(),
+          assetId,
+          data.newTrustTier,
+          data.newQualityScore,
+          data.newConfidence,
+          data.newRiskScore,
+          data.newDiversityRatio,
+        ]
+      );
+    } else {
+      await db.query(
+        `UPDATE agents SET
+           ${baseUpdate}
+         WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId]
+      );
     }
     await replayOrphanResponsesForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
     await reconcileOrphanRevocationForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
@@ -2062,39 +2114,33 @@ async function handleFeedbackRevoked(
   const id = `${assetId}:${clientAddress}:${data.feedbackIndex}`;
 
   try {
-    // Check feedback exists and validate seal_hash
+    // Check feedback exists
     const feedbackCheck = await db.query(
       `SELECT id, feedback_hash FROM feedbacks WHERE id = $1 LIMIT 1`,
       [id]
     );
     const hasFeedback = (feedbackCheck.rowCount ?? feedbackCheck.rows.length) > 0;
-    let sealMismatch = false;
+    const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+    const revokeSealHash = data.sealHash
+      ? Buffer.from(data.sealHash).toString("hex")
+      : null;
+    const sealMismatch = hasFeedback && !hashesMatchHex(revokeSealHash, feedbackHash);
     if (!hasFeedback) {
       logger.warn(
         { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
         "Feedback not found for revocation (orphan revoke)"
       );
-    } else {
-      const storedHash = feedbackCheck.rows[0].feedback_hash;
-      const eventHash = data.sealHash
-        ? Buffer.from(data.sealHash).toString("hex")
-        : null;
-      if (!hashesMatchHex(storedHash, eventHash)) {
-        sealMismatch = true;
-        logger.warn(
-          { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-          "seal_hash mismatch: revocation sealHash does not match stored feedbackHash"
-        );
-      }
+    } else if (sealMismatch) {
+      logger.warn(
+        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
+        "Revocation seal_hash mismatch with parent feedback"
+      );
     }
 
-    const revokeStatus = classifyRevocationStatus(hasFeedback);
+    const revokeStatus = classifyRevocationStatus(hasFeedback, sealMismatch);
     const isOrphan = revokeStatus === "ORPHANED";
     const revokeDigest = data.newRevokeDigest
       ? Buffer.from(data.newRevokeDigest)
-      : null;
-    const revokeSealHash = data.sealHash
-      ? Buffer.from(data.sealHash).toString("hex")
       : null;
     const revokeResult = await db.query(
       `INSERT INTO revocations (id, revocation_id, asset, client_address, feedback_index, feedback_hash, slot, original_score, atom_enabled, had_impact, running_digest, revoke_count, tx_index, event_ordinal, tx_signature, created_at, status)
@@ -2161,7 +2207,7 @@ async function handleFeedbackRevoked(
       }
     }
 
-    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan, sealMismatch }, "Feedback revoked");
+    logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, feedbackIndex: data.feedbackIndex }, "Failed to revoke feedback");
   }
@@ -2199,25 +2245,25 @@ async function handleResponseAppended(
       return;
     }
 
-    // Validate seal_hash matches stored feedback_hash
-    const storedHash = feedbackCheck.rows[0].feedback_hash;
     const eventHash = data.sealHash
       ? Buffer.from(data.sealHash).toString("hex")
       : null;
-    const sealMismatch = !hashesMatchHex(storedHash, eventHash);
+    const feedbackHash = feedbackCheck.rows[0]?.feedback_hash ?? null;
+    const sealMismatch = !hashesMatchHex(eventHash, feedbackHash);
+    const responseStatus = classifyResponseStatus(true, sealMismatch);
     if (sealMismatch) {
       logger.warn(
-        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString() },
-        "seal_hash mismatch: response sealHash does not match stored feedbackHash"
+        { assetId, client: clientAddress, feedbackIndex: data.feedbackIndex.toString(), responder },
+        "Response seal_hash mismatch with parent feedback"
       );
     }
-    const responseStatus = sealMismatch ? "ORPHANED" : DEFAULT_STATUS;
     await db.query(
-      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT (id) DO UPDATE SET
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
+         seal_hash = EXCLUDED.seal_hash,
          running_digest = EXCLUDED.running_digest,
          response_count = EXCLUDED.response_count,
          block_slot = EXCLUDED.block_slot,
@@ -2226,7 +2272,7 @@ async function handleResponseAppended(
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
       [id, null, assetId, clientAddress, data.feedbackIndex.toString(), responder, data.responseUri || null,
-       responseHash, responseRunningDigest, data.newResponseCount.toString(),
+       responseHash, eventHash, responseRunningDigest, data.newResponseCount.toString(),
        ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), responder }, "Response appended");
@@ -2313,6 +2359,11 @@ export interface IndexerState {
   lastTxIndex: number | null;
 }
 
+export interface IndexerStateSnapshot extends IndexerState {
+  source: string | null;
+  updatedAt: Date;
+}
+
 // Fallback: first transaction signature of the new program deployment
 // Kept for reference - backfill mode will fetch all transactions anyway
 // DEPLOYMENT_SIGNATURE = "6PXQkP5ihC2UMHD3xbm1Z9Ry8HXxSuKFAaVNGNktLBKXsgCQcqi7CM74SgoGkxvaiMVPMEP8REtGVbZK92Wsigt"
@@ -2349,10 +2400,39 @@ export async function loadIndexerState(): Promise<IndexerState> {
     }
     logger.info("No saved indexer state found, will start from beginning");
   } catch (error: any) {
-    logger.warn({ error: error.message }, "Failed to load indexer state, using deployment fallback");
+    logger.error({ error: error.message }, "Failed to load indexer state");
+    throw error;
   }
   // Fallback: return null to start from beginning (fetches all transactions)
   return { lastSignature: null, lastSlot: null, lastTxIndex: null };
+}
+
+export async function loadIndexerStateSnapshot(): Promise<IndexerStateSnapshot | null> {
+  logger.info("Loading full indexer state snapshot from Supabase...");
+  try {
+    const db = getPool();
+    const result = await db.query(
+      `SELECT last_signature, last_slot, last_tx_index, source, updated_at
+       FROM indexer_state
+       WHERE id = 'main'`
+    );
+    const row = result.rows[0];
+    if (!row?.last_signature || row.last_slot === null || row.last_slot === undefined) {
+      return null;
+    }
+    return {
+      lastSignature: row.last_signature,
+      lastSlot: BigInt(row.last_slot),
+      lastTxIndex: row.last_tx_index === null || row.last_tx_index === undefined
+        ? null
+        : Number(row.last_tx_index),
+      source: row.source ?? null,
+      updatedAt: row.updated_at instanceof Date ? row.updated_at : new Date(row.updated_at),
+    };
+  } catch (error: any) {
+    logger.error({ error: error.message }, "Failed to load full indexer state snapshot");
+    throw error;
+  }
 }
 
 /**
@@ -2395,6 +2475,56 @@ export async function saveIndexerState(
     );
   } catch (error: any) {
     logger.error({ error: error.message }, "Failed to save indexer state");
+    throw error;
+  }
+}
+
+export async function restoreIndexerStateSnapshot(
+  signature: string,
+  slot: bigint,
+  txIndex: number | null,
+  source: "poller" | "websocket" | "substreams",
+  updatedAt: Date
+): Promise<void> {
+  const db = getPool();
+  try {
+    await db.query(
+      `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+       VALUES ('main', $1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET
+         last_signature = EXCLUDED.last_signature,
+         last_slot = EXCLUDED.last_slot,
+         last_tx_index = EXCLUDED.last_tx_index,
+         source = EXCLUDED.source,
+         updated_at = EXCLUDED.updated_at`,
+      [signature, slot.toString(), txIndex, source, updatedAt.toISOString()]
+    );
+  } catch (error: any) {
+    logger.error({ error: error.message }, "Failed to restore indexer state snapshot");
+    throw error;
+  }
+}
+
+export async function clearIndexerStateSnapshot(
+  source: "poller" | "websocket" | "substreams",
+  updatedAt: Date
+): Promise<void> {
+  const db = getPool();
+  try {
+    await db.query(
+      `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+       VALUES ('main', NULL, NULL, NULL, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET
+         last_signature = NULL,
+         last_slot = NULL,
+         last_tx_index = NULL,
+         source = EXCLUDED.source,
+         updated_at = EXCLUDED.updated_at`,
+      [source, updatedAt.toISOString()]
+    );
+  } catch (error: any) {
+    logger.error({ error: error.message }, "Failed to clear indexer state snapshot");
+    throw error;
   }
 }
 
