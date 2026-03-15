@@ -49,6 +49,7 @@ scripts/*.ts
 # Audit files (local only)
 audit.md
 formal.md
+CLAUDE.md
 
 AGENTS.md
 artifacts/
