@@ -1,5 +1,7 @@
 import DataLoader from 'dataloader';
 import type { Pool } from 'pg';
+import { proofPassLookupKey } from '../../extras/proofpass.js';
+import { config } from '../../config.js';
 
 export interface AgentRow {
   asset: string;
@@ -194,6 +196,10 @@ function feedbackLookupCacheKeyFromComposite(key: string): string {
   return feedbackLookupKey(parts[0], parts[1], parts[2]);
 }
 
+function proofPassAuthCacheKey(key: string): string {
+  return key;
+}
+
 function createAgentByIdLoader(pool: Pool) {
   return new DataLoader<string, AgentRow | null>(async (keys) => {
     const { rows } = await pool.query<AgentRow>(
@@ -385,6 +391,87 @@ function createFeedbackPageByAgentLoader(pool: Pool) {
       return keys.map(k => results.get(feedbackPageCacheKey(k)) ?? []);
     },
     { cacheKeyFn: feedbackPageCacheKey }
+  );
+}
+
+function createProofPassAuthByFeedbackLoader(pool: Pool) {
+  if (!config.enableProofPass) {
+    return new DataLoader<string, boolean, string>(
+      async (keys) => keys.map(() => false),
+      { cacheKeyFn: proofPassAuthCacheKey }
+    );
+  }
+
+  return new DataLoader<string, boolean, string>(
+    async (keys) => {
+      const assets: string[] = [];
+      const clients: string[] = [];
+      const indices: string[] = [];
+      const signatures: string[] = [];
+      const hashes: string[] = [];
+
+      for (const key of keys) {
+        const parts = key.split(':');
+        if (parts.length !== 5) continue;
+        assets.push(parts[0]);
+        clients.push(parts[1]);
+        indices.push(parts[2]);
+        signatures.push(parts[3]);
+        hashes.push(parts[4]);
+      }
+
+      if (assets.length === 0) {
+        return keys.map(() => false);
+      }
+
+      const { rows } = await pool.query<{
+        asset: string;
+        client_address: string;
+        feedback_index: string;
+        tx_signature: string;
+        feedback_hash: string;
+      }>(
+        `WITH requested AS (
+           SELECT *
+           FROM unnest(
+             $1::text[],
+             $2::text[],
+             $3::bigint[],
+             $4::text[],
+             $5::text[]
+           ) AS requested(asset, client_address, feedback_index, tx_signature, feedback_hash)
+         )
+         SELECT
+           e.asset,
+           e.client_address,
+           e.feedback_index,
+           e.tx_signature,
+           e.feedback_hash
+         FROM extra_proofpass_feedbacks e
+         INNER JOIN requested r
+           ON r.asset = e.asset
+          AND r.client_address = e.client_address
+          AND r.feedback_index = e.feedback_index
+          AND r.tx_signature = e.tx_signature
+          AND r.feedback_hash = e.feedback_hash`,
+        [assets, clients, indices, signatures, hashes]
+      );
+
+      const rowKeys = new Set(
+        rows.map((row) =>
+          proofPassLookupKey(
+            row.asset,
+            row.client_address,
+            row.feedback_index,
+            row.tx_signature,
+            row.feedback_hash
+          )
+        )
+      );
+
+      return keys.map((key) => rowKeys.has(key));
+    },
+    { cacheKeyFn: proofPassAuthCacheKey }
   );
 }
 
@@ -657,6 +744,7 @@ function createAgentStatsByAgentLoader(pool: Pool) {
 export interface DataLoaders {
   agentById: DataLoader<string, AgentRow | null>;
   feedbackByLookup: DataLoader<string, FeedbackRow | null>;
+  proofPassAuthByFeedback: DataLoader<string, boolean>;
   feedbackPageByAgent: DataLoader<FeedbackPageKey, FeedbackRow[]>;
   responsesPageByFeedback: DataLoader<ResponsePageKey, ResponseRow[]>;
   validationsPageByAgent: DataLoader<ValidationPageKey, ValidationRow[]>;
@@ -671,6 +759,7 @@ export function createDataLoaders(pool: Pool): DataLoaders {
   return {
     agentById: createAgentByIdLoader(pool),
     feedbackByLookup: createFeedbackByLookupLoader(pool),
+    proofPassAuthByFeedback: createProofPassAuthByFeedbackLoader(pool),
     feedbackPageByAgent: createFeedbackPageByAgentLoader(pool),
     responsesPageByFeedback: createResponsesPageByFeedbackLoader(pool),
     validationsPageByAgent: createValidationsPageByAgentLoader(pool),

@@ -23,6 +23,9 @@ import {
 } from "./batch-processor.js";
 import { resolveEventBlockTime } from "./block-time.js";
 import { metadataQueue } from "./metadata-queue.js";
+import { matchProofPassFeedbacks } from "../extras/proofpass.js";
+import { upsertProofPassMatches } from "../db/proofpass.js";
+import type { NewFeedback } from "../parser/types.js";
 
 const logger = createChildLogger("poller");
 
@@ -237,6 +240,35 @@ class RetryableTransactionFetchError extends Error {
 
 function isRetryableTransactionFetchError(error: unknown): error is RetryableTransactionFetchError {
   return error instanceof RetryableTransactionFetchError;
+}
+
+async function maybeUpsertProofPassMatchesForTx(params: {
+  signature: string;
+  slot: bigint;
+  logs: string[];
+  typedEvents: Array<{ typedEvent: { type: string; data: unknown } }>;
+}): Promise<void> {
+  if (!config.enableProofPass) {
+    return;
+  }
+
+  const feedbackEvents = params.typedEvents
+    .filter((entry): entry is { typedEvent: { type: "NewFeedback"; data: NewFeedback } } =>
+      entry.typedEvent.type === "NewFeedback"
+    )
+    .map((entry) => entry.typedEvent.data);
+
+  const matches = matchProofPassFeedbacks({
+    logs: params.logs,
+    signature: params.signature,
+    slot: params.slot,
+    feedbackEvents,
+  });
+  if (matches.length === 0) {
+    return;
+  }
+
+  await upsertProofPassMatches(matches);
 }
 
 const HISTORICAL_SCAN_ROW_PREFIX = "historical-scan:";
@@ -2996,6 +3028,13 @@ export class Poller {
       }
     }
 
+    await maybeUpsertProofPassMatchesForTx({
+      signature: sig.signature,
+      slot: BigInt(sig.slot),
+      logs: tx.meta?.logMessages ?? [],
+      typedEvents,
+    });
+
     return blockTime;
   }
 
@@ -3059,6 +3098,13 @@ export class Poller {
         await handleEventAtomic(this.prisma, typedEvent, ctx as EventContext);
       }
     }
+
+    await maybeUpsertProofPassMatchesForTx({
+      signature: sig.signature,
+      slot: BigInt(sig.slot),
+      logs: tx.meta?.logMessages ?? [],
+      typedEvents,
+    });
 
     return blockTime;
   }

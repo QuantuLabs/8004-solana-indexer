@@ -2,7 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.8.3] - 2026-03-18
+
+### Added
+- Added `ProofPass` indexing on PostgreSQL / Supabase:
+  - `extra_proofpass_feedbacks`
+  - `solana.proofPassAuth`
+  - replay/backfill support for existing indexed feedbacks
+
+### Changed
+- Added operator-facing env guidance for faster devnet/mainnet catch-up and parity runs.
+- Tightened `ProofPass` matching so mixed transactions only match when a real `PP_FINALIZE` marker is present in the correct execution frame.
+- `ProofPass` indexing/matching remains optional and is only activated when `ENABLE_PROOFPASS=true` on PostgreSQL / Supabase.
+
+### Fixed
+- `ProofPass` schema startup checks now validate the required unique conflict target before writes.
+- `ProofPass` program id overrides are validated at startup instead of silently disabling matching.
+- Backfill retry coverage and fail-closed ProofPass matching paths were extended to avoid silent drift.
 
 ## [1.8.2] - 2026-03-15
 

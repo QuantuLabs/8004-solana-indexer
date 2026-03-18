@@ -11,6 +11,7 @@ const mockProcessorStop = vi.fn();
 const mockStartApiServer = vi.fn();
 const mockAssertLocalCollectionIdSchema = vi.fn();
 const mockRepairLocalCollectionIdSchema = vi.fn();
+const mockAssertProofPassSchema = vi.fn();
 const mockLogger = {
   info: vi.fn(),
   warn: vi.fn(),
@@ -67,6 +68,12 @@ vi.mock("../../src/db/supabase.js", () => ({
   getPool: vi.fn(() => ({ query: vi.fn() })),
 }));
 
+vi.mock("../../src/db/proofpass.js", () => ({
+  MISSING_PROOFPASS_SCHEMA_FATAL_MESSAGE:
+    "ENABLE_PROOFPASS requires the extra_proofpass_feedbacks PostgreSQL schema. Apply supabase/migrations/20260309192500_add_extra_proofpass_feedbacks.sql before starting the indexer.",
+  assertProofPassSchema: mockAssertProofPassSchema,
+}));
+
 vi.mock("../../src/parser/decoder.js", () => ({
   IDL_VERSION: "test-idl",
   IDL_PROGRAM_ID: "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C",
@@ -87,6 +94,7 @@ vi.mock("../../src/config.js", () => ({
     indexerMode: "polling",
     dbMode: "local",
     apiMode: "rest",
+    enableProofPass: false,
     enableGraphql: false,
     apiPort: 3001,
     supabaseUrl: "",
@@ -123,6 +131,7 @@ describe("index.ts bootstrap", () => {
     });
     mockAssertLocalCollectionIdSchema.mockResolvedValue(undefined);
     mockRepairLocalCollectionIdSchema.mockResolvedValue(undefined);
+    mockAssertProofPassSchema.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -153,6 +162,46 @@ describe("index.ts bootstrap", () => {
     expect(mockAssertLocalCollectionIdSchema).toHaveBeenCalledTimes(2);
     expect(mockRepairLocalCollectionIdSchema).toHaveBeenCalledTimes(1);
     expect(mockRepairLocalCollectionIdSchema.mock.invocationCallOrder[0]).toBeLessThan(
+      mockProcessorStart.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("asserts ProofPass PostgreSQL schema before starting the processor", async () => {
+    process.env = {
+      ...originalEnv,
+      API_MODE: "graphql",
+      DB_MODE: "supabase",
+      ENABLE_GRAPHQL: "true",
+      ENABLE_PROOFPASS: "true",
+      RPC_URL: "https://api.devnet.solana.com",
+      PROGRAM_ID: "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C",
+      LOG_LEVEL: "silent",
+    };
+    vi.doMock("../../src/config.js", () => ({
+      config: {
+        programId: "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C",
+        rpcUrl: "https://api.devnet.solana.com",
+        indexerMode: "polling",
+        dbMode: "supabase",
+        apiMode: "graphql",
+        enableProofPass: true,
+        enableGraphql: true,
+        apiPort: 3001,
+        supabaseUrl: "https://example.supabase.co",
+        supabaseKey: "service-role",
+      },
+      runtimeConfig: {
+        baseCollection: null,
+        initialized: false,
+      },
+      validateConfig: mockValidateConfig,
+    }));
+
+    const { main } = await import("../../src/index.js");
+    await main();
+
+    expect(mockAssertProofPassSchema).toHaveBeenCalledTimes(1);
+    expect(mockAssertProofPassSchema.mock.invocationCallOrder[0]).toBeLessThan(
       mockProcessorStart.mock.invocationCallOrder[0]
     );
   });

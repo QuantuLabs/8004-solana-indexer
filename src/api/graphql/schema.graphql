@@ -315,6 +315,7 @@ type SolanaFeedbackExtension {
   score: Int
   runningDigest: String
   verificationStatus: String
+  proofPassAuth: Boolean!
   txSignature: String
   blockSlot: BigInt
 }

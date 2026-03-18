@@ -1,11 +1,13 @@
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { execSync } from 'child_process';
-import { unlinkSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const testDbPath = join(__dirname, '../../prisma/test.db');
+const testDbDir = mkdtempSync(join(tmpdir(), 'indexer-e2e-'));
+const testDbPath = join(testDbDir, 'test.db');
 
 // Set environment BEFORE any other imports
 process.env.DATABASE_URL = `file:${testDbPath}`;
@@ -26,6 +28,7 @@ process.env.ATOM_ENGINE_PROGRAM_ID =
 process.env.LOG_LEVEL = "silent";
 process.env.INDEXER_MODE = process.env.INDEXER_MODE || "polling";
 process.env.DB_MODE = "local";
+process.env.ENABLE_PROOFPASS = "false";
 
 // Now import dependencies
 import { vi, beforeAll, afterAll, beforeEach } from "vitest";
@@ -48,11 +51,6 @@ vi.mock("pino", () => {
 let prisma: PrismaClient;
 
 beforeAll(async () => {
-  // Remove old test database if exists
-  if (existsSync(testDbPath)) {
-    unlinkSync(testDbPath);
-  }
-
   // Push schema to create fresh test database
   execSync('bunx prisma db push --skip-generate', {
     cwd: join(__dirname, '../..'),
@@ -65,11 +63,10 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await prisma.$disconnect();
-  // Clean up test database
-  if (existsSync(testDbPath)) {
-    unlinkSync(testDbPath);
+  if (prisma) {
+    await prisma.$disconnect();
   }
+  rmSync(testDbDir, { recursive: true, force: true });
 });
 
 beforeEach(() => {

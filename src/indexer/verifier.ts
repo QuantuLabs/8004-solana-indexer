@@ -16,6 +16,20 @@ import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
 import { parseTransaction, toTypedEvent } from "../parser/decoder.js";
 import {
+  matchProofPassFeedbackCandidates,
+  type ProofPassFeedbackMatch,
+} from "../extras/proofpass.js";
+import {
+  deleteProofPassBackfillRetryTx,
+  getProofPassBackfillCursor,
+  listProofPassBackfillRetryTxs,
+  listMissingProofPassFeedbackCandidatesBySignature,
+  listNextProofPassBackfillTxs,
+  saveProofPassBackfillRetryTx,
+  saveProofPassBackfillCursor,
+  upsertProofPassMatches,
+} from "../db/proofpass.js";
+import {
   incrementVerifyCycles,
   setLastVerifiedSlot,
   setMismatchCount,
@@ -224,6 +238,7 @@ export class DataVerifier {
         : 0n;
       this.currentCutoffSlot = cutoffSlot;
       setLastVerifiedSlot(cutoffSlot);
+      await this.backfillMissingProofPassMatches();
       await this.backfillMissingResponseSealHashes();
 
       // Verify in parallel for better performance
@@ -925,6 +940,122 @@ export class DataVerifier {
     if (!parent) return false;
     void feedbackHash;
     return true;
+  }
+
+  private async backfillMissingProofPassMatches(): Promise<void> {
+    if (!config.enableProofPass || !this.pool) {
+      return;
+    }
+
+    const maxTransactionsPerCycle = Math.min(config.verifyBatchSize, 25);
+    const retryTxs = await listProofPassBackfillRetryTxs(
+      Math.min(maxTransactionsPerCycle, 10)
+    );
+    const cursor = await getProofPassBackfillCursor();
+    const txs = await listNextProofPassBackfillTxs(
+      Math.max(maxTransactionsPerCycle - retryTxs.length, 0),
+      cursor
+    );
+    if (retryTxs.length === 0 && txs.length === 0) {
+      return;
+    }
+
+    const candidates = await listMissingProofPassFeedbackCandidatesBySignature(
+      [...retryTxs, ...txs].map((tx) => tx.txSignature)
+    );
+    const candidatesBySignature = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      const existing = candidatesBySignature.get(candidate.txSignature) ?? [];
+      existing.push(candidate);
+      candidatesBySignature.set(candidate.txSignature, existing);
+    }
+
+    const matches: ProofPassFeedbackMatch[] = [];
+    const retryTxsToDelete: typeof retryTxs = [];
+    const retryTxsToSave: typeof txs = [];
+    let lastProcessedTx: (typeof txs)[number] | null = null;
+
+    for (const tx of retryTxs) {
+      const parsedTx = await this.connection.getParsedTransaction(tx.txSignature, {
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        commitment: "confirmed",
+      });
+
+      if (!parsedTx) {
+        logger.warn(
+          { txSignature: tx.txSignature, blockSlot: tx.blockSlot },
+          "Deferring ProofPass backfill retry because parsed transaction is unavailable"
+        );
+        continue;
+      }
+
+      matches.push(
+        ...matchProofPassFeedbackCandidates({
+          logs: parsedTx.meta?.logMessages ?? [],
+          signature: tx.txSignature,
+          slot: BigInt(tx.blockSlot),
+          feedbacks: candidatesBySignature.get(tx.txSignature) ?? [],
+        })
+      );
+      retryTxsToDelete.push(tx);
+    }
+
+    for (const tx of txs) {
+      const parsedTx = await this.connection.getParsedTransaction(tx.txSignature, {
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        commitment: "confirmed",
+      });
+
+      if (!parsedTx) {
+        logger.warn(
+          { txSignature: tx.txSignature, blockSlot: tx.blockSlot },
+          "Scheduling ProofPass backfill retry because parsed transaction is unavailable"
+        );
+        retryTxsToSave.push(tx);
+        lastProcessedTx = tx;
+        continue;
+      }
+
+      matches.push(
+        ...matchProofPassFeedbackCandidates({
+          logs: parsedTx.meta?.logMessages ?? [],
+          signature: tx.txSignature,
+          slot: BigInt(tx.blockSlot),
+          feedbacks: candidatesBySignature.get(tx.txSignature) ?? [],
+        })
+      );
+      lastProcessedTx = tx;
+    }
+
+    if (matches.length > 0) {
+      await upsertProofPassMatches(matches);
+    }
+
+    for (const tx of retryTxsToSave) {
+      await saveProofPassBackfillRetryTx(tx);
+    }
+
+    if (!lastProcessedTx) {
+      for (const tx of retryTxsToDelete) {
+        await deleteProofPassBackfillRetryTx(tx);
+      }
+      return;
+    }
+
+    await saveProofPassBackfillCursor(lastProcessedTx);
+    for (const tx of retryTxsToDelete) {
+      await deleteProofPassBackfillRetryTx(tx);
+    }
+    logger.info(
+      {
+        retryTransactionsScanned: retryTxs.length,
+        transactionsScanned: txs.length,
+        feedbacksScanned: candidates.length,
+        matchesBackfilled: matches.length,
+        lastSignature: lastProcessedTx.txSignature,
+      },
+      "Backfilled missing ProofPass feedback matches"
+    );
   }
 
   private async backfillMissingResponseSealHashes(): Promise<void> {

@@ -18,6 +18,10 @@ import {
   isMissingCollectionIdSchemaError,
   repairLocalCollectionIdSchema,
 } from "./db/local-collection-id-schema.js";
+import {
+  assertProofPassSchema,
+  MISSING_PROOFPASS_SCHEMA_FATAL_MESSAGE,
+} from "./db/proofpass.js";
 
 export async function main() {
   try {
@@ -106,6 +110,14 @@ export async function main() {
       { supabaseUrl: config.supabaseUrl },
       "Using Supabase for database (API via GraphQL)"
     );
+    if (config.enableProofPass) {
+      try {
+        await assertProofPassSchema();
+      } catch (error) {
+        logger.fatal({ error }, MISSING_PROOFPASS_SCHEMA_FATAL_MESSAGE);
+        process.exit(1);
+      }
+    }
   }
 
   const pool = config.dbMode === "supabase" ? getPool() : null;

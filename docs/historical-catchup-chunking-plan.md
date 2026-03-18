@@ -2,7 +2,12 @@
 
 ## Status
 
-Not green for implementation yet.
+Partially shipped at the config/operator level, but not as a full chunked-replay runtime.
+
+Current runtime already exposes historical scan tuning knobs such as
+`HISTORICAL_SCAN_MAX_PAGES_PER_PASS`, but the deeper replay-allocation design
+described below is still intentionally not implemented as a full architectural
+change.
 
 Deep audit found that the current Solana historical scan primitive is fundamentally
 `newest -> oldest`. A naive `scan bounded chunk -> replay bounded chunk` change

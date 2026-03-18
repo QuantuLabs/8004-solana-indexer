@@ -25,6 +25,9 @@ import {
 } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
+import { matchProofPassFeedbacks } from "../extras/proofpass.js";
+import { upsertProofPassMatches } from "../db/proofpass.js";
+import type { NewFeedback, ProgramEvent } from "../parser/types.js";
 
 const logger = createChildLogger("websocket");
 
@@ -193,6 +196,35 @@ function shouldAdvanceCursor(
   if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
   return nextSignature >= currentSignature;
+}
+
+async function maybeUpsertProofPassMatchesForLogs(params: {
+  signature: string;
+  slot: bigint;
+  logs: string[];
+  typedEvents: Array<{ typedEvent: ProgramEvent }>;
+}): Promise<void> {
+  if (!config.enableProofPass) {
+    return;
+  }
+
+  const feedbackEvents = params.typedEvents
+    .filter((entry): entry is { typedEvent: { type: "NewFeedback"; data: NewFeedback } } =>
+      entry.typedEvent.type === "NewFeedback"
+    )
+    .map((entry) => entry.typedEvent.data);
+
+  const matches = matchProofPassFeedbacks({
+    logs: params.logs,
+    signature: params.signature,
+    slot: params.slot,
+    feedbackEvents,
+  });
+  if (matches.length === 0) {
+    return;
+  }
+
+  await upsertProofPassMatches(matches);
 }
 
 export class WebSocketIndexer {
@@ -794,19 +826,33 @@ export class WebSocketIndexer {
       }
 
       const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
+      const typedEvents: Array<{
+        typedEvent: ProgramEvent;
+        eventOrdinal: number;
+        rawEvent: typeof events[number];
+      }> = [];
+      for (const [eventOrdinal, event] of events.entries()) {
+        const typedEvent = toTypedEvent(event);
+        if (!typedEvent) {
+          continue;
+        }
+        typedEvents.push({
+          typedEvent,
+          eventOrdinal,
+          rawEvent: event,
+        });
+      }
 
       let allEventsProcessed = true;
       const suspendLocalDigests = Boolean(this.prisma && config.dbMode === "local");
       if (suspendLocalDigests) await suspendLocalDerivedDigests();
       try {
-        for (const [eventOrdinal, event] of events.entries()) {
+        for (const { typedEvent, eventOrdinal, rawEvent } of typedEvents) {
           if (!this.isRunning || this.stopRequested) {
             allEventsProcessed = false;
             logger.info({ signature: logs.signature, slot: ctx.slot }, "Stopping WebSocket transaction processing before cursor advancement");
             return;
           }
-          const typedEvent = toTypedEvent(event);
-          if (!typedEvent) continue;
 
           const eventCtx: EventContext = {
             signature: logs.signature,
@@ -852,7 +898,7 @@ export class WebSocketIndexer {
                   signature: logs.signature,
                   slot: BigInt(ctx.slot),
                   blockTime,
-                  data: event.data as object,
+                  data: rawEvent.data as object,
                   processed: eventProcessed,
                   error: eventErrorMessage,
                 },
@@ -872,6 +918,13 @@ export class WebSocketIndexer {
             "Skipping cursor update — failed event(s) in this tx will be retried on restart");
           return;
         }
+
+        await maybeUpsertProofPassMatchesForLogs({
+          signature: logs.signature,
+          slot: BigInt(ctx.slot),
+          logs: logs.logs,
+          typedEvents,
+        });
 
         if (this.freezeCursorAdvancement || this.stopRequested || !this.isRunning) {
           logger.info(

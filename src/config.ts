@@ -301,6 +301,8 @@ export const config = {
   apiMode: parseApiMode(process.env.API_MODE),
   // GraphQL requires Supabase pool and is enabled by default
   enableGraphql: parseBoolean(process.env.ENABLE_GRAPHQL, true),
+  // Optional extras
+  enableProofPass: parseBoolean(process.env.ENABLE_PROOFPASS, false),
   // Cache TTL for expensive GraphQL aggregated stats queries
   graphqlStatsCacheTtlMs: parsePositiveInt(process.env.GRAPHQL_STATS_CACHE_TTL_MS, 60000),
 
@@ -415,6 +417,10 @@ export function validateConfig(): void {
     if (!config.supabaseDsn) {
       throw new Error("SUPABASE_DSN required when DB_MODE=supabase");
     }
+  }
+
+  if (config.enableProofPass && config.dbMode !== "supabase") {
+    throw new Error("ENABLE_PROOFPASS requires DB_MODE=supabase");
   }
 
   // Validate verification config

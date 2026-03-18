@@ -82,7 +82,17 @@ Important:
 
 - Do not run `supabase/schema.sql` on an existing database.
 - `schema.sql` is for fresh initialization only.
+- If `ENABLE_PROOFPASS=true`, startup now fails fast until `20260309192500_add_extra_proofpass_feedbacks.sql` is applied.
 - The repo does not maintain a PostgreSQL migration-tracking table for you. Record the last filename you applied and continue lexicographically from there on future upgrades.
+
+Optional PostgreSQL / Supabase enrichment extras:
+
+| Feature | Env gate | Required SQL | Needed when feature is off? |
+| --- | --- | --- | --- |
+| ProofPass | `ENABLE_PROOFPASS=true` | `20260309192500_add_extra_proofpass_feedbacks.sql` | No |
+
+When `ENABLE_PROOFPASS=true`, custom ProofPass deployments must also set `PROOFPASS_PROGRAM_ID` to the program that emits `PP_FINALIZE`.
+On `DB_MODE=supabase`, GraphQL resolves the badge through `solana.proofPassAuth`; the extra only gates ProofPass storage/backfill, and the field remains in the schema and returns `false` when the extra is disabled.
 
 ## SQLite local upgrade
 
@@ -140,6 +150,7 @@ Migration-only is the supported path when:
 - you are not trying to rebuild an already-corrupted or historically incomplete dataset.
 
 Shipped upgrade migrations are intended to fill missing runtime data needed by the newer code without a full reindex.
+With `ENABLE_PROOFPASS=true` on PostgreSQL / Supabase, startup + verifier can also backfill missing `extra_proofpass_feedbacks` rows from already indexed feedback transactions without a full reindex.
 For local SQLite databases created by the affected drifted releases, the startup repair may deterministically rewrite `agents.agent_id` to the canonical order so the upgraded DB matches a fresh local/pool rebuild.
 Do not treat a successful in-place upgrade on a historically drifted database as proof that every legacy runtime/status field will match a fresh rebuild row-for-row.
 Do not treat a successful in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.

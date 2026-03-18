@@ -1,4 +1,7 @@
 import type { AgentRow, FeedbackRow, ResponseRow, RevocationRow } from '../dataloaders.js';
+import type { GraphQLContext } from '../context.js';
+import { proofPassLookupKey } from '../../../extras/proofpass.js';
+import { config } from '../../../config.js';
 
 function normalizeRunningDigest(value: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -34,6 +37,19 @@ export const solanaResolvers = {
     score(parent: FeedbackRow) { return parent.score; },
     runningDigest(parent: FeedbackRow) { return normalizeRunningDigest(parent.running_digest); },
     verificationStatus(parent: FeedbackRow) { return parent.status; },
+    proofPassAuth(parent: FeedbackRow, _args: unknown, ctx: GraphQLContext) {
+      if (!config.enableProofPass) return false;
+      if (!parent.tx_signature || !parent.feedback_hash) return false;
+      return ctx.loaders.proofPassAuthByFeedback.load(
+        proofPassLookupKey(
+          parent.asset,
+          parent.client_address,
+          parent.feedback_index,
+          parent.tx_signature,
+          parent.feedback_hash
+        )
+      );
+    },
     txSignature(parent: FeedbackRow) { return parent.tx_signature; },
     blockSlot(parent: FeedbackRow) { return parent.block_slot; },
   },

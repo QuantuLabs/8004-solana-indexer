@@ -566,7 +566,9 @@ async function replayAutoOverlap(entries: ReplayEntry[]): Promise<ReplayResult> 
   });
 }
 
-describe.sequential("E2E: Devnet mode parity", () => {
+// This suite proves bounded devnet replay parity across local sqlite-backed modes.
+// It is not the source of truth for sqlite-vs-postgres or live-dev parity.
+describe.sequential("E2E: Devnet bounded local mode parity", () => {
   let replayEntries: ReplayEntry[] = [];
   let multiSlotCount = 0;
   let wsProbeAvailable = false;

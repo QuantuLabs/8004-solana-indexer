@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { config } from "../../../src/config.js";
+import { matchProofPassFeedbacks } from "../../../src/extras/proofpass.js";
+import { upsertProofPassMatches } from "../../../src/db/proofpass.js";
 
 vi.mock("ws", () => {
   let probeBehavior: "supported" | "unsupported" | "timeout" | "error" = "supported";
@@ -146,6 +149,14 @@ vi.mock("../../../src/db/supabase.js", () => ({
   clearIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("../../../src/extras/proofpass.js", () => ({
+  matchProofPassFeedbacks: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("../../../src/db/proofpass.js", () => ({
+  upsertProofPassMatches: vi.fn().mockResolvedValue(undefined),
+}));
+
 import * as web3 from "@solana/web3.js";
 import * as wsModule from "ws";
 import {
@@ -179,6 +190,11 @@ describe("WebSocketIndexer", () => {
   beforeEach(() => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrismaClient();
+    (config as any).enableProofPass = false;
+    vi.mocked(matchProofPassFeedbacks).mockReset();
+    vi.mocked(matchProofPassFeedbacks).mockReturnValue([]);
+    vi.mocked(upsertProofPassMatches).mockReset();
+    vi.mocked(upsertProofPassMatches).mockResolvedValue(undefined);
 
     wsIndexer = new WebSocketIndexer({
       connection: mockConnection as any,
@@ -886,6 +902,61 @@ describe("WebSocketIndexer", () => {
           eventType: "PROCESSING_FAILED",
           processed: false,
           error: "DB error",
+        }),
+      });
+    });
+
+    it("should not advance cursor when ProofPass upsert fails after event processing", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmProofPass",
+      };
+      const logs = createEventLogs("AgentRegistered", eventData);
+
+      (config as any).enableProofPass = true;
+      vi.mocked(matchProofPassFeedbacks).mockReturnValue([
+        {
+          id: "proofpass-match",
+          asset: TEST_ASSET.toBase58(),
+          clientAddress: TEST_OWNER.toBase58(),
+          feedbackIndex: "1",
+          txSignature: TEST_SIGNATURE,
+          blockSlot: TEST_SLOT.toString(),
+          feedbackHash: "aa".repeat(32),
+          proofpassSession: "bb".repeat(32),
+          contextType: 1,
+          contextRefHash: "cc".repeat(32),
+        },
+      ] as any);
+      vi.mocked(upsertProofPassMatches).mockRejectedValueOnce(new Error("proofpass upsert failed"));
+
+      await wsIndexer.start();
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(upsertProofPassMatches).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: "proofpass upsert failed",
         }),
       });
     });

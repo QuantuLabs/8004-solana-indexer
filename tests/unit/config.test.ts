@@ -56,6 +56,7 @@ describe("Config", () => {
       delete process.env.METADATA_MAX_BYTES;
       delete process.env.METADATA_MAX_VALUE_BYTES;
       delete process.env.ALLOW_INSECURE_URI;
+      delete process.env.ENABLE_PROOFPASS;
 
       const { config } = await import("../../src/config.js");
 
@@ -91,6 +92,7 @@ describe("Config", () => {
       expect(config.validationIndexEnabled).toBe(true);
       expect(config.metadataMaxBytes).toBe(262144);
       expect(config.metadataMaxValueBytes).toBe(10000);
+      expect(config.enableProofPass).toBe(false);
     });
 
     it("should use custom env values when set", async () => {
@@ -123,6 +125,7 @@ describe("Config", () => {
       process.env.INDEX_VALIDATIONS = "true";
       process.env.METADATA_MAX_BYTES = "123456";
       process.env.METADATA_MAX_VALUE_BYTES = "2048";
+      process.env.ENABLE_PROOFPASS = "true";
 
       const { config } = await import("../../src/config.js");
 
@@ -157,6 +160,7 @@ describe("Config", () => {
       expect(config.validationIndexEnabled).toBe(true);
       expect(config.metadataMaxBytes).toBe(123456);
       expect(config.metadataMaxValueBytes).toBe(2048);
+      expect(config.enableProofPass).toBe(true);
     });
 
     it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {
@@ -423,6 +427,26 @@ describe("Config", () => {
       const { validateConfig } = await import("../../src/config.js");
 
       expect(() => validateConfig()).not.toThrow();
+    });
+
+    it("should throw when ENABLE_PROOFPASS=true with DB_MODE=local", async () => {
+      process.env.DB_MODE = "local";
+      process.env.ENABLE_PROOFPASS = "true";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "ENABLE_PROOFPASS requires DB_MODE=supabase"
+      );
+    });
+
+    it("should throw when ENABLE_PROOFPASS=true with an invalid PROOFPASS_PROGRAM_ID", async () => {
+      process.env.ENABLE_PROOFPASS = "true";
+      process.env.DB_MODE = "supabase";
+      process.env.SUPABASE_DSN = "POSTGRES_DSN_REDACTED";
+      process.env.PROOFPASS_PROGRAM_ID = "not-a-pubkey";
+
+      await expect(import("../../src/extras/proofpass.js")).rejects.toThrow();
     });
 
     it("should throw when API_MODE=graphql but ENABLE_GRAPHQL=false", async () => {

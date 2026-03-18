@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PublicKey } from "@solana/web3.js";
 import { config } from "../../../src/config.js";
+import { matchProofPassFeedbacks } from "../../../src/extras/proofpass.js";
+import { upsertProofPassMatches } from "../../../src/db/proofpass.js";
 import { Poller } from "../../../src/indexer/poller.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
@@ -16,6 +18,14 @@ import {
   TEST_COLLECTION,
   TEST_REGISTRY,
 } from "../../mocks/solana.js";
+
+vi.mock("../../../src/extras/proofpass.js", () => ({
+  matchProofPassFeedbacks: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("../../../src/db/proofpass.js", () => ({
+  upsertProofPassMatches: vi.fn().mockResolvedValue(undefined),
+}));
 
 const createDeferred = <T = void>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -35,6 +45,11 @@ describe("Poller", () => {
   beforeEach(() => {
     mockConnection = createMockConnection();
     mockPrisma = createMockPrismaClient();
+    (config as any).enableProofPass = false;
+    vi.mocked(matchProofPassFeedbacks).mockReset();
+    vi.mocked(matchProofPassFeedbacks).mockReturnValue([]);
+    vi.mocked(upsertProofPassMatches).mockReset();
+    vi.mocked(upsertProofPassMatches).mockResolvedValue(undefined);
     (mockConnection.getBlock as any).mockResolvedValue({
       transactions: [
         { transaction: { signatures: [TEST_SIGNATURE] } },
@@ -613,6 +628,57 @@ describe("Poller", () => {
       await new Promise((r) => setTimeout(r, 200));
 
       expect(mockPrisma.indexerState.upsert).toHaveBeenCalled();
+    });
+
+    it("should not advance cursor when ProofPass upsert fails after event processing", async () => {
+      const sig = createMockSignatureInfo();
+      const eventData = {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmProofPass",
+      };
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, createEventLogs("AgentRegistered", eventData));
+
+      (config as any).enableProofPass = true;
+      vi.mocked(matchProofPassFeedbacks).mockReturnValue([
+        {
+          id: "proofpass-match",
+          asset: TEST_ASSET.toBase58(),
+          clientAddress: TEST_OWNER.toBase58(),
+          feedbackIndex: "1",
+          txSignature: TEST_SIGNATURE,
+          blockSlot: TEST_SLOT.toString(),
+          feedbackHash: "aa".repeat(32),
+          proofpassSession: "bb".repeat(32),
+          contextType: 1,
+          contextRefHash: "cc".repeat(32),
+        },
+      ] as any);
+      vi.mocked(upsertProofPassMatches).mockRejectedValueOnce(new Error("proofpass upsert failed"));
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "previous-sig",
+        lastSlot: 100n,
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([sig]);
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+      (mockConnection.getParsedTransaction as any).mockResolvedValue(tx);
+
+      await poller.start();
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(upsertProofPassMatches).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: "PROCESSING_FAILED",
+          processed: false,
+          error: "proofpass upsert failed",
+        }),
+      });
     });
 
     it("should log failed transaction processing", async () => {

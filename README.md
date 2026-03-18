@@ -50,6 +50,17 @@ If you are upgrading from `v1.7.7`, read:
 - Do not run `supabase/schema.sql` on an existing database.
 - Keep an operator record of the last migration filename you applied; the repo does not maintain a PG migration-tracking table for you.
 
+Optional PostgreSQL / Supabase enrichment extras:
+
+| Feature | Env gate | Required SQL | Needed when feature is off? |
+| --- | --- | --- | --- |
+| ProofPass | `ENABLE_PROOFPASS=true` | `20260309192500_add_extra_proofpass_feedbacks.sql` | No |
+
+When `ENABLE_PROOFPASS=true`, the runtime matches ProofPass logs against a single program id.
+The default is the canonical `ProofPass` deployment, but custom deployments must also set `PROOFPASS_PROGRAM_ID` to the program that emits `PP_FINALIZE`.
+When enabled on `DB_MODE=supabase`, GraphQL resolves `solana.proofPassAuth` from the indexed ProofPass tuple.
+The extra only gates ProofPass storage/backfill on PostgreSQL / Supabase; the GraphQL field remains present in the schema even when the extra is disabled and resolves `false` in that case.
+
 ### Existing local SQLite
 
 - Back up the SQLite file.
@@ -80,6 +91,7 @@ If you are upgrading from `v1.7.7`, read:
 - Upgrading the image alone is not enough for persisted databases.
 - Container startup does not run upgrade migrations automatically.
 - If the container uses PostgreSQL / Supabase, apply the pending `supabase/migrations/*.sql` to that persisted database, then restart the container.
+- If `ENABLE_PROOFPASS=true`, make sure `20260309192500_add_extra_proofpass_feedbacks.sql` has been applied before restart; startup now fails fast if that schema is missing.
 - If the container uses local SQLite, run `prisma migrate deploy` against the same persisted SQLite file, then restart the container.
 - The runtime image defaults local SQLite to `file:/app/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
 - If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, apply `prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql` with `sqlite3` against the mounted file, then restart the container.
@@ -90,6 +102,7 @@ If you are upgrading from `v1.7.7`, read:
 
 - This is the supported path when you keep the same network/program/history and upgrade an already indexed database through the shipped migrations only.
 - Shipped upgrade migrations are intended to fill missing runtime data needed by the newer runtime without a full reindex.
+- With `ENABLE_PROOFPASS=true` on PostgreSQL / Supabase, startup + verifier can backfill missing `extra_proofpass_feedbacks` rows from already indexed feedback transactions without a full reindex.
 - For affected local SQLite drift, startup repair may rewrite previously wrong `agents.agent_id` values to their canonical order without requiring a reindex.
 - Do not treat an in-place upgrade on a historically drifted database as proof that every public sequential ID will match a fresh rebuild row-for-row.
 - Do not treat an in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
@@ -151,6 +164,33 @@ WebSocket subscriptions are live notifications, not historical replay.
 - Then run live tail with `INDEXER_MODE=websocket` or `INDEXER_MODE=auto`.
 - If your provider/network keeps limited history (often devnet/testnet), use archival RPC for bootstrap, or set `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT` to the same exact tx/slot pair.
 - When both are set, startup validates that the signature resolves to that slot and fails fast on mismatch.
+
+## Recommended Poller Profiles
+
+Use the `.env` examples as the operator-facing defaults.
+
+- Balanced baseline:
+  - `POLLING_INTERVAL=10000`
+  - `BATCH_SIZE=200`
+  - `POLLER_MAX_SIGNATURES_PER_CYCLE=1000`
+  - `POLLER_BATCH_RPC_ENABLED=true`
+  - `POLLER_RPC_CHUNK_SIZE=100`
+  - `POLLER_RPC_CHUNK_CONCURRENCY=4`
+  - `HISTORICAL_SCAN_MAX_PAGES_PER_PASS=15`
+  - `HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT=1000`
+- Faster bootstrap/parity profile:
+  - `POLLING_INTERVAL=5000`
+  - `BATCH_SIZE=200`
+  - `POLLER_MAX_SIGNATURES_PER_CYCLE=2000`
+  - `POLLER_BATCH_RPC_ENABLED=true`
+  - `POLLER_RPC_CHUNK_SIZE=200`
+  - `POLLER_RPC_CHUNK_CONCURRENCY=6`
+  - `HISTORICAL_SCAN_MAX_PAGES_PER_PASS=25`
+  - `HISTORICAL_SCAN_SIGNATURE_PAGE_LIMIT=1000`
+- For core-only parity runs, disable metadata enrichment noise:
+  - `INDEX_METADATA=off`
+  - `INDEX_COLLECTION_METADATA=false`
+- If your RPC provider starts returning `429`, `502`, or `503` on parsed batch RPC, try `POLLER_BATCH_RPC_ENABLED=false` before reducing the other knobs.
 
 ## Remote API Docs
 
@@ -338,8 +378,8 @@ Integrity helpers:
 
 ```bash
 # Official GHCR namespace: ghcr.io/quantulabs/*
-scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.2 docker/digests.yml
-scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.2
+scripts/docker/record-digest.sh ghcr.io/quantulabs/8004-indexer v1.8.3 docker/digests.yml
+scripts/docker/verify-image-integrity.sh ghcr.io/quantulabs/8004-indexer v1.8.3
 ```
 
 ## GraphQL Example
@@ -371,6 +411,7 @@ query Dashboard {
 
 - `tests/e2e/reorg-resilience.test.ts`
 - `tests/e2e/devnet-verification.test.ts`
+- `tests/e2e/devnet-mode-parity.test.ts`
 
 `npm run test:localnet` handles the full localnet flow:
 
