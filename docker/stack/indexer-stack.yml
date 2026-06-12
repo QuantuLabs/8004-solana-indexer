@@ -6,7 +6,7 @@ services:
     container_name: 8004-indexer
     restart: unless-stopped
     ports:
-      - "${API_PORT:-3001}:${API_PORT:-3001}"
+      - "127.0.0.1:${API_PORT:-3001}:${API_PORT:-3001}"
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       DB_MODE: ${DB_MODE:?set DB_MODE}

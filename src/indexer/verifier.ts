@@ -342,6 +342,36 @@ export class DataVerifier {
     return new Date(0);
   }
 
+  private buildAgentPdaByAgentId(agentIds: string[]): Map<string, string> {
+    const pdaByAgentId = new Map<string, string>();
+    for (const agentId of new Set(agentIds)) {
+      try {
+        const assetPubkey = parseAssetPubkey(agentId);
+        const [agentPda] = getAgentPda(assetPubkey);
+        pdaByAgentId.set(agentId, agentPda.toBase58());
+      } catch (error: any) {
+        logger.error({ agentId, error: error.message }, "Failed to derive agent PDA for verification");
+      }
+    }
+    return pdaByAgentId;
+  }
+
+  private async batchVerifyAgentExistenceById(
+    agentIds: string[],
+    commitment: Commitment = "finalized"
+  ): Promise<Map<string, boolean | null>> {
+    const pdaByAgentId = this.buildAgentPdaByAgentId(agentIds);
+    const pdaExistsMap = await this.batchVerifyAccounts([...pdaByAgentId.values()], commitment);
+    const existsByAgentId = new Map<string, boolean | null>();
+
+    for (const agentId of new Set(agentIds)) {
+      const agentPda = pdaByAgentId.get(agentId);
+      existsByAgentId.set(agentId, agentPda ? pdaExistsMap.get(agentPda) ?? null : null);
+    }
+
+    return existsByAgentId;
+  }
+
   // =========================================================================
   // Existence Verification (Agent, Metadata, Registry, Validation)
   // =========================================================================
@@ -744,8 +774,10 @@ export class DataVerifier {
     }
 
     if (orphanedAgents.length > 0) {
-      const pubkeys = orphanedAgents.map(a => a.id);
-      const existsMap = await this.batchVerifyAccounts(pubkeys, "finalized");
+      const existsMap = await this.batchVerifyAgentExistenceById(
+        orphanedAgents.map(a => a.id),
+        "finalized"
+      );
       const now = new Date();
 
       for (const agent of orphanedAgents) {
@@ -786,7 +818,7 @@ export class DataVerifier {
 
     if (orphanedFeedbacks.length > 0) {
       const agentIds = [...new Set(orphanedFeedbacks.map(f => f.agentId))];
-      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
       const now = new Date();
 
       for (const fb of orphanedFeedbacks) {
@@ -843,7 +875,7 @@ export class DataVerifier {
 
     if (orphanedRevocations.length > 0) {
       const agentIds = [...new Set(orphanedRevocations.map(r => r.agentId))];
-      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
       const now = new Date();
 
       for (const rev of orphanedRevocations) {
@@ -898,7 +930,7 @@ export class DataVerifier {
 
     if (orphanedResponses.length > 0) {
       const agentIds = [...new Set(orphanedResponses.map(r => r.agentId))];
-      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
       const now = new Date();
 
       for (const resp of orphanedResponses) {
@@ -1219,7 +1251,7 @@ export class DataVerifier {
     }
 
     const agentIds = [...byAgent.keys()];
-    const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+    const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
 
     const now = new Date();
 
@@ -1324,7 +1356,7 @@ export class DataVerifier {
       }
 
       const agentIds = [...byAgent.keys()];
-      const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+      const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
 
       for (const [agentId, ids] of byAgent) {
         if (!this.isRunning) break;
@@ -1443,7 +1475,7 @@ export class DataVerifier {
     }
 
     const agentIds = [...byAgent.keys()];
-    const existsMap = await this.batchVerifyAccounts(agentIds, "finalized");
+    const existsMap = await this.batchVerifyAgentExistenceById(agentIds, "finalized");
 
     for (const [agentId, ids] of byAgent) {
       if (!this.isRunning) break;

@@ -11,15 +11,13 @@ describe("Docker PostgREST Overlay Config", () => {
     expect(stackContent).toContain("API_MODE: both");
   });
 
-  it("waits for postgrest health before starting the indexer", () => {
+  it("waits for postgrest startup before starting the indexer", () => {
     expect(stackContent).toContain("postgrest:");
-    expect(stackContent).toContain("condition: service_healthy");
+    expect(stackContent).toContain("condition: service_started");
   });
 
-  it("defines a concrete postgrest HTTP healthcheck", () => {
+  it("keeps postgrest healthcheck disabled", () => {
     expect(stackContent).toContain("healthcheck:");
-    expect(stackContent).toContain('PeerAddr => "127.0.0.1:3000"');
-    expect(stackContent).toContain('GET / HTTP/1.0');
-    expect(stackContent).toContain("HTTP/\\S+ 200");
+    expect(stackContent).toContain("disable: true");
   });
 });

@@ -13,8 +13,12 @@ vi.mock("../../src/config.js", () => ({
     metadataMaxBytes: 262144, // 256KB
     metadataTimeoutMs: 5000,
     ipfsGatewayBase: "https://ipfs.io",
-    uriDigestTrustedHosts: [],
+    uriDigestTrustedHosts: ["example.com"],
   },
+}));
+
+vi.mock("dns/promises", () => ({
+  lookup: vi.fn().mockResolvedValue([{ address: "93.184.216.34", family: 4 }]),
 }));
 
 // Mock the logger
@@ -218,7 +222,7 @@ describe("URI Digest Module", () => {
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
           ipfsGatewayBase: "https://ipfs.io",
-          uriDigestTrustedHosts: [],
+          uriDigestTrustedHosts: ["example.com"],
         },
       }));
     });
@@ -232,7 +236,7 @@ describe("URI Digest Module", () => {
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
           ipfsGatewayBase: "https://ipfs.io",
-          uriDigestTrustedHosts: [],
+          uriDigestTrustedHosts: ["example.com"],
         },
       }));
 
@@ -284,7 +288,7 @@ describe("URI Digest Module", () => {
           metadataMaxBytes: 262144,
           metadataTimeoutMs: 5000,
           ipfsGatewayBase: "https://ipfs.io",
-          uriDigestTrustedHosts: [],
+          uriDigestTrustedHosts: ["example.com"],
         },
       }));
 

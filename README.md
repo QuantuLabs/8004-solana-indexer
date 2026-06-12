@@ -192,6 +192,41 @@ Use the `.env` examples as the operator-facing defaults.
   - `INDEX_COLLECTION_METADATA=false`
 - If your RPC provider starts returning `429`, `502`, or `503` on parsed batch RPC, try `POLLER_BATCH_RPC_ENABLED=false` before reducing the other knobs.
 
+## Public Parity Check
+
+Use the public GraphQL surfaces to compare one indexer against the live peers without direct DB access.
+
+- This parity check is GraphQL-only:
+  - it requires GraphQL to be enabled on the compared indexers
+  - it waits for a shared head and zero pending backlog before comparing
+- Default scope is the public core surfaces:
+  - `agents`
+  - `feedbacks`
+  - `responses`
+  - `revocations`
+  - `collections`
+- The script uses `/ready` plus `/v2/graphql` only.
+- It validates parity on the public GraphQL contract, not raw DB parity.
+- Metadata enrichment and optional extras such as `ProofPass` are intentionally out of scope for the default run.
+
+Examples:
+
+```bash
+# Mainnet: local PostgreSQL/REST against both public live peers
+npm run check:parity:public -- --network mainnet
+
+# Devnet: local PostgreSQL/REST against the public dev live
+npm run check:parity:public -- --network devnet
+
+# Custom target and explicit peers
+npm run check:parity:public -- \
+  --network mainnet \
+  --target-base http://127.0.0.1:4962 \
+  --peer-base https://8004-indexer-main.qnt.sh \
+  --peer-base https://8004-indexer-main2.qnt.sh \
+  --json-out .tmp/public-parity-mainnet.json
+```
+
 ## Remote API Docs
 
 Canonical API docs are maintained in:

@@ -51,6 +51,7 @@ vi.mock("../../../src/utils/pda.js", () => ({
 }));
 
 import { DataVerifier } from "../../../src/indexer/verifier.js";
+import { getAgentPda } from "../../../src/utils/pda.js";
 import {
   getIntegrityMetricsSnapshot,
   resetIntegrityMetrics,
@@ -1411,6 +1412,8 @@ describe("DataVerifier", () => {
       (config as any).verifyRecoveryCycles = 1; // Run every cycle
 
       const agentId = AGENT_KEY.toBase58();
+      const agentPda = new PublicKey("6kEoE7xkYxQVDv5F3zVJkL4rMdSNqUqkGkqsNv4x5RkK");
+      vi.mocked(getAgentPda).mockReturnValueOnce([agentPda, 255] as any);
 
       // Main verify queries return empty
       mockPrisma.agent.findMany
@@ -1429,6 +1432,7 @@ describe("DataVerifier", () => {
       await verifier.start();
 
       expect(verifier.getStats().orphansRecovered).toBeGreaterThanOrEqual(1);
+      expect(mockConnection.getMultipleAccountsInfo.mock.calls[0][0][0].toBase58()).toBe(agentPda.toBase58());
       await verifier.stop();
       (config as any).verifyRecoveryCycles = 10;
     });
