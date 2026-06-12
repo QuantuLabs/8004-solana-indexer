@@ -795,6 +795,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain("created_at, updated_at");
+        expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
         expect(mockCompressForStorage).toHaveBeenCalled();
       });
 
@@ -1717,17 +1719,23 @@ describe("supabase.ts", () => {
 
     describe("All event types via atomic handler", () => {
       it("AgentRegistered", async () => {
+        const txCollection = new PublicKey(new Uint8Array(32).fill(88));
         const event = {
           type: "AgentRegistered" as const,
           data: {
             asset: TEST_ASSET,
-            collection: TEST_COLLECTION,
+            collection: txCollection,
             owner: TEST_OWNER,
             atomEnabled: false,
             agentUri: "https://example.com/agent.json",
           },
         };
         await handleEventAtomic(event, ctx);
+        const collectionCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("INSERT INTO collections") && c[0].includes("ON CONFLICT (collection)")
+        );
+        expect(collectionCall).toBeDefined();
+        expect(collectionCall![1][2]).toBe(ctx.blockTime.toISOString());
         const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("INSERT INTO agents")
         );
@@ -1881,6 +1889,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain("created_at, updated_at");
+        expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
         expect(insertCall![0]).toContain("tx_signature = EXCLUDED.tx_signature");
       });
 

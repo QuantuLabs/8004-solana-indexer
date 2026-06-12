@@ -742,11 +742,11 @@ async function updateCursorAtomic(
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
             AND (
-              COALESCE(indexer_state.last_tx_index, -1)
-                < COALESCE(EXCLUDED.last_tx_index, -1)
+              COALESCE(indexer_state.last_tx_index, 2147483647)
+                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
               OR (
-                COALESCE(indexer_state.last_tx_index, -1)
-                  = COALESCE(EXCLUDED.last_tx_index, -1)
+                COALESCE(indexer_state.last_tx_index, 2147483647)
+                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
                 AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                   <= EXCLUDED.last_signature COLLATE "C"
               )
@@ -849,14 +849,14 @@ async function ensureCollection(collection: string): Promise<void> {
   }
 }
 
-async function ensureCollectionTx(client: PoolClient, collection: string): Promise<void> {
+async function ensureCollectionTx(client: PoolClient, collection: string, createdAt: Date): Promise<void> {
   if (hasSeenCollection(collection)) return;
   try {
     await client.query(
       `INSERT INTO collections (collection, registry_type, created_at, status)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (collection) DO NOTHING`,
-      [collection, "BASE", new Date().toISOString(), DEFAULT_STATUS]
+      [collection, "BASE", createdAt.toISOString(), DEFAULT_STATUS]
     );
     markCollectionSeen(collection);
   } catch (error: any) {
@@ -876,7 +876,7 @@ async function handleAgentRegisteredTx(
   const assetId = data.asset.toBase58();
   const collection = data.collection.toBase58();
   const agentUri = data.agentUri || null;
-  await ensureCollectionTx(client, collection);
+  await ensureCollectionTx(client, collection, ctx.blockTime);
   await client.query(
     `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17)
@@ -1194,8 +1194,8 @@ async function handleMetadataSetTx(
   const id = `${assetId}:${keyHash}`;
   const compressedValue = await compressForStorage(stripNullBytes(data.value));
   await client.query(
-    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, updated_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)
      ON CONFLICT (id) DO UPDATE SET
        value = EXCLUDED.value,
        immutable = metadata.immutable OR EXCLUDED.immutable,
@@ -1936,12 +1936,12 @@ async function handleMetadataSet(
     const compressedValue = await compressForStorage(stripNullBytes(data.value));
 
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       ON CONFLICT (id) DO UPDATE SET
-         value = EXCLUDED.value,
-         immutable = metadata.immutable OR EXCLUDED.immutable,
-         block_slot = EXCLUDED.block_slot,
+    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+     ON CONFLICT (id) DO UPDATE SET
+       value = EXCLUDED.value,
+       immutable = metadata.immutable OR EXCLUDED.immutable,
+       block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
@@ -2461,11 +2461,11 @@ export async function saveIndexerState(
           OR (
             indexer_state.last_slot = EXCLUDED.last_slot
             AND (
-              COALESCE(indexer_state.last_tx_index, -1)
-                < COALESCE(EXCLUDED.last_tx_index, -1)
+              COALESCE(indexer_state.last_tx_index, 2147483647)
+                < COALESCE(EXCLUDED.last_tx_index, 2147483647)
               OR (
-                COALESCE(indexer_state.last_tx_index, -1)
-                  = COALESCE(EXCLUDED.last_tx_index, -1)
+                COALESCE(indexer_state.last_tx_index, 2147483647)
+                  = COALESCE(EXCLUDED.last_tx_index, 2147483647)
                 AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                   <= EXCLUDED.last_signature COLLATE "C"
               )

@@ -1087,6 +1087,37 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
+    it("should write null response_uri for empty ResponseAppended URI", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          return { rows: [{ id: "f1", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ResponseAppended", {
+          asset: "asset1",
+          client: "client1",
+          responder: "responder1",
+          feedbackIndex: 0n,
+          responseUri: "",
+          responseHash: new Uint8Array(32).fill(0xab),
+          sealHash: new Uint8Array(32).fill(0xab),
+          newResponseCount: 1n,
+        })
+      );
+      await buffer.flush();
+
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][6]).toBeNull();
+    });
+
     it("should preserve all-zero responseHash bytes for orphan response inserts", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
@@ -1164,6 +1195,32 @@ describe("EventBuffer", () => {
           typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
       );
       expect(validationInsert).toBeDefined();
+      expect(validationInsert[0]).toContain("chain_status");
+      expect(validationInsert[1][5]).toBe("https://example.com/req");
+    });
+
+    it("should write null request_uri and explicit chain_status for empty ValidationRequested URI", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ValidationRequested", {
+          asset: "asset1",
+          validatorAddress: "validator1",
+          requester: "requester1",
+          nonce: 3n,
+          requestUri: "",
+          requestHash: new Uint8Array(32).fill(0xab),
+        })
+      );
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const validationInsert = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+      );
+      expect(validationInsert).toBeDefined();
+      expect(validationInsert[0]).toContain("chain_status");
+      expect(validationInsert[1][5]).toBeNull();
     });
 
     it("should no-op ValidationRequested when validation indexing is disabled", async () => {
@@ -1217,6 +1274,33 @@ describe("EventBuffer", () => {
           typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
       );
       expect(validationUpsert).toBeDefined();
+      expect(validationUpsert[0]).toContain("chain_status");
+    });
+
+    it("should write null response_uri and tag for empty ValidationResponded fields", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("ValidationResponded", {
+          asset: "asset1",
+          validatorAddress: "validator1",
+          nonce: 4n,
+          response: 1,
+          responseUri: "",
+          responseHash: new Uint8Array(32).fill(0xab),
+          tag: "",
+        })
+      );
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const validationUpsert = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" && call[0].includes("INSERT INTO validations")
+      );
+      expect(validationUpsert).toBeDefined();
+      expect(validationUpsert[0]).toContain("chain_status");
+      expect(validationUpsert[1][5]).toBeNull();
+      expect(validationUpsert[1][7]).toBeNull();
     });
 
     it("should no-op ValidationResponded when validation indexing is disabled", async () => {
@@ -1280,6 +1364,24 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+    });
+
+    it("should write null agent_uri for empty UriUpdated URI", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      await buffer.addEvent(
+        makeEvent("UriUpdated", {
+          asset: "asset1",
+          newUri: "",
+        })
+      );
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const updateCall = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("UPDATE agents SET agent_uri")
+      );
+      expect(updateCall).toBeDefined();
+      expect(updateCall[1][0]).toBeNull();
     });
 
     it("should handle WalletUpdated event", async () => {

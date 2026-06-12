@@ -731,11 +731,11 @@ export class EventBuffer {
              OR (
                indexer_state.last_slot = EXCLUDED.last_slot
                AND (
-                 COALESCE(indexer_state.last_tx_index, -1)
-                   < COALESCE(EXCLUDED.last_tx_index, -1)
+                 COALESCE(indexer_state.last_tx_index, 2147483647)
+                   < COALESCE(EXCLUDED.last_tx_index, 2147483647)
                  OR (
-                   COALESCE(indexer_state.last_tx_index, -1)
-                     = COALESCE(EXCLUDED.last_tx_index, -1)
+                   COALESCE(indexer_state.last_tx_index, 2147483647)
+                     = COALESCE(EXCLUDED.last_tx_index, 2147483647)
                    AND COALESCE(indexer_state.last_signature, '') COLLATE "C"
                      <= EXCLUDED.last_signature COLLATE "C"
                  )
@@ -1370,7 +1370,7 @@ export class EventBuffer {
          tx_signature = EXCLUDED.tx_signature,
          status = EXCLUDED.status`,
       [id, null, asset, client_addr, feedbackIndex.toString(), responder,
-        data.responseUri || "", responseHash, eventHash, responseRunningDigest, responseCount.toString(),
+        data.responseUri || null, responseHash, eventHash, responseRunningDigest, responseCount.toString(),
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), responseStatus]
     );
   }
@@ -1383,8 +1383,8 @@ export class EventBuffer {
     const id = `${asset}:${validator}:${nonce}`;
 
     await client.query(`
-      INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
+      INSERT INTO validations (id, asset, validator_address, nonce, requester, request_uri, request_hash, status, block_slot, tx_index, event_ordinal, tx_signature, created_at, chain_status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8, $9, $10, $11, $12, 'PENDING')
       ON CONFLICT (id) DO UPDATE SET
         requester = EXCLUDED.requester,
         request_uri = EXCLUDED.request_uri,
@@ -1393,7 +1393,7 @@ export class EventBuffer {
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature
-    `, [id, asset, validator, nonce.toString(), requester, data.requestUri || "",
+    `, [id, asset, validator, nonce.toString(), requester, data.requestUri || null,
         data.requestHash ? Buffer.from(data.requestHash).toString("hex") : null,
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
@@ -1419,9 +1419,9 @@ export class EventBuffer {
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
-    `, [id, asset, validator, nonce.toString(), data.response || 0, data.responseUri || "",
+    `, [id, asset, validator, nonce.toString(), data.response || 0, data.responseUri || null,
         data.responseHash ? Buffer.from(data.responseHash).toString("hex") : null,
-        data.tag || "", "RESPONDED",
+        data.tag || null, "RESPONDED",
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
@@ -1443,7 +1443,7 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     await client.query(`
       UPDATE agents SET agent_uri = $1, updated_at = $2 WHERE asset = $3
-    `, [data.newUri || "", ctx.blockTime.toISOString(), asset]);
+    `, [data.newUri || null, ctx.blockTime.toISOString(), asset]);
   }
 
   private async updateAgentWalletSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
