@@ -55,10 +55,18 @@ export class Processor {
     }
 
     if (this.mode === "polling") {
-      return this.poller?.isCaughtUp() ?? false;
+      return this.poller?.isActive() ? this.poller.isCaughtUp() : false;
     }
 
-    return true;
+    if (this.poller) {
+      return this.poller.isActive() && this.poller.isCaughtUp();
+    }
+
+    if (this.wsIndexer) {
+      return this.wsIndexer.isActive() && !this.wsIndexer.isRecovering();
+    }
+
+    return false;
   }
 
   async start(): Promise<void> {
@@ -212,13 +220,16 @@ export class Processor {
     }
   }
 
-  private async startWebSocket(expectedRunToken: number): Promise<void> {
+  private async startWebSocket(expectedRunToken: number, holdProcessing = false): Promise<WebSocketIndexer | null> {
     const nextWsIndexer = new WebSocketIndexer({
       connection: this.connection,
       prisma: this.prisma,
       programId: this.programId,
       wsUrl: config.wsUrl,
     });
+    if (holdProcessing) {
+      nextWsIndexer.holdProcessing();
+    }
     this.pendingWsIndexer = nextWsIndexer;
     const startPromise = nextWsIndexer.start();
     this.pendingWsStart = startPromise;
@@ -234,13 +245,14 @@ export class Processor {
     }
     if (!this.isRunning || this.runToken !== expectedRunToken) {
       await nextWsIndexer.stop();
-      return;
+      return null;
     }
     if (!nextWsIndexer.isActive()) {
       await nextWsIndexer.stop();
       throw new Error("WebSocket indexer failed to establish an active subscription");
     }
     this.wsIndexer = nextWsIndexer;
+    return nextWsIndexer;
   }
 
   private createPoller(pollingInterval?: number): Poller {
@@ -288,11 +300,13 @@ export class Processor {
   private async startWebSocketPipeline(expectedRunToken: number): Promise<void> {
     await this.bootstrapAutoCatchUp(expectedRunToken);
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
-    await this.startWebSocket(expectedRunToken);
+    const heldWsIndexer = await this.startWebSocket(expectedRunToken, true);
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
-    // Close the bootstrap -> live subscription gap with a short catch-up pass.
     await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
+    if (heldWsIndexer) {
+      heldWsIndexer.releaseProcessing();
+    }
     this.monitorWebSocket();
   }
 
@@ -365,6 +379,10 @@ export class Processor {
     }
 
     const runToken = this.runToken;
+    if (this.poller && !this.poller.isActive()) {
+      logger.warn("Poller run loop is inactive; clearing stale poller reference");
+      this.poller = null;
+    }
     const shouldRetryAutoWebSocket = this.mode === "auto" && !!this.poller && !this.wsIndexer;
     if (shouldRetryAutoWebSocket) {
       this.wsMonitorInProgress = true;
@@ -435,9 +453,13 @@ export class Processor {
 
     await this.bootstrapAutoCatchUp(expectedRunToken);
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
-    await this.startWebSocket(expectedRunToken);
+    const heldWsIndexer = await this.startWebSocket(expectedRunToken, true);
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
     await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
+    if (!this.isRunning || this.runToken !== expectedRunToken) return;
+    if (heldWsIndexer) {
+      heldWsIndexer.releaseProcessing();
+    }
   }
 
   private async failOverToPolling(expectedRunToken: number): Promise<void> {
@@ -478,7 +500,18 @@ export class Processor {
     logger.info("WebSocket available again, promoting auto mode back to websocket");
 
     const currentPoller = this.poller;
-    await currentPoller.stop();
+    try {
+      await currentPoller.stop();
+    } catch (error) {
+      logger.warn({ error }, "Failed to stop poller during auto websocket promotion; restarting polling");
+      if (this.poller === currentPoller) {
+        this.poller = null;
+      }
+      if (this.isRunning && this.runToken === expectedRunToken) {
+        await this.startPolling(expectedRunToken);
+      }
+      return;
+    }
     if (this.poller === currentPoller) {
       this.poller = null;
     }
@@ -515,7 +548,7 @@ export class Processor {
     verifierStats?: ReturnType<DataVerifier["getStats"]>;
   } {
     const wsActive = this.wsIndexer?.isActive() ?? false;
-    const pollerActive = this.poller !== null;
+    const pollerActive = this.poller?.isActive() ?? false;
     const effectiveMode: IndexerMode = pollerActive && !wsActive
       ? "polling"
       : wsActive

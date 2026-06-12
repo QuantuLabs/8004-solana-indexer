@@ -156,6 +156,9 @@ vi.mock("@solana/web3.js", async () => {
 // Mock supabase for saveIndexerState
 vi.mock("../../../src/db/supabase.js", () => ({
   saveIndexerState: vi.fn().mockResolvedValue(undefined),
+  loadIndexerStateSnapshot: vi.fn().mockResolvedValue(null),
+  restoreIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
+  clearIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock handlers
@@ -183,7 +186,7 @@ import {
   TEST_OWNER,
   TEST_COLLECTION,
 } from "../../mocks/solana.js";
-import { saveIndexerState } from "../../../src/db/supabase.js";
+import { saveIndexerState, loadIndexerStateSnapshot } from "../../../src/db/supabase.js";
 import {
   handleEventAtomic,
   suspendLocalDerivedDigests,
@@ -205,6 +208,7 @@ describe("WebSocketIndexer Coverage", () => {
     vi.mocked(suspendLocalDerivedDigests).mockResolvedValue(undefined as never);
     vi.mocked(resumeLocalDerivedDigests).mockImplementation(() => undefined);
     vi.mocked(saveIndexerState).mockResolvedValue(undefined);
+    vi.mocked(loadIndexerStateSnapshot).mockResolvedValue(null);
     (mockConnection as any)._rpcWebSocketConnected = true;
     (mockConnection as any)._subscriptionHashByClientSubscriptionId = {};
     (mockConnection as any)._subscriptionsByHash = {};
@@ -356,12 +360,24 @@ describe("WebSocketIndexer Coverage", () => {
 
       // Make connection stale (no activity for > STALE_THRESHOLD)
       (wsIndexer as any).lastActivityTime = Date.now() - 130_000; // 130s ago
+      (wsIndexer as any).lastPersistedCursor = {
+        signature: "cursor-sig",
+        slot: 123n,
+        txIndex: 0,
+        source: "websocket",
+        updatedAt: new Date(),
+      };
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([]);
 
       await (wsIndexer as any).checkHealth();
 
       // Activity time should have been reset to recent
       expect(Date.now() - (wsIndexer as any).lastActivityTime).toBeLessThan(5000);
       expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
+        TEST_PROGRAM_ID,
+        { until: "cursor-sig", limit: 25 }
+      );
     });
 
     it("should force reconnect when stale AND onLogs heartbeat probe fails", async () => {
@@ -440,19 +456,20 @@ describe("WebSocketIndexer Coverage", () => {
       reconnectSpy.mockRestore();
     });
 
-    it("should clean up existing subscription before reconnecting", async () => {
+    it("should stop the active subscription so processor-managed catch-up can recover gaps", async () => {
       createIndexer();
       await wsIndexer.start();
 
       expect((wsIndexer as any).subscriptionId).toBe(1);
 
-      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect").mockResolvedValue(undefined);
+      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect");
 
       await (wsIndexer as any).forceReconnect();
 
       expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
       expect((wsIndexer as any).subscriptionId).toBe(null);
-      expect(reconnectSpy).toHaveBeenCalled();
+      expect(reconnectSpy).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(false);
 
       // isReconnecting should be cleared in finally block
       expect((wsIndexer as any).isReconnecting).toBe(false);
@@ -460,7 +477,7 @@ describe("WebSocketIndexer Coverage", () => {
       reconnectSpy.mockRestore();
     });
 
-    it("should handle subscription removal error during force reconnect", async () => {
+    it("should handle subscription removal error during force recovery stop", async () => {
       createIndexer();
       await wsIndexer.start();
 
@@ -468,32 +485,29 @@ describe("WebSocketIndexer Coverage", () => {
         new Error("Removal failed")
       );
 
-      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect").mockResolvedValue(undefined);
+      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect");
 
       // Should not throw
       await (wsIndexer as any).forceReconnect();
 
-      expect(reconnectSpy).toHaveBeenCalled();
+      expect(reconnectSpy).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(false);
       expect((wsIndexer as any).isReconnecting).toBe(false);
 
       reconnectSpy.mockRestore();
     });
 
-    it("should clear isReconnecting even if reconnect throws", async () => {
+    it("should ignore stale force recovery requests from an old subscription", async () => {
       createIndexer();
       await wsIndexer.start();
 
-      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect").mockRejectedValue(
-        new Error("reconnect failure")
-      );
+      const reconnectSpy = vi.spyOn(wsIndexer as any, "reconnect");
 
-      try {
-        await (wsIndexer as any).forceReconnect();
-      } catch {
-        // Expected
-      }
+      await (wsIndexer as any).forceReconnect(999);
 
       expect((wsIndexer as any).isReconnecting).toBe(false);
+      expect(reconnectSpy).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(true);
 
       reconnectSpy.mockRestore();
     });
@@ -559,7 +573,7 @@ describe("WebSocketIndexer Coverage", () => {
       parseTxSpy.mockRestore();
     });
 
-    it("should preserve lock fallback when parsed transaction fetch fails", async () => {
+    it("should fail-safe stop when parsed transaction fetch for identity lock enrichment keeps failing", async () => {
       createIndexer();
       await wsIndexer.start();
 
@@ -571,12 +585,12 @@ describe("WebSocketIndexer Coverage", () => {
             parent_asset: TEST_COLLECTION.toBase58(),
             parent_creator: TEST_OWNER.toBase58(),
             set_by: TEST_OWNER.toBase58(),
-            lock: true,
           },
         },
       ]);
       const parseTxSpy = vi.spyOn(decoder, "parseTransaction").mockReturnValue(null);
       (mockConnection.getParsedTransaction as any).mockRejectedValue(new Error("rpc timeout"));
+      vi.spyOn(wsIndexer as any, "waitForTransactionRetryDelay").mockResolvedValue(true);
       vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
 
       logsHandler!(
@@ -586,14 +600,9 @@ describe("WebSocketIndexer Coverage", () => {
 
       await new Promise((r) => setTimeout(r, 100));
 
-      expect(handleEventAtomic).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          type: "ParentAssetSet",
-          data: expect.objectContaining({ lock: true }),
-        }),
-        expect.any(Object)
-      );
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(5);
+      expect(handleEventAtomic).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(false);
 
       parseLogsSpy.mockRestore();
       parseTxSpy.mockRestore();
@@ -806,6 +815,7 @@ describe("WebSocketIndexer Coverage", () => {
       (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
         lastSlot: BigInt(TEST_SLOT),
         lastSignature: "sig-a",
+        lastTxIndex: 0,
       });
       (mockConnection.getBlock as any).mockResolvedValue({
         transactions: [
@@ -1692,10 +1702,11 @@ describe("WebSocketIndexer Coverage", () => {
 
       await new Promise((r) => setTimeout(r, 150));
 
-      // saveIndexerState was called but failed - error caught at line 385-389
+      // saveIndexerState was called but failed; websocket now fail-stops instead of
+      // reporting a durable processed transaction without a cursor.
       expect(saveIndexerState).toHaveBeenCalled();
-      // processedCount should still increment (state save failure doesn't block processing)
-      expect((wsIndexer as any).processedCount).toBe(1);
+      expect((wsIndexer as any).processedCount).toBe(0);
+      expect(wsIndexer.isActive()).toBe(false);
     });
   });
 
@@ -1732,8 +1743,8 @@ describe("WebSocketIndexer Coverage", () => {
     });
   });
 
-  describe("queue error handler - reconnect at errorCount threshold (lines 252-257)", () => {
-    it("should call forceReconnect when errorCount > 10 and divisible by 10", async () => {
+  describe("queue error handler - fail-safe stop", () => {
+    it("should fail-stop when queued handling throws", async () => {
       createIndexer();
       await wsIndexer.start();
 
@@ -1743,10 +1754,8 @@ describe("WebSocketIndexer Coverage", () => {
       // If we set to 19, increment makes 20: 20 > 10 = true, 20 % 10 === 0 = true
       (wsIndexer as any).errorCount = 19;
 
-      const forceReconnectSpy = vi.spyOn(wsIndexer as any, "forceReconnect").mockResolvedValue(undefined);
-
       // Need handleLogs to throw (hit the outer catch which re-throws)
-      // so the queue catch at line 243 catches it
+      // so the queue catch handles it.
       const decoderModule = await import("../../../src/parser/decoder.js");
       vi.spyOn(decoderModule, "parseTransactionLogs").mockImplementation(() => {
         throw new Error("Force queue catch");
@@ -1768,20 +1777,15 @@ describe("WebSocketIndexer Coverage", () => {
       await new Promise((r) => setTimeout(r, 300));
 
       expect((wsIndexer as any).errorCount).toBe(20);
-      expect(forceReconnectSpy).toHaveBeenCalled();
-
-      forceReconnectSpy.mockRestore();
+      expect(wsIndexer.isActive()).toBe(false);
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
     });
 
-    it("should catch forceReconnect failure in queue handler (line 255)", async () => {
+    it("should tolerate repeated fail-safe stop scheduling from queued handler errors", async () => {
       createIndexer();
       await wsIndexer.start();
 
       (wsIndexer as any).errorCount = 29;
-
-      const forceReconnectSpy = vi.spyOn(wsIndexer as any, "forceReconnect").mockRejectedValue(
-        new Error("Reconnect explosion")
-      );
 
       const decoderModule = await import("../../../src/parser/decoder.js");
       vi.spyOn(decoderModule, "parseTransactionLogs").mockImplementation(() => {
@@ -1805,10 +1809,7 @@ describe("WebSocketIndexer Coverage", () => {
 
       // errorCount should be 30
       expect((wsIndexer as any).errorCount).toBe(30);
-      // forceReconnect was called but its rejection was caught
-      expect(forceReconnectSpy).toHaveBeenCalled();
-
-      forceReconnectSpy.mockRestore();
+      expect(wsIndexer.isActive()).toBe(false);
     });
   });
 

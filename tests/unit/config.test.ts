@@ -28,6 +28,7 @@ describe("Config", () => {
       delete process.env.BATCH_SIZE;
       delete process.env.WS_RECONNECT_INTERVAL;
       delete process.env.WS_MAX_RETRIES;
+      delete process.env.WS_RECONCILIATION_INTERVAL_MS;
       delete process.env.LOG_LEVEL;
       delete process.env.API_MODE;
       delete process.env.ENABLE_GRAPHQL;
@@ -74,6 +75,7 @@ describe("Config", () => {
       expect(config.historicalScanSignaturePageLimit).toBe(1000);
       expect(config.wsReconnectInterval).toBe(3000);
       expect(config.wsMaxRetries).toBe(5);
+      expect(config.wsReconciliationIntervalMs).toBe(600000);
       expect(config.logLevel).toBe("info");
       expect(config.apiMode).toBe("both");
       expect(config.graphqlStatsCacheTtlMs).toBe(60000);
@@ -104,6 +106,7 @@ describe("Config", () => {
       process.env.BATCH_SIZE = "200";
       process.env.WS_RECONNECT_INTERVAL = "5000";
       process.env.WS_MAX_RETRIES = "10";
+      process.env.WS_RECONCILIATION_INTERVAL_MS = "120000";
       process.env.LOG_LEVEL = "debug";
       process.env.API_MODE = "rest";
       process.env.GRAPHQL_STATS_CACHE_TTL_MS = "45000";
@@ -142,6 +145,7 @@ describe("Config", () => {
       expect(config.historicalScanSignaturePageLimit).toBe(750);
       expect(config.wsReconnectInterval).toBe(5000);
       expect(config.wsMaxRetries).toBe(10);
+      expect(config.wsReconciliationIntervalMs).toBe(120000);
       expect(config.logLevel).toBe("debug");
       expect(config.apiMode).toBe("rest");
       expect(config.graphqlStatsCacheTtlMs).toBe(45000);
@@ -417,6 +421,16 @@ describe("Config", () => {
 
       expect(() => validateConfig()).toThrow(
         "SUPABASE_DSN required when DB_MODE=supabase"
+      );
+    });
+
+    it("should throw when WS_RECONCILIATION_INTERVAL_MS is below the minimum", async () => {
+      process.env.WS_RECONCILIATION_INTERVAL_MS = "1000";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "WS_RECONCILIATION_INTERVAL_MS must be at least 60000"
       );
     });
 

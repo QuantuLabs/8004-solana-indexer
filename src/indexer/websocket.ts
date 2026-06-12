@@ -3,6 +3,7 @@ import {
   PublicKey,
   Logs,
   Context,
+  ConfirmedSignatureInfo,
   ParsedTransactionWithMeta,
 } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
@@ -25,6 +26,7 @@ import {
 } from "../db/supabase.js";
 import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
+import { compareCanonicalTransactionOrder } from "./canonical-order.js";
 import { matchProofPassFeedbacks } from "../extras/proofpass.js";
 import { upsertProofPassMatches } from "../db/proofpass.js";
 import type { NewFeedback, ProgramEvent } from "../parser/types.js";
@@ -38,6 +40,8 @@ const STALE_THRESHOLD = 120_000;
 // Keep websocket tx handling sequential so cursor advancement remains prefix-safe.
 const MAX_CONCURRENT_HANDLERS = 1;
 const MAX_QUEUE_SIZE = 10_000;
+const RECONCILIATION_SIGNATURE_LIMIT = 25;
+const RECENT_OBSERVED_SIGNATURE_LIMIT = MAX_QUEUE_SIZE * 2;
 
 export interface WebSocketIndexerOptions {
   connection: Connection;
@@ -46,6 +50,7 @@ export interface WebSocketIndexerOptions {
   wsUrl?: string;
   reconnectInterval?: number;
   maxRetries?: number;
+  canonicalBufferMs?: number;
 }
 
 type PersistedCursorSnapshot = {
@@ -54,6 +59,29 @@ type PersistedCursorSnapshot = {
   txIndex: number | null;
   source: string | null;
   updatedAt: Date;
+};
+
+type CurrentCursorSnapshot = {
+  lastSignature: string | null;
+  lastSlot: bigint | null;
+  lastTxIndex: number | null;
+  source: string | null;
+  updatedAt?: Date | null;
+};
+
+type BufferedLogNotification = {
+  logs: Logs;
+  ctx: Context;
+  sequence: number;
+};
+
+type ResolvedLogOrder = {
+  txIndex: number | undefined;
+  blockTimeSeconds: number | null | undefined;
+};
+
+type ResolvedLogNotification = BufferedLogNotification & {
+  order: ResolvedLogOrder;
 };
 
 type LogsSubscribeProbeResult = "supported" | "unsupported" | "unknown";
@@ -188,14 +216,37 @@ function shouldAdvanceCursor(
   nextSignature: string
 ): boolean {
   if (currentSlot === null || currentSlot === undefined) return true;
-  if (nextSlot > currentSlot) return true;
-  if (nextSlot < currentSlot) return false;
-  const currentOrderTxIndex = currentTxIndex ?? -1;
-  const nextOrderTxIndex = nextTxIndex ?? -1;
-  if (nextOrderTxIndex > currentOrderTxIndex) return true;
-  if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
-  return nextSignature >= currentSignature;
+  return compareCanonicalTransactionOrder(
+    { slot: currentSlot, txIndex: currentTxIndex, signature: currentSignature },
+    { slot: nextSlot, txIndex: nextTxIndex, signature: nextSignature }
+  ) <= 0;
+}
+
+function hasProgramDataLogsForProgram(logs: string[], programId: string): boolean {
+  const invokeStack: string[] = [];
+
+  for (const log of logs) {
+    const invokeMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[\d+\]$/.exec(log);
+    if (invokeMatch) {
+      invokeStack.push(invokeMatch[1]);
+      continue;
+    }
+
+    const completionMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) (success|failed:.*)$/.exec(log);
+    if (completionMatch) {
+      if (invokeStack[invokeStack.length - 1] === completionMatch[1]) {
+        invokeStack.pop();
+      }
+      continue;
+    }
+
+    if (log.startsWith("Program data:") && invokeStack[invokeStack.length - 1] === programId) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function maybeUpsertProofPassMatchesForLogs(params: {
@@ -252,10 +303,21 @@ export class WebSocketIndexer {
   private stopRequested = false;
   private freezeCursorAdvancement = false;
   private runToken = 0;
+  private canonicalBufferMs: number;
+  private canonicalFlushTimer: NodeJS.Timeout | null = null;
+  private notificationSequence = 0;
+  private pendingLogNotifications = new Map<string, BufferedLogNotification>();
   // Bounded concurrency queue to prevent OOM during high traffic
   private logQueue: PQueue;
   private droppedLogs = 0;
   private lastPersistedCursor: PersistedCursorSnapshot | null = null;
+  private sessionStartCursor: PersistedCursorSnapshot | null = null;
+  private processingHoldCount = 0;
+  private observedSignatures = new Set<string>();
+  private observedSignatureOrder: string[] = [];
+  private reconciliationTimer: NodeJS.Timeout | null = null;
+  private isReconciling = false;
+  private stopPromise: Promise<void> | null = null;
 
   constructor(options: WebSocketIndexerOptions) {
     // Initialize bounded queue for log processing
@@ -266,6 +328,7 @@ export class WebSocketIndexer {
     this.wsUrl = options.wsUrl ?? null;
     this.reconnectInterval = options.reconnectInterval || config.wsReconnectInterval;
     this.maxRetries = options.maxRetries || config.wsMaxRetries;
+    this.canonicalBufferMs = Math.max(0, options.canonicalBufferMs ?? config.wsCanonicalBufferMs);
   }
 
   async start(): Promise<void> {
@@ -280,6 +343,13 @@ export class WebSocketIndexer {
     this.retryCount = 0;
     this.runToken += 1;
     this.lastPersistedCursor = null;
+    this.sessionStartCursor = null;
+    this.clearCanonicalFlushTimer();
+    this.pendingLogNotifications.clear();
+    this.notificationSequence = 0;
+    this.observedSignatures.clear();
+    this.observedSignatureOrder = [];
+    this.stopReconciliationCheck();
     this.logQueue.start();
     this.lastActivityTime = Date.now();
     if (this.prisma) {
@@ -302,6 +372,7 @@ export class WebSocketIndexer {
             source: current.source ?? null,
             updatedAt: current.updatedAt ?? new Date(),
           };
+          this.sessionStartCursor = { ...this.lastPersistedCursor };
         }
       } catch (error) {
         logger.warn({ error }, "Failed to snapshot current cursor before starting websocket indexer");
@@ -317,6 +388,7 @@ export class WebSocketIndexer {
             source: current.source ?? null,
             updatedAt: current.updatedAt,
           };
+          this.sessionStartCursor = { ...this.lastPersistedCursor };
         }
       } catch (error) {
         logger.warn({ error }, "Failed to snapshot current Supabase cursor before starting websocket indexer");
@@ -343,25 +415,58 @@ export class WebSocketIndexer {
     }
 
     this.startHealthCheck();
+    this.startReconciliationCheck();
   }
 
-  async stop(): Promise<void> {
+  holdProcessing(): void {
+    this.processingHoldCount++;
+    this.clearCanonicalFlushTimer();
+  }
+
+  releaseProcessing(): void {
+    if (this.processingHoldCount > 0) {
+      this.processingHoldCount--;
+    }
+    if (this.processingHoldCount === 0) {
+      this.flushPendingLogNotifications();
+    }
+  }
+
+  stop(): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    this.stopPromise = this.stopInternal().finally(() => {
+      this.stopPromise = null;
+    });
+    return this.stopPromise;
+  }
+
+  private async stopInternal(): Promise<void> {
     logger.info({
       processedCount: this.processedCount,
       errorCount: this.errorCount,
-      queueSize: this.logQueue.size,
+      queueSize: this.logQueue.size + this.pendingLogNotifications.size,
       droppedLogs: this.droppedLogs
     }, "Stopping WebSocket indexer");
 
     this.isRunning = false;
     this.stopRequested = true;
     this.freezeCursorAdvancement = true;
+    this.processingHoldCount = 0;
     this.retryCount = 0;
     this.stopHealthCheck();
+    this.stopReconciliationCheck();
     this.clearReconnectDelay();
 
+    this.clearCanonicalFlushTimer();
+    const clearedBufferedLogs = this.pendingLogNotifications.size;
+    if (clearedBufferedLogs > 0) {
+      this.pendingLogNotifications.clear();
+    }
+
     this.logQueue.pause();
-    const clearedQueuedLogs = this.logQueue.size;
+    const clearedQueuedLogs = this.logQueue.size + clearedBufferedLogs;
     const hadInFlightWork = this.logQueue.pending > 0;
     const restoreCursorSnapshot = this.lastPersistedCursor
       ? { ...this.lastPersistedCursor }
@@ -391,75 +496,131 @@ export class WebSocketIndexer {
 
     if (restoreCursorSnapshot && (clearedQueuedLogs > 0 || hadInFlightWork)) {
       try {
-        if (this.prisma) {
-          await this.prisma.indexerState.upsert({
-            where: { id: "main" },
-            create: {
-              id: "main",
-              lastSignature: restoreCursorSnapshot.signature,
-              lastSlot: restoreCursorSnapshot.slot,
-              lastTxIndex: restoreCursorSnapshot.txIndex,
-              source: restoreCursorSnapshot.source ?? "websocket",
-              updatedAt: restoreCursorSnapshot.updatedAt,
-            },
-            update: {
-              lastSignature: restoreCursorSnapshot.signature,
-              lastSlot: restoreCursorSnapshot.slot,
-              lastTxIndex: restoreCursorSnapshot.txIndex,
-              source: restoreCursorSnapshot.source ?? "websocket",
-              updatedAt: restoreCursorSnapshot.updatedAt,
-            },
-          });
-        } else {
-          await restoreIndexerStateSnapshot(
-            restoreCursorSnapshot.signature,
-            restoreCursorSnapshot.slot,
-            restoreCursorSnapshot.txIndex,
-            (restoreCursorSnapshot.source as "poller" | "websocket" | "substreams" | null) ?? "websocket",
-            restoreCursorSnapshot.updatedAt,
-          );
-        }
-        logger.info(
-          {
-            signature: restoreCursorSnapshot.signature,
-            slot: restoreCursorSnapshot.slot.toString(),
-            txIndex: restoreCursorSnapshot.txIndex,
-          },
-          "Restored safe cursor snapshot after websocket shutdown"
-        );
+        await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot);
       } catch (error) {
         logger.warn({ error }, "Failed to restore safe cursor snapshot after websocket shutdown");
       }
     } else if (clearedQueuedLogs > 0 || hadInFlightWork) {
       const clearedAt = new Date();
       try {
-        if (this.prisma) {
-          await this.prisma.indexerState.upsert({
-            where: { id: "main" },
-            create: {
-              id: "main",
-              lastSignature: null,
-              lastSlot: null,
-              lastTxIndex: null,
-              source: "websocket",
-              updatedAt: clearedAt,
-            },
-            update: {
-              lastSignature: null,
-              lastSlot: null,
-              lastTxIndex: null,
-              source: "websocket",
-              updatedAt: clearedAt,
-            },
-          });
-        } else {
-          await clearIndexerStateSnapshot("websocket", clearedAt);
-        }
-        logger.info("Cleared websocket cursor after shutdown because no safe snapshot existed");
+        await this.clearSafeCursorSnapshotAfterStop(clearedAt);
       } catch (error) {
         logger.warn({ error }, "Failed to clear websocket cursor after shutdown without a safe snapshot");
       }
     }
+  }
+
+  private currentCursorIsOwnedByWebSocket(current: CurrentCursorSnapshot | null): boolean {
+    return !current?.source || current.source === "websocket";
+  }
+
+  private currentCursorIsNewerThanSnapshot(
+    current: CurrentCursorSnapshot | null,
+    snapshot: PersistedCursorSnapshot
+  ): boolean {
+    if (!current?.lastSignature || current.lastSlot === null || current.lastSlot === undefined) {
+      return false;
+    }
+    return compareCanonicalTransactionOrder(
+      { slot: current.lastSlot, txIndex: current.lastTxIndex, signature: current.lastSignature },
+      { slot: snapshot.slot, txIndex: snapshot.txIndex, signature: snapshot.signature }
+    ) > 0;
+  }
+
+  private async restoreSafeCursorSnapshotAfterStop(snapshot: PersistedCursorSnapshot): Promise<void> {
+    const current = await this.loadCurrentCursorSnapshot();
+    if (!this.currentCursorIsOwnedByWebSocket(current) || this.currentCursorIsNewerThanSnapshot(current, snapshot)) {
+      logger.info(
+        {
+          signature: snapshot.signature,
+          slot: snapshot.slot.toString(),
+          txIndex: snapshot.txIndex,
+          currentSource: current?.source ?? null,
+          currentSignature: current?.lastSignature ?? null,
+          currentSlot: current?.lastSlot?.toString() ?? null,
+          currentTxIndex: current?.lastTxIndex ?? null,
+        },
+        "Skipped websocket cursor snapshot restore after shutdown"
+      );
+      return;
+    }
+
+    if (this.prisma) {
+      await this.prisma.indexerState.upsert({
+        where: { id: "main" },
+        create: {
+          id: "main",
+          lastSignature: snapshot.signature,
+          lastSlot: snapshot.slot,
+          lastTxIndex: snapshot.txIndex,
+          source: snapshot.source ?? "websocket",
+          updatedAt: snapshot.updatedAt,
+        },
+        update: {
+          lastSignature: snapshot.signature,
+          lastSlot: snapshot.slot,
+          lastTxIndex: snapshot.txIndex,
+          source: snapshot.source ?? "websocket",
+          updatedAt: snapshot.updatedAt,
+        },
+      });
+    } else {
+      await restoreIndexerStateSnapshot(
+        snapshot.signature,
+        snapshot.slot,
+        snapshot.txIndex,
+        (snapshot.source as "poller" | "websocket" | "substreams" | null) ?? "websocket",
+        snapshot.updatedAt,
+      );
+    }
+    logger.info(
+      {
+        signature: snapshot.signature,
+        slot: snapshot.slot.toString(),
+        txIndex: snapshot.txIndex,
+      },
+      "Restored safe cursor snapshot after websocket shutdown"
+    );
+  }
+
+  private async clearSafeCursorSnapshotAfterStop(clearedAt: Date): Promise<void> {
+    const current = await this.loadCurrentCursorSnapshot();
+    if (!this.currentCursorIsOwnedByWebSocket(current) || (current?.lastSignature && current.lastSlot !== null)) {
+      logger.info(
+        {
+          currentSource: current?.source ?? null,
+          currentSignature: current?.lastSignature ?? null,
+          currentSlot: current?.lastSlot?.toString() ?? null,
+          currentTxIndex: current?.lastTxIndex ?? null,
+        },
+        "Skipped websocket cursor clear after shutdown"
+      );
+      return;
+    }
+
+    if (this.prisma) {
+      await this.prisma.indexerState.upsert({
+        where: { id: "main" },
+        create: {
+          id: "main",
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: null,
+          source: "websocket",
+          updatedAt: clearedAt,
+        },
+        update: {
+          lastSignature: null,
+          lastSlot: null,
+          lastTxIndex: null,
+          source: "websocket",
+          updatedAt: clearedAt,
+        },
+      });
+    } else {
+      await clearIndexerStateSnapshot("websocket", clearedAt);
+    }
+    logger.info("Cleared websocket cursor after shutdown because no safe snapshot existed");
   }
 
   private rememberPersistedCursor(
@@ -501,6 +662,22 @@ export class WebSocketIndexer {
     }
   }
 
+  private startReconciliationCheck(): void {
+    this.stopReconciliationCheck();
+    this.reconciliationTimer = setInterval(() => {
+      void this.runReconciliationCheck("periodic").catch((error) => {
+        logger.error({ error }, "Unhandled WebSocket reconciliation check error");
+      });
+    }, config.wsReconciliationIntervalMs);
+  }
+
+  private stopReconciliationCheck(): void {
+    if (this.reconciliationTimer) {
+      clearInterval(this.reconciliationTimer);
+      this.reconciliationTimer = null;
+    }
+  }
+
   private clearReconnectDelay(): void {
     if (this.reconnectDelayTimer) {
       clearTimeout(this.reconnectDelayTimer);
@@ -511,6 +688,139 @@ export class WebSocketIndexer {
     this.reconnectDelayResolve = null;
     this.reconnectDelayPromise = null;
     resolve?.();
+  }
+
+  private clearCanonicalFlushTimer(): void {
+    if (this.canonicalFlushTimer) {
+      clearTimeout(this.canonicalFlushTimer);
+      this.canonicalFlushTimer = null;
+    }
+  }
+
+  private markSignatureObserved(signature: string): void {
+    if (this.observedSignatures.has(signature)) {
+      return;
+    }
+    this.observedSignatures.add(signature);
+    this.observedSignatureOrder.push(signature);
+    while (this.observedSignatureOrder.length > RECENT_OBSERVED_SIGNATURE_LIMIT) {
+      const oldest = this.observedSignatureOrder.shift();
+      if (oldest) {
+        this.observedSignatures.delete(oldest);
+      }
+    }
+  }
+
+  private signatureIsKnownToPipeline(signature: string): boolean {
+    return (
+      this.lastPersistedCursor?.signature === signature ||
+      this.pendingLogNotifications.has(signature) ||
+      this.observedSignatures.has(signature)
+    );
+  }
+
+  private findUnobservedSuccessfulSignature(signatures: ConfirmedSignatureInfo[]): ConfirmedSignatureInfo | null {
+    return signatures.find((signature) =>
+      signature.err === null && !this.signatureIsKnownToPipeline(signature.signature)
+    ) ?? null;
+  }
+
+  private async runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
+    if (!this.isRunning || this.stopRequested || this.isReconciling) {
+      return false;
+    }
+    const cursor = this.lastPersistedCursor;
+    if (!cursor?.signature) {
+      return false;
+    }
+
+    this.isReconciling = true;
+    try {
+      const signatures = await this.connection.getSignaturesForAddress(this.programId, {
+        until: cursor.signature,
+        limit: RECONCILIATION_SIGNATURE_LIMIT,
+      });
+      if (!this.isRunning || this.stopRequested) {
+        return false;
+      }
+
+      const missed = this.findUnobservedSuccessfulSignature(signatures);
+      if (!missed) {
+        return false;
+      }
+
+      this.errorCount++;
+      this.restoreSessionStartCursorOnFailSafe();
+      this.scheduleFailSafeStop(
+        "WebSocket reconciliation found a successful program signature outside the live pipeline; entering fail-safe stop so polling catch-up can replay the gap",
+        {
+          reason,
+          signature: missed.signature,
+          slot: missed.slot,
+          cursorSignature: cursor.signature,
+          cursorSlot: cursor.slot.toString(),
+          cursorTxIndex: cursor.txIndex,
+          errorCount: this.errorCount,
+        }
+      );
+      return true;
+    } finally {
+      this.isReconciling = false;
+    }
+  }
+
+  private async waitForTransactionRetryDelay(ms: number): Promise<boolean> {
+    if (!this.isRunning || this.stopRequested || ms <= 0) {
+      return false;
+    }
+    return await new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(this.isRunning && !this.stopRequested), ms);
+    });
+  }
+
+  private async fetchParsedTransactionForIdentityLocks(
+    signature: string,
+    slot: number
+  ): Promise<ParsedTransactionWithMeta | null> {
+    const maxRetries = 5;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const tx = await this.connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        });
+        if (tx) {
+          return tx;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+
+      if (attempt >= maxRetries) {
+        break;
+      }
+      logger.warn(
+        {
+          signature,
+          slot,
+          attempt,
+          maxRetries,
+          error: lastError instanceof Error ? lastError.message : lastError === null ? "transaction unavailable" : String(lastError),
+        },
+        "Parsed transaction unavailable for identity lock enrichment; retrying"
+      );
+      const retryDelayMs = Math.min(5000, 500 * (2 ** (attempt - 1)));
+      if (!(await this.waitForTransactionRetryDelay(retryDelayMs))) {
+        return null;
+      }
+    }
+
+    const reason = lastError instanceof Error
+      ? lastError.message
+      : lastError === null
+        ? "transaction unavailable"
+        : String(lastError);
+    throw new Error(`Parsed transaction unavailable for identity lock enrichment: ${reason}`);
   }
 
   private waitForReconnectDelay(): Promise<void> {
@@ -568,9 +878,13 @@ export class WebSocketIndexer {
           return;
         }
         if (wsHealthy) {
+          const failSafeTriggered = await this.runReconciliationCheck("stale-health");
+          if (!this.isRunning || this.runToken !== runToken || failSafeTriggered) {
+            return;
+          }
           logger.info({
             timeSinceActivity,
-          }, "No WebSocket events but onLogs heartbeat probe is healthy - program may have low activity");
+          }, "No WebSocket events but onLogs heartbeat probe is healthy after reconciliation - program may have low activity");
           this.lastActivityTime = Date.now();
           return;
         }
@@ -604,36 +918,30 @@ export class WebSocketIndexer {
 
   private async forceReconnect(expectedSubscriptionId: number | null = this.subscriptionId): Promise<void> {
     const runToken = this.runToken;
-    // Concurrency guard - prevent overlapping reconnects
     if (this.isReconnecting) {
-      logger.debug("Reconnection already in progress, skipping");
+      logger.debug("WebSocket recovery already in progress, skipping");
       return;
     }
 
     this.isReconnecting = true;
     try {
-      logger.info("Forcing WebSocket reconnection...");
-
-      // Clean up existing subscription
-      if (expectedSubscriptionId !== null) {
-        try {
-          if (!this.isRunning || this.runToken !== runToken) {
-            return;
-          }
-          await this.connection.removeOnLogsListener(expectedSubscriptionId);
-        } catch (error) {
-          logger.debug({ error }, "Error removing old subscription during reconnect");
-        }
-        if (this.subscriptionId === expectedSubscriptionId) {
-          this.subscriptionId = null;
-        }
-      }
-
-      // Reconnect
       if (!this.isRunning || this.runToken !== runToken) {
         return;
       }
-      await this.reconnect(this.runToken);
+      if (expectedSubscriptionId !== null && this.subscriptionId !== expectedSubscriptionId) {
+        logger.debug(
+          { expectedSubscriptionId, currentSubscriptionId: this.subscriptionId },
+          "Skipping stale WebSocket recovery request"
+        );
+        return;
+      }
+
+      this.freezeCursorAdvancement = true;
+      logger.warn(
+        { subscriptionId: this.subscriptionId },
+        "WebSocket transport needs recovery; stopping live subscription so processor catch-up can close any missed-log gap before resubscribe"
+      );
+      await this.stop();
     } finally {
       this.isReconnecting = false;
     }
@@ -653,7 +961,7 @@ export class WebSocketIndexer {
 
           this.lastActivityTime = Date.now();
 
-          if (this.logQueue.size >= MAX_QUEUE_SIZE) {
+          if (this.logQueue.size + this.pendingLogNotifications.size >= MAX_QUEUE_SIZE) {
             this.errorCount++;
             this.droppedLogs++;
 
@@ -677,27 +985,8 @@ export class WebSocketIndexer {
             return;
           }
 
-          // Add to bounded queue instead of fire-and-forget
-          this.logQueue.add(async () => {
-            try {
-              await this.handleLogs(logs, ctx);
-            } catch (error) {
-              this.errorCount++;
-              logger.error({
-                error: error instanceof Error ? error.message : String(error),
-                signature: logs.signature,
-                errorCount: this.errorCount
-              }, "Error in handleLogs - caught by queue");
-
-              // If too many errors, force reconnect
-              if (this.errorCount > 10 && this.errorCount % 10 === 0) {
-                logger.warn({ errorCount: this.errorCount }, "High error count, scheduling reconnect");
-                this.forceReconnect().catch(e => {
-                  logger.error({ error: e }, "Failed to reconnect after errors");
-                });
-              }
-            }
-          });
+          this.markSignatureObserved(logs.signature);
+          this.enqueueLogNotification(logs, ctx);
         },
         "confirmed"
       );
@@ -733,7 +1022,205 @@ export class WebSocketIndexer {
     });
   }
 
-  private async handleLogs(logs: Logs, ctx: Context): Promise<void> {
+  private enqueueLogNotification(logs: Logs, ctx: Context): void {
+    if (!this.isRunning || this.stopRequested) {
+      return;
+    }
+
+    const existing = this.pendingLogNotifications.get(logs.signature);
+    this.pendingLogNotifications.set(logs.signature, {
+      logs,
+      ctx,
+      sequence: existing?.sequence ?? ++this.notificationSequence,
+    });
+
+    if (this.canonicalBufferMs === 0) {
+      this.flushPendingLogNotifications();
+      return;
+    }
+
+    if (!this.canonicalFlushTimer) {
+      this.canonicalFlushTimer = setTimeout(() => {
+        this.canonicalFlushTimer = null;
+        this.flushPendingLogNotifications();
+      }, this.canonicalBufferMs);
+    }
+  }
+
+  private flushPendingLogNotifications(): void {
+    if (
+      this.pendingLogNotifications.size === 0 ||
+      !this.isRunning ||
+      this.stopRequested ||
+      this.processingHoldCount > 0
+    ) {
+      return;
+    }
+
+    this.clearCanonicalFlushTimer();
+    const batch = [...this.pendingLogNotifications.values()];
+    this.pendingLogNotifications.clear();
+
+    this.logQueue.add(async () => {
+      try {
+        await this.processLogNotificationBatch(batch);
+      } catch (error) {
+        this.errorCount++;
+        logger.error({
+          error: error instanceof Error ? error.message : String(error),
+          errorCount: this.errorCount
+        }, "Error in WebSocket log batch - caught by queue");
+
+        this.scheduleFailSafeStop(
+          "WebSocket log processing failed; entering fail-safe stop so catch-up can replay from the last safe cursor",
+          {
+            error: error instanceof Error ? error.message : String(error),
+            errorCount: this.errorCount,
+          }
+        );
+      }
+    });
+  }
+
+  private async resolveLogOrder(logs: Logs, ctx: Context): Promise<ResolvedLogOrder> {
+    try {
+      const block = await this.connection.getBlock(ctx.slot, {
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        transactionDetails: "full",
+      });
+      if (block?.transactions) {
+        const idx = block.transactions.findIndex(
+          (tx) => tx.transaction.signatures[0] === logs.signature,
+        );
+        return {
+          txIndex: idx >= 0 ? idx : undefined,
+          blockTimeSeconds: block.blockTime,
+        };
+      }
+      return {
+        txIndex: undefined,
+        blockTimeSeconds: block?.blockTime,
+      };
+    } catch (blockError) {
+      logger.debug(
+        { slot: ctx.slot, error: blockError instanceof Error ? blockError.message : String(blockError) },
+        "Failed to resolve tx_index from block (non-fatal)",
+      );
+      return { txIndex: undefined, blockTimeSeconds: undefined };
+    }
+  }
+
+  private async processLogNotificationBatch(batch: BufferedLogNotification[]): Promise<void> {
+    const resolved: ResolvedLogNotification[] = [];
+    for (const entry of batch) {
+      if (!this.isRunning || this.stopRequested) {
+        return;
+      }
+      resolved.push({
+        ...entry,
+        order: await this.resolveLogOrder(entry.logs, entry.ctx),
+      });
+    }
+
+    const unresolved = resolved.find((entry) => entry.order.txIndex === undefined);
+    if (unresolved) {
+      this.errorCount++;
+      this.scheduleFailSafeStop(
+        "Deterministic tx_index unavailable in websocket batch; entering fail-safe stop before processing partial canonical order",
+        {
+          slot: unresolved.ctx.slot,
+          signature: unresolved.logs.signature,
+          errorCount: this.errorCount,
+        }
+      );
+      return;
+    }
+
+    resolved.sort((a, b) => {
+      const order = compareCanonicalTransactionOrder(
+        { slot: a.ctx.slot, txIndex: a.order.txIndex, signature: a.logs.signature },
+        { slot: b.ctx.slot, txIndex: b.order.txIndex, signature: b.logs.signature }
+      );
+      return order !== 0 ? order : a.sequence - b.sequence;
+    });
+
+    for (const entry of resolved) {
+      if (!this.isRunning || this.stopRequested) {
+        return;
+      }
+      try {
+        await this.handleLogs(entry.logs, entry.ctx, entry.order);
+      } catch (error) {
+        this.errorCount++;
+        logger.error({
+          error: error instanceof Error ? error.message : String(error),
+          signature: entry.logs.signature,
+          errorCount: this.errorCount
+        }, "Error in handleLogs - caught by queue");
+
+        this.scheduleFailSafeStop(
+          "WebSocket log processing failed; entering fail-safe stop so catch-up can replay from the last safe cursor",
+          {
+            signature: entry.logs.signature,
+            error: error instanceof Error ? error.message : String(error),
+            errorCount: this.errorCount,
+          }
+        );
+        return;
+      }
+    }
+  }
+
+  private async loadCurrentCursorSnapshot(): Promise<CurrentCursorSnapshot | null> {
+    if (this.prisma) {
+      const current = await this.prisma.indexerState.findUnique({
+        where: { id: "main" },
+        select: {
+          lastSignature: true,
+          lastSlot: true,
+          lastTxIndex: true,
+          source: true,
+          updatedAt: true,
+        },
+      });
+      if (!current) {
+        return null;
+      }
+      return {
+        lastSignature: current.lastSignature ?? null,
+        lastSlot: current.lastSlot === null || current.lastSlot === undefined
+          ? null
+          : BigInt(current.lastSlot),
+        lastTxIndex: current.lastTxIndex ?? null,
+        source: current.source ?? null,
+        updatedAt: current.updatedAt ?? null,
+      };
+    }
+
+    const current = await loadIndexerStateSnapshot();
+    if (!current) {
+      return null;
+    }
+    return {
+      lastSignature: current.lastSignature,
+      lastSlot: current.lastSlot,
+      lastTxIndex: current.lastTxIndex,
+      source: current.source,
+      updatedAt: current.updatedAt,
+    };
+  }
+
+  private restoreSessionStartCursorOnFailSafe(): void {
+    this.lastPersistedCursor = this.sessionStartCursor
+      ? { ...this.sessionStartCursor }
+      : null;
+  }
+
+  private async handleLogs(
+    logs: Logs,
+    ctx: Context,
+    resolvedOrder?: ResolvedLogOrder
+  ): Promise<void> {
     if (logs.err) {
       logger.debug({ signature: logs.signature }, "Transaction failed, skipping");
       return;
@@ -756,9 +1243,7 @@ export class WebSocketIndexer {
 
       if (shouldEnrichIdentityLocks) {
         try {
-          parsedTx = await this.connection.getParsedTransaction(logs.signature, {
-            maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
-          });
+          parsedTx = await this.fetchParsedTransactionForIdentityLocks(logs.signature, ctx.slot);
           if (!this.isRunning || this.stopRequested) return;
 
           if (parsedTx) {
@@ -768,17 +1253,34 @@ export class WebSocketIndexer {
             }
           }
         } catch (txFetchError) {
-          logger.debug(
+          this.errorCount++;
+          this.scheduleFailSafeStop(
+            "WebSocket could not enrich identity lock fields; entering fail-safe stop so polling catch-up can replay with full transaction data",
             {
               signature: logs.signature,
+              slot: ctx.slot,
               error: txFetchError instanceof Error ? txFetchError.message : String(txFetchError),
+              errorCount: this.errorCount,
             },
-            "Failed to fetch parsed transaction for identity lock enrichment (non-fatal)"
           );
+          return;
         }
       }
 
-      if (events.length === 0) return;
+      if (events.length === 0) {
+        if (hasProgramDataLogsForProgram(logs.logs, this.programId.toBase58())) {
+          this.errorCount++;
+          this.scheduleFailSafeStop(
+            "WebSocket received program data logs but decoded no events; entering fail-safe stop so polling catch-up can retry with full transaction data",
+            {
+              signature: logs.signature,
+              slot: ctx.slot,
+              errorCount: this.errorCount,
+            }
+          );
+        }
+        return;
+      }
 
       logger.debug(
         { signature: logs.signature, eventCount: events.length, slot: ctx.slot },
@@ -789,27 +1291,17 @@ export class WebSocketIndexer {
       let blockTimeSeconds: number | null | undefined = parsedTx?.blockTime;
 
       // Resolve tx_index from block for metadata/tie-break parity with other indexers
-      let txIndex: number | undefined;
-      try {
-        const block = await this.connection.getBlock(ctx.slot, {
-          maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
-          transactionDetails: "full",
-        });
+      let txIndex = resolvedOrder?.txIndex;
+      if (resolvedOrder?.blockTimeSeconds !== undefined) {
+        blockTimeSeconds = resolvedOrder.blockTimeSeconds;
+      }
+      if (!resolvedOrder) {
+        const order = await this.resolveLogOrder(logs, ctx);
         if (!this.isRunning || this.stopRequested) return;
-        if (block?.blockTime !== null && block?.blockTime !== undefined) {
-          blockTimeSeconds = block.blockTime;
+        txIndex = order.txIndex;
+        if (order.blockTimeSeconds !== undefined) {
+          blockTimeSeconds = order.blockTimeSeconds;
         }
-        if (block?.transactions) {
-          const idx = block.transactions.findIndex(
-            (tx) => tx.transaction.signatures[0] === logs.signature,
-          );
-          if (idx >= 0) txIndex = idx;
-        }
-      } catch (blockError) {
-        logger.debug(
-          { slot: ctx.slot, error: blockError instanceof Error ? blockError.message : String(blockError) },
-          "Failed to resolve tx_index from block (non-fatal)",
-        );
       }
 
       if (txIndex === undefined) {
@@ -825,6 +1317,55 @@ export class WebSocketIndexer {
         return;
       }
 
+      const currentCursor = await this.loadCurrentCursorSnapshot();
+      if (!this.isRunning || this.stopRequested) return;
+      const nextSlot = BigInt(ctx.slot);
+      if (
+        currentCursor?.lastSlot !== null
+        && currentCursor?.lastSlot !== undefined
+        && !shouldAdvanceCursor(
+          currentCursor.lastSlot,
+          currentCursor.lastTxIndex,
+          currentCursor.lastSignature,
+          nextSlot,
+          txIndex,
+          logs.signature
+        )
+      ) {
+        if (currentCursor.source === "poller" || currentCursor.source === "substreams") {
+          logger.debug(
+            {
+              signature: logs.signature,
+              slot: ctx.slot,
+              txIndex,
+              cursorSlot: currentCursor.lastSlot.toString(),
+              cursorTxIndex: currentCursor.lastTxIndex,
+              cursorSignature: currentCursor.lastSignature,
+              cursorSource: currentCursor.source,
+            },
+            "Skipping WebSocket log already covered by canonical cursor"
+          );
+          return;
+        }
+
+        this.errorCount++;
+        this.restoreSessionStartCursorOnFailSafe();
+        this.scheduleFailSafeStop(
+          "WebSocket observed an older notification after its own durable cursor advanced; restoring session-start cursor so catch-up can replay the gap",
+          {
+            signature: logs.signature,
+            slot: ctx.slot,
+            txIndex,
+            cursorSlot: currentCursor.lastSlot.toString(),
+            cursorTxIndex: currentCursor.lastTxIndex,
+            cursorSignature: currentCursor.lastSignature,
+            cursorSource: currentCursor.source,
+            errorCount: this.errorCount,
+          }
+        );
+        return;
+      }
+
       const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
       const typedEvents: Array<{
         typedEvent: ProgramEvent;
@@ -834,7 +1375,18 @@ export class WebSocketIndexer {
       for (const [eventOrdinal, event] of events.entries()) {
         const typedEvent = toTypedEvent(event);
         if (!typedEvent) {
-          continue;
+          this.errorCount++;
+          this.scheduleFailSafeStop(
+            "WebSocket decoded an unsupported program event; entering fail-safe stop instead of advancing past an unknown event",
+            {
+              signature: logs.signature,
+              slot: ctx.slot,
+              eventOrdinal,
+              eventName: event.name,
+              errorCount: this.errorCount,
+            }
+          );
+          return;
         }
         typedEvents.push({
           typedEvent,
@@ -914,8 +1466,14 @@ export class WebSocketIndexer {
         // Only advance cursor if ALL events in this tx were processed successfully
         if (!allEventsProcessed) {
           this.errorCount++;
-          logger.warn({ signature: logs.signature, slot: ctx.slot },
-            "Skipping cursor update — failed event(s) in this tx will be retried on restart");
+          this.scheduleFailSafeStop(
+            "WebSocket transaction processing failed; entering fail-safe stop so catch-up can replay from the last safe cursor",
+            {
+              signature: logs.signature,
+              slot: ctx.slot,
+              errorCount: this.errorCount,
+            }
+          );
           return;
         }
 
@@ -1021,10 +1579,17 @@ export class WebSocketIndexer {
             );
           }
         } catch (stateError) {
-          logger.error({
-            error: stateError instanceof Error ? stateError.message : String(stateError),
-            signature: logs.signature
-          }, "Failed to save indexer state");
+          this.errorCount++;
+          this.scheduleFailSafeStop(
+            "Failed to save websocket cursor after processing transaction; entering fail-safe stop so catch-up can reconcile durable state",
+            {
+              error: stateError instanceof Error ? stateError.message : String(stateError),
+              signature: logs.signature,
+              slot: ctx.slot,
+              errorCount: this.errorCount,
+            }
+          );
+          return;
         }
 
         this.processedCount++;
@@ -1127,7 +1692,7 @@ export class WebSocketIndexer {
       processedCount: this.processedCount,
       errorCount: this.errorCount,
       lastActivity: this.lastActivityTime,
-      queueSize: this.logQueue.size,
+      queueSize: this.logQueue.size + this.pendingLogNotifications.size,
       droppedLogs: this.droppedLogs,
     };
   }

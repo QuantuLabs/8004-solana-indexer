@@ -171,6 +171,7 @@ import {
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
   createMockConnection,
+  createMockSignatureInfo,
   createEventLogs,
   encodeAnchorEvent,
   TEST_SIGNATURE,
@@ -179,6 +180,7 @@ import {
   TEST_ASSET,
   TEST_OWNER,
   TEST_COLLECTION,
+  TEST_CLIENT,
   TEST_REGISTRY,
 } from "../../mocks/solana.js";
 
@@ -387,6 +389,25 @@ describe("WebSocketIndexer", () => {
       await wsIndexer.stop();
 
       expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
+    });
+
+    it("should return the same in-flight stop promise to concurrent callers", async () => {
+      let releaseRemove!: () => void;
+      (mockConnection.removeOnLogsListener as any).mockImplementationOnce(
+        () => new Promise<void>((resolve) => {
+          releaseRemove = resolve;
+        })
+      );
+
+      await wsIndexer.start();
+
+      const firstStop = wsIndexer.stop();
+      const secondStop = wsIndexer.stop();
+
+      expect(secondStop).toBe(firstStop);
+      releaseRemove();
+      await firstStop;
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledTimes(1);
     });
 
     it("should handle stop when not started", async () => {
@@ -650,6 +671,53 @@ describe("WebSocketIndexer", () => {
       }
     });
 
+    it("should skip Supabase cursor restore after another source takes ownership", async () => {
+      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
+      vi.mocked(loadIndexerStateSnapshot)
+        .mockResolvedValueOnce({
+          lastSignature: "safe-signature",
+          lastSlot: 41n,
+          lastTxIndex: 2,
+          source: "websocket",
+          updatedAt: safeUpdatedAt,
+        })
+        .mockResolvedValueOnce({
+          lastSignature: "poller-signature",
+          lastSlot: 42n,
+          lastTxIndex: 0,
+          source: "poller",
+          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+        });
+
+      const supabaseIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+      });
+
+      try {
+        await supabaseIndexer.start();
+        let releaseWork!: () => void;
+        ((supabaseIndexer as any).logQueue).add(
+          () => new Promise<void>((resolve) => {
+            releaseWork = () => resolve();
+          })
+        );
+        for (let i = 0; i < 20 && !releaseWork; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        const stopPromise = supabaseIndexer.stop();
+        releaseWork();
+        await stopPromise;
+
+        expect(restoreIndexerStateSnapshot).not.toHaveBeenCalled();
+      } finally {
+        await supabaseIndexer.stop();
+      }
+    });
+
     it("should clear the Supabase cursor on shutdown when no safe snapshot exists yet", async () => {
       vi.mocked(loadIndexerStateSnapshot).mockResolvedValueOnce(null);
 
@@ -683,6 +751,47 @@ describe("WebSocketIndexer", () => {
         await supabaseIndexer.stop();
       }
     });
+
+    it("should skip Supabase cursor clear after another source takes ownership", async () => {
+      vi.mocked(loadIndexerStateSnapshot)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          lastSignature: "poller-signature",
+          lastSlot: 42n,
+          lastTxIndex: 0,
+          source: "poller",
+          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+        });
+
+      const supabaseIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+      });
+
+      try {
+        await supabaseIndexer.start();
+        let releaseWork!: () => void;
+        ((supabaseIndexer as any).logQueue).add(
+          () => new Promise<void>((resolve) => {
+            releaseWork = () => resolve();
+          })
+        );
+        for (let i = 0; i < 20 && !releaseWork; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+
+        const stopPromise = supabaseIndexer.stop();
+        releaseWork();
+        await stopPromise;
+
+        expect(clearIndexerStateSnapshot).not.toHaveBeenCalled();
+      } finally {
+        await supabaseIndexer.stop();
+      }
+    });
   });
 
   describe("isActive", () => {
@@ -698,6 +807,73 @@ describe("WebSocketIndexer", () => {
     it("should return false after stop", async () => {
       await wsIndexer.start();
       await wsIndexer.stop();
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+  });
+
+  describe("holdProcessing/releaseProcessing", () => {
+    it("should buffer notifications while held and flush through the canonical batch path on release", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      const batchSpy = vi
+        .spyOn(wsIndexer as any, "processLogNotificationBatch")
+        .mockResolvedValue(undefined);
+
+      wsIndexer.holdProcessing();
+      await wsIndexer.start();
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs: ["Program log: held"] },
+        { slot: Number(TEST_SLOT) }
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(batchSpy).not.toHaveBeenCalled();
+      expect(wsIndexer.getStats().queueSize).toBe(1);
+
+      wsIndexer.releaseProcessing();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(batchSpy).toHaveBeenCalledTimes(1);
+      expect(batchSpy.mock.calls[0][0][0]).toEqual(
+        expect.objectContaining({
+          logs: expect.objectContaining({ signature: TEST_SIGNATURE }),
+          ctx: { slot: Number(TEST_SLOT) },
+        })
+      );
+    });
+  });
+
+  describe("reconciliation", () => {
+    it("should enter fail-safe stop when a successful signature newer than the cursor was not observed by the pipeline", async () => {
+      mockPrisma.indexerState.findUnique.mockResolvedValueOnce({
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      } as any);
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        createMockSignatureInfo("missed-sig", 101, null),
+        createMockSignatureInfo("failed-sig", 102, { InstructionError: [0, "Custom"] }),
+      ]);
+
+      await wsIndexer.start();
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(triggered).toBe(true);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
+        TEST_PROGRAM_ID,
+        { until: "cursor-sig", limit: 25 }
+      );
+      expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
       expect(wsIndexer.isActive()).toBe(false);
     });
   });
@@ -819,6 +995,129 @@ describe("WebSocketIndexer", () => {
       expect(mockPrisma.agent.upsert).toHaveBeenCalled();
     });
 
+    it("should process buffered same-slot notifications in tx_index order", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      wsIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+        canonicalBufferMs: 10,
+      });
+
+      const firstSignature = TEST_SIGNATURE;
+      const laterSignature = "7wHu1qwD7q2ggbJqCPtxnHZ2TrLQfEV9B7NqcBYBqzXh9J6vQQYc4Kdb8ZnZJwZqNjKt1QZcJZGJ";
+      const firstLogs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmFirst",
+      });
+      const laterLogs = createEventLogs("AgentRegistered", {
+        asset: TEST_CLIENT,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmLater",
+      });
+
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue(null);
+      (mockConnection.getBlock as any).mockResolvedValue({
+        blockTime: 123,
+        transactions: [
+          { transaction: { signatures: [firstSignature] } },
+          { transaction: { signatures: [laterSignature] } },
+        ],
+      });
+
+      await wsIndexer.start();
+
+      logsHandler!({ signature: laterSignature, err: null, logs: laterLogs }, { slot: Number(TEST_SLOT) });
+      logsHandler!({ signature: firstSignature, err: null, logs: firstLogs }, { slot: Number(TEST_SLOT) });
+
+      await new Promise((r) => setTimeout(r, 30));
+      await ((wsIndexer as any).logQueue).onIdle();
+
+      const upsertedAssets = mockPrisma.agent.upsert.mock.calls.map(([args]) => args?.create?.id);
+      expect(upsertedAssets.slice(0, 2)).toEqual([
+        TEST_ASSET.toBase58(),
+        TEST_CLIENT.toBase58(),
+      ]);
+    });
+
+    it("should restore session-start cursor when an older notification arrives behind a websocket cursor", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
+      const safeSignature = "safe-session-start-signature";
+      const laterSignature = "7wHu1qwD7q2ggbJqCPtxnHZ2TrLQfEV9B7NqcBYBqzXh9J6vQQYc4Kdb8ZnZJwZqNjKt1QZcJZGJ";
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmStale",
+      });
+
+      (mockPrisma.indexerState.findUnique as any)
+        .mockResolvedValueOnce({
+          lastSignature: safeSignature,
+          lastSlot: 41n,
+          lastTxIndex: 2,
+          source: "poller",
+          updatedAt: safeUpdatedAt,
+        })
+        .mockResolvedValueOnce({
+          lastSignature: laterSignature,
+          lastSlot: TEST_SLOT,
+          lastTxIndex: 1,
+          source: "websocket",
+          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+        });
+      (mockConnection.getBlock as any).mockResolvedValue({
+        blockTime: 123,
+        transactions: [
+          { transaction: { signatures: [TEST_SIGNATURE] } },
+          { transaction: { signatures: [laterSignature] } },
+        ],
+      });
+
+      await wsIndexer.start();
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+
+      await new Promise((r) => setTimeout(r, 100));
+      await ((wsIndexer as any).logQueue).onIdle().catch(() => undefined);
+
+      expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            lastSignature: safeSignature,
+            lastSlot: 41n,
+            lastTxIndex: 2,
+            source: "poller",
+            updatedAt: safeUpdatedAt,
+          }),
+        })
+      );
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
     it("should enter fail-safe stop and avoid writes when tx_index cannot be resolved", async () => {
       let logsHandler: (logs: any, ctx: any) => void;
       (mockConnection.onLogs as any).mockImplementation(
@@ -906,6 +1205,52 @@ describe("WebSocketIndexer", () => {
       });
     });
 
+    it("should fail-stop and prevent later queued logs from advancing after a transaction failure", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+
+      const firstSignature = TEST_SIGNATURE;
+      const laterSignature = "7wHu1qwD7q2ggbJqCPtxnHZ2TrLQfEV9B7NqcBYBqzXh9J6vQQYc4Kdb8ZnZJwZqNjKt1QZcJZGJ";
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmFailStop",
+      });
+
+      (mockConnection.getBlock as any)
+        .mockResolvedValueOnce({
+          blockTime: 123,
+          transactions: [{ transaction: { signatures: [firstSignature] } }],
+        })
+        .mockResolvedValueOnce({
+          blockTime: 124,
+          transactions: [{ transaction: { signatures: [laterSignature] } }],
+        });
+      (mockPrisma.agent.upsert as any).mockRejectedValueOnce(new Error("DB error"));
+
+      await wsIndexer.start();
+
+      logsHandler!({ signature: firstSignature, err: null, logs }, { slot: Number(TEST_SLOT) });
+      logsHandler!({ signature: laterSignature, err: null, logs }, { slot: Number(TEST_SLOT) + 1 });
+
+      await new Promise((r) => setTimeout(r, 150));
+      await ((wsIndexer as any).logQueue).onIdle().catch(() => undefined);
+
+      const advancedToLaterSignature = mockPrisma.indexerState.upsert.mock.calls.some(([args]) => (
+        args?.update?.lastSignature === laterSignature || args?.create?.lastSignature === laterSignature
+      ));
+      expect(advancedToLaterSignature).toBe(false);
+      expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
     it("should not advance cursor when ProofPass upsert fails after event processing", async () => {
       let logsHandler: (logs: any, ctx: any) => void;
       (mockConnection.onLogs as any).mockImplementation(
@@ -951,7 +1296,11 @@ describe("WebSocketIndexer", () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect(upsertProofPassMatches).toHaveBeenCalledTimes(1);
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      const advancedToProofPassSignature = mockPrisma.indexerState.upsert.mock.calls.some(([args]) => (
+        args?.update?.lastSignature === TEST_SIGNATURE || args?.create?.lastSignature === TEST_SIGNATURE
+      ));
+      expect(advancedToProofPassSignature).toBe(false);
+      expect(wsIndexer.isActive()).toBe(false);
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           eventType: "PROCESSING_FAILED",
@@ -1107,7 +1456,11 @@ describe("WebSocketIndexer", () => {
 
       await new Promise((r) => setTimeout(r, 50));
 
-      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+      const advancedToFailedSignature = mockPrisma.indexerState.upsert.mock.calls.some(([args]) => (
+        args?.update?.lastSignature === TEST_SIGNATURE || args?.create?.lastSignature === TEST_SIGNATURE
+      ));
+      expect(advancedToFailedSignature).toBe(false);
+      expect(wsIndexer.isActive()).toBe(false);
       expect(mockPrisma.eventLog.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           eventType: "PROCESSING_FAILED",

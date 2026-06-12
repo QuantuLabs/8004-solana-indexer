@@ -477,7 +477,7 @@ async function replayPolling(entries: ReplayEntry[]): Promise<ReplayResult> {
   });
 }
 
-async function replayWebsocket(entries: ReplayEntry[]): Promise<ReplayResult> {
+async function replayWebsocket(entries: ReplayEntry[], options?: { viaLiveQueue?: boolean }): Promise<ReplayResult> {
   return withTempPrisma("idx-mode-websocket", async (prisma) => {
     const { connection, counters } = createInstrumentedConnection(new Connection(rpcUrl, {
       wsEndpoint: wsUrl,
@@ -487,20 +487,36 @@ async function replayWebsocket(entries: ReplayEntry[]): Promise<ReplayResult> {
       connection,
       prisma,
       programId,
+      canonicalBufferMs: options?.viaLiveQueue ? 10 : 0,
     });
     (wsIndexer as any).isRunning = true;
     (wsIndexer as any).stopRequested = false;
     (wsIndexer as any).freezeCursorAdvancement = false;
 
-    for (const entry of entries) {
-      await (wsIndexer as any).handleLogs(
-        {
-          err: null,
-          logs: entry.parsedTx.meta?.logMessages || [],
-          signature: entry.signatureInfo.signature,
-        } as Logs,
-        { slot: entry.signatureInfo.slot } as Context
-      );
+    if (options?.viaLiveQueue) {
+      for (const entry of entries) {
+        (wsIndexer as any).enqueueLogNotification(
+          {
+            err: null,
+            logs: entry.parsedTx.meta?.logMessages || [],
+            signature: entry.signatureInfo.signature,
+          } as Logs,
+          { slot: entry.signatureInfo.slot } as Context
+        );
+      }
+      await sleep(20);
+      await (wsIndexer as any).logQueue.onIdle();
+    } else {
+      for (const entry of entries) {
+        await (wsIndexer as any).handleLogs(
+          {
+            err: null,
+            logs: entry.parsedTx.meta?.logMessages || [],
+            signature: entry.signatureInfo.signature,
+          } as Logs,
+          { slot: entry.signatureInfo.slot } as Context
+        );
+      }
     }
 
     return {
@@ -690,7 +706,7 @@ describe.sequential("E2E: Devnet bounded local mode parity", () => {
     }
 
     const polling = await replayPolling(replayEntries);
-    const websocketReordered = await replayWebsocket(reverseWithinSlots(replayEntries));
+    const websocketReordered = await replayWebsocket(reverseWithinSlots(replayEntries), { viaLiveQueue: true });
 
     expect(websocketReordered.snapshot).toEqual(polling.snapshot);
   }, 120000);

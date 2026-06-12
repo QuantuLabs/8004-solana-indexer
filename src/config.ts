@@ -337,6 +337,11 @@ export const config = {
     10
   ),
   wsMaxRetries: parseInt(process.env.WS_MAX_RETRIES || "5", 10),
+  wsCanonicalBufferMs: parseNonNegativeInt(
+    process.env.WS_CANONICAL_BUFFER_MS,
+    process.env.NODE_ENV === "test" || process.env.VITEST !== undefined ? 0 : 500
+  ),
+  wsReconciliationIntervalMs: parsePositiveInt(process.env.WS_RECONCILIATION_INTERVAL_MS, 600000),
 
   // Logging
   logLevel: process.env.LOG_LEVEL || "info",
@@ -410,6 +415,10 @@ export function validateConfig(): void {
     console.warn(
       `[CONFIG WARNING] INDEXER_MODE=${config.indexerMode} with no INDEXER_START_SIGNATURE and a public/non-HTTP RPC_URL may run as realtime-only ingestion when historical RPC backfill is unavailable. Use a reliable archival RPC and/or set INDEXER_START_SIGNATURE (+ INDEXER_START_SLOT).`
     );
+  }
+
+  if (config.wsReconciliationIntervalMs < 60000) {
+    throw new Error("WS_RECONCILIATION_INTERVAL_MS must be at least 60000");
   }
 
   // Validate Supabase config when in supabase mode
