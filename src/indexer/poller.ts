@@ -26,6 +26,7 @@ import { metadataQueue } from "./metadata-queue.js";
 import { matchProofPassFeedbacks } from "../extras/proofpass.js";
 import { upsertProofPassMatches } from "../db/proofpass.js";
 import type { NewFeedback } from "../parser/types.js";
+import { compareCanonicalTransactionOrder } from "./canonical-order.js";
 
 const logger = createChildLogger("poller");
 
@@ -63,19 +64,11 @@ function shouldAdvanceCursor(
   nextSignature: string
 ): boolean {
   if (currentSlot === null || currentSlot === undefined) return true;
-  if (nextSlot > currentSlot) return true;
-  if (nextSlot < currentSlot) return false;
-  const currentOrderTxIndex = currentTxIndex ?? -1;
-  const nextOrderTxIndex = nextTxIndex ?? -1;
-  if (nextOrderTxIndex > currentOrderTxIndex) return true;
-  if (nextOrderTxIndex < currentOrderTxIndex) return false;
   if (!currentSignature) return true;
-  return nextSignature >= currentSignature;
-}
-
-function compareSignatures(a: string, b: string): number {
-  if (a === b) return 0;
-  return a < b ? -1 : 1;
+  return compareCanonicalTransactionOrder(
+    { slot: currentSlot, txIndex: currentTxIndex, signature: currentSignature },
+    { slot: nextSlot, txIndex: nextTxIndex, signature: nextSignature }
+  ) <= 0;
 }
 
 function compareTransactionCursor(
@@ -84,12 +77,10 @@ function compareTransactionCursor(
   bTxIndex: number | null | undefined,
   bSignature: string
 ): number {
-  const aOrderTxIndex = aTxIndex ?? -1;
-  const bOrderTxIndex = bTxIndex ?? -1;
-  if (aOrderTxIndex !== bOrderTxIndex) {
-    return aOrderTxIndex - bOrderTxIndex;
-  }
-  return compareSignatures(aSignature, bSignature);
+  return compareCanonicalTransactionOrder(
+    { slot: 0, txIndex: aTxIndex, signature: aSignature },
+    { slot: 0, txIndex: bTxIndex, signature: bSignature }
+  );
 }
 
 function hasProgramDataLogsForProgram(
@@ -1915,13 +1906,13 @@ export class Poller {
       let txIndexMap: Map<string, number | null>;
       try {
         txIndexMap = await this.getTxIndexMap(slot, sigs);
-        if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
+        if (hasUnresolvedTxIndex(txIndexMap, sigs)) {
           throw new Error(`Deterministic tx_index unavailable for slot ${slot}`);
         }
       } catch (error) {
         logger.fatal(
           { slot, error: error instanceof Error ? error.message : String(error) },
-          "Backfill aborted: deterministic tx_index unavailable for multi-transaction slot"
+          "Backfill aborted: deterministic tx_index unavailable"
         );
         throw (error instanceof Error ? error : new Error(String(error)));
       }
@@ -2056,12 +2047,15 @@ export class Poller {
           logger.warn({ slot, attempt, error: error instanceof Error ? error.message : String(error) }, "getBlock failed, retrying");
           const shouldRetry = await this.waitForDelay(500 * attempt);
           if (!shouldRetry) {
+            if (this.isRunning) {
+              throw new Error(`Deterministic tx_index unavailable for slot ${slot}`);
+            }
             sigs.forEach(sig => txIndexMap.set(sig.signature, null));
             break;
           }
         } else {
           logger.warn({ slot, sigCount: sigs.length }, "getBlock failed after retries, tx_index is unavailable");
-          sigs.forEach(sig => txIndexMap.set(sig.signature, null));
+          throw new Error(`Deterministic tx_index unavailable for slot ${slot}`);
         }
       }
     }
@@ -2120,6 +2114,10 @@ export class Poller {
 
   isCaughtUp(): boolean {
     return this.hasReachedLiveFrontier;
+  }
+
+  isActive(): boolean {
+    return this.isRunning;
   }
 
   private logNoSavedCursorWarning(source: "local" | "supabase"): void {
@@ -2484,7 +2482,7 @@ export class Poller {
         if (this.stopBeforeNewerSlot(slot, "polling")) break;
         const sigs = bySlot.get(slot)!;
         const txIndexMap = await this.getTxIndexMap(slot, sigs);
-        if (sigs.length > 1 && hasUnresolvedTxIndex(txIndexMap, sigs)) {
+        if (hasUnresolvedTxIndex(txIndexMap, sigs)) {
           throw new Error(`Deterministic tx_index unavailable for live slot ${slot}`);
         }
 
@@ -2697,7 +2695,7 @@ export class Poller {
                 sameSlotBefore = nextBefore;
                 if (!(await this.waitForDelay(100))) break;
               }
-              let stopTxIndex = this.lastTxIndex ?? -1;
+              let stopTxIndex = this.lastTxIndex ?? null;
               const sameSlotCursorEntries = [sig, ...sameSlotCandidates];
               try {
                 const sameSlotTxIndexMap = await this.getTxIndexMap(stopSlot, sameSlotCursorEntries);
@@ -2705,7 +2703,7 @@ export class Poller {
                   throw new Error(`Deterministic tx_index unavailable for pagination stop slot ${stopSlot}`);
                 }
                 if (sameSlotTxIndexMap.has(stopSignature)) {
-                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? -1;
+                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
                 }
                 sameSlotCandidates.sort((a, b) =>
                   compareTransactionCursor(
@@ -2796,7 +2794,7 @@ export class Poller {
                 sameSlotBefore = nextBefore;
                 if (!(await this.waitForDelay(100))) break;
               }
-              let stopTxIndex = this.lastTxIndex ?? -1;
+              let stopTxIndex = this.lastTxIndex ?? null;
               const stopCursorSignature: ConfirmedSignatureInfo = {
                 signature: stopSignature,
                 slot: stopSlot,
@@ -2812,7 +2810,7 @@ export class Poller {
                   throw new Error(`Deterministic tx_index unavailable for pagination slot boundary ${stopSlot}`);
                 }
                 if (sameSlotTxIndexMap.has(stopSignature)) {
-                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? -1;
+                  stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
                 }
                 sameSlotCandidates.sort((a, b) =>
                   compareTransactionCursor(

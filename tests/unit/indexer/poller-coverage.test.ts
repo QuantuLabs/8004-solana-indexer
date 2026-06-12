@@ -79,6 +79,120 @@ async function safeStopPoller(poller: any): Promise<void> {
   poller.eventBuffer = null;
 }
 
+const DEFAULT_BLOCK_SIGNATURES = [
+  TEST_SIGNATURE,
+  "backfill-stop-100",
+  "backfill-stop-101",
+  "bad-sig",
+  "checkpoint-1",
+  "checkpoint-2",
+  "cp-1",
+  "cp-2",
+  "cp-a",
+  "cp-b",
+  "cp-only",
+  "cursor-only-batch",
+  "err-idx-a",
+  "err-idx-b",
+  "error-a",
+  "error-b",
+  "error-single",
+  "fail-live-1",
+  "fail-live-2",
+  "fail-tx",
+  "far-back-sig",
+  "flush-sig",
+  "good-sig-1",
+  "good-sig-2",
+  "initial-1",
+  "initial-2",
+  "live-null-1",
+  "live-null-2",
+  "live-sig-1",
+  "live-sig-2",
+  "live-slot-a",
+  "live-slot-b",
+  "log-fail-tx",
+  "multi-sig-a",
+  "multi-sig-b",
+  "new-1",
+  "new-2",
+  "new-sig",
+  "new-sig-1",
+  "new-sig-2",
+  "new-sig-3",
+  "newest-1",
+  "newest-2",
+  "newest-sig",
+  "no-block-a",
+  "no-block-b",
+  "older-stop",
+  "older-stop-sig",
+  "oldest-1",
+  "oldest-2",
+  "oldest-3",
+  "original-last",
+  "partial-1",
+  "partial-boundary-a",
+  "partial-boundary-b",
+  "partial-new-a",
+  "partial-new-b",
+  "phase1-sig-1",
+  "phase1-sig-2",
+  "phase1-sig-3",
+  "prev-flush",
+  "prev-live-slot",
+  "prev-sig",
+  "prev-sig-2",
+  "prev-sig-3",
+  "prev-sig-batch-null",
+  "prev-sig-log",
+  "resume-stop",
+  "resumed-1",
+  "retry-a",
+  "retry-b",
+  "sig-a",
+  "sig-below-stop-slot",
+  "sig-cached",
+  "sig-fb-a",
+  "sig-fb-b",
+  "sig-j",
+  "sig-m",
+  "sig-n",
+  "sig-new-slot",
+  "sig-newer-same-slot",
+  "sig-old-slot",
+  "sig-older-same-slot",
+  "sig-q",
+  "sig-single",
+  "sig-slot-a",
+  "sig-slot-b",
+  "sig-start",
+  "sig-y",
+  "sig-z",
+  "single-live",
+  "single-sig",
+  "slot10-a",
+  "slot10-b",
+  "slot10-c",
+  "slot9-a",
+  "stop-at-this-sig",
+  "stop-sig-filter",
+  "stop-slot-100",
+  "stop-slot-101",
+  "window-sig-1",
+  "window-sig-2",
+  ...Array.from({ length: 400 }, (_, i) => `sig-${i}`),
+  ...Array.from({ length: 20 }, (_, i) => `sig-batch1-${i}`),
+  ...Array.from({ length: 20 }, (_, i) => `sig-batch2-${i}`),
+  ...Array.from({ length: 20 }, (_, i) => `progress-sig-${i}`),
+  ...Array.from({ length: 20 }, (_, i) => `stop-sig-${i}`),
+  ...Array.from({ length: 10 }, (_, i) => `gap-0-${i}`),
+  ...Array.from({ length: 10 }, (_, i) => `gap-1-${i}`),
+  ...Array.from({ length: 10 }, (_, i) => `large-gap-0-${i}`),
+  ...Array.from({ length: 10 }, (_, i) => `large-gap-5000-${i}`),
+];
+
 describe("Poller Coverage", () => {
   let poller: Poller;
   let mockConnection: ReturnType<typeof createMockConnection>;
@@ -93,6 +207,11 @@ describe("Poller Coverage", () => {
     (config as any).indexerStartSignature = null;
     (config as any).indexerStartSlot = null;
     (config as any).indexerStopSlot = null;
+    (mockConnection.getBlock as any).mockResolvedValue({
+      transactions: DEFAULT_BLOCK_SIGNATURES.map((signature) => ({
+        transaction: { signatures: [signature] },
+      })),
+    });
   });
 
   afterEach(async () => {
@@ -764,7 +883,7 @@ describe("Poller Coverage", () => {
       expect(result).toBeDefined();
     });
 
-    it("should return NULL tx_index when getBlock fails after retries", async () => {
+    it("should throw when getBlock fails after retries for a multi-signature slot", async () => {
       poller = new Poller({
         connection: mockConnection as any,
         prisma: mockPrisma,
@@ -778,12 +897,30 @@ describe("Poller Coverage", () => {
       const sig2 = createMockSignatureInfo("error-b", 400);
 
       (mockConnection as any).getBlock = vi.fn().mockRejectedValue(new Error("Block fetch failed"));
+      vi.spyOn(poller as any, "waitForDelay").mockResolvedValue(true);
 
-      const result = await (poller as any).getTxIndexMap(400, [sig1, sig2]);
+      await expect((poller as any).getTxIndexMap(400, [sig1, sig2]))
+        .rejects.toThrow("Deterministic tx_index unavailable for slot 400");
 
-      // After 3 retries, tx_index is null (not sequential fallback)
-      expect(result.get("error-a")).toBeNull();
-      expect(result.get("error-b")).toBeNull();
+      expect((mockConnection as any).getBlock).toHaveBeenCalledTimes(3);
+    });
+
+    it("should throw when getBlock fails after retries for a single-signature slot", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+
+      const sig = createMockSignatureInfo("error-single", 401);
+      (mockConnection as any).getBlock = vi.fn().mockRejectedValue(new Error("Block fetch failed"));
+      vi.spyOn(poller as any, "waitForDelay").mockResolvedValue(true);
+
+      await expect((poller as any).getTxIndexMap(401, [sig]))
+        .rejects.toThrow("Deterministic tx_index unavailable for slot 401");
       expect((mockConnection as any).getBlock).toHaveBeenCalledTimes(3);
     });
 
@@ -3339,7 +3476,7 @@ describe("Poller Coverage", () => {
       (mockConnection as any).getBlock = vi.fn().mockRejectedValue(new Error("Block unavailable"));
 
       await expect((poller as any).processNewTransactions()).rejects.toThrow(
-        "Deterministic tx_index unavailable for live slot 900"
+        "Deterministic tx_index unavailable for slot 900"
       );
 
       expect((poller as any).processedCount).toBe(0);

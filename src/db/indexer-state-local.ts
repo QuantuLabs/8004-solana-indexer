@@ -31,11 +31,11 @@ const SQLITE_INDEXER_STATE_UPSERT_SQL = `
      OR (
        "IndexerState"."lastSlot" = excluded."lastSlot"
        AND (
-         COALESCE("IndexerState"."lastTxIndex", -1)
-           < COALESCE(excluded."lastTxIndex", -1)
+         COALESCE("IndexerState"."lastTxIndex", 2147483647)
+           < COALESCE(excluded."lastTxIndex", 2147483647)
          OR (
-           COALESCE("IndexerState"."lastTxIndex", -1)
-             = COALESCE(excluded."lastTxIndex", -1)
+           COALESCE("IndexerState"."lastTxIndex", 2147483647)
+             = COALESCE(excluded."lastTxIndex", 2147483647)
            AND COALESCE("IndexerState"."lastSignature", '')
              <= excluded."lastSignature"
          )

@@ -496,6 +496,19 @@ describe("Poller", () => {
 
       vi.useRealTimers();
     });
+
+    it("should not advance a same-slot cursor from legacy null txIndex to a resolved lower txIndex", async () => {
+      const updatedAt = new Date("2026-03-14T00:00:00.000Z");
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSignature: "legacy-null-cursor",
+        lastSlot: TEST_SLOT,
+        lastTxIndex: null,
+      });
+
+      await (poller as any).saveState("resolved-lower-index", TEST_SLOT, 0, updatedAt);
+
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    });
   });
 
   describe("processNewTransactions", () => {

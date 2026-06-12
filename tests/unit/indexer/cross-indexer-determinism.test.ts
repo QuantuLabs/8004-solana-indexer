@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { compareCanonicalTransactionOrder } from "../../../src/indexer/canonical-order.js";
 
 /**
  * Cross-indexer determinism tests.
@@ -20,13 +21,10 @@ import { describe, it, expect } from "vitest";
 function deterministicSort<T extends { block_slot: bigint; tx_index: number | null; tx_signature: string }>(
   agents: T[],
 ): T[] {
-  return [...agents].sort((a, b) => {
-    if (a.block_slot !== b.block_slot) return Number(a.block_slot - b.block_slot);
-    const txA = a.tx_index ?? Number.MAX_SAFE_INTEGER;
-    const txB = b.tx_index ?? Number.MAX_SAFE_INTEGER;
-    if (txA !== txB) return txA - txB;
-    return a.tx_signature.localeCompare(b.tx_signature);
-  });
+  return [...agents].sort((a, b) => compareCanonicalTransactionOrder(
+    { slot: a.block_slot, txIndex: a.tx_index, signature: a.tx_signature },
+    { slot: b.block_slot, txIndex: b.tx_index, signature: b.tx_signature }
+  ));
 }
 
 /** SQL-equivalent sort with tx_index-first ordering and NULLS LAST tx_index tie-break */
