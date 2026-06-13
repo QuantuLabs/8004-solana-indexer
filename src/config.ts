@@ -24,6 +24,7 @@ const PUBLIC_RPC_HOSTS_WITH_LIMITED_HISTORY = new Set([
   "api.testnet.solana.com",
 ]);
 const TRUST_PROXY_NAMES = new Set(["loopback", "linklocal", "uniquelocal"]);
+const LOCAL_DATABASE_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "host.docker.internal"]);
 
 function resolvePreferredEnv(primaryKey: string, aliasKey: string): string | undefined {
   const primaryValue = process.env[primaryKey];
@@ -213,6 +214,22 @@ export function parseTrustProxyValue(value: string | undefined): string | number
   throw new Error(
     "Invalid TRUST_PROXY value. Use false, a non-negative hop count, loopback/linklocal/uniquelocal, or an IP/CIDR list."
   );
+}
+
+function parseSupabaseDsnHost(dsn: string | undefined): string | null {
+  const trimmed = dsn?.trim();
+  if (!trimmed) return null;
+
+  try {
+    return new URL(trimmed).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return null;
+  }
+}
+
+function isLocalDatabaseHost(host: string | null): boolean {
+  if (!host) return false;
+  return LOCAL_DATABASE_HOSTS.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
 function parseOptionalString(value: string | undefined): string | null {
@@ -449,6 +466,10 @@ export function validateConfig(): void {
 
   // Warn about disabled SSL verification
   if (!config.supabaseSslVerify) {
+    const dsnHost = parseSupabaseDsnHost(config.supabaseDsn);
+    if (config.supabaseDsn && !isLocalDatabaseHost(dsnHost)) {
+      throw new Error("SUPABASE_SSL_VERIFY=false is only allowed for local SUPABASE_DSN hosts");
+    }
     console.warn('[SECURITY WARNING] SUPABASE_SSL_VERIFY=false — TLS certificate verification is disabled for database connections. This is vulnerable to MITM attacks. Do NOT use in production.');
   }
 

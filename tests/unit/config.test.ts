@@ -352,11 +352,37 @@ describe("Config", () => {
 
     it("should warn when SUPABASE_SSL_VERIFY is false", async () => {
       process.env.SUPABASE_SSL_VERIFY = "false";
+      process.env.SUPABASE_DSN = "postgresql://postgres:postgres@127.0.0.1:5432/postgres";
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
       const { validateConfig } = await import("../../src/config.js");
       validateConfig();
 
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("SUPABASE_SSL_VERIFY=false")
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("should throw when SUPABASE_SSL_VERIFY is false for a remote DSN", async () => {
+      process.env.SUPABASE_SSL_VERIFY = "false";
+      process.env.SUPABASE_DSN = "postgresql://postgres:postgres@db.example.com:5432/postgres";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(
+        "SUPABASE_SSL_VERIFY=false is only allowed for local SUPABASE_DSN hosts"
+      );
+    });
+
+    it("should allow SUPABASE_SSL_VERIFY false for local sidecar DSNs", async () => {
+      process.env.SUPABASE_SSL_VERIFY = "false";
+      process.env.SUPABASE_DSN = "postgresql://postgres:postgres@host.docker.internal:5432/postgres";
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).not.toThrow();
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining("SUPABASE_SSL_VERIFY=false")
       );
