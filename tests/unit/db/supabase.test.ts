@@ -1400,6 +1400,7 @@ describe("supabase.ts", () => {
 
       it("should store response when feedback exists with matching hash", async () => {
         const storedHash = Buffer.from(TEST_HASH).toString("hex");
+        (ctx as any).eventOrdinal = 2;
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [{ id: "x", feedback_hash: storedHash }], rowCount: 1 })
           .mockResolvedValue({ rows: [], rowCount: 1 });
@@ -1413,10 +1414,14 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO feedback_responses")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![1][0]).toBe(
+          `${TEST_ASSET.toBase58()}:${TEST_CLIENT.toBase58()}:0:${TEST_RESPONDER.toBase58()}:${TEST_SIGNATURE}:2`
+        );
         expect(insertCall![1]).toContain("PENDING");
       });
 
       it("should store as orphan when feedback not found", async () => {
+        (ctx as any).eventOrdinal = 3;
         mockPoolInstance.query
           .mockResolvedValueOnce({ rows: [], rowCount: 0 })
           .mockResolvedValue({ rows: [], rowCount: 1 });
@@ -1430,6 +1435,12 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("INSERT INTO orphan_responses")
         );
         expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toContain(
+          "ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1)))"
+        );
+        expect(insertCall![1][0]).toBe(
+          `${TEST_ASSET.toBase58()}:${TEST_CLIENT.toBase58()}:0:${TEST_RESPONDER.toBase58()}:${TEST_SIGNATURE}:3`
+        );
         expect(insertCall![1]).toContain(Buffer.from(TEST_HASH).toString("hex"));
       });
 

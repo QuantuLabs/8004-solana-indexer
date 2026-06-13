@@ -699,6 +699,7 @@ describe("DB Handlers", () => {
           feedbackHash: Uint8Array.from(TEST_HASH),
         };
         (prisma.feedback.findUnique as any).mockResolvedValue(mockFeedback);
+        ctx.eventOrdinal = 5;
 
         const event: ProgramEvent = {
           type: "ResponseAppended",
@@ -720,6 +721,14 @@ describe("DB Handlers", () => {
 
         expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
           expect.objectContaining({
+            where: {
+              feedbackId_responder_txSignature_eventOrdinal: {
+                feedbackId: "feedback-uuid",
+                responder: TEST_OWNER.toBase58(),
+                txSignature: TEST_SIGNATURE,
+                eventOrdinal: 5,
+              },
+            },
             create: expect.objectContaining({
               feedbackId: "feedback-uuid",
               responder: TEST_OWNER.toBase58(),

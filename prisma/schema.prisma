@@ -224,7 +224,7 @@ model FeedbackResponse {
 
   feedback Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
 
-  @@unique([feedbackId, responder, txSignature])
+  @@unique([feedbackId, responder, txSignature, eventOrdinal])
   @@unique([feedbackId, responseId])
   @@index([feedbackId])
   @@index([feedbackId, responseId])
@@ -277,7 +277,7 @@ model OrphanResponse {
   txIndex        Int?
   eventOrdinal   Int?
 
-  @@unique([agentId, client, feedbackIndex, responder, txSignature])
+  @@unique([agentId, client, feedbackIndex, responder, txSignature, eventOrdinal])
   @@index([agentId])
   @@index([agentId, client, feedbackIndex])
 }

@@ -1146,6 +1146,14 @@ describe("EventBuffer", () => {
     });
 
     it("should insert ResponseAppended event", async () => {
+      const client = mockPool._client;
+      client.query.mockImplementation((sql: string) => {
+        if (typeof sql === "string" && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
+          return { rows: [{ id: "f1", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
         makeEvent("ResponseAppended", {
@@ -1156,11 +1164,15 @@ describe("EventBuffer", () => {
           responseUri: "https://example.com/response",
           responseHash: new Uint8Array(32).fill(0xef),
           newResponseDigest: new Uint8Array(32).fill(0xab),
-        })
+        }, { signature: "same-tx-sig", eventOrdinal: 4 })
       );
       await buffer.flush();
 
-      const client = mockPool._client;
+      const insertCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("INSERT INTO feedback_responses (id, response_id")
+      );
+      expect(insertCall).toBeDefined();
+      expect(insertCall[1][0]).toBe("asset1:client1:0:responder1:same-tx-sig:4");
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
@@ -1910,7 +1922,9 @@ describe("EventBuffer", () => {
       expect(responseInsertCalls[3][1][1]).toBeNull();
       expect(responseInsertCalls[3][1][16]).toBe("PENDING");
       expect(orphanInsertCalls[0][1]).toContain("ab".repeat(32));
-      expect(orphanInsertCalls[0][0]).toContain("ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE");
+      expect(orphanInsertCalls[0][0]).toContain(
+        "ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1))) DO UPDATE"
+      );
     });
 
     it("replays staged orphan responses when feedback arrives later in the same flush", async () => {

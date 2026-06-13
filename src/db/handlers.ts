@@ -125,6 +125,42 @@ function asBigInt(value: bigint | number | null | undefined): bigint {
   return 0n;
 }
 
+function feedbackResponseIdentityWhere(
+  feedbackId: string,
+  responder: string,
+  txSignature: string,
+  eventOrdinal: number | null | undefined
+): any {
+  return {
+    feedbackId_responder_txSignature_eventOrdinal: {
+      feedbackId,
+      responder,
+      txSignature,
+      eventOrdinal: eventOrdinal ?? null,
+    },
+  };
+}
+
+function orphanResponseIdentityWhere(
+  agentId: string,
+  client: string,
+  feedbackIndex: bigint,
+  responder: string,
+  txSignature: string,
+  eventOrdinal: number | null | undefined
+): any {
+  return {
+    agentId_client_feedbackIndex_responder_txSignature_eventOrdinal: {
+      agentId,
+      client,
+      feedbackIndex,
+      responder,
+      txSignature,
+      eventOrdinal: eventOrdinal ?? null,
+    },
+  };
+}
+
 type CollectionDelegate = {
   findUnique(args: unknown): Promise<{
     collectionId: bigint | null;
@@ -2504,13 +2540,7 @@ async function handleNewFeedbackTx(
     await withResponseIdAssignmentLock(async () => {
       const orphanTxSignature = orphan.txSignature ?? "";
       const existingResponse = await tx.feedbackResponse.findUnique({
-        where: {
-          feedbackId_responder_txSignature: {
-            feedbackId: feedback.id,
-            responder: orphan.responder,
-            txSignature: orphanTxSignature,
-          },
-        },
+        where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
         select: { responseId: true },
       });
 
@@ -2529,13 +2559,7 @@ async function handleNewFeedbackTx(
       }
 
       await tx.feedbackResponse.upsert({
-        where: {
-          feedbackId_responder_txSignature: {
-            feedbackId: feedback.id,
-            responder: orphan.responder,
-            txSignature: orphanTxSignature,
-          },
-        },
+        where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
         create: {
           feedbackId: feedback.id,
           responder: orphan.responder,
@@ -2752,13 +2776,7 @@ async function handleNewFeedback(
       await withResponseIdAssignmentLock(async () => {
         const orphanTxSignature = orphan.txSignature ?? "";
         const existingResponse = await tx.feedbackResponse.findUnique({
-          where: {
-            feedbackId_responder_txSignature: {
-              feedbackId: feedback.id,
-              responder: orphan.responder,
-              txSignature: orphanTxSignature,
-            },
-          },
+          where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
           select: { responseId: true },
         });
 
@@ -2777,13 +2795,7 @@ async function handleNewFeedback(
         }
 
         await tx.feedbackResponse.upsert({
-          where: {
-            feedbackId_responder_txSignature: {
-              feedbackId: feedback.id,
-              responder: orphan.responder,
-              txSignature: orphanTxSignature,
-            },
-          },
+          where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
           create: {
             feedbackId: feedback.id,
             responder: orphan.responder,
@@ -3231,15 +3243,7 @@ async function handleResponseAppendedTx(
       "Feedback not found, storing as orphan response"
     );
     await tx.orphanResponse.upsert({
-      where: {
-        agentId_client_feedbackIndex_responder_txSignature: {
-          agentId: assetId,
-          client: clientAddress,
-          feedbackIndex: data.feedbackIndex,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: orphanResponseIdentityWhere(assetId, clientAddress, data.feedbackIndex, responder, ctx.signature, ctx.eventOrdinal),
       create: {
         agentId: assetId,
         client: clientAddress,
@@ -3284,13 +3288,7 @@ async function handleResponseAppendedTx(
 
   await withResponseIdAssignmentLock(async () => {
     const existingResponse = await tx.feedbackResponse.findUnique({
-      where: {
-        feedbackId_responder_txSignature: {
-          feedbackId: feedback.id,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: feedbackResponseIdentityWhere(feedback.id, responder, ctx.signature, ctx.eventOrdinal),
       select: { responseId: true },
     });
 
@@ -3306,13 +3304,7 @@ async function handleResponseAppendedTx(
     }
 
     await tx.feedbackResponse.upsert({
-      where: {
-        feedbackId_responder_txSignature: {
-          feedbackId: feedback.id,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: feedbackResponseIdentityWhere(feedback.id, responder, ctx.signature, ctx.eventOrdinal),
       create: {
         feedbackId: feedback.id,
         responder,
@@ -3404,15 +3396,7 @@ async function handleResponseAppended(
     );
 
     await prisma.orphanResponse.upsert({
-      where: {
-        agentId_client_feedbackIndex_responder_txSignature: {
-          agentId: assetId,
-          client: clientAddress,
-          feedbackIndex: data.feedbackIndex,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: orphanResponseIdentityWhere(assetId, clientAddress, data.feedbackIndex, responder, ctx.signature, ctx.eventOrdinal),
       create: {
         agentId: assetId,
         client: clientAddress,
@@ -3461,13 +3445,7 @@ async function handleResponseAppended(
 
   await withResponseIdAssignmentLock(async () => {
     const existingResponse = await prisma.feedbackResponse.findUnique({
-      where: {
-        feedbackId_responder_txSignature: {
-          feedbackId: feedback.id,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: feedbackResponseIdentityWhere(feedback.id, responder, ctx.signature, ctx.eventOrdinal),
       select: { responseId: true },
     });
 
@@ -3483,13 +3461,7 @@ async function handleResponseAppended(
     }
 
     await prisma.feedbackResponse.upsert({
-      where: {
-        feedbackId_responder_txSignature: {
-          feedbackId: feedback.id,
-          responder,
-          txSignature: ctx.signature,
-        },
-      },
+      where: feedbackResponseIdentityWhere(feedback.id, responder, ctx.signature, ctx.eventOrdinal),
       create: {
         feedbackId: feedback.id,
         responder,

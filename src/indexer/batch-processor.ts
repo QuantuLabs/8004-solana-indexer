@@ -1079,7 +1079,7 @@ export class EventBuffer {
     const clientAddr = data.client?.toBase58?.() || data.client;
     const responder = data.responder?.toBase58?.() || data.responder;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
-    const id = `${asset}:${clientAddr}:${feedbackIndex}:${responder}:${ctx.signature}`;
+    const id = `${asset}:${clientAddr}:${feedbackIndex}:${responder}:${ctx.signature}:${ctx.eventOrdinal ?? -1}`;
     const responseHash = toRequiredHashHex(data.responseHash);
     const sealHash = toRequiredHashHex(data.sealHash);
     const runningDigest = data.newResponseDigest
@@ -1095,7 +1095,7 @@ export class EventBuffer {
          $1, $2, $3, $4, $5, $6, $7, $8,
          $9, $10, $11, $12, $13, $14, $15
        )
-       ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE SET
+       ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1))) DO UPDATE SET
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
          seal_hash = EXCLUDED.seal_hash,
@@ -1372,7 +1372,7 @@ export class EventBuffer {
     const responder = data.responder?.toBase58?.() || data.responder;
     const feedbackIndex = BigInt(data.feedbackIndex?.toString() || "0");
     const responseCount = BigInt(data.newResponseCount?.toString() || "0");
-    const id = `${asset}:${client_addr}:${feedbackIndex}:${responder}:${ctx.signature}`;
+    const id = `${asset}:${client_addr}:${feedbackIndex}:${responder}:${ctx.signature}:${ctx.eventOrdinal ?? -1}`;
 
     const responseHash = toRequiredHashHex(data.responseHash);
     const responseRunningDigest = data.newResponseDigest

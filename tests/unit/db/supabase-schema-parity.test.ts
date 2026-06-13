@@ -34,7 +34,10 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("seal_hash TEXT");
     expect(schemaSql).toContain("running_digest BYTEA");
     expect(schemaSql).toContain("response_count BIGINT NOT NULL DEFAULT 0");
-    expect(schemaSql).toContain("UNIQUE(asset, client_address, feedback_index, responder, tx_signature)");
+    expect(schemaSql).toContain("CREATE UNIQUE INDEX idx_orphan_responses_response_event_identity");
+    expect(schemaSql).toContain(
+      "ON orphan_responses(asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1)));"
+    );
     expect(schemaSql).toContain("CREATE INDEX idx_orphan_responses_asset ON orphan_responses(asset);");
     expect(schemaSql).toContain("CREATE INDEX idx_orphan_responses_lookup");
   });
@@ -60,7 +63,12 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
     expect(schemaSql).toContain("'feedback:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
     expect(schemaSql).toContain(
-      "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '')"
+      "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '') || ':' || COALESCE(NEW.event_ordinal, -1)::text"
+    );
+    expect(schemaSql).toContain("AND COALESCE(event_ordinal, -1) = COALESCE(NEW.event_ordinal, -1)");
+    expect(schemaSql).toContain("CREATE UNIQUE INDEX idx_feedback_responses_response_event_identity");
+    expect(schemaSql).toContain(
+      "ON feedback_responses(asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1)));"
     );
     expect(schemaSql).toContain("'revocation:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
     expect(schemaSql).toContain("OR (TG_OP = 'UPDATE' AND OLD.status = 'ORPHANED')");

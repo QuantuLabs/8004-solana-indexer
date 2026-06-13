@@ -240,7 +240,7 @@ async function upsertOrphanResponseRow(
   const assetId = data.asset.toBase58();
   const clientAddress = data.client.toBase58();
   const responder = data.responder.toBase58();
-  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}`;
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}:${ctx.eventOrdinal ?? -1}`;
   const responseHash = data.responseHash
     ? Buffer.from(data.responseHash).toString("hex")
     : null;
@@ -260,7 +260,7 @@ async function upsertOrphanResponseRow(
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, $10, $11, $12, $13, $14, $15
      )
-     ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature) DO UPDATE SET
+     ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1))) DO UPDATE SET
        response_uri = EXCLUDED.response_uri,
        response_hash = EXCLUDED.response_hash,
        seal_hash = EXCLUDED.seal_hash,
@@ -1573,7 +1573,7 @@ async function handleResponseAppendedTx(
   const assetId = data.asset.toBase58();
   const clientAddress = data.client.toBase58();
   const responder = data.responder.toBase58();
-  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}`;
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}:${ctx.eventOrdinal ?? -1}`;
   const feedbackCheck = await client.query(
     `SELECT id, feedback_hash FROM feedbacks WHERE asset = $1 AND client_address = $2 AND feedback_index = $3 LIMIT 1`,
     [assetId, clientAddress, data.feedbackIndex.toString()]
@@ -2443,7 +2443,7 @@ async function handleResponseAppended(
   const assetId = data.asset.toBase58();
   const clientAddress = data.client.toBase58();
   const responder = data.responder.toBase58();
-  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}`;
+  const id = `${assetId}:${clientAddress}:${data.feedbackIndex}:${responder}:${ctx.signature}:${ctx.eventOrdinal ?? -1}`;
 
   try {
     const feedbackCheck = await db.query(

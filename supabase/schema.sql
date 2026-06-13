@@ -432,10 +432,11 @@ CREATE TABLE orphan_responses (
   tx_index INTEGER,
   event_ordinal INTEGER,
   tx_signature TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX idx_orphan_responses_response_event_identity
+ON orphan_responses(asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1)));
 CREATE INDEX idx_orphan_responses_asset ON orphan_responses(asset);
 CREATE INDEX idx_orphan_responses_lookup
 ON orphan_responses(asset, client_address, feedback_index);
@@ -463,12 +464,11 @@ CREATE TABLE feedback_responses (
   -- Verification status (reorg resilience) --
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
-  CHECK (status = 'ORPHANED' OR response_id IS NOT NULL),
-  -- Multiple responses per responder allowed (ERC-8004)
-  -- id format: asset:client:index:responder:tx_signature
-  UNIQUE(asset, client_address, feedback_index, responder, tx_signature)
+  CHECK (status = 'ORPHANED' OR response_id IS NOT NULL)
 );
 
+CREATE UNIQUE INDEX idx_feedback_responses_response_event_identity
+ON feedback_responses(asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1)));
 CREATE INDEX idx_responses_asset ON feedback_responses(asset);
 CREATE INDEX idx_responses_lookup ON feedback_responses(asset, client_address, feedback_index);
 CREATE INDEX idx_responses_status ON feedback_responses(status) WHERE status = 'PENDING';
@@ -628,7 +628,7 @@ BEGIN
   -- Serialize by canonical response identity to make duplicate upserts idempotent.
   PERFORM pg_advisory_xact_lock(
     hashtextextended(
-      'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, ''),
+      'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '') || ':' || COALESCE(NEW.event_ordinal, -1)::text,
       0
     )
   );
@@ -640,7 +640,8 @@ BEGIN
     AND client_address = NEW.client_address
     AND feedback_index = NEW.feedback_index
     AND responder = NEW.responder
-    AND tx_signature = NEW.tx_signature
+    AND tx_signature IS NOT DISTINCT FROM NEW.tx_signature
+    AND COALESCE(event_ordinal, -1) = COALESCE(NEW.event_ordinal, -1)
   LIMIT 1;
 
   IF FOUND AND existing_response_id IS NOT NULL THEN
