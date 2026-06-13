@@ -123,51 +123,6 @@ interface IdentityLockHints {
   parent: Array<boolean | undefined>;
 }
 
-function extractIdentityLockHintsFromLogs(logs: readonly string[]): IdentityLockHints {
-  const hints: IdentityLockHints = {
-    collection: [],
-    parent: [],
-  };
-
-  for (const line of logs) {
-    const normalized = line.toLowerCase();
-    if (!normalized.includes("instruction:")) continue;
-
-    if (
-      normalized.includes("set_collection_pointer_with_options") ||
-      normalized.includes("setcollectionpointerwithoptions")
-    ) {
-      // lock flag is not encoded in the log line itself.
-      hints.collection.push(undefined);
-      continue;
-    }
-    if (
-      normalized.includes("set_collection_pointer") ||
-      normalized.includes("setcollectionpointer")
-    ) {
-      hints.collection.push(true);
-      continue;
-    }
-
-    if (
-      normalized.includes("set_parent_asset_with_options") ||
-      normalized.includes("setparentassetwithoptions")
-    ) {
-      // lock flag is not encoded in the log line itself.
-      hints.parent.push(undefined);
-      continue;
-    }
-    if (
-      normalized.includes("set_parent_asset") ||
-      normalized.includes("setparentasset")
-    ) {
-      hints.parent.push(true);
-    }
-  }
-
-  return hints;
-}
-
 function getInstructionProgramId(instruction: unknown): string | null {
   if (!instruction || typeof instruction !== "object") return null;
   const programId = (instruction as { programId?: unknown }).programId;
@@ -290,7 +245,7 @@ function applyIdentityLockHints(
   for (const event of events) {
     if (event.name === "CollectionPointerSet") {
       const lock = hints.collection[collectionIdx];
-      if (typeof event.data.lock !== "boolean" && typeof lock === "boolean") {
+      if (typeof lock === "boolean") {
         event.data.lock = lock;
       }
       collectionIdx += 1;
@@ -298,7 +253,7 @@ function applyIdentityLockHints(
     }
     if (event.name === "ParentAssetSet") {
       const lock = hints.parent[parentIdx];
-      if (typeof event.data.lock !== "boolean" && typeof lock === "boolean") {
+      if (typeof lock === "boolean") {
         event.data.lock = lock;
       }
       parentIdx += 1;
@@ -311,7 +266,6 @@ function applyIdentityLockHints(
  */
 export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
   const events: ParsedEvent[] = [];
-  const logHints = extractIdentityLockHintsFromLogs(logs);
 
   try {
     const generator = eventParser.parseLogs(logs);
@@ -324,8 +278,6 @@ export function parseTransactionLogs(logs: string[]): ParsedEvent[] {
   } catch (error) {
     logger.debug({ error }, "Failed to parse some logs");
   }
-
-  applyIdentityLockHints(events, logHints);
 
   return events;
 }

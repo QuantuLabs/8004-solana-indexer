@@ -306,7 +306,7 @@ describe("Parser Decoder", () => {
       spy.mockRestore();
     });
 
-    it("should infer lock=true from default parent instruction logs", () => {
+    it("should not derive parent lock from instruction log strings alone", () => {
       const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
         return (function* () {
           yield {
@@ -330,7 +330,7 @@ describe("Parser Decoder", () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe("ParentAssetSet");
-      expect(result[0].data.lock).toBe(true);
+      expect(result[0].data.lock).toBeUndefined();
 
       spy.mockRestore();
     });
@@ -401,6 +401,47 @@ describe("Parser Decoder", () => {
       });
 
       const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
+        `Program ${TEST_PROGRAM_ID.toBase58()} success`,
+      ]) as any;
+      const encodedIx = coder.instruction.encode("set_collection_pointer_with_options", {
+        col: "c1:test",
+        lock: false,
+      });
+      tx.transaction.message.instructions = [{
+        programId: TEST_PROGRAM_ID,
+        accounts: [],
+        data: bs58.encode(encodedIx),
+      }];
+
+      const result = parseTransaction(tx);
+      expect(result).not.toBeNull();
+      expect(result!.events).toHaveLength(1);
+      expect(result!.events[0].name).toBe("CollectionPointerSet");
+      expect(result!.events[0].data.lock).toBe(false);
+
+      spy.mockRestore();
+    });
+
+    it("should keep decoded collection lock authoritative over foreign log strings", () => {
+      const spy = vi.spyOn(eventParser, "parseLogs").mockImplementation(() => {
+        return (function* () {
+          yield {
+            name: "CollectionPointerSet",
+            data: {
+              asset: TEST_ASSET.toBase58(),
+              set_by: TEST_OWNER.toBase58(),
+              col: "c1:test",
+              lock: true,
+            },
+          } as any;
+        })();
+      });
+
+      const tx = createMockParsedTransaction(TEST_SIGNATURE, [
+        "Program 11111111111111111111111111111111 invoke [1]",
+        "Program log: Instruction: set_collection_pointer",
+        "Program 11111111111111111111111111111111 success",
         `Program ${TEST_PROGRAM_ID.toBase58()} invoke [1]`,
         `Program ${TEST_PROGRAM_ID.toBase58()} success`,
       ]) as any;
