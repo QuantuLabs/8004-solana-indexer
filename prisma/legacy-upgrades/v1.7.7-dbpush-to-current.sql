@@ -443,6 +443,9 @@ BEGIN
   SELECT RAISE(IGNORE);
 END;
 
+-- 20260318203000_add_metadata_tombstones
+ALTER TABLE "AgentMetadata" ADD COLUMN "deleted" BOOLEAN NOT NULL DEFAULT false;
+
 -- 20260312110000_add_local_collection_id_counter
 CREATE TABLE IF NOT EXISTS "IdCounter" (
   "scope" TEXT NOT NULL PRIMARY KEY,

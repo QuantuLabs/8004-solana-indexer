@@ -114,6 +114,7 @@ model AgentMetadata {
   key       String  // metadata key (max 32 bytes)
   value     Bytes   // metadata value (max 256 bytes)
   immutable Boolean @default(false)
+  deleted   Boolean @default(false)
 
   // Transaction reference
   txSignature String?

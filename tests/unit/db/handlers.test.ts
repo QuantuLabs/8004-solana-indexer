@@ -163,18 +163,19 @@ describe("DB Handlers", () => {
 
         expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
           expect.objectContaining({
-            data: expect.objectContaining({
-              agentId: TEST_ASSET.toBase58(),
-              key: "description",
-              immutable: false,
-            }),
+              data: expect.objectContaining({
+                agentId: TEST_ASSET.toBase58(),
+                key: "description",
+                immutable: false,
+                deleted: false,
+              }),
           })
         );
       });
     });
 
     describe("MetadataDeleted", () => {
-      it("should delete metadata entry", async () => {
+      it("should tombstone metadata entry", async () => {
         const event: ProgramEvent = {
           type: "MetadataDeleted",
           data: {
@@ -185,12 +186,135 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-          where: {
-            agentId: TEST_ASSET.toBase58(),
-            key: "description",
-          },
+        expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              agentId: TEST_ASSET.toBase58(),
+              key: "description",
+              deleted: true,
+              slot: ctx.slot,
+              txSignature: ctx.signature,
+            }),
+          })
+        );
+      });
+
+      function createStatefulMetadataPrisma() {
+        const state = new Map<string, any>();
+        const stateful = createMockPrismaClient();
+        const rowKey = (agentId: string, key: string) => `${agentId}:${key}`;
+        const getWhereKey = (where: any) => rowKey(where.agentId_key.agentId, where.agentId_key.key);
+
+        (stateful.agentMetadata.findUnique as any).mockImplementation(async (args: any) => {
+          const row = state.get(getWhereKey(args.where));
+          return row ? { ...row } : null;
         });
+        (stateful.agentMetadata.create as any).mockImplementation(async (args: any) => {
+          const row = { ...args.data };
+          state.set(rowKey(row.agentId, row.key), row);
+          return row;
+        });
+        (stateful.agentMetadata.updateMany as any).mockImplementation(async (args: any) => {
+          const row = state.get(rowKey(args.where.agentId, args.where.key));
+          if (!row) return { count: 0 };
+          Object.assign(row, args.data);
+          return { count: 1 };
+        });
+
+        return {
+          prisma: stateful,
+          row: (key: string) => state.get(rowKey(TEST_ASSET.toBase58(), key)),
+        };
+      }
+
+      function metadataCtx(slot: number, txIndex = 0, signature = `sig-${slot}`): EventContext {
+        return {
+          signature,
+          slot: BigInt(slot),
+          txIndex,
+          blockTime: new Date(`2026-03-${String(Math.min(slot, 28)).padStart(2, "0")}T00:00:00.000Z`),
+        };
+      }
+
+      function metadataSet(key: string, value: number): ProgramEvent {
+        return {
+          type: "MetadataSet",
+          data: {
+            asset: TEST_ASSET,
+            key,
+            value: new Uint8Array([value]),
+            immutable: false,
+          },
+        };
+      }
+
+      function metadataDeleted(key: string): ProgramEvent {
+        return {
+          type: "MetadataDeleted",
+          data: {
+            asset: TEST_ASSET,
+            key,
+          },
+        };
+      }
+
+      it("rejects stale set after newer delete", async () => {
+        const { prisma: stateful, row } = createStatefulMetadataPrisma();
+
+        await handleEvent(stateful, metadataDeleted("profile"), metadataCtx(20));
+        await handleEvent(stateful, metadataSet("profile", 7), metadataCtx(10));
+
+        expect(row("profile")).toMatchObject({
+          deleted: true,
+          slot: 20n,
+          txSignature: "sig-20",
+        });
+      });
+
+      it("rejects stale delete after newer set", async () => {
+        const { prisma: stateful, row } = createStatefulMetadataPrisma();
+
+        await handleEvent(stateful, metadataSet("profile", 9), metadataCtx(20));
+        await handleEvent(stateful, metadataDeleted("profile"), metadataCtx(10));
+
+        expect(row("profile")).toMatchObject({
+          deleted: false,
+          slot: 20n,
+          txSignature: "sig-20",
+        });
+        expect(Buffer.from(row("profile").value)).toEqual(Buffer.from([0x00, 9]));
+      });
+
+      it("un-deletes on newer set after older delete", async () => {
+        const { prisma: stateful, row } = createStatefulMetadataPrisma();
+
+        await handleEvent(stateful, metadataDeleted("profile"), metadataCtx(10));
+        await handleEvent(stateful, metadataSet("profile", 11), metadataCtx(20));
+
+        expect(row("profile")).toMatchObject({
+          deleted: false,
+          slot: 20n,
+          txSignature: "sig-20",
+          status: "PENDING",
+          verifiedAt: null,
+        });
+        expect(Buffer.from(row("profile").value)).toEqual(Buffer.from([0x00, 11]));
+      });
+
+      it("tombstones on newer delete after older set", async () => {
+        const { prisma: stateful, row } = createStatefulMetadataPrisma();
+
+        await handleEvent(stateful, metadataSet("profile", 13), metadataCtx(10));
+        await handleEvent(stateful, metadataDeleted("profile"), metadataCtx(20));
+
+        expect(row("profile")).toMatchObject({
+          deleted: true,
+          slot: 20n,
+          txSignature: "sig-20",
+          status: "PENDING",
+          verifiedAt: null,
+        });
+        expect(Buffer.from(row("profile").value)).toEqual(Buffer.alloc(0));
       });
     });
 

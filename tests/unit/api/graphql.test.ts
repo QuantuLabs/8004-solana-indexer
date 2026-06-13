@@ -1735,9 +1735,10 @@ describe('Collection And Tree Queries', () => {
     expect(rows).toEqual([row]);
     expect(query).toHaveBeenCalledTimes(1);
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
-    expect(sql).toContain('FROM metadata');
-    expect(sql).toContain("key NOT LIKE '\\_uri:%' ESCAPE '\\'");
-    expect(sql).toContain('ORDER BY asset, key');
+      expect(sql).toContain('FROM metadata');
+      expect(sql).toContain("key NOT LIKE '\\_uri:%' ESCAPE '\\'");
+      expect(sql).toContain('NOT deleted');
+      expect(sql).toContain('ORDER BY asset, key');
     expect(params.at(-2)).toBe(5);
     expect(params.at(-1)).toBe(1);
   });
@@ -1852,9 +1853,10 @@ describe('Collection And Tree Queries', () => {
     expect(invalid).toEqual([]);
     expect(query).toHaveBeenCalledTimes(1);
     const [sql, params] = query.mock.calls[0] as [string, unknown[]];
-    expect(sql).toContain('FROM metadata m');
-    expect(sql).toContain("m.key LIKE '\\_uri:%' ESCAPE '\\'");
-    expect(sql).toContain('m.asset = $1::text');
+      expect(sql).toContain('FROM metadata m');
+      expect(sql).toContain("m.key LIKE '\\_uri:%' ESCAPE '\\'");
+      expect(sql).toContain('NOT m.deleted');
+      expect(sql).toContain('m.asset = $1::text');
     expect(sql).toContain('LIMIT $2::int OFFSET $3::int');
     expect(params).toEqual(['Agent111', 7, 2]);
   });

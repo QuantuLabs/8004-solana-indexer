@@ -1756,27 +1756,49 @@ export class EventBuffer {
     const id = `${asset}:${keyHash}`;
 
     await client.query(`
-      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING')
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, deleted)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING', false)
       ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
-        immutable = metadata.immutable OR EXCLUDED.immutable,
+        immutable = CASE WHEN metadata.deleted THEN EXCLUDED.immutable ELSE metadata.immutable OR EXCLUDED.immutable END,
+        deleted = false,
         block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
+        created_at = CASE WHEN metadata.deleted THEN EXCLUDED.created_at ELSE metadata.created_at END,
+        status = CASE WHEN metadata.deleted THEN EXCLUDED.status ELSE metadata.status END,
+        verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
         updated_at = EXCLUDED.updated_at
-      WHERE NOT metadata.immutable
+      WHERE (NOT metadata.immutable OR metadata.deleted)
         AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
   }
 
-  private async deleteMetadataSupabase(client: PoolClient, data: EventData, _ctx: BatchEvent["ctx"]): Promise<void> {
+  private async deleteMetadataSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     const key = data.key || "";
-    await client.query(`DELETE FROM metadata WHERE asset = $1 AND key = $2`, [asset, key]);
+    const keyHash = createHash("sha256").update(key).digest().slice(0, 16).toString("hex");
+    const id = `${asset}:${keyHash}`;
+    await client.query(`
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, verified_at)
+      VALUES ($1, $2, $3, $4, $5, false, true, $6, $7, $8, $9, $10, $10, 'PENDING', NULL)
+      ON CONFLICT (id) DO UPDATE SET
+        value = EXCLUDED.value,
+        immutable = false,
+        deleted = true,
+        block_slot = EXCLUDED.block_slot,
+        tx_index = EXCLUDED.tx_index,
+        event_ordinal = EXCLUDED.event_ordinal,
+        tx_signature = EXCLUDED.tx_signature,
+        created_at = EXCLUDED.created_at,
+        updated_at = EXCLUDED.updated_at,
+        status = EXCLUDED.status,
+        verified_at = NULL
+      WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
+    `, [id, asset, key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
   private async updateAgentOwnerSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {

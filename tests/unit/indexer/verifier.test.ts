@@ -850,13 +850,18 @@ describe("DataVerifier", () => {
       const verifier = new DataVerifier(mockConnection, mockPrisma, null);
       await verifier.start();
 
-      expect(mockPrisma.agentMetadata.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ status: "FINALIZED", verifiedAt }),
-        })
-      );
-      expect(verifier.getStats().metadataVerified).toBe(1);
-      await verifier.stop();
+        expect(mockPrisma.agentMetadata.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "FINALIZED", verifiedAt }),
+          })
+        );
+        expect(mockPrisma.agentMetadata.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ status: "PENDING", deleted: false }),
+          })
+        );
+        expect(verifier.getStats().metadataVerified).toBe(1);
+        await verifier.stop();
     });
 
     it("should verify on-chain metadata via PDA", async () => {
@@ -915,10 +920,15 @@ describe("DataVerifier", () => {
       const verifier = new DataVerifier(mockConnection, null, mockPool);
       await verifier.start();
 
-      expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining("UPDATE metadata SET status = 'FINALIZED', verified_at = $1 WHERE id = $2"),
-        [verifiedAt, "m1"]
-      );
+        expect(mockPool.query).toHaveBeenCalledWith(
+          expect.stringContaining("UPDATE metadata SET status = 'FINALIZED', verified_at = $1 WHERE id = $2"),
+          [verifiedAt, "m1"]
+        );
+        expect(mockPool.query.mock.calls.some((call: any[]) =>
+          typeof call[0] === "string" &&
+          call[0].includes("FROM metadata") &&
+          call[0].includes("NOT deleted")
+        )).toBe(true);
       expect(verifier.getStats().metadataVerified).toBe(1);
       await verifier.stop();
     });

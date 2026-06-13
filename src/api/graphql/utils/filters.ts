@@ -266,6 +266,9 @@ export function buildWhereClause(
 
   const statusCol = entityType === 'validation' ? 'chain_status' : 'status';
   conditions.push(`${statusCol} != 'ORPHANED'`);
+  if (entityType === 'metadata') {
+    conditions.push('NOT deleted');
+  }
 
   const sql = conditions.length > 0
     ? `WHERE ${conditions.join(' AND ')}`

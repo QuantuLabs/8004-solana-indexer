@@ -66,8 +66,8 @@ describe("REST metadata pagination parity", () => {
       expect(res.status).toBe(200);
       await res.json();
 
-      expect(prisma.agentMetadata.findMany).toHaveBeenCalledWith({
-        where: { status: { not: "ORPHANED" }, agentId: "asset-1", key: "profile" },
+        expect(prisma.agentMetadata.findMany).toHaveBeenCalledWith({
+          where: { status: { not: "ORPHANED" }, deleted: false, agentId: "asset-1", key: "profile" },
         orderBy: [
           { slot: "desc" },
           { txIndex: "desc" },
@@ -126,7 +126,7 @@ describe("REST metadata pagination parity", () => {
           skip: 2,
         })
       );
-      expect(prisma.agentMetadata.count).toHaveBeenCalledWith({ where: { status: { not: "ORPHANED" } } });
+        expect(prisma.agentMetadata.count).toHaveBeenCalledWith({ where: { status: { not: "ORPHANED" }, deleted: false } });
     } finally {
       await stopServer(server);
     }

@@ -1871,7 +1871,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             prisma.feedback.count({ where: { status: 'PENDING' } }),
             prisma.feedbackResponse.count({ where: { status: 'PENDING' } }),
             prisma.revocation.count({ where: { status: 'PENDING' } }),
-            prisma.agentMetadata.count({ where: { status: 'PENDING' } }),
+            prisma.agentMetadata.count({ where: { status: 'PENDING', deleted: false } as any }),
             prisma.registry.count({ where: { status: 'PENDING' } }),
             typeof (prisma as any).validation?.count === 'function'
               ? (prisma as any).validation.count({ where: { chainStatus: 'PENDING' } })
@@ -1880,7 +1880,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             prisma.feedback.count({ where: { status: 'ORPHANED' } }),
             prisma.feedbackResponse.count({ where: { status: 'ORPHANED' } }),
             prisma.revocation.count({ where: { status: 'ORPHANED' } }),
-            prisma.agentMetadata.count({ where: { status: 'ORPHANED' } }),
+            prisma.agentMetadata.count({ where: { status: 'ORPHANED', deleted: false } as any }),
             prisma.registry.count({ where: { status: 'ORPHANED' } }),
             typeof (prisma as any).validation?.count === 'function'
               ? (prisma as any).validation.count({ where: { chainStatus: 'ORPHANED' } })
@@ -1958,14 +1958,14 @@ export function createApiServer(options: ApiServerOptions): Express {
                (SELECT COUNT(*) FROM feedbacks WHERE status = 'PENDING') AS pending_feedbacks,
                (SELECT COUNT(*) FROM feedback_responses WHERE status = 'PENDING') AS pending_responses,
                (SELECT COUNT(*) FROM revocations WHERE status = 'PENDING') AS pending_revocations,
-               (SELECT COUNT(*) FROM metadata WHERE status = 'PENDING') AS pending_metadata,
+               (SELECT COUNT(*) FROM metadata WHERE status = 'PENDING' AND NOT deleted) AS pending_metadata,
                (SELECT COUNT(*) FROM collections WHERE status = 'PENDING') AS pending_registries,
                (SELECT COUNT(*) FROM validations WHERE chain_status = 'PENDING') AS pending_validations,
                (SELECT COUNT(*) FROM agents WHERE status = 'ORPHANED') AS orphan_agents,
                (SELECT COUNT(*) FROM feedbacks WHERE status = 'ORPHANED') AS orphan_feedbacks,
                (SELECT COUNT(*) FROM feedback_responses WHERE status = 'ORPHANED') AS orphan_responses,
                (SELECT COUNT(*) FROM revocations WHERE status = 'ORPHANED') AS orphan_revocations,
-               (SELECT COUNT(*) FROM metadata WHERE status = 'ORPHANED') AS orphan_metadata,
+               (SELECT COUNT(*) FROM metadata WHERE status = 'ORPHANED' AND NOT deleted) AS orphan_metadata,
                (SELECT COUNT(*) FROM collections WHERE status = 'ORPHANED') AS orphan_registries,
                (SELECT COUNT(*) FROM validations WHERE chain_status = 'ORPHANED') AS orphan_validations,
                (SELECT COUNT(*) FROM orphan_feedbacks) AS staging_orphan_feedbacks,
@@ -2213,6 +2213,13 @@ export function createApiServer(options: ApiServerOptions): Express {
           const includeOrphaned = params.get('includeOrphaned') === 'true';
           params.delete('includeOrphaned');
           if (!includeOrphaned && !params.has('status')) {
+            params.append('status', 'neq.ORPHANED');
+          }
+          upstreamQuery = params.toString();
+        } else if (upstreamPathname === '/metadata' || upstreamPathname.startsWith('/metadata/')) {
+          const params = new URLSearchParams(upstreamRawQuery);
+          params.set('deleted', 'eq.false');
+          if (!params.has('status')) {
             params.append('status', 'neq.ORPHANED');
           }
           upstreamQuery = params.toString();
@@ -4354,7 +4361,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         prisma.agent.groupBy({ by: ['status'], _count: true }),
         prisma.feedback.groupBy({ by: ['status'], _count: true }),
         prisma.registry.groupBy({ by: ['status'], _count: true }),
-        prisma.agentMetadata.groupBy({ by: ['status'], _count: true }),
+        prisma.agentMetadata.groupBy({ by: ['status'], where: { deleted: false } as any, _count: true }),
         typeof (prisma as any).validation?.groupBy === 'function'
           ? (prisma as any).validation.groupBy({ by: ['chainStatus'], _count: true })
           : Promise.resolve([]),
@@ -4410,7 +4417,7 @@ export function createApiServer(options: ApiServerOptions): Express {
         res.status(400).json({ error: 'Invalid status value. Allowed: PENDING, FINALIZED, ORPHANED' });
         return;
       }
-      const where: Prisma.AgentMetadataWhereInput = { ...statusFilter };
+      const where = { ...statusFilter, deleted: false } as Prisma.AgentMetadataWhereInput & { deleted: boolean };
       if (asset) where.agentId = asset;
       if (key) where.key = key;
       if (blockSlotFilter !== undefined) where.slot = blockSlotFilter;

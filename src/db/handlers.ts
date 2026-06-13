@@ -620,7 +620,8 @@ function startLocalDigestRecoveryLoop(prisma: PrismaClient): void {
             where: {
               agentId: { in: agents.map((a) => a.id) },
               key: { in: ["_uri:_source", "_uri:_status"] },
-            },
+              deleted: false,
+            } as any,
             select: {
               agentId: true,
               key: true,
@@ -1098,12 +1099,11 @@ function localAgentMutationData(
   };
 }
 
-function localMetadataMutationWhere(assetId: string, key: string, ctx: EventContext): any {
+function localMetadataOrderWhere(assetId: string, key: string, ctx: EventContext): any {
   const txIndex = ctx.txIndex ?? null;
   return {
     agentId: assetId,
     key,
-    immutable: false,
     OR: [
       { slot: null },
       { slot: { lt: ctx.slot } },
@@ -1120,6 +1120,16 @@ function localMetadataMutationWhere(assetId: string, key: string, ctx: EventCont
       },
     ],
   };
+}
+
+function localMetadataSetMutationWhere(
+  assetId: string,
+  key: string,
+  ctx: EventContext,
+  existingDeleted: boolean
+): any {
+  const where = localMetadataOrderWhere(assetId, key, ctx);
+  return existingDeleted ? where : { ...where, immutable: false };
 }
 
 /**
@@ -2084,9 +2094,9 @@ async function handleMetadataSetTx(
   const prefixedValue = Buffer.concat([Buffer.from([0x00]), cleanValue]);
   const existing = await tx.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true, slot: true, txIndex: true, txSignature: true },
-  });
-  if (existing?.immutable) {
+    select: { immutable: true, deleted: true, slot: true, txIndex: true, txSignature: true },
+  } as any) as any;
+  if (existing?.immutable && !existing.deleted) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
     return;
   }
@@ -2104,24 +2114,28 @@ async function handleMetadataSetTx(
         key: data.key,
         value: prefixedValue,
         immutable: data.immutable,
+        deleted: false,
         txSignature: ctx.signature,
         slot: ctx.slot,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
         status: DEFAULT_STATUS,
-      },
+      } as any,
     });
   } else {
+    const wasDeleted = existing.deleted;
     await tx.agentMetadata.updateMany({
-      where: localMetadataMutationWhere(assetId, data.key, ctx),
+      where: localMetadataSetMutationWhere(assetId, data.key, ctx, wasDeleted),
       data: {
         value: prefixedValue,
         immutable: data.immutable,
+        deleted: false,
         txSignature: ctx.signature,
         slot: ctx.slot,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
-      },
+        ...(wasDeleted ? { status: DEFAULT_STATUS, verifiedAt: null } : {}),
+      } as any,
     });
   }
   logger.info({ assetId, key: data.key }, "Metadata set");
@@ -2146,9 +2160,9 @@ async function handleMetadataSet(
 
   const existing = await prisma.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true, slot: true, txIndex: true, txSignature: true },
-  });
-  if (existing?.immutable) {
+    select: { immutable: true, deleted: true, slot: true, txIndex: true, txSignature: true },
+  } as any) as any;
+  if (existing?.immutable && !existing.deleted) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
     return;
   }
@@ -2168,24 +2182,28 @@ async function handleMetadataSet(
         key: data.key,
         value: prefixedValue,
         immutable: data.immutable,
+        deleted: false,
         txSignature: ctx.signature,
         slot: ctx.slot,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
         status: DEFAULT_STATUS,
-      },
+      } as any,
     });
   } else {
+    const wasDeleted = existing.deleted;
     await prisma.agentMetadata.updateMany({
-      where: localMetadataMutationWhere(assetId, data.key, ctx),
+      where: localMetadataSetMutationWhere(assetId, data.key, ctx, wasDeleted),
       data: {
         value: prefixedValue,
         immutable: data.immutable,
+        deleted: false,
         txSignature: ctx.signature,
         slot: ctx.slot,
         txIndex: ctx.txIndex ?? null,
         eventOrdinal: ctx.eventOrdinal ?? null,
-      },
+        ...(wasDeleted ? { status: DEFAULT_STATUS, verifiedAt: null } : {}),
+      } as any,
     });
   }
 
@@ -2195,28 +2213,108 @@ async function handleMetadataSet(
 async function handleMetadataDeletedTx(
   tx: PrismaTransactionClient,
   data: MetadataDeleted,
-  _ctx: EventContext
+  ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  await tx.agentMetadata.deleteMany({
-    where: { agentId: assetId, key: data.key },
+  const existing = await tx.agentMetadata.findUnique({
+    where: { agentId_key: { agentId: assetId, key: data.key } },
+    select: { slot: true, txIndex: true, txSignature: true },
   });
+  if (existing && !isCanonicalEventOrderNewerOrEqual({
+    slot: existing.slot,
+    txIndex: existing.txIndex,
+    signature: existing.txSignature,
+  }, ctx)) {
+    return;
+  }
+  const tombstoneValue = new Uint8Array();
+  if (!existing) {
+    await tx.agentMetadata.create({
+      data: {
+        agentId: assetId,
+        key: data.key,
+        value: tombstoneValue,
+        immutable: false,
+        deleted: true,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
+        verifiedAt: null,
+      } as any,
+    });
+  } else {
+    await tx.agentMetadata.updateMany({
+      where: localMetadataOrderWhere(assetId, data.key, ctx),
+      data: {
+        value: tombstoneValue,
+        immutable: false,
+        deleted: true,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
+        verifiedAt: null,
+      } as any,
+    });
+  }
   logger.info({ assetId, key: data.key }, "Metadata deleted");
 }
 
 async function handleMetadataDeleted(
   prisma: PrismaClient,
   data: MetadataDeleted,
-  _ctx: EventContext
+  ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
 
-  await prisma.agentMetadata.deleteMany({
-    where: {
-      agentId: assetId,
-      key: data.key,
-    },
+  const existing = await prisma.agentMetadata.findUnique({
+    where: { agentId_key: { agentId: assetId, key: data.key } },
+    select: { slot: true, txIndex: true, txSignature: true },
   });
+  if (existing && !isCanonicalEventOrderNewerOrEqual({
+    slot: existing.slot,
+    txIndex: existing.txIndex,
+    signature: existing.txSignature,
+  }, ctx)) {
+    return;
+  }
+
+  const tombstoneValue = new Uint8Array();
+  if (!existing) {
+    await prisma.agentMetadata.create({
+      data: {
+        agentId: assetId,
+        key: data.key,
+        value: tombstoneValue,
+        immutable: false,
+        deleted: true,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
+        verifiedAt: null,
+      } as any,
+    });
+  } else {
+    await prisma.agentMetadata.updateMany({
+      where: localMetadataOrderWhere(assetId, data.key, ctx),
+      data: {
+        value: tombstoneValue,
+        immutable: false,
+        deleted: true,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
+        verifiedAt: null,
+      } as any,
+    });
+  }
 
   logger.info({ assetId, key: data.key }, "Metadata deleted");
 }
@@ -3869,9 +3967,9 @@ async function storeUriMetadataLocal(
           key,
         },
       },
-      select: { immutable: true },
-    });
-    if (existing?.immutable) {
+      select: { immutable: true, deleted: true },
+    } as any) as any;
+    if (existing?.immutable && !existing.deleted) {
       logger.debug({ assetId, key }, "Skipping URI metadata overwrite for immutable entry");
       return;
     }
@@ -3896,15 +3994,17 @@ async function storeUriMetadataLocal(
         key,
         value: storedValue,
         immutable: false,
+        deleted: false,
         slot: 0n,
         status: "FINALIZED",
         verifiedAt,
-      },
+      } as any,
       update: {
         value: storedValue,
+        deleted: false,
         status: "FINALIZED",
         verifiedAt,
-      },
+      } as any,
     });
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key }, "Failed to store URI metadata");

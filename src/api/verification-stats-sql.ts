@@ -41,9 +41,9 @@ FROM revocations
 UNION ALL
 SELECT
   'metadata' AS model,
-  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
-  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
-  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+  COUNT(*) FILTER (WHERE status = 'PENDING' AND NOT deleted) AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED' AND NOT deleted) AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED' AND NOT deleted) AS orphaned_count
 FROM metadata
 UNION ALL
 SELECT

@@ -1518,7 +1518,7 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("should keep immutable guard in metadata upsert", async () => {
+    it("should keep tombstone-aware immutable guard in metadata upsert", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
         makeEvent("MetadataSet", {
@@ -1531,17 +1531,19 @@ describe("EventBuffer", () => {
       await buffer.flush();
 
       const client = mockPool._client;
-      const metadataInsertCall = client.query.mock.calls.find(
-        (call: any[]) =>
-          typeof call[0] === "string" &&
-          call[0].includes("INSERT INTO metadata") &&
-          call[0].includes("WHERE NOT metadata.immutable")
-      );
-      expect(metadataInsertCall).toBeDefined();
-      expect(metadataInsertCall[0]).toContain("created_at, updated_at, status");
-      expect(metadataInsertCall[0]).toContain("updated_at = EXCLUDED.updated_at");
-      expect(metadataInsertCall[0]).toContain("tx_signature = EXCLUDED.tx_signature");
-      expect(metadataInsertCall[1][10]).toBe(metadataInsertCall[1][11]);
+        const metadataInsertCall = client.query.mock.calls.find(
+          (call: any[]) =>
+            typeof call[0] === "string" &&
+            call[0].includes("INSERT INTO metadata") &&
+            call[0].includes("WHERE (NOT metadata.immutable OR metadata.deleted)")
+        );
+        expect(metadataInsertCall).toBeDefined();
+        expect(metadataInsertCall[0]).toContain("created_at, updated_at, status, deleted");
+        expect(metadataInsertCall[0]).toContain("deleted = false");
+        expect(metadataInsertCall[0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+        expect(metadataInsertCall[0]).toContain("updated_at = EXCLUDED.updated_at");
+        expect(metadataInsertCall[0]).toContain("tx_signature = EXCLUDED.tx_signature");
+        expect(metadataInsertCall[1][10]).toBe(metadataInsertCall[1][11]);
     });
 
     it("should flush cursor state even when no events are buffered", async () => {
@@ -1595,6 +1597,18 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const metadataDeleteCall = client.query.mock.calls.find(
+        (call: any[]) =>
+          typeof call[0] === "string" &&
+          call[0].includes("INSERT INTO metadata") &&
+          call[0].includes("deleted, block_slot")
+      );
+      expect(metadataDeleteCall).toBeDefined();
+      expect(metadataDeleteCall[0]).toContain("deleted = true");
+      expect(metadataDeleteCall[0]).toContain("immutable = false");
+      expect(metadataDeleteCall[0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+      expect(metadataDeleteCall[1][1]).toBe("asset1");
+      expect(metadataDeleteCall[1][2]).toBe("capabilities");
     });
 
     it("should handle AgentOwnerSynced event", async () => {

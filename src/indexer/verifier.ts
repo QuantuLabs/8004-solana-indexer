@@ -559,14 +559,15 @@ export class DataVerifier {
       pending = await this.prisma.agentMetadata.findMany({
         where: {
           status: "PENDING",
+          deleted: false,
           slot: { lte: cutoffSlot },
-        },
+        } as any,
         take: config.verifyBatchSize,
         select: { id: true, agentId: true, key: true },
       });
     } else if (this.pool) {
       const result = await this.pool.query(
-        `SELECT id, asset AS "agentId", key FROM metadata WHERE status = 'PENDING' AND block_slot <= $1 LIMIT $2`,
+        `SELECT id, asset AS "agentId", key FROM metadata WHERE status = 'PENDING' AND NOT deleted AND block_slot <= $1 LIMIT $2`,
         [cutoffSlot.toString(), config.verifyBatchSize]
       );
       pending = result.rows;

@@ -102,6 +102,16 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("GRANT SELECT ON global_stats TO authenticated;");
   });
 
+  it("defines metadata tombstones and excludes them from public metadata reads", () => {
+    expect(schemaSql).toContain("deleted BOOLEAN NOT NULL DEFAULT FALSE");
+    expect(schemaSql).toContain("CREATE INDEX idx_metadata_status ON metadata(status) WHERE status = 'PENDING' AND NOT deleted;");
+    expect(schemaSql).toContain("CREATE INDEX idx_metadata_graphql_asset_key ON metadata(asset, key) WHERE status != 'ORPHANED' AND NOT deleted;");
+    expect(schemaSql).toContain("WHERE status != 'ORPHANED' AND NOT deleted AND key LIKE");
+    expect(schemaSql).toContain("FROM metadata\nWHERE NOT deleted;");
+    expect(schemaSql).toContain("COUNT(*) FILTER (WHERE status = 'PENDING' AND NOT deleted) AS pending_count");
+    expect(schemaSql).toContain('CREATE POLICY "Public read metadata" ON metadata FOR SELECT USING (NOT deleted);');
+  });
+
   it("grants leaderboard proxy objects to anon/authenticated roles", () => {
     expect(schemaSql).toContain("GRANT SELECT ON leaderboard TO anon;");
     expect(schemaSql).toContain("GRANT SELECT ON leaderboard TO authenticated;");

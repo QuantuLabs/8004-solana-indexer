@@ -2093,10 +2093,11 @@ describe('API Server REST cutoff/order parity', () => {
     ]);
     expect(metadataFindMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          agentId: 'Agent1111111111111111111111111111111111111',
-          slot: { lte: 88n },
-        }),
+          where: expect.objectContaining({
+            agentId: 'Agent1111111111111111111111111111111111111',
+            slot: { lte: 88n },
+            deleted: false,
+          }),
         orderBy: [
           { slot: 'asc' },
           { txIndex: 'asc' },

@@ -664,7 +664,7 @@ function createMetadataByAgentLoader(pool: Pool) {
     const { rows } = await pool.query<MetadataRow>(
       `SELECT id, asset, key, value, immutable, status, updated_at, tx_signature
        FROM metadata WHERE asset = ANY($1::text[])
-       AND key NOT LIKE '\\_uri:%' ESCAPE '\\' AND status != 'ORPHANED'`,
+       AND key NOT LIKE '\\_uri:%' ESCAPE '\\' AND status != 'ORPHANED' AND NOT deleted`,
       [keys as string[]]
     );
     const map = new Map<string, MetadataRow[]>();
@@ -707,7 +707,7 @@ function createRegistrationByAgentLoader(pool: Pool) {
   return new DataLoader<string, RegistrationRow[]>(async (keys) => {
     const { rows } = await pool.query<RegistrationRow>(
       `SELECT asset, key, value FROM metadata
-       WHERE asset = ANY($1::text[]) AND key LIKE '\\_uri:%' ESCAPE '\\' AND status != 'ORPHANED'`,
+       WHERE asset = ANY($1::text[]) AND key LIKE '\\_uri:%' ESCAPE '\\' AND status != 'ORPHANED' AND NOT deleted`,
       [keys as string[]]
     );
     const map = new Map<string, RegistrationRow[]>();

@@ -1297,17 +1297,21 @@ async function handleMetadataSetTx(
   const id = `${assetId}:${keyHash}`;
   const compressedValue = await compressForStorage(stripNullBytes(data.value));
   await client.query(
-    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)
+    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, deleted)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12, false)
      ON CONFLICT (id) DO UPDATE SET
        value = EXCLUDED.value,
-       immutable = metadata.immutable OR EXCLUDED.immutable,
+       immutable = CASE WHEN metadata.deleted THEN EXCLUDED.immutable ELSE metadata.immutable OR EXCLUDED.immutable END,
+       deleted = false,
        block_slot = EXCLUDED.block_slot,
        tx_index = EXCLUDED.tx_index,
        event_ordinal = EXCLUDED.event_ordinal,
        tx_signature = EXCLUDED.tx_signature,
+       created_at = CASE WHEN metadata.deleted THEN EXCLUDED.created_at ELSE metadata.created_at END,
+       status = CASE WHEN metadata.deleted THEN EXCLUDED.status ELSE metadata.status END,
+       verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
        updated_at = EXCLUDED.updated_at
-     WHERE NOT metadata.immutable
+     WHERE (NOT metadata.immutable OR metadata.deleted)
        AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
     [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
@@ -1317,10 +1321,29 @@ async function handleMetadataSetTx(
 async function handleMetadataDeletedTx(
   client: PoolClient,
   data: MetadataDeleted,
-  _ctx: EventContext
+  ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  await client.query(`DELETE FROM metadata WHERE asset = $1 AND key = $2`, [assetId, data.key]);
+  const keyHash = createHash("sha256").update(data.key).digest().slice(0, 16).toString("hex");
+  const id = `${assetId}:${keyHash}`;
+  await client.query(
+    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, verified_at)
+     VALUES ($1, $2, $3, $4, $5, false, true, $6, $7, $8, $9, $10, $10, $11, NULL)
+     ON CONFLICT (id) DO UPDATE SET
+       value = EXCLUDED.value,
+       immutable = false,
+       deleted = true,
+       block_slot = EXCLUDED.block_slot,
+       tx_index = EXCLUDED.tx_index,
+       event_ordinal = EXCLUDED.event_ordinal,
+       tx_signature = EXCLUDED.tx_signature,
+       created_at = EXCLUDED.created_at,
+       updated_at = EXCLUDED.updated_at,
+       status = EXCLUDED.status,
+       verified_at = NULL
+     WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+    [id, assetId, data.key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+  );
   logger.info({ assetId, key: data.key }, "Metadata deleted");
 }
 
@@ -2102,19 +2125,23 @@ async function handleMetadataSet(
     const compressedValue = await compressForStorage(stripNullBytes(data.value));
 
     await db.query(
-    `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
-     ON CONFLICT (id) DO UPDATE SET
-       value = EXCLUDED.value,
-       immutable = metadata.immutable OR EXCLUDED.immutable,
-       block_slot = EXCLUDED.block_slot,
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, deleted)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12, false)
+       ON CONFLICT (id) DO UPDATE SET
+         value = EXCLUDED.value,
+         immutable = CASE WHEN metadata.deleted THEN EXCLUDED.immutable ELSE metadata.immutable OR EXCLUDED.immutable END,
+         deleted = false,
+         block_slot = EXCLUDED.block_slot,
          tx_index = EXCLUDED.tx_index,
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
+         created_at = CASE WHEN metadata.deleted THEN EXCLUDED.created_at ELSE metadata.created_at END,
+         status = CASE WHEN metadata.deleted THEN EXCLUDED.status ELSE metadata.status END,
+         verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
          updated_at = EXCLUDED.updated_at
-       WHERE NOT metadata.immutable
+       WHERE (NOT metadata.immutable OR metadata.deleted)
          AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
-      [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]
+      [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
   } catch (error: any) {
@@ -2124,13 +2151,32 @@ async function handleMetadataSet(
 
 async function handleMetadataDeleted(
   data: MetadataDeleted,
-  _ctx: EventContext
+  ctx: EventContext
 ): Promise<void> {
   const db = getPool();
   const assetId = data.asset.toBase58();
+  const keyHash = createHash("sha256").update(data.key).digest().slice(0, 16).toString("hex");
+  const id = `${assetId}:${keyHash}`;
 
   try {
-    await db.query(`DELETE FROM metadata WHERE asset = $1 AND key = $2`, [assetId, data.key]);
+    await db.query(
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, verified_at)
+       VALUES ($1, $2, $3, $4, $5, false, true, $6, $7, $8, $9, $10, $10, $11, NULL)
+       ON CONFLICT (id) DO UPDATE SET
+         value = EXCLUDED.value,
+         immutable = false,
+         deleted = true,
+         block_slot = EXCLUDED.block_slot,
+         tx_index = EXCLUDED.tx_index,
+         event_ordinal = EXCLUDED.event_ordinal,
+         tx_signature = EXCLUDED.tx_signature,
+         created_at = EXCLUDED.created_at,
+         updated_at = EXCLUDED.updated_at,
+         status = EXCLUDED.status,
+         verified_at = NULL
+       WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+      [id, assetId, data.key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
+    );
     logger.info({ assetId, key: data.key }, "Metadata deleted");
   } catch (error: any) {
     logger.error({ error: error.message, assetId, key: data.key }, "Failed to delete metadata");
@@ -2897,10 +2943,11 @@ async function storeUriMetadata(
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
 
     await db.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, created_at, updated_at, status, verified_at)
-       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_signature, created_at, updated_at, status, verified_at)
+       VALUES ($1, $2, $3, $4, $5, false, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
+         deleted = false,
          updated_at = EXCLUDED.updated_at,
          status = EXCLUDED.status,
          verified_at = EXCLUDED.verified_at

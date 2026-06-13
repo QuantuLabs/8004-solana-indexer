@@ -427,10 +427,11 @@ class MetadataQueue {
       : Buffer.concat([Buffer.from([0x00]), Buffer.from(value)]); // PREFIX_RAW
 
     await this.pool.query(
-      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_signature, created_at, updated_at, status, verified_at)
-       VALUES ($1, $2, $3, $4, $5, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
+      `INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_signature, created_at, updated_at, status, verified_at)
+       VALUES ($1, $2, $3, $4, $5, false, false, 0, 'uri_derived', $6, $6, 'FINALIZED', $6)
        ON CONFLICT (id) DO UPDATE SET
          value = EXCLUDED.value,
+         deleted = false,
          updated_at = EXCLUDED.updated_at,
          status = EXCLUDED.status,
          verified_at = EXCLUDED.verified_at
@@ -499,9 +500,11 @@ class MetadataQueue {
            LEFT JOIN metadata m_source
              ON m_source.asset = a.asset
             AND m_source.key = '_uri:_source'
+            AND NOT m_source.deleted
            LEFT JOIN metadata m_status
              ON m_status.asset = a.asset
             AND m_status.key = '_uri:_status'
+            AND NOT m_status.deleted
            WHERE a.agent_uri IS NOT NULL
              AND a.agent_uri != ''
              AND (

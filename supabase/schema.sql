@@ -318,6 +318,7 @@ CREATE TABLE metadata (
   key_hash TEXT NOT NULL,
   value BYTEA,  -- binary with compression prefix (0x00=raw, 0x01=zstd)
   immutable BOOLEAN DEFAULT FALSE,
+  deleted BOOLEAN NOT NULL DEFAULT FALSE,
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
   event_ordinal INTEGER,
@@ -332,11 +333,11 @@ CREATE TABLE metadata (
 
 CREATE INDEX idx_metadata_asset ON metadata(asset);
 CREATE INDEX idx_metadata_key ON metadata(key);
-CREATE INDEX idx_metadata_status ON metadata(status) WHERE status = 'PENDING';
-CREATE INDEX idx_metadata_graphql_asset_key ON metadata(asset, key) WHERE status != 'ORPHANED';
+CREATE INDEX idx_metadata_status ON metadata(status) WHERE status = 'PENDING' AND NOT deleted;
+CREATE INDEX idx_metadata_graphql_asset_key ON metadata(asset, key) WHERE status != 'ORPHANED' AND NOT deleted;
 CREATE INDEX idx_metadata_graphql_uri_asset_updated
 ON metadata(asset, updated_at DESC)
-WHERE status != 'ORPHANED' AND key LIKE '\_uri:%' ESCAPE '\';
+WHERE status != 'ORPHANED' AND NOT deleted AND key LIKE '\_uri:%' ESCAPE '\';
 
 -- =============================================
 -- FEEDBACKS (immutable log - raw data only)
@@ -823,7 +824,8 @@ SELECT
     WHEN get_byte(value, 0) = 1 THEN 'zstd'
     ELSE 'legacy'
   END AS encoding
-FROM metadata;
+FROM metadata
+WHERE NOT deleted;
 
 -- Metadata decoded (RAW only) - JSON-safe guaranteed
 -- Use this when you need JSON-parseable values (most common case)
@@ -833,7 +835,8 @@ SELECT
   id, asset, key, key_hash, immutable, block_slot, tx_signature, created_at, updated_at,
   convert_from(substring(value from 2), 'utf8') AS value_text
 FROM metadata
-WHERE value IS NOT NULL
+WHERE NOT deleted
+  AND value IS NOT NULL
   AND octet_length(value) > 0
   AND get_byte(value, 0) = 0;
 
@@ -981,9 +984,9 @@ FROM revocations
 UNION ALL
 SELECT
   'metadata' AS model,
-  COUNT(*) FILTER (WHERE status = 'PENDING') AS pending_count,
-  COUNT(*) FILTER (WHERE status = 'FINALIZED') AS finalized_count,
-  COUNT(*) FILTER (WHERE status = 'ORPHANED') AS orphaned_count
+  COUNT(*) FILTER (WHERE status = 'PENDING' AND NOT deleted) AS pending_count,
+  COUNT(*) FILTER (WHERE status = 'FINALIZED' AND NOT deleted) AS finalized_count,
+  COUNT(*) FILTER (WHERE status = 'ORPHANED' AND NOT deleted) AS orphaned_count
 FROM metadata
 UNION ALL
 SELECT
@@ -1162,7 +1165,7 @@ ALTER TABLE agent_digest_cache ENABLE ROW LEVEL SECURITY;
 -- Public read access
 CREATE POLICY "Public read agents" ON agents FOR SELECT USING (true);
 CREATE POLICY "Public read collections" ON collections FOR SELECT USING (true);
-CREATE POLICY "Public read metadata" ON metadata FOR SELECT USING (true);
+CREATE POLICY "Public read metadata" ON metadata FOR SELECT USING (NOT deleted);
 CREATE POLICY "Public read feedbacks" ON feedbacks FOR SELECT USING (true);
 CREATE POLICY "Public read feedback_responses" ON feedback_responses FOR SELECT USING (true);
 CREATE POLICY "Public read revocations" ON revocations FOR SELECT USING (true);

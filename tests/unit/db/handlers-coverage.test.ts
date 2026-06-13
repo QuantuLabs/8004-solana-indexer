@@ -2067,18 +2067,27 @@ describe("DB Handlers Coverage", () => {
       expect(prisma.feedbackResponse.upsert).not.toHaveBeenCalled();
     });
 
-    it("should handle MetadataDeleted before advancing cursor", async () => {
-      const event: ProgramEvent = {
-        type: "MetadataDeleted",
-        data: { asset: TEST_ASSET, key: "test-key" },
-      };
+      it("should handle MetadataDeleted before advancing cursor", async () => {
+        const event: ProgramEvent = {
+          type: "MetadataDeleted",
+          data: { asset: TEST_ASSET, key: "test-key" },
+        };
+        (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
 
-      (prisma.$transaction as any).mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => {
-        expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-          where: { agentId: TEST_ASSET.toBase58(), key: "test-key" },
+        (prisma.$transaction as any).mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => {
+          expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({
+                agentId: TEST_ASSET.toBase58(),
+                key: "test-key",
+                deleted: true,
+                slot: ctx.slot,
+                txSignature: ctx.signature,
+              }),
+            })
+          );
+          return fn(prisma);
         });
-        return fn(prisma);
-      });
 
       await handleEventAtomic(prisma, event, ctx);
 
@@ -2661,20 +2670,29 @@ describe("DB Handlers Coverage", () => {
   // ==========================================================================
   // 25. MetadataDeleted non-atomic
   // ==========================================================================
-  describe("MetadataDeleted (non-atomic, via handleEvent)", () => {
-    it("should delete metadata in non-atomic path", async () => {
-      const event: ProgramEvent = {
-        type: "MetadataDeleted",
-        data: { asset: TEST_ASSET, key: "test-key" },
-      };
+    describe("MetadataDeleted (non-atomic, via handleEvent)", () => {
+      it("should tombstone metadata in non-atomic path", async () => {
+        const event: ProgramEvent = {
+          type: "MetadataDeleted",
+          data: { asset: TEST_ASSET, key: "test-key" },
+        };
+        (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
 
-      await handleEvent(prisma, event, ctx);
+        await handleEvent(prisma, event, ctx);
 
-      expect(prisma.agentMetadata.deleteMany).toHaveBeenCalledWith({
-        where: { agentId: TEST_ASSET.toBase58(), key: "test-key" },
+        expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              agentId: TEST_ASSET.toBase58(),
+              key: "test-key",
+              deleted: true,
+              slot: ctx.slot,
+              txSignature: ctx.signature,
+            }),
+          })
+        );
       });
     });
-  });
 
   // ==========================================================================
   // 26. Identity event coverage (wallet/collection/parent)

@@ -22,6 +22,7 @@ describe("legacy SQLite v1.7.7 db-push upgrade bundle", () => {
     expect(bundleSql).toContain('ALTER TABLE "IndexerState"\nADD COLUMN "lastTxIndex" INTEGER;');
     expect(bundleSql).toContain('ALTER TABLE "OrphanResponse" ADD COLUMN "sealHash" BLOB;');
     expect(bundleSql).toContain('ALTER TABLE "FeedbackResponse"\nADD COLUMN "sealHash" BLOB;');
+    expect(bundleSql).toContain('ALTER TABLE "AgentMetadata" ADD COLUMN "deleted" BOOLEAN NOT NULL DEFAULT false;');
     expect(bundleSql).toContain('CREATE TABLE "new_Feedback"');
     expect(bundleSql).toContain('CREATE TRIGGER "IndexerState_monotonic_guard"');
   });

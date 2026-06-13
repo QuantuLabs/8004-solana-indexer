@@ -1582,6 +1582,7 @@ export const queryResolvers = {
                    INNER JOIN agents a ON a.asset = m.asset
                    WHERE m.key LIKE '\\_uri:%' ESCAPE '\\'
                      AND m.status != 'ORPHANED'
+                     AND NOT m.deleted
                      AND a.status != 'ORPHANED'
                      ${assetSql}
                    GROUP BY m.asset

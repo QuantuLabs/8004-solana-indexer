@@ -804,11 +804,15 @@ describe("supabase.ts", () => {
         const insertCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
         );
-        expect(insertCall).toBeDefined();
-        expect(insertCall![0]).toContain("created_at, updated_at");
-        expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
-        expect(mockCompressForStorage).toHaveBeenCalled();
-      });
+          expect(insertCall).toBeDefined();
+          expect(insertCall![0]).toContain("created_at, updated_at");
+          expect(insertCall![0]).toContain("status, deleted");
+          expect(insertCall![0]).toContain("deleted = false");
+          expect(insertCall![0]).toContain("WHERE (NOT metadata.immutable OR metadata.deleted)");
+          expect(insertCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
+          expect(mockCompressForStorage).toHaveBeenCalled();
+        });
 
       it("should skip _uri: prefixed keys", async () => {
         const event = {
@@ -856,18 +860,24 @@ describe("supabase.ts", () => {
       });
     });
 
-    describe("MetadataDeleted", () => {
-      it("should delete metadata by asset and key", async () => {
-        const event = {
-          type: "MetadataDeleted" as const,
-          data: { asset: TEST_ASSET, key: "website" },
-        };
-        await handleEvent(event, ctx);
-        const deleteCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("DELETE FROM metadata")
-        );
-        expect(deleteCall).toBeDefined();
-      });
+      describe("MetadataDeleted", () => {
+        it("should tombstone metadata by asset and key", async () => {
+          const event = {
+            type: "MetadataDeleted" as const,
+            data: { asset: TEST_ASSET, key: "website" },
+          };
+          await handleEvent(event, ctx);
+          const deleteCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+            typeof c[0] === "string" && c[0].includes("INSERT INTO metadata") && c[0].includes("deleted, block_slot")
+          );
+          expect(deleteCall).toBeDefined();
+          expect(deleteCall![0]).toContain("deleted = true");
+          expect(deleteCall![0]).toContain("immutable = false");
+          expect(deleteCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(deleteCall![1][1]).toBe(TEST_ASSET.toBase58());
+          expect(deleteCall![1][2]).toBe("website");
+          expect(deleteCall![1][5]).toBe(ctx.slot.toString());
+        });
 
       it("should catch query error", async () => {
         mockPoolInstance.query.mockRejectedValueOnce(new Error("fail"));
@@ -1895,14 +1905,17 @@ describe("supabase.ts", () => {
           data: { asset: TEST_ASSET, key: "website", value: new Uint8Array([1, 2, 3]), immutable: false },
         };
         await handleEventAtomic(event, ctx);
-        const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
-        );
-        expect(insertCall).toBeDefined();
-        expect(insertCall![0]).toContain("created_at, updated_at");
-        expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
-        expect(insertCall![0]).toContain("tx_signature = EXCLUDED.tx_signature");
-      });
+          const insertCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
+            typeof c[0] === "string" && c[0].includes("INSERT INTO metadata")
+          );
+          expect(insertCall).toBeDefined();
+          expect(insertCall![0]).toContain("created_at, updated_at");
+          expect(insertCall![0]).toContain("status, deleted");
+          expect(insertCall![0]).toContain("deleted = false");
+          expect(insertCall![0]).toContain("WHERE (NOT metadata.immutable OR metadata.deleted)");
+          expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
+          expect(insertCall![0]).toContain("tx_signature = EXCLUDED.tx_signature");
+        });
 
       it("MetadataSet _uri: prefix key is skipped", async () => {
         const event = {
@@ -1929,17 +1942,23 @@ describe("supabase.ts", () => {
         expect(insertCall![1][5]).toBe(true); // immutable param
       });
 
-      it("MetadataDeleted", async () => {
-        const event = {
-          type: "MetadataDeleted" as const,
-          data: { asset: TEST_ASSET, key: "website" },
-        };
-        await handleEventAtomic(event, ctx);
-        const deleteCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("DELETE FROM metadata")
-        );
-        expect(deleteCall).toBeDefined();
-      });
+        it("MetadataDeleted tombstones with the canonical guard", async () => {
+          const event = {
+            type: "MetadataDeleted" as const,
+            data: { asset: TEST_ASSET, key: "website" },
+          };
+          await handleEventAtomic(event, ctx);
+          const deleteCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
+            typeof c[0] === "string" && c[0].includes("INSERT INTO metadata") && c[0].includes("deleted, block_slot")
+          );
+          expect(deleteCall).toBeDefined();
+          expect(deleteCall![0]).toContain("deleted = true");
+          expect(deleteCall![0]).toContain("immutable = false");
+          expect(deleteCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(deleteCall![1][1]).toBe(TEST_ASSET.toBase58());
+          expect(deleteCall![1][2]).toBe("website");
+          expect(deleteCall![1][5]).toBe(ctx.slot.toString());
+        });
 
       it("RegistryInitialized", async () => {
         const event = {
