@@ -59,9 +59,14 @@ describe("supabase schema revocations bootstrap parity", () => {
       "CREATE OR REPLACE FUNCTION alloc_gapless_id(p_scope TEXT, p_updated_at TIMESTAMPTZ DEFAULT NULL)"
     );
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_feedback_id()");
+    expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION recanonicalize_feedback_ids(p_asset TEXT)");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_response_id()");
     expect(schemaSql).toContain("CREATE OR REPLACE FUNCTION assign_revocation_id()");
     expect(schemaSql).toContain("'feedback:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text");
+    expect(schemaSql).toContain("hashtextextended('feedback:asset:' || NEW.asset, 0)");
+    expect(schemaSql).toContain("NEW.feedback_id := NULL;\n    RETURN NEW;\n  END IF;");
+    expect(schemaSql).toContain("UPDATE feedbacks\n  SET feedback_id = NULL\n  WHERE asset = p_asset\n    AND status = 'ORPHANED'");
+    expect(schemaSql).toContain("PERFORM pg_advisory_xact_lock(\n    hashtextextended('feedback:asset:' || p_asset, 0)");
     expect(schemaSql).toContain(
       "'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '') || ':' || COALESCE(NEW.event_ordinal, -1)::text"
     );
