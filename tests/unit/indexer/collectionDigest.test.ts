@@ -21,6 +21,7 @@ vi.mock("../../../src/logger.js", () => ({
 }));
 
 import { digestCollectionPointerDoc } from "../../../src/indexer/collectionDigest.js";
+import { resetHardenedFetchStateForTests } from "../../../src/indexer/hardenedFetch.js";
 
 function mockStreamResponse(body: string, headers: Record<string, string> = {}): Response {
   const encoded = new TextEncoder().encode(body);
@@ -46,6 +47,7 @@ function mockStreamResponse(body: string, headers: Record<string, string> = {}):
 describe("collectionDigest", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetHardenedFetchStateForTests();
   });
 
   it("returns error for invalid canonical pointer", async () => {
@@ -66,6 +68,19 @@ describe("collectionDigest", () => {
     global.fetch = fetchSpy as unknown as typeof fetch;
 
     const result = await digestCollectionPointerDoc("c1:bafy123?bad=1");
+
+    expect(result).toEqual({
+      status: "error",
+      error: "Invalid canonical collection pointer format (expected c1:<cid>)",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns error for canonical pointers with dot path segments", async () => {
+    const fetchSpy = vi.fn();
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123/../../admin");
 
     expect(result).toEqual({
       status: "error",
@@ -113,7 +128,7 @@ describe("collectionDigest", () => {
     );
   });
 
-  it("uses follow redirect mode for collection pointer fetches", async () => {
+  it("uses manual redirect mode for collection pointer fetches", async () => {
     global.fetch = vi.fn().mockResolvedValue(mockStreamResponse(JSON.stringify({ name: "Collection" }))) as unknown as typeof fetch;
 
     await digestCollectionPointerDoc("c1:bafy123");
@@ -121,9 +136,24 @@ describe("collectionDigest", () => {
     expect(global.fetch).toHaveBeenCalledWith(
       "https://ipfs.io/ipfs/bafy123",
       expect.objectContaining({
-        redirect: "follow",
+        redirect: "manual",
       })
     );
+  });
+
+  it("blocks redirects to metadata IPs", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 302,
+      headers: new Headers({ location: "http://169.254.169.254/latest/meta-data/" }),
+    } as unknown as Response) as unknown as typeof fetch;
+
+    const result = await digestCollectionPointerDoc("c1:bafy123");
+
+    expect(result).toEqual({
+      status: "blocked",
+      error: "Redirect to internal host blocked",
+    });
   });
 
   it("uses configured IPFS gateway base for canonical pointers", async () => {
@@ -265,6 +295,5 @@ describe("collectionDigest", () => {
 
     expect(result.status).toBe("error");
     expect(result.error).toContain("network down");
-    expect(mockWarn).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
-import { config } from "../config.js";
 import { createChildLogger } from "../logger.js";
+import { hardenedFetchBuffer, shouldAllowTrustedLocalHostForUri } from "./hardenedFetch.js";
 import { buildIpfsGatewayUrl, sanitizeText, sanitizeUrl } from "./uriDigest.js";
 
 const logger = createChildLogger("collection-digest");
@@ -8,7 +8,7 @@ const logger = createChildLogger("collection-digest");
 const COLLECTION_POINTER_PREFIX = "c1:";
 const CID_PATH_REGEX = /^[a-zA-Z0-9]+(?:\/[a-zA-Z0-9._-]+)*$/;
 
-export type CollectionDigestStatus = "ok" | "timeout" | "error" | "oversize" | "invalid_json";
+export type CollectionDigestStatus = "ok" | "timeout" | "error" | "oversize" | "invalid_json" | "blocked";
 
 export interface CollectionDocFields {
   version: string | null;
@@ -37,6 +37,9 @@ function parseCollectionPointerToFetchUrl(pointer: string): string | null {
 
   const cidPath = pointer.slice(COLLECTION_POINTER_PREFIX.length).trim();
   if (!cidPath || !CID_PATH_REGEX.test(cidPath)) {
+    return null;
+  }
+  if (cidPath.split("/").some((segment) => segment === "." || segment === "..")) {
     return null;
   }
 
@@ -75,50 +78,19 @@ export async function digestCollectionPointerDoc(pointer: string): Promise<Colle
     return { status: "error", error: "Invalid canonical collection pointer format (expected c1:<cid>)" };
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.metadataTimeoutMs);
-
   try {
-    const response = await fetch(fetchUrl, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "8004-Indexer/1.0",
-      },
+    const url = new URL(fetchUrl);
+    const response = await hardenedFetchBuffer(fetchUrl, {
+      sourceUri: pointer,
+      allowTrustedLocalHostOverride: shouldAllowTrustedLocalHostForUri(pointer, url.hostname),
     });
 
-    if (!response.ok) {
-      return { status: "error", error: `HTTP ${response.status}` };
+    if (response.status !== "ok") {
+      return response;
     }
 
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > config.metadataMaxBytes) {
-      return {
-        status: "oversize",
-        bytes: parseInt(contentLength, 10),
-      };
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      return { status: "error", error: "No response body" };
-    }
-
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalBytes += value.length;
-      if (totalBytes > config.metadataMaxBytes) {
-        reader.cancel();
-        return { status: "oversize", bytes: totalBytes };
-      }
-      chunks.push(value);
-    }
-
-    const buffer = Buffer.concat(chunks);
+    const buffer = response.body;
+    const totalBytes = response.bytes;
     const hash = createHash("sha256").update(buffer).digest("hex");
 
     let json: Record<string, unknown>;
@@ -151,12 +123,7 @@ export async function digestCollectionPointerDoc(pointer: string): Promise<Colle
       fields,
     };
   } catch (error: unknown) {
-    if (error instanceof Error && error.name === "AbortError") {
-      return { status: "timeout" };
-    }
     logger.warn({ pointer, error: String(error) }, "Collection digest failed");
     return { status: "error", error: String(error) };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
