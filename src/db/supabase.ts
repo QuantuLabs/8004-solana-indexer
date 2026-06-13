@@ -37,14 +37,17 @@ const logger = createChildLogger("supabase-handlers");
 // Default status for new records (will be verified later)
 const DEFAULT_STATUS: ChainStatus = "PENDING";
 const NULLS_LAST_SQL_TX_INDEX = 2147483647;
+const NULLS_LAST_SQL_EVENT_ORDINAL = 2147483647;
 
 function canonicalOrderGuardSql(
   tableRef: string,
   slotExpr: string,
   txIndexExpr: string,
+  eventOrdinalExpr: string,
   signatureExpr: string,
   slotColumn = "block_slot",
   txIndexColumn = "tx_index",
+  eventOrdinalColumn = "event_ordinal",
   signatureColumn = "tx_signature"
 ): string {
   return `(
@@ -56,19 +59,25 @@ function canonicalOrderGuardSql(
         COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) < COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
         OR (
           COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) = COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
-          AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
+          AND (
+            COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) < COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
+            OR (
+              COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) = COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
+              AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
+            )
+          )
         )
       )
     )
   )`;
 }
 
-function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
-  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, signatureExpr);
+function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
 }
 
-function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
-  return canonicalOrderGuardSql("metadata", slotExpr, txIndexExpr, signatureExpr);
+function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("metadata", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
 }
 
 export interface EventContext {
@@ -935,7 +944,7 @@ async function handleAgentRegisteredTx(
        event_ordinal = EXCLUDED.event_ordinal,
        tx_signature = EXCLUDED.tx_signature,
        updated_at = EXCLUDED.updated_at
-     WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+     WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
     [
       assetId,
       data.owner.toBase58(),
@@ -980,7 +989,7 @@ async function handleAgentOwnerSyncedTx(
          event_ordinal = $6,
          tx_signature = $7
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
     [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
@@ -1001,7 +1010,7 @@ async function handleAtomEnabledTx(
          event_ordinal = $5,
          tx_signature = $6
      WHERE asset = $2
-       AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$6::text")}`,
+       AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}`,
     [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
@@ -1023,7 +1032,7 @@ async function handleUriUpdatedTx(
          event_ordinal = $6,
          tx_signature = $7
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
     [newUri, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, newUri }, "Agent URI updated");
@@ -1051,7 +1060,7 @@ async function handleWalletUpdatedTx(
          event_ordinal = $6,
          tx_signature = $7
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
     [newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
@@ -1075,7 +1084,7 @@ async function handleWalletResetOnOwnerSyncTx(
          event_ordinal = $7,
          tx_signature = $8
      WHERE asset = $4
-       AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$8::text")}`,
+       AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
     [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
@@ -1122,7 +1131,7 @@ async function handleCollectionPointerSetTx(
            event_ordinal = $9,
            tx_signature = $6
        WHERE asset = $1
-         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$6::text")}
+         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
        RETURNING 1
      ),
      inserted AS (
@@ -1262,7 +1271,7 @@ async function handleParentAssetSetTx(
          event_ordinal = $8,
          tx_signature = $9
      WHERE asset = $4
-       AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$9::text")}`,
+       AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
     [
       data.parentAsset.toBase58(),
       data.parentCreator.toBase58(),
@@ -1312,7 +1321,7 @@ async function handleMetadataSetTx(
        verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
        updated_at = EXCLUDED.updated_at
      WHERE (NOT metadata.immutable OR metadata.deleted)
-       AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+       AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
     [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, key: data.key }, "Metadata set");
@@ -1341,7 +1350,7 @@ async function handleMetadataDeletedTx(
        updated_at = EXCLUDED.updated_at,
        status = EXCLUDED.status,
        verified_at = NULL
-     WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+     WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
     [id, assetId, data.key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
   );
   logger.info({ assetId, key: data.key }, "Metadata deleted");
@@ -1717,7 +1726,7 @@ async function handleAgentRegistered(
          event_ordinal = EXCLUDED.event_ordinal,
          tx_signature = EXCLUDED.tx_signature,
          updated_at = EXCLUDED.updated_at
-       WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+       WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
       [
         assetId,
         data.owner.toBase58(),
@@ -1766,7 +1775,7 @@ async function handleAgentOwnerSynced(
            event_ordinal = $6,
            tx_signature = $7
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
       [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
@@ -1792,7 +1801,7 @@ async function handleAtomEnabled(
            event_ordinal = $5,
            tx_signature = $6
        WHERE asset = $2
-         AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$6::text")}`,
+         AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}`,
       [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
@@ -1819,7 +1828,7 @@ async function handleUriUpdated(
            event_ordinal = $6,
            tx_signature = $7
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
       [newUri, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, newUri }, "Agent URI updated");
@@ -1853,7 +1862,7 @@ async function handleWalletUpdated(
            event_ordinal = $6,
            tx_signature = $7
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
       [newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
@@ -1882,7 +1891,7 @@ async function handleWalletResetOnOwnerSync(
            event_ordinal = $7,
            tx_signature = $8
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$8::text")}`,
+         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
       [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
@@ -1935,7 +1944,7 @@ async function handleCollectionPointerSet(
            event_ordinal = $9,
            tx_signature = $6
        WHERE asset = $1
-         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$6::text")}
+         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
        RETURNING 1
      ),
        inserted AS (
@@ -2080,7 +2089,7 @@ async function handleParentAssetSet(
            event_ordinal = $8,
            tx_signature = $9
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$9::text")}`,
+         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
       [
         data.parentAsset.toBase58(),
         data.parentCreator.toBase58(),
@@ -2140,7 +2149,7 @@ async function handleMetadataSet(
          verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
          updated_at = EXCLUDED.updated_at
        WHERE (NOT metadata.immutable OR metadata.deleted)
-         AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+         AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
       [id, assetId, data.key, keyHash, compressedValue, data.immutable, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, key: data.key }, "Metadata set");
@@ -2174,7 +2183,7 @@ async function handleMetadataDeleted(
          updated_at = EXCLUDED.updated_at,
          status = EXCLUDED.status,
          verified_at = NULL
-       WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}`,
+       WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
       [id, assetId, data.key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(), DEFAULT_STATUS]
     );
     logger.info({ assetId, key: data.key }, "Metadata deleted");

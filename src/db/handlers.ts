@@ -1047,9 +1047,10 @@ export interface EventContext {
 }
 
 const NULLS_LAST_TX_INDEX = Number.MAX_SAFE_INTEGER;
+const NULLS_LAST_EVENT_ORDINAL = Number.MAX_SAFE_INTEGER;
 
-function isCanonicalEventOrderNewerOrEqual(
-  current: { slot?: bigint | number | null; txIndex?: number | null; signature?: string | null },
+export function isCanonicalEventOrderNewerOrEqual(
+  current: { slot?: bigint | number | null; txIndex?: number | null; eventOrdinal?: number | null; signature?: string | null },
   ctx: EventContext
 ): boolean {
   if (current.slot === null || current.slot === undefined) return true;
@@ -1059,12 +1060,18 @@ function isCanonicalEventOrderNewerOrEqual(
   const currentTxIndex = current.txIndex ?? NULLS_LAST_TX_INDEX;
   const nextTxIndex = ctx.txIndex ?? NULLS_LAST_TX_INDEX;
   if (nextTxIndex !== currentTxIndex) return nextTxIndex > currentTxIndex;
+
+  const currentEventOrdinal = current.eventOrdinal ?? NULLS_LAST_EVENT_ORDINAL;
+  const nextEventOrdinal = ctx.eventOrdinal ?? NULLS_LAST_EVENT_ORDINAL;
+  if (nextEventOrdinal !== currentEventOrdinal) return nextEventOrdinal > currentEventOrdinal;
+
   if (!current.signature) return true;
   return current.signature <= ctx.signature;
 }
 
 function localAgentMutationWhere(assetId: string, ctx: EventContext): any {
   const txIndex = ctx.txIndex ?? null;
+  const eventOrdinal = ctx.eventOrdinal ?? null;
   return {
     id: assetId,
     OR: [
@@ -1077,8 +1084,16 @@ function localAgentMutationWhere(assetId: string, ctx: EventContext): any {
         createdSlot: ctx.slot,
         txIndex,
         OR: [
-          { createdTxSignature: null },
-          { createdTxSignature: { lte: ctx.signature } },
+          ...(eventOrdinal === null
+            ? [{ eventOrdinal: { not: null } }]
+            : [{ eventOrdinal: { lt: eventOrdinal } }]),
+          {
+            eventOrdinal,
+            OR: [
+              { createdTxSignature: null },
+              { createdTxSignature: { lte: ctx.signature } },
+            ],
+          },
         ],
       },
     ],
@@ -1101,6 +1116,7 @@ function localAgentMutationData(
 
 function localMetadataOrderWhere(assetId: string, key: string, ctx: EventContext): any {
   const txIndex = ctx.txIndex ?? null;
+  const eventOrdinal = ctx.eventOrdinal ?? null;
   return {
     agentId: assetId,
     key,
@@ -1114,8 +1130,16 @@ function localMetadataOrderWhere(assetId: string, key: string, ctx: EventContext
         slot: ctx.slot,
         txIndex,
         OR: [
-          { txSignature: null },
-          { txSignature: { lte: ctx.signature } },
+          ...(eventOrdinal === null
+            ? [{ eventOrdinal: { not: null } }]
+            : [{ eventOrdinal: { lt: eventOrdinal } }]),
+          {
+            eventOrdinal,
+            OR: [
+              { txSignature: null },
+              { txSignature: { lte: ctx.signature } },
+            ],
+          },
         ],
       },
     ],
@@ -1479,6 +1503,7 @@ async function handleAgentRegisteredCore(
         creator: true,
         createdSlot: true,
         txIndex: true,
+        eventOrdinal: true,
         createdTxSignature: true,
       },
     });
@@ -1495,6 +1520,7 @@ async function handleAgentRegisteredCore(
     const canMutateExisting = !existingAgent || isCanonicalEventOrderNewerOrEqual({
       slot: existingAgent.createdSlot,
       txIndex: existingAgent.txIndex,
+      eventOrdinal: existingAgent.eventOrdinal,
       signature: existingAgent.createdTxSignature,
     }, ctx);
 
@@ -2094,7 +2120,7 @@ async function handleMetadataSetTx(
   const prefixedValue = Buffer.concat([Buffer.from([0x00]), cleanValue]);
   const existing = await tx.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true, deleted: true, slot: true, txIndex: true, txSignature: true },
+    select: { immutable: true, deleted: true, slot: true, txIndex: true, eventOrdinal: true, txSignature: true },
   } as any) as any;
   if (existing?.immutable && !existing.deleted) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
@@ -2103,6 +2129,7 @@ async function handleMetadataSetTx(
   if (existing && !isCanonicalEventOrderNewerOrEqual({
     slot: existing.slot,
     txIndex: existing.txIndex,
+    eventOrdinal: existing.eventOrdinal,
     signature: existing.txSignature,
   }, ctx)) {
     return;
@@ -2160,7 +2187,7 @@ async function handleMetadataSet(
 
   const existing = await prisma.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true, deleted: true, slot: true, txIndex: true, txSignature: true },
+    select: { immutable: true, deleted: true, slot: true, txIndex: true, eventOrdinal: true, txSignature: true },
   } as any) as any;
   if (existing?.immutable && !existing.deleted) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
@@ -2170,6 +2197,7 @@ async function handleMetadataSet(
   if (existing && !isCanonicalEventOrderNewerOrEqual({
     slot: existing.slot,
     txIndex: existing.txIndex,
+    eventOrdinal: existing.eventOrdinal,
     signature: existing.txSignature,
   }, ctx)) {
     return;
@@ -2218,11 +2246,12 @@ async function handleMetadataDeletedTx(
   const assetId = data.asset.toBase58();
   const existing = await tx.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { slot: true, txIndex: true, txSignature: true },
+    select: { slot: true, txIndex: true, eventOrdinal: true, txSignature: true },
   });
   if (existing && !isCanonicalEventOrderNewerOrEqual({
     slot: existing.slot,
     txIndex: existing.txIndex,
+    eventOrdinal: existing.eventOrdinal,
     signature: existing.txSignature,
   }, ctx)) {
     return;
@@ -2272,11 +2301,12 @@ async function handleMetadataDeleted(
 
   const existing = await prisma.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { slot: true, txIndex: true, txSignature: true },
+    select: { slot: true, txIndex: true, eventOrdinal: true, txSignature: true },
   });
   if (existing && !isCanonicalEventOrderNewerOrEqual({
     slot: existing.slot,
     txIndex: existing.txIndex,
+    eventOrdinal: existing.eventOrdinal,
     signature: existing.txSignature,
   }, ctx)) {
     return;

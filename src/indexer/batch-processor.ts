@@ -38,14 +38,17 @@ const PROVIDER_BACKOFF_MAX_MS = 30000;
 
 const ZERO_HASH_HEX = "0".repeat(64);
 const NULLS_LAST_SQL_TX_INDEX = 2147483647;
+const NULLS_LAST_SQL_EVENT_ORDINAL = 2147483647;
 
 function canonicalOrderGuardSql(
   tableRef: string,
   slotExpr: string,
   txIndexExpr: string,
+  eventOrdinalExpr: string,
   signatureExpr: string,
   slotColumn = "block_slot",
   txIndexColumn = "tx_index",
+  eventOrdinalColumn = "event_ordinal",
   signatureColumn = "tx_signature"
 ): string {
   return `(
@@ -57,19 +60,25 @@ function canonicalOrderGuardSql(
         COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) < COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
         OR (
           COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) = COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
-          AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
+          AND (
+            COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) < COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
+            OR (
+              COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) = COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
+              AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
+            )
+          )
         )
       )
     )
   )`;
 }
 
-function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
-  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, signatureExpr);
+function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
 }
 
-function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
-  return canonicalOrderGuardSql("metadata", slotExpr, txIndexExpr, signatureExpr);
+function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("metadata", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
 }
 
 function toRequiredHashHex(hash: Uint8Array | undefined | null): string | null {
@@ -883,7 +892,7 @@ export class EventBuffer {
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
-      WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
+      WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}
     `, [
         asset,
         owner,
@@ -1486,7 +1495,7 @@ export class EventBuffer {
           event_ordinal = $6,
           tx_signature = $7
       WHERE asset = $3
-        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}
+        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
     `, [data.newUri || null, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
@@ -1503,7 +1512,7 @@ export class EventBuffer {
           event_ordinal = $6,
           tx_signature = $7
       WHERE asset = $3
-        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}
+        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
     `, [wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
@@ -1522,7 +1531,7 @@ export class EventBuffer {
            event_ordinal = $7,
            tx_signature = $8
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$8::text")}`,
+         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
       [ownerAfterSync, wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
@@ -1565,7 +1574,7 @@ export class EventBuffer {
              event_ordinal = $9,
              tx_signature = $6
          WHERE asset = $1
-           AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$6::text")}
+           AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
          RETURNING 1
        ),
        inserted AS (
@@ -1717,7 +1726,7 @@ export class EventBuffer {
            event_ordinal = $8,
            tx_signature = $9
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$9::text")}`,
+         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
       [parentAsset, parentCreator, ctx.blockTime.toISOString(), asset, lock, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
@@ -1733,7 +1742,7 @@ export class EventBuffer {
           event_ordinal = $5,
           tx_signature = $6
       WHERE asset = $2
-        AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$6::text")}
+        AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}
     `, [ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
@@ -1771,7 +1780,7 @@ export class EventBuffer {
         verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
         updated_at = EXCLUDED.updated_at
       WHERE (NOT metadata.immutable OR metadata.deleted)
-        AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
+        AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
@@ -1797,7 +1806,7 @@ export class EventBuffer {
         updated_at = EXCLUDED.updated_at,
         status = EXCLUDED.status,
         verified_at = NULL
-      WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
+      WHERE ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}
     `, [id, asset, key, keyHash, Buffer.alloc(0), ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString()]);
   }
 
@@ -1813,7 +1822,7 @@ export class EventBuffer {
            event_ordinal = $6,
            tx_signature = $7
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
       [newOwner, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
