@@ -454,11 +454,41 @@ export class Processor {
     await this.bootstrapAutoCatchUp(expectedRunToken);
     if (!this.isRunning || this.runToken !== expectedRunToken) return;
     const heldWsIndexer = await this.startWebSocket(expectedRunToken, true);
-    if (!this.isRunning || this.runToken !== expectedRunToken) return;
-    await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
-    if (!this.isRunning || this.runToken !== expectedRunToken) return;
-    if (heldWsIndexer) {
-      heldWsIndexer.releaseProcessing();
+    try {
+      if (!this.isRunning || this.runToken !== expectedRunToken) {
+        if (heldWsIndexer) {
+          await heldWsIndexer.stop();
+          if (this.wsIndexer === heldWsIndexer) {
+            this.wsIndexer = null;
+          }
+        }
+        return;
+      }
+      await this.bootstrapAutoCatchUp(expectedRunToken, { suppressEventLogWrites: true });
+      if (!this.isRunning || this.runToken !== expectedRunToken) {
+        if (heldWsIndexer) {
+          await heldWsIndexer.stop();
+          if (this.wsIndexer === heldWsIndexer) {
+            this.wsIndexer = null;
+          }
+        }
+        return;
+      }
+      if (heldWsIndexer) {
+        heldWsIndexer.releaseProcessing();
+      }
+    } catch (error) {
+      if (heldWsIndexer) {
+        try {
+          await heldWsIndexer.stop();
+        } catch (stopError) {
+          logger.warn({ error: stopError }, "Failed to stop WebSocket indexer after recovery catch-up error");
+        }
+        if (this.wsIndexer === heldWsIndexer) {
+          this.wsIndexer = null;
+        }
+      }
+      throw error;
     }
   }
 

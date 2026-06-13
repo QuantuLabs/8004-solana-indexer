@@ -529,6 +529,32 @@ describe("Processor", () => {
       vi.useRealTimers();
     });
 
+    it("should stop a held websocket indexer when recovery catch-up fails", async () => {
+      vi.useFakeTimers();
+
+      const processor = new Processor(mockPrisma, null, { mode: "websocket" });
+      await processor.start();
+      vi.clearAllMocks();
+
+      (processor as any).wsIndexer = null;
+      mockPollerInstance.bootstrap
+        .mockReset()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("bootstrap failed"));
+
+      await vi.advanceTimersByTimeAsync(10000);
+
+      expect(mockPollerInstance.bootstrap).toHaveBeenCalledTimes(2);
+      expect(mockWsIndexerInstance.holdProcessing).toHaveBeenCalledTimes(1);
+      expect(mockWsIndexerInstance.releaseProcessing).not.toHaveBeenCalled();
+      expect(mockWsIndexerInstance.stop).toHaveBeenCalledTimes(1);
+      expect((processor as any).wsIndexer).toBeNull();
+      expect(processor.getStatus().wsActive).toBe(false);
+
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
     it("should handle WebSocket connection loss in auto mode", async () => {
       vi.useFakeTimers();
 
