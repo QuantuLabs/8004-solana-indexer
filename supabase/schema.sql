@@ -318,7 +318,6 @@ CREATE TABLE metadata (
   key_hash TEXT NOT NULL,
   value BYTEA,  -- binary with compression prefix (0x00=raw, 0x01=zstd)
   immutable BOOLEAN DEFAULT FALSE,
-  deleted BOOLEAN NOT NULL DEFAULT FALSE,
   block_slot BIGINT NOT NULL,
   tx_index INTEGER,
   event_ordinal INTEGER,
@@ -328,6 +327,7 @@ CREATE TABLE metadata (
   -- Verification status (reorg resilience) --
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
+  deleted BOOLEAN NOT NULL DEFAULT FALSE,
   UNIQUE(asset, key_hash)
 );
 
@@ -526,19 +526,29 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  IF TG_OP = 'UPDATE'
+    AND current_setting('app.recanonicalize_feedback_ids', true) = 'on'
+  THEN
+    RETURN NEW;
+  END IF;
+
   IF TG_OP = 'UPDATE' AND OLD.feedback_id IS NOT NULL THEN
     NEW.feedback_id := OLD.feedback_id;
     RETURN NEW;
   END IF;
 
+  -- Ignore caller-provided IDs and assign under DB lock instead.
   IF NEW.feedback_id IS NOT NULL THEN
     NEW.feedback_id := NULL;
   END IF;
 
+  -- Serialize asset-scoped assignment so targeted re-canonicalization can safely
+  -- run without racing new inserts for the same asset.
   PERFORM pg_advisory_xact_lock(
     hashtextextended('feedback:asset:' || NEW.asset, 0)
   );
 
+  -- Serialize by canonical feedback identity to make duplicate upserts idempotent.
   PERFORM pg_advisory_xact_lock(
     hashtextextended(
       'feedback:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text,
@@ -614,6 +624,8 @@ BEGIN
   FROM mismatched;
 
   IF affected_rows > 0 THEN
+    PERFORM set_config('app.recanonicalize_feedback_ids', 'on', true);
+
     WITH ranked AS (
       SELECT
         id,
@@ -649,6 +661,8 @@ BEGIN
       AND status != 'ORPHANED'
       AND feedback_id IS NOT NULL
       AND feedback_id < 0;
+
+    PERFORM set_config('app.recanonicalize_feedback_ids', 'off', true);
   END IF;
 
   SELECT COALESCE(MAX(feedback_id) + 1, 1)
@@ -661,7 +675,9 @@ BEGIN
   VALUES ('feedback:' || p_asset, next_feedback_id, NOW())
   ON CONFLICT (scope) DO UPDATE
     SET next_value = EXCLUDED.next_value,
-        updated_at = EXCLUDED.updated_at;
+        updated_at = EXCLUDED.updated_at
+    WHERE id_counters.next_value IS DISTINCT FROM EXCLUDED.next_value
+       OR affected_rows > 0;
 
   RETURN affected_rows;
 END;
@@ -721,7 +737,6 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Ignore caller-provided IDs and assign under DB lock instead.
   IF NEW.response_id IS NOT NULL THEN
     NEW.response_id := NULL;
   END IF;
@@ -730,7 +745,6 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Serialize by canonical response identity to make duplicate upserts idempotent.
   PERFORM pg_advisory_xact_lock(
     hashtextextended(
       'response:id:' || NEW.asset || ':' || NEW.client_address || ':' || NEW.feedback_index::text || ':' || NEW.responder || ':' || COALESCE(NEW.tx_signature, '') || ':' || COALESCE(NEW.event_ordinal, -1)::text,
