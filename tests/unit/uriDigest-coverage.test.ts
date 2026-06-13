@@ -16,6 +16,7 @@ vi.mock("../../src/config.js", () => ({
     metadataIndexMode: "normal",
     metadataMaxBytes: 262144,
     metadataMaxValueBytes: 10000,
+    metadataPerHostFetchConcurrency: 2,
     metadataTimeoutMs: 5000,
     ipfsGatewayBase: "https://ipfs.io",
     uriDigestTrustedHosts: [],
@@ -37,6 +38,11 @@ import {
   sanitizeText,
   sanitizeUrl,
 } from "../../src/indexer/uriDigest.js";
+import {
+  resetHardenedFetchStateForTests,
+  setHardenedFetchTransportForTests,
+} from "../../src/indexer/hardenedFetch.js";
+import { config } from "../../src/config.js";
 
 // Helper: create a mock fetch response with a JSON body
 function mockFetchOk(body: unknown, headers: Record<string, string> = {}) {
@@ -60,6 +66,19 @@ function mockFetchOk(body: unknown, headers: Record<string, string> = {}) {
   } as unknown as Response;
 }
 
+function mockTransportOk(calls: any[], body: unknown = { name: "Test" }) {
+  const encoded = Buffer.from(JSON.stringify(body));
+  setHardenedFetchTransportForTests(async (request) => {
+    calls.push(request);
+    return {
+      statusCode: 200,
+      headers: { "content-length": String(encoded.length) },
+      body: encoded,
+      bytes: encoded.length,
+    };
+  });
+}
+
 // Helper: mock DNS to resolve to a public IP
 function mockPublicDns() {
   mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
@@ -73,6 +92,8 @@ function mockPrivateDns() {
 describe("URI Digest Coverage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetHardenedFetchStateForTests();
+    (config as any).metadataPerHostFetchConcurrency = 2;
     mockPublicDns();
   });
 
@@ -821,6 +842,11 @@ describe("URI Digest Coverage", () => {
       expect(result.status).toBe("blocked");
     });
 
+    it("should block CGNAT 100.64.0.0/10 addresses", async () => {
+      const result = await digestUri("https://100.64.0.1/agent.json");
+      expect(result.status).toBe("blocked");
+    });
+
     it("should block DNS resolving to private IP", async () => {
       mockPrivateDns();
       const result = await digestUri("https://evil.com/agent.json");
@@ -907,30 +933,35 @@ describe("URI Digest Coverage", () => {
   });
 
   // =========================================================================
-  // DNS rebinding detection (HTTPS re-check)
+  // DNS rebinding detection
   // =========================================================================
   describe("DNS rebinding detection", () => {
-    it("should detect DNS rebinding on HTTPS (re-resolve returns private IP)", async () => {
-      // First call returns public IP, second call returns private IP (rebinding)
+    it("should pass the pre-validated HTTPS IP pin to the transport", async () => {
+      const calls: any[] = [];
+      mockTransportOk(calls, { name: "Pinned" });
+      mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+
+      const result = await digestUri("https://pinned.example/agent.json");
+
+      expect(result.status).toBe("ok");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url.hostname).toBe("pinned.example");
+      expect(calls[0].resolved).toEqual({ ip: "93.184.216.34", family: 4 });
+    });
+
+    it("should block a later HTTPS resolution that rebinds to a private IP", async () => {
       mockLookup
         .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }])
         .mockResolvedValueOnce([{ address: "10.0.0.1", family: 4 }]);
 
       global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Evil" }));
-      const result = await digestUri("https://evil-rebinding.com/agent.json");
-      expect(result.status).toBe("blocked");
-      expect(result.error).toBe("DNS rebinding detected on HTTPS");
-    });
+      const first = await digestUri("https://evil-rebinding.com/agent.json");
+      const second = await digestUri("https://evil-rebinding.com/agent2.json");
 
-    it("should detect DNS rebinding on HTTPS when re-resolve fails", async () => {
-      mockLookup
-        .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }])
-        .mockRejectedValueOnce(new Error("DNS timeout"));
-
-      global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Evil" }));
-      const result = await digestUri("https://evil-timeout.com/agent.json");
-      expect(result.status).toBe("blocked");
-      expect(result.error).toBe("DNS rebinding detected on HTTPS");
+      expect(first.status).toBe("ok");
+      expect(second.status).toBe("blocked");
+      expect(second.error).toBe("DNS resolved to private IP");
+      expect(global.fetch).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -997,12 +1028,9 @@ describe("URI Digest Coverage", () => {
     });
 
     it("should block redirect when DNS resolves to private IP", async () => {
-      // For HTTPS: first DNS call = original host, second = HTTPS re-check (must pass),
-      // then redirect target DNS check must fail
       mockLookup
-        .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }]) // original
-        .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }]) // HTTPS re-check (pass)
-        .mockResolvedValueOnce([{ address: "10.0.0.1", family: 4 }]); // redirect target DNS
+        .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }])
+        .mockResolvedValueOnce([{ address: "10.0.0.1", family: 4 }]);
 
       global.fetch = vi.fn().mockResolvedValue({
         ok: false,
@@ -1121,46 +1149,89 @@ describe("URI Digest Coverage", () => {
   });
 
   // =========================================================================
-  // IP pinning (HTTP with resolved IP)
+  // IP pinning
   // =========================================================================
-  describe("IP pinning for HTTP", () => {
-    it("should pin to resolved IP for HTTP (non-HTTPS)", async () => {
+  describe("IP pinning", () => {
+    it("should pass the pre-validated HTTP IPv4 pin to the transport", async () => {
       const original = process.env.ALLOW_INSECURE_URI;
       process.env.ALLOW_INSECURE_URI = "true";
 
+      const calls: any[] = [];
+      mockTransportOk(calls);
       mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
-      global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Test" }));
 
-      await digestUri("http://example.com/agent.json");
+      const result = await digestUri("http://example.com/agent.json");
 
-      // Should have pinned to IP
-      expect(global.fetch).toHaveBeenCalledWith(
-        expect.stringContaining("93.184.216.34"),
-        expect.objectContaining({
-          headers: expect.objectContaining({ Host: "example.com" }),
-        })
-      );
+      expect(result.status).toBe("ok");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url.hostname).toBe("example.com");
+      expect(calls[0].resolved).toEqual({ ip: "93.184.216.34", family: 4 });
 
       process.env.ALLOW_INSECURE_URI = original;
     });
 
-    it("should pin with bracketed IPv6 for HTTP", async () => {
+    it("should pass the pre-validated HTTP IPv6 pin to the transport", async () => {
       const original = process.env.ALLOW_INSECURE_URI;
       process.env.ALLOW_INSECURE_URI = "true";
 
+      const calls: any[] = [];
+      mockTransportOk(calls);
       mockLookup.mockResolvedValue([
         { address: "2001:db8::1", family: 6 },
       ]);
-      global.fetch = vi.fn().mockResolvedValue(mockFetchOk({ name: "Test" }));
 
-      await digestUri("http://example.com/agent.json");
+      const result = await digestUri("http://example.com/agent.json");
 
-      expect(global.fetch).toHaveBeenCalledWith(
-        expect.stringContaining("[2001:db8::1]"),
-        expect.any(Object)
-      );
+      expect(result.status).toBe("ok");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url.hostname).toBe("example.com");
+      expect(calls[0].resolved).toEqual({ ip: "2001:db8::1", family: 6 });
 
       process.env.ALLOW_INSECURE_URI = original;
+    });
+
+    it("should limit concurrent fetches to one resolved host when configured", async () => {
+      (config as any).metadataPerHostFetchConcurrency = 1;
+      mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+
+      let active = 0;
+      let maxActive = 0;
+      let releaseFirst: (() => void) | null = null;
+      const started: string[] = [];
+      setHardenedFetchTransportForTests(async (request) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        started.push(request.url.pathname);
+
+        if (started.length === 1) {
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          });
+        }
+
+        active--;
+        const encoded = Buffer.from(JSON.stringify({ name: request.url.pathname }));
+        return {
+          statusCode: 200,
+          headers: { "content-length": String(encoded.length) },
+          body: encoded,
+          bytes: encoded.length,
+        };
+      });
+
+      const first = digestUri("https://same-host.example/one.json");
+      await vi.waitFor(() => expect(started).toEqual(["/one.json"]));
+      const second = digestUri("https://same-host.example/two.json");
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(started).toEqual(["/one.json"]);
+      expect(releaseFirst).toBeTypeOf("function");
+      releaseFirst?.();
+
+      const results = await Promise.all([first, second]);
+      expect(results.map((result) => result.status)).toEqual(["ok", "ok"]);
+      expect(started).toEqual(["/one.json", "/two.json"]);
+      expect(maxActive).toBe(1);
     });
   });
 
