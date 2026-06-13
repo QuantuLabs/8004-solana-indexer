@@ -10,7 +10,7 @@ import { PrismaClient } from "@prisma/client";
 import PQueue from "p-queue";
 import WebSocket from "ws";
 import { config } from "../config.js";
-import { parseTransaction, parseTransactionLogs, toTypedEvent } from "../parser/decoder.js";
+import { parseTransaction, parseTransactionLogs, toTypedEvent, type ParsedEvent } from "../parser/decoder.js";
 import {
   handleEventAtomic,
   EventContext,
@@ -84,6 +84,11 @@ type ResolvedLogOrder = {
 
 type ResolvedLogNotification = BufferedLogNotification & {
   order: ResolvedLogOrder;
+};
+
+type IdentityLockEnrichment = {
+  tx: ParsedTransactionWithMeta;
+  events: ParsedEvent[];
 };
 
 type LogsSubscribeProbeResult = "supported" | "unsupported" | "unknown";
@@ -921,7 +926,7 @@ export class WebSocketIndexer {
   private async fetchParsedTransactionForIdentityLocks(
     signature: string,
     slot: number
-  ): Promise<ParsedTransactionWithMeta | null> {
+  ): Promise<IdentityLockEnrichment | null> {
     const maxRetries = 5;
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -930,7 +935,11 @@ export class WebSocketIndexer {
           maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
         });
         if (tx) {
-          return tx;
+          const parsed = parseTransaction(tx);
+          if (parsed?.events.length) {
+            return { tx, events: parsed.events };
+          }
+          lastError = new Error("parsed transaction contained no events");
         }
       } catch (error) {
         lastError = error;
@@ -1384,14 +1393,12 @@ export class WebSocketIndexer {
 
       if (shouldEnrichIdentityLocks) {
         try {
-          parsedTx = await this.fetchParsedTransactionForIdentityLocks(logs.signature, ctx.slot);
+          const enrichment = await this.fetchParsedTransactionForIdentityLocks(logs.signature, ctx.slot);
           if (!this.isRunning || this.stopRequested) return;
 
-          if (parsedTx) {
-            const parsed = parseTransaction(parsedTx);
-            if (parsed?.events.length) {
-              events = parsed.events;
-            }
+          if (enrichment) {
+            parsedTx = enrichment.tx;
+            events = enrichment.events;
           }
         } catch (txFetchError) {
           this.errorCount++;

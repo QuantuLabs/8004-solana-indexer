@@ -608,6 +608,48 @@ describe("WebSocketIndexer Coverage", () => {
       parseTxSpy.mockRestore();
     });
 
+    it("should fail-safe stop when identity lock enrichment parses no events", async () => {
+      createIndexer();
+      await wsIndexer.start();
+
+      const parseLogsSpy = vi.spyOn(decoder, "parseTransactionLogs").mockReturnValue([
+        {
+          name: "CollectionPointerSet",
+          data: {
+            asset: TEST_ASSET.toBase58(),
+            set_by: TEST_OWNER.toBase58(),
+            col: "c1:test",
+          },
+        },
+      ]);
+      const parseTxSpy = vi.spyOn(decoder, "parseTransaction").mockReturnValue({
+        signature: TEST_SIGNATURE,
+        slot: Number(TEST_SLOT),
+        blockTime: null,
+        events: [],
+      });
+      (mockConnection.getParsedTransaction as any).mockResolvedValue({
+        blockTime: null,
+      });
+      vi.spyOn(wsIndexer as any, "waitForTransactionRetryDelay").mockResolvedValue(true);
+      vi.mocked(handleEventAtomic).mockResolvedValue(undefined);
+
+      logsHandler!(
+        { signature: TEST_SIGNATURE, err: null, logs: ["Program log: Instruction: set_collection_pointer"] },
+        { slot: Number(TEST_SLOT) }
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(5);
+      expect(parseTxSpy).toHaveBeenCalledTimes(5);
+      expect(handleEventAtomic).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(false);
+
+      parseLogsSpy.mockRestore();
+      parseTxSpy.mockRestore();
+    });
+
     it("should not advance cursor when event processing fails", async () => {
       createIndexer();
       await wsIndexer.start();
