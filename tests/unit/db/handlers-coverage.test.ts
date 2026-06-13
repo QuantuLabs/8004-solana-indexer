@@ -237,15 +237,25 @@ describe("DB Handlers Coverage", () => {
       (prisma.agent.findUnique as any).mockResolvedValue({
         agentId: 9n,
         creator: TEST_OWNER.toBase58(),
+        createdSlot: 1n,
+        txIndex: 0,
+        createdTxSignature: "older-signature",
       });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       await handleEventAtomic(prisma, event, ctx);
 
       expect(prisma.agent.findMany).not.toHaveBeenCalled();
-      const upsertArgs = (prisma.agent.upsert as any).mock.calls[0]?.[0];
-      expect(upsertArgs?.create?.agentId).toBeNull();
-      expect(upsertArgs?.update?.agentId).toBeUndefined();
+      expect(prisma.agent.upsert).not.toHaveBeenCalled();
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: TEST_ASSET.toBase58(),
+            OR: expect.any(Array),
+          }),
+          data: expect.not.objectContaining({ agentId: expect.anything() }),
+        })
+      );
     });
 
     it("should trigger URI digest for AgentRegistered with URI", async () => {
@@ -558,6 +568,9 @@ describe("DB Handlers Coverage", () => {
       (prisma.agent.findUnique as any).mockResolvedValue({
         agentId: 9n,
         creator: TEST_OWNER.toBase58(),
+        createdSlot: 1n,
+        txIndex: 0,
+        createdTxSignature: "older-signature",
         uri: "ipfs://QmNonAtomic",
         nftName: "",
       });
@@ -567,7 +580,14 @@ describe("DB Handlers Coverage", () => {
         expect(mockDigestUri).toHaveBeenCalledWith("ipfs://QmNonAtomic");
       }, { timeout: 500 });
 
-      expect(prisma.agent.upsert).toHaveBeenCalled();
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: TEST_ASSET.toBase58(),
+            OR: expect.any(Array),
+          }),
+        })
+      );
     });
 
     it("should skip URI digest when metadataIndexMode is off (non-atomic)", async () => {
@@ -624,10 +644,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("handleAtomEnabledTx: agent not found", async () => {
@@ -641,10 +661,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { atomEnabled: true, updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("handleUriUpdatedTx: agent not found", async () => {
@@ -658,10 +678,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { uri: "https://example.com/updated.json", updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ uri: "https://example.com/updated.json", updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("handleWalletUpdatedTx: agent not found", async () => {
@@ -675,10 +695,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { wallet: TEST_WALLET.toBase58(), updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ wallet: TEST_WALLET.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("handleAtomEnabled (non-atomic): agent not found", async () => {
@@ -691,10 +711,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { atomEnabled: true, updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("handleUriUpdated (non-atomic): agent not found", async () => {
@@ -742,16 +762,15 @@ describe("DB Handlers Coverage", () => {
       (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
       (prisma.$transaction as any).mockImplementationOnce(async (fn: (tx: any) => Promise<any>) => {
-        expect(prisma.agentMetadata.upsert).toHaveBeenCalled();
+        expect(prisma.agentMetadata.create).toHaveBeenCalled();
         return fn(prisma);
       });
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agentMetadata.upsert).toHaveBeenCalledWith(
+      expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { agentId_key: { agentId: TEST_ASSET.toBase58(), key: "description" } },
-          create: expect.objectContaining({
+          data: expect.objectContaining({
             agentId: TEST_ASSET.toBase58(),
             key: "description",
             immutable: false,
@@ -776,7 +795,8 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agentMetadata.upsert).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.create).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.updateMany).not.toHaveBeenCalled();
     });
 
     it("should skip update when existing metadata is immutable", async () => {
@@ -795,7 +815,8 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agentMetadata.upsert).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.create).not.toHaveBeenCalled();
+      expect(prisma.agentMetadata.updateMany).not.toHaveBeenCalled();
     });
 
     it("should allow update when existing metadata is not immutable", async () => {
@@ -809,14 +830,19 @@ describe("DB Handlers Coverage", () => {
         },
       };
 
-      (prisma.agentMetadata.findUnique as any).mockResolvedValue({ immutable: false });
+      (prisma.agentMetadata.findUnique as any).mockResolvedValue({
+        immutable: false,
+        slot: 1n,
+        txIndex: 0,
+        txSignature: "sig-old",
+      });
       (prisma.indexerState.findUnique as any).mockResolvedValue(null);
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agentMetadata.upsert).toHaveBeenCalledWith(
+      expect(prisma.agentMetadata.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({ immutable: true }),
+          data: expect.objectContaining({ immutable: true, slot: ctx.slot, txSignature: ctx.signature }),
         })
       );
     });
@@ -834,7 +860,7 @@ describe("DB Handlers Coverage", () => {
 
       const writeError = new Error("metadata write failed");
       (prisma.agentMetadata.findUnique as any).mockResolvedValue(null);
-      (prisma.agentMetadata.upsert as any).mockRejectedValue(writeError);
+      (prisma.agentMetadata.create as any).mockRejectedValue(writeError);
 
       await expect(handleEventAtomic(prisma, event, ctx)).rejects.toThrow("metadata write failed");
       expect(prisma.$transaction).not.toHaveBeenCalled();
@@ -898,10 +924,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { wallet: null, updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
 
     it("should set wallet to null when DEFAULT_PUBKEY (non-atomic)", async () => {
@@ -916,10 +942,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { wallet: null, updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
   });
 
@@ -2162,10 +2188,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
   });
 
@@ -2183,10 +2209,10 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: { atomEnabled: true, updatedAt: ctx.blockTime },
-      });
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+      }));
     });
   });
 
@@ -2671,14 +2697,15 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: {
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({
           owner: TEST_NEW_OWNER.toBase58(),
           wallet: null,
           updatedAt: ctx.blockTime,
-        },
-      });
+          createdSlot: ctx.slot,
+        }),
+      }));
     });
 
     it("CollectionPointerSet should preserve existing creator and apply lock (atomic)", async () => {
@@ -2711,12 +2738,13 @@ describe("DB Handlers Coverage", () => {
       );
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: TEST_ASSET.toBase58() },
+          where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
           data: expect.objectContaining({
             collectionPointer: "c1:new-pointer",
             creator: immutableCreator,
             colLocked: true,
             updatedAt: ctx.blockTime,
+            createdSlot: ctx.slot,
           }),
         })
       );
@@ -3226,15 +3254,16 @@ describe("DB Handlers Coverage", () => {
 
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-        where: { id: TEST_ASSET.toBase58() },
-        data: {
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({
           parentAsset: TEST_COLLECTION.toBase58(),
           parentCreator: TEST_OWNER.toBase58(),
           parentLocked: true,
           updatedAt: ctx.blockTime,
-        },
-      });
+          createdSlot: ctx.slot,
+        }),
+      }));
     });
 
     it("ParentAssetSet should leave parentLocked unchanged when lock omitted (non-atomic)", async () => {

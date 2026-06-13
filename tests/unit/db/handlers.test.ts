@@ -75,13 +75,18 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-          where: { id: TEST_ASSET.toBase58() },
-          data: {
+        expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              id: TEST_ASSET.toBase58(),
+              OR: expect.any(Array),
+            }),
+            data: expect.objectContaining({
             owner: TEST_NEW_OWNER.toBase58(),
             updatedAt: ctx.blockTime,
-          },
-        });
+            }),
+          })
+        );
       });
     });
 
@@ -101,7 +106,13 @@ describe("DB Handlers", () => {
 
         expect(prisma.agent.updateMany).toHaveBeenCalledWith(
           expect.objectContaining({
-            where: { id: TEST_ASSET.toBase58() },
+            where: expect.objectContaining({
+              id: TEST_ASSET.toBase58(),
+              OR: expect.any(Array),
+            }),
+            data: expect.objectContaining({
+              uri: newUri,
+            }),
           })
         );
       });
@@ -121,13 +132,18 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agent.updateMany).toHaveBeenCalledWith({
-          where: { id: TEST_ASSET.toBase58() },
-          data: {
+        expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              id: TEST_ASSET.toBase58(),
+              OR: expect.any(Array),
+            }),
+            data: expect.objectContaining({
             wallet: TEST_WALLET.toBase58(),
             updatedAt: ctx.blockTime,
-          },
-        });
+            }),
+          })
+        );
       });
     });
 
@@ -145,15 +161,9 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agentMetadata.upsert).toHaveBeenCalledWith(
+        expect(prisma.agentMetadata.create).toHaveBeenCalledWith(
           expect.objectContaining({
-            where: {
-              agentId_key: {
-                agentId: TEST_ASSET.toBase58(),
-                key: "description",
-              },
-            },
-            create: expect.objectContaining({
+            data: expect.objectContaining({
               agentId: TEST_ASSET.toBase58(),
               key: "description",
               immutable: false,

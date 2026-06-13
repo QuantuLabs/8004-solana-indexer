@@ -266,7 +266,6 @@ describe("WebSocketIndexer", () => {
         expect.objectContaining({ transactionDetails: "full" })
       );
       expect((wsIndexer as any).lastPersistedCursor.txIndex).toBe(1);
-      expect((wsIndexer as any).sessionStartCursor.txIndex).toBe(1);
     });
 
     it("should treat a legacy null snapshot tx index as slot-start when resolution fails", async () => {
@@ -282,7 +281,6 @@ describe("WebSocketIndexer", () => {
       await wsIndexer.start();
 
       expect((wsIndexer as any).lastPersistedCursor.txIndex).toBe(-1);
-      expect((wsIndexer as any).sessionStartCursor.txIndex).toBe(-1);
     });
 
     it("should not start twice", async () => {
@@ -950,16 +948,26 @@ describe("WebSocketIndexer", () => {
       })
     );
 
-    const mockIndexedSignatures = (signatures: string[] = []) => {
-      mockPrisma.agent.findMany.mockImplementation(async (args: any) => {
-        if (args?.where?.createdTxSignature?.in) {
-          return signatures.map((signature) => ({ createdTxSignature: signature }));
-        }
-        return [];
-      });
+    const mockPollerReplay = (signatures: Array<ReturnType<typeof createMockSignatureInfo>>) => {
+      const bySlot = new Map<number, string[]>();
+      for (const signature of signatures.filter((sig) => sig.err === null)) {
+        const slotSignatures = bySlot.get(signature.slot) ?? [];
+        slotSignatures.push(signature.signature);
+        bySlot.set(signature.slot, slotSignatures);
+      }
+
+      (mockConnection.getBlock as any).mockImplementation(async (slot: number) => ({
+        blockTime: 123,
+        transactions: (bySlot.get(slot) ?? []).map((signature) => ({
+          transaction: { signatures: [signature] },
+        })),
+      }));
+      (mockConnection.getParsedTransaction as any).mockImplementation(async (signature: string) => (
+        makeRecoveryTransaction(signature)
+      ));
     };
 
-    it("should directly recover a persisted-tip miss after a restart", async () => {
+    it("should replay a persisted-tip miss through the poller after a restart", async () => {
       const sessionStartCursor = {
         lastSignature: "session-start",
         lastSlot: 100n,
@@ -971,7 +979,7 @@ describe("WebSocketIndexer", () => {
         lastSignature: "advanced-cursor",
         lastSlot: 200n,
         lastTxIndex: 0,
-        source: "websocket",
+        source: "poller",
         updatedAt: new Date("2026-03-14T00:01:00.000Z"),
       };
       let mainCursor = sessionStartCursor;
@@ -1005,13 +1013,11 @@ describe("WebSocketIndexer", () => {
         maxRetries: 3,
       });
       mockConnection.removeOnLogsListener.mockClear();
-      mockIndexedSignatures();
-      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+      const replaySignatures = [
         createMockSignatureInfo("missed-behind-advanced-cursor", 150, null),
-      ]);
-      (mockConnection.getParsedTransaction as any).mockResolvedValueOnce(
-        makeRecoveryTransaction("missed-behind-advanced-cursor")
-      );
+      ];
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(replaySignatures);
+      mockPollerReplay(replaySignatures);
 
       await wsIndexer.start();
       const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
@@ -1026,15 +1032,25 @@ describe("WebSocketIndexer", () => {
         expect.objectContaining({ maxSupportedTransactionVersion: config.maxSupportedTransactionVersion })
       );
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(1);
-      expect(mockConnection.getBlock).not.toHaveBeenCalled();
-      expect(mockPrisma.agent.upsert).toHaveBeenCalled();
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        150,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      expect(mockPrisma.agent.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({
+            createdTxSignature: "missed-behind-advanced-cursor",
+            txIndex: 0,
+          }),
+        })
+      );
       expect(mainCursor).toEqual(advancedCursor);
       expect(durableTip).toBe("missed-behind-advanced-cursor");
       expect(mockConnection.removeOnLogsListener).not.toHaveBeenCalled();
       expect(wsIndexer.isActive()).toBe(true);
     });
 
-    it("should directly recover a missed signature without rewinding or stopping", async () => {
+    it("should replay a scanned window in canonical order without rewinding or stopping", async () => {
       const sessionStartCursor = {
         lastSignature: "session-start",
         lastSlot: 100n,
@@ -1076,14 +1092,15 @@ describe("WebSocketIndexer", () => {
         }
         return args.update ?? args.create;
       });
-      mockIndexedSignatures(["already-indexed"]);
-      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
-        createMockSignatureInfo("already-indexed", 151, null),
+      const replaySignatures = [
+        createMockSignatureInfo("already-indexed", 150, null),
         createMockSignatureInfo("missed-behind-advanced-cursor", 150, null),
+      ];
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(replaySignatures);
+      mockPollerReplay([
+        createMockSignatureInfo("missed-behind-advanced-cursor", 150, null),
+        createMockSignatureInfo("already-indexed", 150, null),
       ]);
-      (mockConnection.getParsedTransaction as any).mockResolvedValueOnce(
-        makeRecoveryTransaction("missed-behind-advanced-cursor")
-      );
 
       await wsIndexer.start();
       currentCursor = advancedCursor;
@@ -1106,9 +1123,23 @@ describe("WebSocketIndexer", () => {
         "missed-behind-advanced-cursor",
         expect.any(Object)
       );
-      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(1);
-      expect(mockConnection.getBlock).not.toHaveBeenCalled();
-      expect(mockPrisma.agent.upsert).toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith(
+        "already-indexed",
+        expect.any(Object)
+      );
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(2);
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        150,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      const upsertedSignatures = mockPrisma.agent.upsert.mock.calls.map(([args]) => (
+        args?.create?.createdTxSignature
+      ));
+      expect(upsertedSignatures).toEqual([
+        "missed-behind-advanced-cursor",
+        "already-indexed",
+      ]);
+      expect(mockPrisma.agent.upsert.mock.calls.map(([args]) => args?.create?.txIndex)).toEqual([0, 1]);
       expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: "main" } })
       );
@@ -1142,13 +1173,16 @@ describe("WebSocketIndexer", () => {
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
         createMockSignatureInfo("observed-newest", 101, null),
       ]);
-      mockIndexedSignatures(["observed-newest"]);
+      mockPollerReplay([
+        createMockSignatureInfo("observed-newest", 101, null),
+      ]);
 
       await wsIndexer.start();
 
       const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
 
       expect(triggered).toBe(false);
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("observed-newest", expect.any(Object));
       expect(durableTip).toBe("observed-newest");
       expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1192,7 +1226,6 @@ describe("WebSocketIndexer", () => {
       for (const page of pages) {
         (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(page);
       }
-      mockIndexedSignatures(pages.flat().map((signature) => signature.signature));
 
       await wsIndexer.start();
 
@@ -1210,7 +1243,7 @@ describe("WebSocketIndexer", () => {
       expect(wsIndexer.isActive()).toBe(false);
     });
 
-    it("should directly ingest a successful signature not present in indexed rows", async () => {
+    it("should replay a successful signature not present in indexed rows", async () => {
       const cursorRow = {
         lastSignature: "cursor-sig",
         lastSlot: 100n,
@@ -1221,14 +1254,12 @@ describe("WebSocketIndexer", () => {
       mockPrisma.indexerState.findUnique
         .mockResolvedValueOnce(cursorRow as any)
         .mockResolvedValueOnce(cursorRow as any);
-      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+      const replaySignatures = [
         createMockSignatureInfo("missed-sig", 101, null),
         createMockSignatureInfo("failed-sig", 102, { InstructionError: [0, "Custom"] }),
-      ]);
-      mockIndexedSignatures();
-      (mockConnection.getParsedTransaction as any).mockResolvedValueOnce(
-        makeRecoveryTransaction("missed-sig")
-      );
+      ];
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(replaySignatures);
+      mockPollerReplay(replaySignatures);
 
       await wsIndexer.start();
 
@@ -1241,6 +1272,10 @@ describe("WebSocketIndexer", () => {
       );
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("missed-sig", expect.any(Object));
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(1);
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        101,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
       expect(mockPrisma.agent.upsert).toHaveBeenCalled();
       expect(wsIndexer.isActive()).toBe(true);
     });
@@ -1259,15 +1294,13 @@ describe("WebSocketIndexer", () => {
       mockPrisma.indexerState.findUnique
         .mockResolvedValueOnce(cursorRow as any)
         .mockResolvedValueOnce(cursorRow as any);
+      const secondPage = [
+        createMockSignatureInfo("missed-second-page", 101, null),
+      ];
       (mockConnection.getSignaturesForAddress as any)
         .mockResolvedValueOnce(firstPage)
-        .mockResolvedValueOnce([
-          createMockSignatureInfo("missed-second-page", 101, null),
-        ]);
-      mockIndexedSignatures(firstPage.map((signature) => signature.signature));
-      (mockConnection.getParsedTransaction as any).mockResolvedValueOnce(
-        makeRecoveryTransaction("missed-second-page")
-      );
+        .mockResolvedValueOnce(secondPage);
+      mockPollerReplay([...firstPage, ...secondPage]);
 
       await wsIndexer.start();
 
@@ -1285,6 +1318,7 @@ describe("WebSocketIndexer", () => {
         { until: "cursor-sig", limit: 50, before: "observed-49" }
       );
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("missed-second-page", expect.any(Object));
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledTimes(51);
       expect(wsIndexer.isActive()).toBe(true);
     });
 
@@ -1312,10 +1346,9 @@ describe("WebSocketIndexer", () => {
         .mockResolvedValueOnce([
           createMockSignatureInfo("missed-behind-ws-cursor", 150, null),
         ]);
-      mockIndexedSignatures();
-      (mockConnection.getParsedTransaction as any).mockResolvedValueOnce(
-        makeRecoveryTransaction("missed-behind-ws-cursor")
-      );
+      mockPollerReplay([
+        createMockSignatureInfo("missed-behind-ws-cursor", 150, null),
+      ]);
 
       await wsIndexer.start();
 
@@ -1339,7 +1372,7 @@ describe("WebSocketIndexer", () => {
       expect(wsIndexer.isActive()).toBe(true);
     });
 
-    it("should not fetch signatures already present in indexed rows", async () => {
+    it("should replay scanned signatures without an indexed-row diff", async () => {
       const startCursor = {
         lastSignature: "cursor-sig",
         lastSlot: 100n,
@@ -1360,15 +1393,48 @@ describe("WebSocketIndexer", () => {
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
         createMockSignatureInfo("poller-covered-sig", 120, null),
       ]);
-      mockIndexedSignatures(["poller-covered-sig"]);
+      mockPollerReplay([
+        createMockSignatureInfo("poller-covered-sig", 120, null),
+      ]);
 
       await wsIndexer.start();
 
       const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
 
       expect(triggered).toBe(false);
-      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("poller-covered-sig", expect.any(Object));
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        120,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      expect(wsIndexer.isActive()).toBe(true);
+    });
+
+    it("should spend one scan and no transaction fetches on an idle reconciliation interval", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(cursorRow as any)
+        .mockResolvedValueOnce(cursorRow as any);
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([]);
+
+      await wsIndexer.start();
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+
+      expect(triggered).toBe(false);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledTimes(1);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
+        TEST_PROGRAM_ID,
+        { until: "cursor-sig", limit: 50 }
+      );
       expect(mockConnection.getBlock).not.toHaveBeenCalled();
+      expect(mockConnection.getParsedTransaction).not.toHaveBeenCalled();
       expect(wsIndexer.isActive()).toBe(true);
     });
 
@@ -1570,7 +1636,7 @@ describe("WebSocketIndexer", () => {
       ]);
     });
 
-    it("should restore session-start cursor when an older notification arrives behind a websocket cursor", async () => {
+    it("should process an older notification idempotently without rewinding the cursor", async () => {
       let logsHandler: (logs: any, ctx: any) => void;
       (mockConnection.onLogs as any).mockImplementation(
         (_: any, handler: any) => {
@@ -1579,8 +1645,6 @@ describe("WebSocketIndexer", () => {
         }
       );
 
-      const safeUpdatedAt = new Date("2026-03-14T00:00:00.000Z");
-      const safeSignature = "safe-session-start-signature";
       const laterSignature = "7wHu1qwD7q2ggbJqCPtxnHZ2TrLQfEV9B7NqcBYBqzXh9J6vQQYc4Kdb8ZnZJwZqNjKt1QZcJZGJ";
       const logs = createEventLogs("AgentRegistered", {
         asset: TEST_ASSET,
@@ -1590,28 +1654,13 @@ describe("WebSocketIndexer", () => {
         agentUri: "ipfs://QmStale",
       });
 
-      (mockPrisma.indexerState.findUnique as any)
-        .mockResolvedValueOnce({
-          lastSignature: safeSignature,
-          lastSlot: 41n,
-          lastTxIndex: 2,
-          source: "poller",
-          updatedAt: safeUpdatedAt,
-        })
-        .mockResolvedValueOnce({
-          lastSignature: laterSignature,
-          lastSlot: TEST_SLOT,
-          lastTxIndex: 1,
-          source: "websocket",
-          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
-        })
-        .mockResolvedValueOnce({
-          lastSignature: laterSignature,
-          lastSlot: TEST_SLOT,
-          lastTxIndex: 1,
-          source: "websocket",
-          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
-        });
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        lastSignature: laterSignature,
+        lastSlot: TEST_SLOT,
+        lastTxIndex: 1,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+      });
       (mockConnection.getBlock as any).mockResolvedValue({
         blockTime: 123,
         transactions: [
@@ -1627,20 +1676,19 @@ describe("WebSocketIndexer", () => {
       await new Promise((r) => setTimeout(r, 100));
       await ((wsIndexer as any).logQueue).onIdle().catch(() => undefined);
 
-      expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
-      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(3);
-      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+      expect(mockPrisma.agent.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          update: expect.objectContaining({
-            lastSignature: safeSignature,
-            lastSlot: 41n,
-            lastTxIndex: 2,
-            source: "poller",
-            updatedAt: safeUpdatedAt,
+          create: expect.objectContaining({
+            createdTxSignature: TEST_SIGNATURE,
+            txIndex: 0,
           }),
         })
       );
-      expect(wsIndexer.isActive()).toBe(false);
+      expect(mockPrisma.indexerState.upsert).not.toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: "main" } })
+      );
+      expect(mockConnection.removeOnLogsListener).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(true);
     });
 
     it("should enter fail-safe stop and avoid writes when tx_index cannot be resolved", async () => {

@@ -284,7 +284,8 @@ describe("supabase.ts", () => {
         expect(insertCall).toBeDefined();
         expect(insertCall![0]).toContain("created_at, updated_at");
         expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-        expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
+        expect(insertCall![0]).toContain("block_slot = EXCLUDED.block_slot");
+        expect(insertCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(insertCall![1]).toContain(TEST_ASSET.toBase58());
         expect(insertCall![1]).toContain("ipfs://QmTest");
       });
@@ -576,10 +577,11 @@ describe("supabase.ts", () => {
         await handleEvent(event, ctx);
         const calls = mockPoolInstance.query.mock.calls;
         const updateCall = calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner")
+          typeof c[0] === "string" && c[0].includes("SET owner = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(updateCall![1]).toContain(TEST_NEW_OWNER.toBase58());
       });
 
@@ -613,7 +615,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("atom_enabled = true")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
       });
 
       it("should catch query error", async () => {
@@ -638,10 +641,11 @@ describe("supabase.ts", () => {
         };
         await handleEvent(event, ctx);
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET agent_uri")
+          typeof c[0] === "string" && c[0].includes("SET agent_uri = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(updateCall![1][0]).toBe("ipfs://QmNewUri");
       });
 
@@ -656,7 +660,7 @@ describe("supabase.ts", () => {
         };
         await handleEvent(event, ctx);
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET agent_uri")
+          typeof c[0] === "string" && c[0].includes("SET agent_uri = $1")
         );
         expect(updateCall![1][0]).toBeNull();
       });
@@ -687,7 +691,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(updateCall![1][0]).toBe(TEST_WALLET.toBase58());
       });
 
@@ -705,7 +710,8 @@ describe("supabase.ts", () => {
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(updateCall![1][0]).toBeNull();
       });
 
@@ -731,10 +737,12 @@ describe("supabase.ts", () => {
         };
         await handleEvent(event, ctx);
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1, agent_wallet = $2")
+          typeof c[0] === "string" && c[0].includes("SET owner = $1")
+            && c[0].includes("agent_wallet = $2")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
       });
 
       it("should not rewrite block_slot on CollectionPointerSet", async () => {
@@ -752,7 +760,8 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
         expect(updateCall![0]).toContain("last_seen_tx_index");
         expect(updateCall![0]).toContain("WHERE EXISTS (SELECT 1 FROM updated)");
         expect(updateCall![0]).toContain("COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)");
@@ -774,8 +783,9 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).not.toContain("block_slot");
-        expect(updateCall![1]).toHaveLength(5);
+        expect(updateCall![0]).toContain("block_slot");
+        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![1]).toHaveLength(9);
       });
     });
 
@@ -1795,7 +1805,7 @@ describe("supabase.ts", () => {
         };
         await handleEventAtomic(event, ctx);
         const updateCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner")
+          typeof c[0] === "string" && c[0].includes("SET owner = $1")
         );
         expect(updateCall).toBeDefined();
       });
@@ -1819,7 +1829,7 @@ describe("supabase.ts", () => {
         };
         await handleEventAtomic(event, ctx);
         const updateCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET agent_uri")
+          typeof c[0] === "string" && c[0].includes("SET agent_uri = $1")
         );
         expect(updateCall).toBeDefined();
         expect(updateCall![1][0]).toBe("ipfs://new");
@@ -1832,7 +1842,7 @@ describe("supabase.ts", () => {
         };
         await handleEventAtomic(event, ctx);
         const updateCall = mockClientInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("UPDATE agents SET agent_uri")
+          typeof c[0] === "string" && c[0].includes("SET agent_uri = $1")
         );
         expect(updateCall![1][0]).toBeNull();
       });

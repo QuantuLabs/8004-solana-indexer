@@ -41,6 +41,7 @@ export function createMockPrismaClient(): PrismaClient {
       findMany: vi.fn().mockResolvedValue([]),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       upsert: vi.fn(),
       delete: vi.fn(),
       deleteMany: vi.fn(),

@@ -652,7 +652,8 @@ describe("EventBuffer", () => {
       expect(insertCall).toBeDefined();
       expect(insertCall![0]).toContain("created_at, updated_at, status");
       expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-      expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
+      expect(insertCall![0]).toContain("block_slot = EXCLUDED.block_slot");
+      expect(insertCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
 
       const collectionCallIndex = client.query.mock.calls.findIndex((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("INSERT INTO collections")
@@ -1454,7 +1455,7 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       const updateCall = client.query.mock.calls.find((call: any[]) =>
-        typeof call[0] === "string" && call[0].includes("UPDATE agents SET agent_uri")
+        typeof call[0] === "string" && call[0].includes("SET agent_uri = $1")
       );
       expect(updateCall).toBeDefined();
       expect(updateCall[1][0]).toBeNull();
@@ -2631,10 +2632,11 @@ describe("EventBuffer", () => {
       client.query.mockClear();
       await buffer.updateAgentOwnerSupabase(client, { asset: "asset1", newOwner: "owner1" }, ctx);
       const ownerCall = client.query.mock.calls.find((c: any[]) =>
-        typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1")
+        typeof c[0] === "string" && c[0].includes("SET owner = $1")
       );
       expect(ownerCall).toBeDefined();
-      expect(ownerCall![0]).not.toContain("block_slot");
+      expect(ownerCall![0]).toContain("block_slot");
+      expect(ownerCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
 
       client.query.mockClear();
       await buffer.updateWalletResetOnOwnerSyncSupabase(
@@ -2643,10 +2645,12 @@ describe("EventBuffer", () => {
         ctx
       );
       const walletResetCall = client.query.mock.calls.find((c: any[]) =>
-        typeof c[0] === "string" && c[0].includes("UPDATE agents SET owner = $1, agent_wallet = $2")
+        typeof c[0] === "string" && c[0].includes("SET owner = $1")
+          && c[0].includes("agent_wallet = $2")
       );
       expect(walletResetCall).toBeDefined();
-      expect(walletResetCall![0]).not.toContain("block_slot");
+      expect(walletResetCall![0]).toContain("block_slot");
+      expect(walletResetCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
 
       client.query.mockClear();
       await buffer.updateCollectionPointerSupabase(
@@ -2658,7 +2662,8 @@ describe("EventBuffer", () => {
         typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
       );
       expect(collectionCall).toBeDefined();
-      expect(collectionCall![0]).not.toContain("block_slot");
+      expect(collectionCall![0]).toContain("block_slot");
+      expect(collectionCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
 
       client.query.mockClear();
       await buffer.updateParentAssetSupabase(
@@ -2670,8 +2675,9 @@ describe("EventBuffer", () => {
         typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
       );
       expect(parentCall).toBeDefined();
-      expect(parentCall![0]).not.toContain("block_slot");
-      expect(parentCall![1]).toHaveLength(5);
+      expect(parentCall![0]).toContain("block_slot");
+      expect(parentCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(parentCall![1]).toHaveLength(9);
     });
   });
 });
