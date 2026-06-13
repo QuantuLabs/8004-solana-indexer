@@ -37,6 +37,40 @@ const PROVIDER_BACKOFF_MIN_MS = 2000;
 const PROVIDER_BACKOFF_MAX_MS = 30000;
 
 const ZERO_HASH_HEX = "0".repeat(64);
+const NULLS_LAST_SQL_TX_INDEX = 2147483647;
+
+function canonicalOrderGuardSql(
+  tableRef: string,
+  slotExpr: string,
+  txIndexExpr: string,
+  signatureExpr: string,
+  slotColumn = "block_slot",
+  txIndexColumn = "tx_index",
+  signatureColumn = "tx_signature"
+): string {
+  return `(
+    ${tableRef}.${slotColumn} IS NULL
+    OR ${tableRef}.${slotColumn} < ${slotExpr}
+    OR (
+      ${tableRef}.${slotColumn} = ${slotExpr}
+      AND (
+        COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) < COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
+        OR (
+          COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) = COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
+          AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
+        )
+      )
+    )
+  )`;
+}
+
+function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, signatureExpr);
+}
+
+function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, signatureExpr: string): string {
+  return canonicalOrderGuardSql("metadata", slotExpr, txIndexExpr, signatureExpr);
+}
 
 function toRequiredHashHex(hash: Uint8Array | undefined | null): string | null {
   if (!hash) return null;
@@ -844,9 +878,12 @@ export class EventBuffer {
         creator = COALESCE(agents.creator, EXCLUDED.creator),
         agent_uri = EXCLUDED.agent_uri,
         atom_enabled = EXCLUDED.atom_enabled,
+        block_slot = EXCLUDED.block_slot,
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
+        tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
+      WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
     `, [
         asset,
         owner,
@@ -1441,8 +1478,16 @@ export class EventBuffer {
   private async updateAgentUriSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     await client.query(`
-      UPDATE agents SET agent_uri = $1, updated_at = $2 WHERE asset = $3
-    `, [data.newUri || null, ctx.blockTime.toISOString(), asset]);
+      UPDATE agents
+      SET agent_uri = $1,
+          updated_at = $2,
+          block_slot = $4,
+          tx_index = $5,
+          event_ordinal = $6,
+          tx_signature = $7
+      WHERE asset = $3
+        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}
+    `, [data.newUri || null, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
   private async updateAgentWalletSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
@@ -1450,8 +1495,16 @@ export class EventBuffer {
     const walletRaw = data.newWallet?.toBase58?.() || data.newWallet;
     const wallet = walletRaw === DEFAULT_PUBKEY ? null : walletRaw;
     await client.query(`
-      UPDATE agents SET agent_wallet = $1, updated_at = $2 WHERE asset = $3
-    `, [wallet, ctx.blockTime.toISOString(), asset]);
+      UPDATE agents
+      SET agent_wallet = $1,
+          updated_at = $2,
+          block_slot = $4,
+          tx_index = $5,
+          event_ordinal = $6,
+          tx_signature = $7
+      WHERE asset = $3
+        AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}
+    `, [wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
   private async updateWalletResetOnOwnerSyncSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
@@ -1460,8 +1513,17 @@ export class EventBuffer {
     const wallet = walletRaw === DEFAULT_PUBKEY ? null : walletRaw;
     const ownerAfterSync = data.ownerAfterSync?.toBase58?.() || data.ownerAfterSync;
     await client.query(
-      `UPDATE agents SET owner = $1, agent_wallet = $2, updated_at = $3 WHERE asset = $4`,
-      [ownerAfterSync, wallet, ctx.blockTime.toISOString(), asset]
+      `UPDATE agents
+       SET owner = $1,
+           agent_wallet = $2,
+           updated_at = $3,
+           block_slot = $5,
+           tx_index = $6,
+           event_ordinal = $7,
+           tx_signature = $8
+       WHERE asset = $4
+         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$8::text")}`,
+      [ownerAfterSync, wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
 
@@ -1497,8 +1559,13 @@ export class EventBuffer {
          SET canonical_col = $2,
              creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
              updated_at = $5,
-             col_locked = COALESCE($8, col_locked)
+             col_locked = COALESCE($8, col_locked),
+             block_slot = $4,
+             tx_index = $7,
+             event_ordinal = $9,
+             tx_signature = $6
          WHERE asset = $1
+           AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$6::text")}
          RETURNING 1
        ),
        inserted AS (
@@ -1593,7 +1660,7 @@ export class EventBuffer {
          AND cp.creator = (SELECT creator_key FROM resolved)
          AND EXISTS (SELECT 1 FROM updated)
       `,
-      [asset, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, ctx.txIndex ?? null, lock]
+      [asset, pointer, setBy, ctx.slot.toString(), ctx.blockTime.toISOString(), ctx.signature, ctx.txIndex ?? null, lock, ctx.eventOrdinal ?? null]
     );
 
     const currentResult = await client.query(
@@ -1644,17 +1711,30 @@ export class EventBuffer {
        SET parent_asset = $1,
            parent_creator = $2,
            updated_at = $3,
-           parent_locked = COALESCE($5, parent_locked)
-       WHERE asset = $4`,
-      [parentAsset, parentCreator, ctx.blockTime.toISOString(), asset, lock]
+           parent_locked = COALESCE($5, parent_locked),
+           block_slot = $6,
+           tx_index = $7,
+           event_ordinal = $8,
+           tx_signature = $9
+       WHERE asset = $4
+         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$9::text")}`,
+      [parentAsset, parentCreator, ctx.blockTime.toISOString(), asset, lock, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
 
   private async updateAtomEnabledSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
     const asset = data.asset?.toBase58?.() || data.asset;
     await client.query(`
-      UPDATE agents SET atom_enabled = true, updated_at = $1 WHERE asset = $2
-    `, [ctx.blockTime.toISOString(), asset]);
+      UPDATE agents
+      SET atom_enabled = true,
+          updated_at = $1,
+          block_slot = $3,
+          tx_index = $4,
+          event_ordinal = $5,
+          tx_signature = $6
+      WHERE asset = $2
+        AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$6::text")}
+    `, [ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
   }
 
   private async insertMetadataSupabase(client: PoolClient, data: EventData, ctx: BatchEvent["ctx"]): Promise<void> {
@@ -1687,6 +1767,7 @@ export class EventBuffer {
         tx_signature = EXCLUDED.tx_signature,
         updated_at = EXCLUDED.updated_at
       WHERE NOT metadata.immutable
+        AND ${metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")}
     `, [id, asset, key, keyHash, compressedValue, data.immutable || false,
         ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature, ctx.blockTime.toISOString(),
         ctx.blockTime.toISOString()]);
@@ -1702,8 +1783,16 @@ export class EventBuffer {
     const asset = data.asset?.toBase58?.() || data.asset;
     const newOwner = data.newOwner?.toBase58?.() || data.newOwner;
     await client.query(
-      `UPDATE agents SET owner = $1, updated_at = $2 WHERE asset = $3`,
-      [newOwner, ctx.blockTime.toISOString(), asset]
+      `UPDATE agents
+       SET owner = $1,
+           updated_at = $2,
+           block_slot = $4,
+           tx_index = $5,
+           event_ordinal = $6,
+           tx_signature = $7
+       WHERE asset = $3
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$7::text")}`,
+      [newOwner, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
   }
 

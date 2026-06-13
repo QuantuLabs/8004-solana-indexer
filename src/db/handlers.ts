@@ -982,7 +982,7 @@ interface AgentAtomPatch {
 async function syncAgentFeedbackStatsTx(
   tx: PrismaTransactionClient,
   assetId: string,
-  blockTime: Date,
+  ctx: EventContext,
   atomPatch?: AgentAtomPatch
 ): Promise<void> {
   const aggregate = await tx.feedback.aggregate({
@@ -999,19 +999,18 @@ async function syncAgentFeedbackStatsTx(
   const baseData = {
     feedbackCount,
     rawAvgScore: toRoundedScore(avgScore),
-    updatedAt: blockTime,
   };
 
   await tx.agent.updateMany({
-    where: { id: assetId },
-    data: atomPatch ? { ...baseData, ...atomPatch } : baseData,
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, atomPatch ? { ...baseData, ...atomPatch } : baseData),
   });
 }
 
 async function syncAgentFeedbackStats(
   prisma: PrismaClient,
   assetId: string,
-  blockTime: Date,
+  ctx: EventContext,
   atomPatch?: AgentAtomPatch
 ): Promise<void> {
   const aggregate = await prisma.feedback.aggregate({
@@ -1028,12 +1027,11 @@ async function syncAgentFeedbackStats(
   const baseData = {
     feedbackCount,
     rawAvgScore: toRoundedScore(avgScore),
-    updatedAt: blockTime,
   };
 
   await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: atomPatch ? { ...baseData, ...atomPatch } : baseData,
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, atomPatch ? { ...baseData, ...atomPatch } : baseData),
   });
 }
 
@@ -1045,6 +1043,83 @@ export interface EventContext {
   eventOrdinal?: number; // Event index within the transaction (deterministic intra-tx ordering)
   source?: "poller" | "websocket" | "substreams"; // Event source for cursor tracking
   skipCursorUpdate?: boolean;
+}
+
+const NULLS_LAST_TX_INDEX = Number.MAX_SAFE_INTEGER;
+
+function isCanonicalEventOrderNewerOrEqual(
+  current: { slot?: bigint | number | null; txIndex?: number | null; signature?: string | null },
+  ctx: EventContext
+): boolean {
+  if (current.slot === null || current.slot === undefined) return true;
+  const currentSlot = typeof current.slot === "bigint" ? current.slot : BigInt(current.slot);
+  if (ctx.slot !== currentSlot) return ctx.slot > currentSlot;
+
+  const currentTxIndex = current.txIndex ?? NULLS_LAST_TX_INDEX;
+  const nextTxIndex = ctx.txIndex ?? NULLS_LAST_TX_INDEX;
+  if (nextTxIndex !== currentTxIndex) return nextTxIndex > currentTxIndex;
+  if (!current.signature) return true;
+  return current.signature <= ctx.signature;
+}
+
+function localAgentMutationWhere(assetId: string, ctx: EventContext): any {
+  const txIndex = ctx.txIndex ?? null;
+  return {
+    id: assetId,
+    OR: [
+      { createdSlot: null },
+      { createdSlot: { lt: ctx.slot } },
+      ...(txIndex === null
+        ? [{ createdSlot: ctx.slot, txIndex: { not: null } }]
+        : [{ createdSlot: ctx.slot, txIndex: { lt: txIndex } }]),
+      {
+        createdSlot: ctx.slot,
+        txIndex,
+        OR: [
+          { createdTxSignature: null },
+          { createdTxSignature: { lte: ctx.signature } },
+        ],
+      },
+    ],
+  };
+}
+
+function localAgentMutationData(
+  ctx: EventContext,
+  data: Record<string, unknown>
+): any {
+  return {
+    ...data,
+    createdSlot: ctx.slot,
+    txIndex: ctx.txIndex ?? null,
+    eventOrdinal: ctx.eventOrdinal ?? null,
+    createdTxSignature: ctx.signature,
+    updatedAt: ctx.blockTime,
+  };
+}
+
+function localMetadataMutationWhere(assetId: string, key: string, ctx: EventContext): any {
+  const txIndex = ctx.txIndex ?? null;
+  return {
+    agentId: assetId,
+    key,
+    immutable: false,
+    OR: [
+      { slot: null },
+      { slot: { lt: ctx.slot } },
+      ...(txIndex === null
+        ? [{ slot: ctx.slot, txIndex: { not: null } }]
+        : [{ slot: ctx.slot, txIndex: { lt: txIndex } }]),
+      {
+        slot: ctx.slot,
+        txIndex,
+        OR: [
+          { txSignature: null },
+          { txSignature: { lte: ctx.signature } },
+        ],
+      },
+    ],
+  };
 }
 
 /**
@@ -1382,14 +1457,20 @@ async function handleAgentRegisteredCore(
   client: PrismaClientOrTx,
   data: AgentRegistered,
   ctx: EventContext
-): Promise<void> {
+): Promise<boolean> {
   const assetId = data.asset.toBase58();
   const agentUri = data.agentUri || "";
   const collectionId = data.collection.toBase58();
-  await withAgentIdAssignmentLock(async () => {
+  return await withAgentIdAssignmentLock(async () => {
     const existingAgent = await client.agent.findUnique({
       where: { id: assetId },
-      select: { agentId: true, creator: true },
+      select: {
+        agentId: true,
+        creator: true,
+        createdSlot: true,
+        txIndex: true,
+        createdTxSignature: true,
+      },
     });
     const ownerBase58 = data.owner.toBase58();
     const canonicalCreator = existingAgent
@@ -1401,8 +1482,14 @@ async function handleAgentRegisteredCore(
         })()
       : ownerBase58;
 
+    const canMutateExisting = !existingAgent || isCanonicalEventOrderNewerOrEqual({
+      slot: existingAgent.createdSlot,
+      txIndex: existingAgent.txIndex,
+      signature: existingAgent.createdTxSignature,
+    }, ctx);
+
     let assignedAgentId: bigint | undefined;
-    if (!existingAgent || existingAgent.agentId === null) {
+    if ((!existingAgent || existingAgent.agentId === null) && canMutateExisting) {
       const highestAssigned = await client.agent.findMany({
         where: { agentId: { not: null } },
         select: { agentId: true },
@@ -1412,44 +1499,61 @@ async function handleAgentRegisteredCore(
       assignedAgentId = asBigInt(highestAssigned[0]?.agentId) + 1n;
     }
 
-    await client.agent.upsert({
-      where: { id: assetId },
-      create: {
-        id: assetId,
-        owner: ownerBase58,
-        creator: canonicalCreator,
-        uri: agentUri,
-        nftName: "",
+    if (!existingAgent) {
+      await client.agent.upsert({
+        where: { id: assetId },
+        create: {
+          id: assetId,
+          owner: ownerBase58,
+          creator: canonicalCreator,
+          uri: agentUri,
+          nftName: "",
+          collection: collectionId,
+          collectionPointer: "",
+          colLocked: false,
+          parentLocked: false,
+          registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
+          atomEnabled: data.atomEnabled,
+          createdTxSignature: ctx.signature,
+          createdSlot: ctx.slot,
+          txIndex: ctx.txIndex ?? null,
+          eventOrdinal: ctx.eventOrdinal ?? null,
+          agentId: assignedAgentId ?? null,
+          status: DEFAULT_STATUS,
+          createdAt: ctx.blockTime,
+          updatedAt: ctx.blockTime,
+        },
+        update: localAgentMutationData(ctx, {
+          collection: collectionId,
+          registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
+          atomEnabled: data.atomEnabled,
+          uri: agentUri,
+          creator: canonicalCreator,
+          ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
+        }),
+      });
+      logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
+      return true;
+    }
+
+    const result = await client.agent.updateMany({
+      where: localAgentMutationWhere(assetId, ctx),
+      data: localAgentMutationData(ctx, {
         collection: collectionId,
-        collectionPointer: "",
-        colLocked: false,
-        parentLocked: false,
         registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
         atomEnabled: data.atomEnabled,
-        createdTxSignature: ctx.signature,
-        createdSlot: ctx.slot,
-        txIndex: ctx.txIndex ?? null,
-        eventOrdinal: ctx.eventOrdinal ?? null,
-        agentId: assignedAgentId ?? null,
-        status: DEFAULT_STATUS,
-        createdAt: ctx.blockTime,
-        updatedAt: ctx.blockTime,
-      },
-      update: {
-        collection: collectionId,
-        registry: collectionId, // v0.6.0: registry = collection
-        atomEnabled: data.atomEnabled,
         uri: agentUri,
         creator: canonicalCreator,
-        txIndex: ctx.txIndex ?? null,
-        eventOrdinal: ctx.eventOrdinal ?? null,
-        updatedAt: ctx.blockTime,
         ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
-      },
+      }),
     });
+    if (result.count === 0) {
+      logger.warn({ assetId }, "Agent registration skipped, event may be out of order");
+      return false;
+    }
+    logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
+    return true;
   });
-
-  logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
 }
 
 async function reconcileOrphanFeedbacksTx(
@@ -1514,7 +1618,8 @@ async function handleAgentRegisteredTx(
   data: AgentRegistered,
   ctx: EventContext
 ): Promise<void> {
-  await handleAgentRegisteredCore(tx, data, ctx);
+  const applied = await handleAgentRegisteredCore(tx, data, ctx);
+  if (!applied) return;
   const assetId = data.asset.toBase58();
   await reconcileOrphanFeedbacksTx(tx, assetId);
 }
@@ -1525,7 +1630,8 @@ async function handleAgentRegistered(
   data: AgentRegistered,
   ctx: EventContext
 ): Promise<void> {
-  await handleAgentRegisteredCore(prisma, data, ctx);
+  const applied = await handleAgentRegisteredCore(prisma, data, ctx);
+  if (!applied) return;
   const assetId = data.asset.toBase58();
   await reconcileOrphanFeedbacks(prisma, assetId);
   const agentUri = data.agentUri || "";
@@ -1543,8 +1649,8 @@ async function handleAgentOwnerSyncedTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: { owner: data.newOwner.toBase58(), updatedAt: ctx.blockTime },
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, { owner: data.newOwner.toBase58() }),
   });
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for owner sync, event may be out of order");
@@ -1562,11 +1668,10 @@ async function handleAgentOwnerSynced(
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       owner: data.newOwner.toBase58(),
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1591,8 +1696,8 @@ async function handleAtomEnabledTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: { atomEnabled: true, updatedAt: ctx.blockTime },
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, { atomEnabled: true }),
   });
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for ATOM enable, event may be out of order");
@@ -1610,11 +1715,10 @@ async function handleAtomEnabled(
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       atomEnabled: true,
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1633,8 +1737,8 @@ async function handleUriUpdatedTx(
   const assetId = data.asset.toBase58();
   const newUri = data.newUri || "";
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: { uri: newUri, updatedAt: ctx.blockTime },
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, { uri: newUri }),
   });
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for URI update, event may be out of order");
@@ -1653,11 +1757,10 @@ async function handleUriUpdated(
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       uri: newUri,
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1682,8 +1785,8 @@ async function handleWalletUpdatedTx(
   const newWalletRaw = data.newWallet.toBase58();
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: { wallet: newWallet, updatedAt: ctx.blockTime },
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, { wallet: newWallet }),
   });
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for wallet update, event may be out of order");
@@ -1704,11 +1807,10 @@ async function handleWalletUpdated(
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       wallet: newWallet,
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1733,12 +1835,11 @@ async function handleWalletResetOnOwnerSyncTx(
   const ownerAfterSync = data.ownerAfterSync.toBase58();
 
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       owner: ownerAfterSync,
       wallet: newWallet,
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1760,12 +1861,11 @@ async function handleWalletResetOnOwnerSync(
   const ownerAfterSync = data.ownerAfterSync.toBase58();
 
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       owner: ownerAfterSync,
       wallet: newWallet,
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1791,13 +1891,12 @@ async function handleCollectionPointerSetTx(
   const creator = existing?.creator ?? setBy;
 
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       collectionPointer: pointer,
       creator,
       ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count > 0) {
@@ -1859,13 +1958,12 @@ async function handleCollectionPointerSet(
   const creator = existing?.creator ?? setBy;
 
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       collectionPointer: pointer,
       creator,
       ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count > 0) {
@@ -1923,13 +2021,12 @@ async function handleParentAssetSetTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const result = await tx.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
       ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1952,13 +2049,12 @@ async function handleParentAssetSet(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const result = await prisma.agent.updateMany({
-    where: { id: assetId },
-    data: {
+    where: localAgentMutationWhere(assetId, ctx),
+    data: localAgentMutationData(ctx, {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
       ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
-      updatedAt: ctx.blockTime,
-    },
+    }),
   });
 
   if (result.count === 0) {
@@ -1988,34 +2084,46 @@ async function handleMetadataSetTx(
   const prefixedValue = Buffer.concat([Buffer.from([0x00]), cleanValue]);
   const existing = await tx.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true },
+    select: { immutable: true, slot: true, txIndex: true, txSignature: true },
   });
   if (existing?.immutable) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
     return;
   }
-  await tx.agentMetadata.upsert({
-    where: { agentId_key: { agentId: assetId, key: data.key } },
-    create: {
-      agentId: assetId,
-      key: data.key,
-      value: prefixedValue,
-      immutable: data.immutable,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: DEFAULT_STATUS,
-    },
-    update: {
-      value: prefixedValue,
-      immutable: data.immutable,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-    },
-  });
+  if (existing && !isCanonicalEventOrderNewerOrEqual({
+    slot: existing.slot,
+    txIndex: existing.txIndex,
+    signature: existing.txSignature,
+  }, ctx)) {
+    return;
+  }
+  if (!existing) {
+    await tx.agentMetadata.create({
+      data: {
+        agentId: assetId,
+        key: data.key,
+        value: prefixedValue,
+        immutable: data.immutable,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
+      },
+    });
+  } else {
+    await tx.agentMetadata.updateMany({
+      where: localMetadataMutationWhere(assetId, data.key, ctx),
+      data: {
+        value: prefixedValue,
+        immutable: data.immutable,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+      },
+    });
+  }
   logger.info({ assetId, key: data.key }, "Metadata set");
 }
 
@@ -2038,40 +2146,48 @@ async function handleMetadataSet(
 
   const existing = await prisma.agentMetadata.findUnique({
     where: { agentId_key: { agentId: assetId, key: data.key } },
-    select: { immutable: true },
+    select: { immutable: true, slot: true, txIndex: true, txSignature: true },
   });
   if (existing?.immutable) {
     logger.debug({ assetId, key: data.key }, "Skipping update: metadata is immutable");
     return;
   }
 
-  await prisma.agentMetadata.upsert({
-    where: {
-      agentId_key: {
+  if (existing && !isCanonicalEventOrderNewerOrEqual({
+    slot: existing.slot,
+    txIndex: existing.txIndex,
+    signature: existing.txSignature,
+  }, ctx)) {
+    return;
+  }
+
+  if (!existing) {
+    await prisma.agentMetadata.create({
+      data: {
         agentId: assetId,
         key: data.key,
+        value: prefixedValue,
+        immutable: data.immutable,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+        status: DEFAULT_STATUS,
       },
-    },
-    create: {
-      agentId: assetId,
-      key: data.key,
-      value: prefixedValue,
-      immutable: data.immutable,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-      status: DEFAULT_STATUS,
-    },
-    update: {
-      value: prefixedValue,
-      immutable: data.immutable,
-      txSignature: ctx.signature,
-      slot: ctx.slot,
-      txIndex: ctx.txIndex ?? null,
-      eventOrdinal: ctx.eventOrdinal ?? null,
-    },
-  });
+    });
+  } else {
+    await prisma.agentMetadata.updateMany({
+      where: localMetadataMutationWhere(assetId, data.key, ctx),
+      data: {
+        value: prefixedValue,
+        immutable: data.immutable,
+        txSignature: ctx.signature,
+        slot: ctx.slot,
+        txIndex: ctx.txIndex ?? null,
+        eventOrdinal: ctx.eventOrdinal ?? null,
+      },
+    });
+  }
 
   logger.info({ assetId, key: data.key }, "Metadata set");
 }
@@ -2382,7 +2498,7 @@ async function handleNewFeedbackTx(
   await syncAgentFeedbackStatsTx(
     tx,
     assetId,
-    ctx.blockTime,
+    ctx,
     data.atomEnabled
       ? {
           trustTier: data.newTrustTier,
@@ -2632,7 +2748,7 @@ async function handleNewFeedback(
   await syncAgentFeedbackStats(
     prisma,
     assetId,
-    ctx.blockTime,
+    ctx,
     data.atomEnabled
       ? {
           trustTier: data.newTrustTier,
@@ -2795,7 +2911,7 @@ async function handleFeedbackRevokedTx(
     await syncAgentFeedbackStatsTx(
       tx,
       assetId,
-      ctx.blockTime,
+      ctx,
       data.atomEnabled && data.hadImpact
         ? {
             trustTier: data.newTrustTier,
@@ -2950,7 +3066,7 @@ async function handleFeedbackRevoked(
     await syncAgentFeedbackStats(
       prisma,
       assetId,
-      ctx.blockTime,
+      ctx,
       data.atomEnabled && data.hadImpact
         ? {
             trustTier: data.newTrustTier,
