@@ -93,6 +93,12 @@ export type HardenedFetchOptions = {
 };
 
 type HardenedFetchTransport = (request: HardenedTransportRequest) => Promise<HardenedTransportResponse>;
+type PinnedLookupCallback = (
+  err: NodeJS.ErrnoException | null,
+  address: string | Array<{ address: string; family: number }>,
+  family?: number
+) => void;
+type PinnedLookupOptions = { all?: boolean } | undefined;
 
 const negativeDnsCache = new Map<string, NegativeDnsEntry>();
 const hostLimitStates = new Map<string, { active: number; waiters: Array<() => void> }>();
@@ -149,6 +155,16 @@ export function resetHardenedFetchStateForTests(): void {
   negativeDnsCache.clear();
   hostLimitStates.clear();
   transportOverride = null;
+}
+
+export function createPinnedLookup(resolved: HostResolution) {
+  return (_hostname: string, options: PinnedLookupOptions, callback: PinnedLookupCallback): void => {
+    if (options?.all === true) {
+      callback(null, [{ address: resolved.ip, family: resolved.family }]);
+      return;
+    }
+    callback(null, resolved.ip, resolved.family);
+  };
 }
 
 export function shouldAllowTrustedLocalHostForUri(uri: string, hostname: string): boolean {
@@ -589,9 +605,7 @@ function nodeTransport(request: HardenedTransportRequest): Promise<HardenedTrans
         servername: requestUrl.hostname,
         lookup: request.resolved.family === 0
           ? undefined
-          : (_hostname, _options, callback) => {
-              callback(null, request.resolved.ip, request.resolved.family);
-            },
+          : createPinnedLookup(request.resolved),
       },
       async (res) => {
         const statusCode = res.statusCode ?? 0;
