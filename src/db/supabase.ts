@@ -692,10 +692,11 @@ export async function handleEventAtomic(
   const client = await db.connect();
 
   try {
+    const collectionsToMarkSeen = new Set<string>();
     await client.query("BEGIN");
 
     // Handle event inside transaction
-    await handleEventInTx(client, event, ctx);
+    await handleEventInTx(client, event, ctx, collectionsToMarkSeen);
 
     // Update cursor atomically with monotonic guard
     if (!ctx.skipCursorUpdate) {
@@ -703,6 +704,9 @@ export async function handleEventAtomic(
     }
 
     await client.query("COMMIT");
+    for (const collection of collectionsToMarkSeen) {
+      markCollectionSeen(collection);
+    }
   } catch (error: any) {
     await client.query("ROLLBACK");
     eventStats.errors++;
@@ -762,11 +766,12 @@ async function updateCursorAtomic(
 async function handleEventInTx(
   client: PoolClient,
   event: ProgramEvent,
-  ctx: EventContext
+  ctx: EventContext,
+  collectionsToMarkSeen: Set<string>
 ): Promise<void> {
   switch (event.type) {
     case "AgentRegistered":
-      await handleAgentRegisteredTx(client, event.data, ctx);
+      await handleAgentRegisteredTx(client, event.data, ctx, collectionsToMarkSeen);
       eventStats.agentRegistered++;
       break;
     case "AgentOwnerSynced":
@@ -849,7 +854,12 @@ async function ensureCollection(collection: string): Promise<void> {
   }
 }
 
-async function ensureCollectionTx(client: PoolClient, collection: string, createdAt: Date): Promise<void> {
+async function ensureCollectionTx(
+  client: PoolClient,
+  collection: string,
+  createdAt: Date,
+  collectionsToMarkSeen: Set<string>
+): Promise<void> {
   if (hasSeenCollection(collection)) return;
   try {
     await client.query(
@@ -858,7 +868,7 @@ async function ensureCollectionTx(client: PoolClient, collection: string, create
        ON CONFLICT (collection) DO NOTHING`,
       [collection, "BASE", createdAt.toISOString(), DEFAULT_STATUS]
     );
-    markCollectionSeen(collection);
+    collectionsToMarkSeen.add(collection);
   } catch (error: any) {
     eventStats.errors++;
     logger.error({ error: error.message, collection }, "Failed to ensure collection");
@@ -871,12 +881,13 @@ async function ensureCollectionTx(client: PoolClient, collection: string, create
 async function handleAgentRegisteredTx(
   client: PoolClient,
   data: AgentRegistered,
-  ctx: EventContext
+  ctx: EventContext,
+  collectionsToMarkSeen: Set<string>
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const collection = data.collection.toBase58();
   const agentUri = data.agentUri || null;
-  await ensureCollectionTx(client, collection, ctx.blockTime);
+  await ensureCollectionTx(client, collection, ctx.blockTime, collectionsToMarkSeen);
   await client.query(
     `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17)
@@ -1568,9 +1579,13 @@ async function handleAgentRegistered(
       [assetId],
     );
     if ((orphanFeedbackExists.rowCount ?? orphanFeedbackExists.rows.length) > 0) {
+      const collectionsToMarkSeen = new Set<string>();
       await runWithDedicatedTransaction(async (client) => {
-        await handleAgentRegisteredTx(client, data, ctx);
+        await handleAgentRegisteredTx(client, data, ctx, collectionsToMarkSeen);
       });
+      for (const collectionToMark of collectionsToMarkSeen) {
+        markCollectionSeen(collectionToMark);
+      }
       return;
     }
     await db.query(

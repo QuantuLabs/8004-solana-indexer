@@ -2576,6 +2576,46 @@ describe("supabase.ts", () => {
       await expect(handleEventAtomic(event, ctx)).rejects.toThrow("tx collection fail");
     });
 
+    it("should not cache a tx collection insert until commit succeeds", async () => {
+      const UNIQUE_COLLECTION3 = new PublicKey(new Uint8Array(32).fill(67));
+      const event = {
+        type: "AgentRegistered" as const,
+        data: {
+          asset: TEST_ASSET,
+          collection: UNIQUE_COLLECTION3,
+          owner: TEST_OWNER,
+          atomEnabled: false,
+          agentUri: "",
+        },
+      };
+
+      mockClientInstance.query.mockImplementation((sql: string) => {
+        if (sql === "BEGIN" || sql === "ROLLBACK") {
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO collections")) {
+          return Promise.resolve({ rows: [], rowCount: 1 });
+        }
+        if (typeof sql === "string" && sql.includes("INSERT INTO agents")) {
+          return Promise.reject(new Error("agent insert fail"));
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      });
+
+      await expect(handleEventAtomic(event, ctx)).rejects.toThrow("agent insert fail");
+
+      mockClientInstance.query.mockClear();
+      mockClientInstance.query.mockImplementation((...args: any[]) => mockPoolInstance.query(...args));
+      mockPoolInstance.query.mockResolvedValue({ rows: [], rowCount: 1 });
+
+      await handleEventAtomic(event, ctx);
+
+      const collectionInserts = mockClientInstance.query.mock.calls.filter((c: any[]) =>
+        typeof c[0] === "string" && c[0].includes("INSERT INTO collections") && c[0].includes("ON CONFLICT (collection)")
+      );
+      expect(collectionInserts.length).toBe(1);
+    });
+
     it("should evict oldest entry when LRU cache reaches 1000 entries", async () => {
       // Fill cache to capacity by registering many agents with unique collections
       // We can trigger this by calling handleEvent with 1000+ unique collections
