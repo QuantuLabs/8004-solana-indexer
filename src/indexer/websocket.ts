@@ -29,7 +29,6 @@ import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
 import { compareCanonicalTransactionOrder } from "./canonical-order.js";
 import {
-  findMissingProgramSignatures,
   hasProgramDataLogsForProgram,
   maybeUpsertProofPassMatchesForLogs,
   recoverMissingProgramSignatures,
@@ -276,8 +275,6 @@ export class WebSocketIndexer {
   private logQueue: PQueue;
   private droppedLogs = 0;
   private lastPersistedCursor: PersistedCursorSnapshot | null = null;
-  private sessionStartCursor: PersistedCursorSnapshot | null = null;
-  private restoreSessionStartCursorAfterStop = false;
   private processingHoldCount = 0;
   private reconciliationTimer: NodeJS.Timeout | null = null;
   private isReconciling = false;
@@ -363,8 +360,6 @@ export class WebSocketIndexer {
     this.retryCount = 0;
     this.runToken += 1;
     this.lastPersistedCursor = null;
-    this.sessionStartCursor = null;
-    this.restoreSessionStartCursorAfterStop = false;
     this.clearCanonicalFlushTimer();
     this.pendingLogNotifications.clear();
     this.notificationSequence = 0;
@@ -400,7 +395,6 @@ export class WebSocketIndexer {
             source: current.source ?? null,
             updatedAt: current.updatedAt ?? new Date(),
           };
-          this.sessionStartCursor = { ...this.lastPersistedCursor };
         }
       } catch (error) {
         logger.warn({ error }, "Failed to snapshot current cursor before starting websocket indexer");
@@ -422,7 +416,6 @@ export class WebSocketIndexer {
             source: current.source ?? null,
             updatedAt: current.updatedAt,
           };
-          this.sessionStartCursor = { ...this.lastPersistedCursor };
         }
       } catch (error) {
         logger.warn({ error }, "Failed to snapshot current Supabase cursor before starting websocket indexer");
@@ -507,7 +500,6 @@ export class WebSocketIndexer {
     const restoreCursorSnapshot = this.lastPersistedCursor
       ? { ...this.lastPersistedCursor }
       : null;
-    const allowIntentionalRewind = this.restoreSessionStartCursorAfterStop;
     if (clearedQueuedLogs > 0) {
       this.logQueue.clear();
       this.droppedLogs += clearedQueuedLogs;
@@ -531,9 +523,9 @@ export class WebSocketIndexer {
       await this.logQueue.onIdle();
     }
 
-    if (restoreCursorSnapshot && (allowIntentionalRewind || clearedQueuedLogs > 0 || hadInFlightWork)) {
+    if (restoreCursorSnapshot && (clearedQueuedLogs > 0 || hadInFlightWork)) {
       try {
-        await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot, allowIntentionalRewind);
+        await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot);
       } catch (error) {
         logger.warn({ error }, "Failed to restore safe cursor snapshot after websocket shutdown");
       }
@@ -565,13 +557,12 @@ export class WebSocketIndexer {
   }
 
   private async restoreSafeCursorSnapshotAfterStop(
-    snapshot: PersistedCursorSnapshot,
-    allowIntentionalRewind = false
+    snapshot: PersistedCursorSnapshot
   ): Promise<void> {
     const current = await this.loadCurrentCursorSnapshot();
     if (
       !this.currentCursorIsOwnedByWebSocket(current)
-      || (!allowIntentionalRewind && this.currentCursorIsNewerThanSnapshot(current, snapshot))
+      || this.currentCursorIsNewerThanSnapshot(current, snapshot)
     ) {
       logger.info(
         {
@@ -802,14 +793,14 @@ export class WebSocketIndexer {
   }
 
   private async initializeReconciliationTip(): Promise<void> {
-    const cursor = this.sessionStartCursor;
+    const cursor = this.lastPersistedCursor;
     if (!cursor?.signature) {
       return;
     }
 
     try {
       const storedTip = await this.loadReconciliationTipSignature();
-      const canReuseStoredTip = Boolean(storedTip) && cursor.source !== "poller" && cursor.source !== "substreams";
+      const canReuseStoredTip = Boolean(storedTip);
       const tip = canReuseStoredTip ? storedTip! : cursor.signature;
       this.reconciliationTipSignature = tip;
       if (!canReuseStoredTip) {
@@ -932,61 +923,6 @@ export class WebSocketIndexer {
         return false;
       }
 
-      let missing: ConfirmedSignatureInfo[];
-      try {
-        missing = await findMissingProgramSignatures(this.prisma, scan.signatures);
-      } catch (error) {
-        this.errorCount++;
-        logger.warn(
-          {
-            reason,
-            previousTip,
-            error: error instanceof Error ? error.message : String(error),
-            errorCount: this.errorCount,
-          },
-          "WebSocket reconciliation DB diff failed"
-        );
-        return false;
-      }
-
-      if (missing.length > 0) {
-        this.errorCount += missing.length;
-        try {
-          const recovered = await recoverMissingProgramSignatures({
-            connection: this.connection,
-            prisma: this.prisma,
-            programId: this.programId,
-            signatures: missing,
-            isActive: () => this.isRunning && !this.stopRequested,
-          });
-          this.processedCount += recovered;
-          logger.warn(
-            {
-              reason,
-              recovered,
-              signatures: missing.map((signature) => signature.signature),
-              errorCount: this.errorCount,
-            },
-            "WebSocket reconciliation directly recovered missing signatures"
-          );
-          if (scan.scanComplete && scan.signatures[0]?.signature) {
-            await this.persistReconciliationTip(scan.signatures[0].signature);
-          }
-        } catch (error) {
-          this.errorCount++;
-          logger.error(
-            {
-              reason,
-              signatures: missing.map((signature) => signature.signature),
-              error: error instanceof Error ? error.message : String(error),
-              errorCount: this.errorCount,
-            },
-            "WebSocket reconciliation direct recovery failed"
-          );
-        }
-        return false;
-      }
-
       if (scan.scanLimitReached) {
         this.errorCount++;
         this.scheduleFailSafeStop(
@@ -1003,6 +939,41 @@ export class WebSocketIndexer {
           }
         );
         return true;
+      }
+
+      const replayWindow = scan.signatures.filter((signature) => signature.err === null);
+      if (replayWindow.length > 0) {
+        try {
+          const replayed = await recoverMissingProgramSignatures({
+            connection: this.connection,
+            prisma: this.prisma,
+            programId: this.programId,
+            signatures: replayWindow,
+            isActive: () => this.isRunning && !this.stopRequested,
+          });
+          this.processedCount += replayed;
+          logger.warn(
+            {
+              reason,
+              replayed,
+              signatures: replayWindow.map((signature) => signature.signature),
+              errorCount: this.errorCount,
+            },
+            "WebSocket reconciliation replayed signatures through poller pipeline"
+          );
+        } catch (error) {
+          this.errorCount++;
+          this.scheduleFailSafeStop(
+            "WebSocket reconciliation replay failed; entering fail-safe stop so polling catch-up can retry",
+            {
+              reason,
+              signatures: replayWindow.map((signature) => signature.signature),
+              error: error instanceof Error ? error.message : String(error),
+              errorCount: this.errorCount,
+            }
+          );
+          return true;
+        }
       }
 
       if (scan.scanComplete && scan.signatures[0]?.signature) {
@@ -1458,13 +1429,6 @@ export class WebSocketIndexer {
     };
   }
 
-  private restoreSessionStartCursorOnFailSafe(): void {
-    this.lastPersistedCursor = this.sessionStartCursor
-      ? { ...this.sessionStartCursor }
-      : null;
-    this.restoreSessionStartCursorAfterStop = true;
-  }
-
   private async handleLogs(
     logs: Logs,
     ctx: Context,
@@ -1567,6 +1531,7 @@ export class WebSocketIndexer {
       const currentCursor = await this.loadCurrentCursorSnapshot();
       if (!this.isRunning || this.stopRequested) return;
       const nextSlot = BigInt(ctx.slot);
+      let shouldAdvanceDurableCursor = true;
       if (
         currentCursor?.lastSlot !== null
         && currentCursor?.lastSlot !== undefined
@@ -1579,26 +1544,8 @@ export class WebSocketIndexer {
           logs.signature
         )
       ) {
-        if (currentCursor.source === "poller" || currentCursor.source === "substreams") {
-          logger.debug(
-            {
-              signature: logs.signature,
-              slot: ctx.slot,
-              txIndex,
-              cursorSlot: currentCursor.lastSlot.toString(),
-              cursorTxIndex: currentCursor.lastTxIndex,
-              cursorSignature: currentCursor.lastSignature,
-              cursorSource: currentCursor.source,
-            },
-            "Skipping WebSocket log already covered by canonical cursor"
-          );
-          return;
-        }
-
-        this.errorCount++;
-        this.restoreSessionStartCursorOnFailSafe();
-        this.scheduleFailSafeStop(
-          "WebSocket observed an older notification after its own durable cursor advanced; restoring session-start cursor so catch-up can replay the gap",
+        shouldAdvanceDurableCursor = false;
+        logger.debug(
           {
             signature: logs.signature,
             slot: ctx.slot,
@@ -1607,10 +1554,9 @@ export class WebSocketIndexer {
             cursorTxIndex: currentCursor.lastTxIndex,
             cursorSignature: currentCursor.lastSignature,
             cursorSource: currentCursor.source,
-            errorCount: this.errorCount,
-          }
+          },
+          "Processing WebSocket log behind durable cursor without cursor advance"
         );
-        return;
       }
 
       const blockTime = resolveEventBlockTime(blockTimeSeconds, ctx.slot);
@@ -1730,6 +1676,14 @@ export class WebSocketIndexer {
           logs: logs.logs,
           typedEvents,
         });
+
+        if (!shouldAdvanceDurableCursor) {
+          logger.debug(
+            { signature: logs.signature, slot: ctx.slot },
+            "Skipping cursor update for WebSocket log behind durable cursor"
+          );
+          return;
+        }
 
         if (this.freezeCursorAdvancement || this.stopRequested || !this.isRunning) {
           logger.info(

@@ -56,6 +56,11 @@ interface ProcessNewTransactionsResult {
   haltedOnError: boolean;
 }
 
+interface ProcessSignatureBatchOptions {
+  onTransactionProcessed?: (sig: ConfirmedSignatureInfo) => Promise<void>;
+  advanceCursor?: boolean;
+}
+
 function shouldAdvanceCursor(
   currentSlot: bigint | null | undefined,
   currentTxIndex: number | null | undefined,
@@ -1879,9 +1884,14 @@ export class Poller {
     signatures: ConfirmedSignatureInfo[],
     previousCount: number,
     totalEstimate: number,
-    onTransactionProcessed?: (sig: ConfirmedSignatureInfo) => Promise<void>
+    options: ProcessSignatureBatchOptions | ((sig: ConfirmedSignatureInfo) => Promise<void>) = {}
   ): Promise<number> {
     const startTime = Date.now();
+    const batchOptions = typeof options === "function"
+      ? { onTransactionProcessed: options }
+      : options;
+    const onTransactionProcessed = batchOptions.onTransactionProcessed;
+    const advanceCursor = batchOptions.advanceCursor ?? true;
 
     // BATCH RPC: Fetch all transactions in batch first (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
@@ -1940,7 +1950,7 @@ export class Poller {
           } else {
             blockTime = await this.processTransaction(sig, txIndex);
           }
-          if (USE_BATCH_DB && this.eventBuffer) {
+          if (advanceCursor && USE_BATCH_DB && this.eventBuffer) {
             this.eventBuffer.noteCursor({
               signature: sig.signature,
               slot: BigInt(sig.slot),
@@ -1948,12 +1958,14 @@ export class Poller {
               txIndex,
             }, false);
           }
-          this.lastSignature = sig.signature;
-          this.lastSlot = BigInt(sig.slot);
-          this.lastTxIndex = txIndex ?? null;
-          // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
-          if (!USE_BATCH_DB) {
-            await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
+          if (advanceCursor) {
+            this.lastSignature = sig.signature;
+            this.lastSlot = BigInt(sig.slot);
+            this.lastTxIndex = txIndex ?? null;
+            // Skip individual cursor saves when using batch DB - handled by EventBuffer flush
+            if (!USE_BATCH_DB) {
+              await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
+            }
           }
           if (onTransactionProcessed) {
             await onTransactionProcessed(sig);
@@ -2107,6 +2119,27 @@ export class Poller {
     if (this.eventBuffer) {
       const stats = this.eventBuffer.getStats();
       logger.info(stats, "Event buffer stats");
+    }
+  }
+
+  async replaySignatures(
+    signatures: ConfirmedSignatureInfo[],
+    options: { suppressEventLogWrites?: boolean; advanceCursor?: boolean } = {}
+  ): Promise<number> {
+    const wasRunning = this.isRunning;
+    const previousSuppressEventLogWrites = this.suppressEventLogWrites;
+    this.isRunning = true;
+    this.suppressEventLogWrites = Boolean(options.suppressEventLogWrites);
+    try {
+      return await this.processSignatureBatch(
+        signatures,
+        0,
+        signatures.length,
+        { advanceCursor: options.advanceCursor ?? false }
+      );
+    } finally {
+      this.suppressEventLogWrites = previousSuppressEventLogWrites;
+      this.isRunning = wasRunning;
     }
   }
 
