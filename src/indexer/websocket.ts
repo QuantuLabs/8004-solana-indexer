@@ -312,6 +312,7 @@ export class WebSocketIndexer {
   private droppedLogs = 0;
   private lastPersistedCursor: PersistedCursorSnapshot | null = null;
   private sessionStartCursor: PersistedCursorSnapshot | null = null;
+  private restoreSessionStartCursorAfterStop = false;
   private processingHoldCount = 0;
   private observedSignatures = new Set<string>();
   private observedSignatureOrder: string[] = [];
@@ -344,6 +345,7 @@ export class WebSocketIndexer {
     this.runToken += 1;
     this.lastPersistedCursor = null;
     this.sessionStartCursor = null;
+    this.restoreSessionStartCursorAfterStop = false;
     this.clearCanonicalFlushTimer();
     this.pendingLogNotifications.clear();
     this.notificationSequence = 0;
@@ -471,6 +473,7 @@ export class WebSocketIndexer {
     const restoreCursorSnapshot = this.lastPersistedCursor
       ? { ...this.lastPersistedCursor }
       : null;
+    const allowIntentionalRewind = this.restoreSessionStartCursorAfterStop;
     if (clearedQueuedLogs > 0) {
       this.logQueue.clear();
       this.droppedLogs += clearedQueuedLogs;
@@ -496,7 +499,7 @@ export class WebSocketIndexer {
 
     if (restoreCursorSnapshot && (clearedQueuedLogs > 0 || hadInFlightWork)) {
       try {
-        await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot);
+        await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot, allowIntentionalRewind);
       } catch (error) {
         logger.warn({ error }, "Failed to restore safe cursor snapshot after websocket shutdown");
       }
@@ -527,9 +530,15 @@ export class WebSocketIndexer {
     ) > 0;
   }
 
-  private async restoreSafeCursorSnapshotAfterStop(snapshot: PersistedCursorSnapshot): Promise<void> {
+  private async restoreSafeCursorSnapshotAfterStop(
+    snapshot: PersistedCursorSnapshot,
+    allowIntentionalRewind = false
+  ): Promise<void> {
     const current = await this.loadCurrentCursorSnapshot();
-    if (!this.currentCursorIsOwnedByWebSocket(current) || this.currentCursorIsNewerThanSnapshot(current, snapshot)) {
+    if (
+      !this.currentCursorIsOwnedByWebSocket(current)
+      || (!allowIntentionalRewind && this.currentCursorIsNewerThanSnapshot(current, snapshot))
+    ) {
       logger.info(
         {
           signature: snapshot.signature,
@@ -1214,6 +1223,7 @@ export class WebSocketIndexer {
     this.lastPersistedCursor = this.sessionStartCursor
       ? { ...this.sessionStartCursor }
       : null;
+    this.restoreSessionStartCursorAfterStop = true;
   }
 
   private async handleLogs(

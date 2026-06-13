@@ -1087,6 +1087,13 @@ describe("WebSocketIndexer", () => {
           lastTxIndex: 1,
           source: "websocket",
           updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+        })
+        .mockResolvedValueOnce({
+          lastSignature: laterSignature,
+          lastSlot: TEST_SLOT,
+          lastTxIndex: 1,
+          source: "websocket",
+          updatedAt: new Date("2026-03-14T00:01:00.000Z"),
         });
       (mockConnection.getBlock as any).mockResolvedValue({
         blockTime: 123,
@@ -1104,6 +1111,7 @@ describe("WebSocketIndexer", () => {
       await ((wsIndexer as any).logQueue).onIdle().catch(() => undefined);
 
       expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
+      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(3);
       expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
           update: expect.objectContaining({
