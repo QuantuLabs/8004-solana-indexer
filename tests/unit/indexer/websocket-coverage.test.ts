@@ -1141,10 +1141,12 @@ describe("WebSocketIndexer Coverage", () => {
       createIndexer({ maxRetries: 2 });
       (wsIndexer as any).isRunning = true;
       (wsIndexer as any).retryCount = 2; // Already at max
+      (wsIndexer as any).reconciliationTimer = setInterval(() => undefined, 1000);
 
       await (wsIndexer as any).reconnect();
 
       expect((wsIndexer as any).isRunning).toBe(false);
+      expect((wsIndexer as any).reconciliationTimer).toBeNull();
     });
 
     it("should abort reconnect if stop() called during wait", async () => {

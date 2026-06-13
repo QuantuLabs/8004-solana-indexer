@@ -1878,6 +1878,7 @@ export class WebSocketIndexer {
       }, "Max retries exceeded, WebSocket indexer stopped");
       this.isRunning = false;
       this.stopHealthCheck();
+      this.stopReconciliationCheck();
       return;
     }
 
