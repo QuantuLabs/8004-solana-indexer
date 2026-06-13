@@ -28,9 +28,13 @@ import {
 import { createChildLogger } from "../logger.js";
 import { resolveEventBlockTime } from "./block-time.js";
 import { compareCanonicalTransactionOrder } from "./canonical-order.js";
-import { matchProofPassFeedbacks } from "../extras/proofpass.js";
-import { upsertProofPassMatches } from "../db/proofpass.js";
-import type { NewFeedback, ProgramEvent } from "../parser/types.js";
+import {
+  findMissingProgramSignatures,
+  hasProgramDataLogsForProgram,
+  maybeUpsertProofPassMatchesForLogs,
+  recoverMissingProgramSignatures,
+} from "./websocket-recovery.js";
+import type { ProgramEvent } from "../parser/types.js";
 
 const logger = createChildLogger("websocket");
 
@@ -46,7 +50,6 @@ const RECONCILIATION_SIGNATURE_SCAN_LIMIT = 200;
 const RECONCILIATION_FAILURE_THRESHOLD = 3;
 const RECONCILIATION_STATE_ROW_ID = "websocket-reconciliation-tip";
 const RECONCILIATION_STATE_SOURCE = "websocket-reconciliation";
-const RECENT_OBSERVED_SIGNATURE_LIMIT = MAX_QUEUE_SIZE * 2;
 const SLOT_START_TX_INDEX = -1;
 
 export interface WebSocketIndexerOptions {
@@ -240,61 +243,6 @@ function shouldAdvanceCursor(
   ) <= 0;
 }
 
-function hasProgramDataLogsForProgram(logs: string[], programId: string): boolean {
-  const invokeStack: string[] = [];
-
-  for (const log of logs) {
-    const invokeMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[\d+\]$/.exec(log);
-    if (invokeMatch) {
-      invokeStack.push(invokeMatch[1]);
-      continue;
-    }
-
-    const completionMatch = /^Program ([1-9A-HJ-NP-Za-km-z]+) (success|failed:.*)$/.exec(log);
-    if (completionMatch) {
-      if (invokeStack[invokeStack.length - 1] === completionMatch[1]) {
-        invokeStack.pop();
-      }
-      continue;
-    }
-
-    if (log.startsWith("Program data:") && invokeStack[invokeStack.length - 1] === programId) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-async function maybeUpsertProofPassMatchesForLogs(params: {
-  signature: string;
-  slot: bigint;
-  logs: string[];
-  typedEvents: Array<{ typedEvent: ProgramEvent }>;
-}): Promise<void> {
-  if (!config.enableProofPass) {
-    return;
-  }
-
-  const feedbackEvents = params.typedEvents
-    .filter((entry): entry is { typedEvent: { type: "NewFeedback"; data: NewFeedback } } =>
-      entry.typedEvent.type === "NewFeedback"
-    )
-    .map((entry) => entry.typedEvent.data);
-
-  const matches = matchProofPassFeedbacks({
-    logs: params.logs,
-    signature: params.signature,
-    slot: params.slot,
-    feedbackEvents,
-  });
-  if (matches.length === 0) {
-    return;
-  }
-
-  await upsertProofPassMatches(matches);
-}
-
 export class WebSocketIndexer {
   private connection: Connection;
   private prisma: PrismaClient | null;
@@ -331,8 +279,6 @@ export class WebSocketIndexer {
   private sessionStartCursor: PersistedCursorSnapshot | null = null;
   private restoreSessionStartCursorAfterStop = false;
   private processingHoldCount = 0;
-  private observedSignatures = new Set<string>();
-  private observedSignatureOrder: string[] = [];
   private reconciliationTimer: NodeJS.Timeout | null = null;
   private isReconciling = false;
   private reconciliationTipSignature: string | null = null;
@@ -422,8 +368,6 @@ export class WebSocketIndexer {
     this.clearCanonicalFlushTimer();
     this.pendingLogNotifications.clear();
     this.notificationSequence = 0;
-    this.observedSignatures.clear();
-    this.observedSignatureOrder = [];
     this.reconciliationTipSignature = null;
     this.reconciliationFailureCount = 0;
     this.stopReconciliationCheck();
@@ -796,28 +740,6 @@ export class WebSocketIndexer {
     }
   }
 
-  private markSignatureObserved(signature: string): void {
-    if (this.observedSignatures.has(signature)) {
-      return;
-    }
-    this.observedSignatures.add(signature);
-    this.observedSignatureOrder.push(signature);
-    while (this.observedSignatureOrder.length > RECENT_OBSERVED_SIGNATURE_LIMIT) {
-      const oldest = this.observedSignatureOrder.shift();
-      if (oldest) {
-        this.observedSignatures.delete(oldest);
-      }
-    }
-  }
-
-  private signatureIsKnownToPipeline(signature: string): boolean {
-    return (
-      this.lastPersistedCursor?.signature === signature ||
-      this.pendingLogNotifications.has(signature) ||
-      this.observedSignatures.has(signature)
-    );
-  }
-
   private async loadReconciliationTipSignature(): Promise<string | null> {
     if (this.prisma) {
       const rows = await this.prisma.indexerState.findMany({
@@ -960,87 +882,6 @@ export class WebSocketIndexer {
     };
   }
 
-  private async resolveReconciliationTxIndex(signature: ConfirmedSignatureInfo): Promise<number | null> {
-    try {
-      const block = await this.connection.getBlock(signature.slot, {
-        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
-        transactionDetails: "full",
-      });
-      const index = block?.transactions?.findIndex(
-        (tx) => tx.transaction.signatures[0] === signature.signature
-      ) ?? -1;
-      return index >= 0 ? index : null;
-    } catch (error) {
-      logger.warn(
-        {
-          signature: signature.signature,
-          slot: signature.slot,
-          error: error instanceof Error ? error.message : String(error),
-        },
-        "Failed to resolve reconciliation tx_index"
-      );
-      return null;
-    }
-  }
-
-  private async signatureIsCoveredByDurableCursor(
-    signature: ConfirmedSignatureInfo,
-    durableCursor: CurrentCursorSnapshot | null
-  ): Promise<boolean> {
-    if (!durableCursor?.lastSignature || durableCursor.lastSlot === null || durableCursor.lastSlot === undefined) {
-      return false;
-    }
-    if (durableCursor.source !== "poller" && durableCursor.source !== "substreams") {
-      return false;
-    }
-
-    const signatureSlot = BigInt(signature.slot);
-    let txIndex: number | null = null;
-    if (signatureSlot === durableCursor.lastSlot) {
-      txIndex = await this.resolveReconciliationTxIndex(signature);
-    }
-
-    return compareCanonicalTransactionOrder(
-      { slot: signatureSlot, txIndex, signature: signature.signature },
-      {
-        slot: durableCursor.lastSlot,
-        txIndex: durableCursor.lastTxIndex,
-        signature: durableCursor.lastSignature,
-      }
-    ) <= 0;
-  }
-
-  private async findUnobservedSuccessfulSignature(
-    signatures: ConfirmedSignatureInfo[],
-    durableCursor: CurrentCursorSnapshot | null
-  ): Promise<ConfirmedSignatureInfo | null> {
-    for (const signature of signatures) {
-      if (
-        signature.err === null
-        && !this.signatureIsKnownToPipeline(signature.signature)
-        && !(await this.signatureIsCoveredByDurableCursor(signature, durableCursor))
-      ) {
-        return signature;
-      }
-    }
-
-    return null;
-  }
-
-  private async scanReachedDurableCoverageBoundary(
-    signatures: ConfirmedSignatureInfo[],
-    durableCursor: CurrentCursorSnapshot | null
-  ): Promise<boolean> {
-    if (durableCursor?.source !== "poller" && durableCursor?.source !== "substreams") {
-      return false;
-    }
-    const oldestScanned = signatures[signatures.length - 1];
-    if (!oldestScanned) {
-      return false;
-    }
-    return await this.signatureIsCoveredByDurableCursor(oldestScanned, durableCursor);
-  }
-
   private async runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
     if (!this.isRunning || this.stopRequested || this.isReconciling) {
       return false;
@@ -1053,85 +894,120 @@ export class WebSocketIndexer {
     this.isReconciling = true;
     try {
       const previousTip = this.reconciliationTipSignature ?? cursor.signature;
-      const scan = await this.fetchReconciliationSignatures(previousTip);
-      this.reconciliationFailureCount = 0;
-      if (!this.isRunning || this.stopRequested) {
-        return false;
-      }
-
-      const durableCursor = await this.loadCurrentCursorSnapshot();
-      const missed = await this.findUnobservedSuccessfulSignature(scan.signatures, durableCursor);
-      if (!missed) {
-        const reachedDurableCoverage = await this.scanReachedDurableCoverageBoundary(scan.signatures, durableCursor);
-        if (scan.scanLimitReached && !reachedDurableCoverage) {
+      let scan: ReconciliationSignatureScan;
+      try {
+        scan = await this.fetchReconciliationSignatures(previousTip);
+        this.reconciliationFailureCount = 0;
+      } catch (error) {
+        this.reconciliationFailureCount++;
+        if (
+          this.reconciliationFailureCount >= RECONCILIATION_FAILURE_THRESHOLD
+          && this.isRunning
+          && !this.stopRequested
+        ) {
           this.errorCount++;
-          this.restoreSessionStartCursorOnFailSafe();
           this.scheduleFailSafeStop(
-            "WebSocket reconciliation scan reached its signature limit before the previous tip; entering fail-safe stop so polling catch-up can verify continuity",
+            "WebSocket reconciliation failed repeatedly; entering fail-safe stop so polling catch-up can verify continuity",
             {
               reason,
-              previousTip,
-              scannedSignatures: scan.signatures.length,
-              lastScannedSignature: scan.signatures[scan.signatures.length - 1]?.signature ?? null,
-              cursorSignature: cursor.signature,
-              cursorSlot: cursor.slot.toString(),
-              cursorTxIndex: cursor.txIndex,
+              error: error instanceof Error ? error.message : String(error),
+              reconciliationFailureCount: this.reconciliationFailureCount,
               errorCount: this.errorCount,
             }
           );
           return true;
         }
 
-        if ((scan.scanComplete || reachedDurableCoverage) && scan.signatures[0]?.signature) {
-          await this.persistReconciliationTip(scan.signatures[0].signature);
-        }
-        return false;
-      }
-
-      this.errorCount++;
-      this.restoreSessionStartCursorOnFailSafe();
-      this.scheduleFailSafeStop(
-        "WebSocket reconciliation found a successful program signature outside the live pipeline; entering fail-safe stop so polling catch-up can replay the gap",
-        {
-          reason,
-          signature: missed.signature,
-          slot: missed.slot,
-          cursorSignature: cursor.signature,
-          cursorSlot: cursor.slot.toString(),
-          cursorTxIndex: cursor.txIndex,
-          errorCount: this.errorCount,
-        }
-      );
-      return true;
-    } catch (error) {
-      this.reconciliationFailureCount++;
-      if (
-        this.reconciliationFailureCount >= RECONCILIATION_FAILURE_THRESHOLD
-        && this.isRunning
-        && !this.stopRequested
-      ) {
-        this.errorCount++;
-        this.restoreSessionStartCursorOnFailSafe();
-        this.scheduleFailSafeStop(
-          "WebSocket reconciliation failed repeatedly; entering fail-safe stop so polling catch-up can verify continuity",
+        logger.warn(
           {
             reason,
             error: error instanceof Error ? error.message : String(error),
             reconciliationFailureCount: this.reconciliationFailureCount,
+          },
+          "WebSocket reconciliation check failed"
+        );
+        return false;
+      }
+      if (!this.isRunning || this.stopRequested) {
+        return false;
+      }
+
+      let missing: ConfirmedSignatureInfo[];
+      try {
+        missing = await findMissingProgramSignatures(this.prisma, scan.signatures);
+      } catch (error) {
+        this.errorCount++;
+        logger.warn(
+          {
+            reason,
+            previousTip,
+            error: error instanceof Error ? error.message : String(error),
+            errorCount: this.errorCount,
+          },
+          "WebSocket reconciliation DB diff failed"
+        );
+        return false;
+      }
+
+      if (missing.length > 0) {
+        this.errorCount += missing.length;
+        try {
+          const recovered = await recoverMissingProgramSignatures({
+            connection: this.connection,
+            prisma: this.prisma,
+            programId: this.programId,
+            signatures: missing,
+            isActive: () => this.isRunning && !this.stopRequested,
+          });
+          this.processedCount += recovered;
+          logger.warn(
+            {
+              reason,
+              recovered,
+              signatures: missing.map((signature) => signature.signature),
+              errorCount: this.errorCount,
+            },
+            "WebSocket reconciliation directly recovered missing signatures"
+          );
+          if (scan.scanComplete && scan.signatures[0]?.signature) {
+            await this.persistReconciliationTip(scan.signatures[0].signature);
+          }
+        } catch (error) {
+          this.errorCount++;
+          logger.error(
+            {
+              reason,
+              signatures: missing.map((signature) => signature.signature),
+              error: error instanceof Error ? error.message : String(error),
+              errorCount: this.errorCount,
+            },
+            "WebSocket reconciliation direct recovery failed"
+          );
+        }
+        return false;
+      }
+
+      if (scan.scanLimitReached) {
+        this.errorCount++;
+        this.scheduleFailSafeStop(
+          "WebSocket reconciliation scan reached its signature limit before the previous tip; entering fail-safe stop so polling catch-up can verify continuity",
+          {
+            reason,
+            previousTip,
+            scannedSignatures: scan.signatures.length,
+            lastScannedSignature: scan.signatures[scan.signatures.length - 1]?.signature ?? null,
+            cursorSignature: cursor.signature,
+            cursorSlot: cursor.slot.toString(),
+            cursorTxIndex: cursor.txIndex,
             errorCount: this.errorCount,
           }
         );
         return true;
       }
 
-      logger.warn(
-        {
-          reason,
-          error: error instanceof Error ? error.message : String(error),
-          reconciliationFailureCount: this.reconciliationFailureCount,
-        },
-        "WebSocket reconciliation check failed"
-      );
+      if (scan.scanComplete && scan.signatures[0]?.signature) {
+        await this.persistReconciliationTip(scan.signatures[0].signature);
+      }
       return false;
     } finally {
       this.isReconciling = false;
@@ -1358,7 +1234,6 @@ export class WebSocketIndexer {
             return;
           }
 
-          this.markSignatureObserved(logs.signature);
           this.enqueueLogNotification(logs, ctx);
         },
         "confirmed"
