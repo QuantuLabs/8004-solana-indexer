@@ -143,6 +143,9 @@ vi.mock("@solana/web3.js", async () => {
 });
 
 vi.mock("../../../src/db/supabase.js", () => ({
+  getPool: vi.fn().mockReturnValue({
+    query: vi.fn().mockResolvedValue({ rows: [] }),
+  }),
   saveIndexerState: vi.fn().mockResolvedValue(undefined),
   loadIndexerStateSnapshot: vi.fn().mockResolvedValue(null),
   restoreIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
@@ -935,6 +938,164 @@ describe("WebSocketIndexer", () => {
   });
 
   describe("reconciliation", () => {
+    it("should persist and reuse the reconciliation tip across a restart", async () => {
+      const sessionStartCursor = {
+        lastSignature: "session-start",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      const advancedCursor = {
+        lastSignature: "advanced-cursor",
+        lastSlot: 200n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+      };
+      let mainCursor = sessionStartCursor;
+      let durableTip: string | null = null;
+
+      mockPrisma.indexerState.findUnique.mockImplementation(async (args: any) => (
+        args?.where?.id === "main" ? mainCursor as any : null
+      ));
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => (
+        args?.where?.id === "websocket-reconciliation-tip" && durableTip
+          ? [{ lastSignature: durableTip }]
+          : []
+      ));
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        if (args?.where?.id === "websocket-reconciliation-tip") {
+          durableTip = args.update?.lastSignature ?? args.create?.lastSignature ?? null;
+        }
+        return args.update ?? args.create;
+      });
+
+      await wsIndexer.start();
+      expect(durableTip).toBe("session-start");
+      await wsIndexer.stop();
+
+      mainCursor = advancedCursor;
+      wsIndexer = new WebSocketIndexer({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        reconnectInterval: 100,
+        maxRetries: 3,
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        createMockSignatureInfo("missed-behind-advanced-cursor", 150, null),
+      ]);
+
+      await wsIndexer.start();
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(triggered).toBe(true);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
+        TEST_PROGRAM_ID,
+        { until: "session-start", limit: 50 }
+      );
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
+    it("should persist the newest scanned signature after a complete clean reconciliation scan", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      let durableTip: string | null = "cursor-sig";
+
+      mockPrisma.indexerState.findUnique.mockResolvedValue(cursorRow as any);
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => (
+        args?.where?.id === "websocket-reconciliation-tip" && durableTip
+          ? [{ lastSignature: durableTip }]
+          : []
+      ));
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        if (args?.where?.id === "websocket-reconciliation-tip") {
+          durableTip = args.update?.lastSignature ?? args.create?.lastSignature ?? null;
+        }
+        return args.update ?? args.create;
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        createMockSignatureInfo("observed-newest", 101, null),
+      ]);
+
+      await wsIndexer.start();
+      (wsIndexer as any).observedSignatures.add("observed-newest");
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+
+      expect(triggered).toBe(false);
+      expect(durableTip).toBe("observed-newest");
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "websocket-reconciliation-tip" },
+          update: expect.objectContaining({
+            lastSignature: "observed-newest",
+          }),
+        })
+      );
+      expect(wsIndexer.isActive()).toBe(true);
+    });
+
+    it("should fail-safe without advancing the reconciliation tip when the scan limit fills before the anchor", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      let durableTip: string | null = "anchor-sig";
+      const pages = Array.from({ length: 4 }, (_, pageIndex) =>
+        Array.from({ length: 50 }, (_, index) => {
+          const ordinal = pageIndex * 50 + index;
+          return createMockSignatureInfo(`observed-${ordinal}`, 300 - ordinal, null);
+        })
+      );
+
+      mockPrisma.indexerState.findUnique.mockResolvedValue(cursorRow as any);
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => (
+        args?.where?.id === "websocket-reconciliation-tip" && durableTip
+          ? [{ lastSignature: durableTip }]
+          : []
+      ));
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        if (args?.where?.id === "websocket-reconciliation-tip") {
+          durableTip = args.update?.lastSignature ?? args.create?.lastSignature ?? null;
+        }
+        return args.update ?? args.create;
+      });
+      for (const page of pages) {
+        (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(page);
+      }
+
+      await wsIndexer.start();
+      for (const page of pages) {
+        for (const signature of page) {
+          (wsIndexer as any).observedSignatures.add(signature.signature);
+        }
+      }
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(triggered).toBe(true);
+      expect(durableTip).toBe("anchor-sig");
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledTimes(4);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenNthCalledWith(
+        4,
+        TEST_PROGRAM_ID,
+        { until: "anchor-sig", limit: 50, before: "observed-149" }
+      );
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
     it("should enter fail-safe stop when a successful signature newer than the cursor was not observed by the pipeline", async () => {
       const cursorRow = {
         lastSignature: "cursor-sig",

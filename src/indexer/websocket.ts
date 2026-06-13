@@ -20,6 +20,7 @@ import {
 import { trySaveLocalIndexerStateWithSql } from "../db/indexer-state-local.js";
 import {
   clearIndexerStateSnapshot,
+  getPool,
   loadIndexerStateSnapshot,
   restoreIndexerStateSnapshot,
   saveIndexerState,
@@ -43,6 +44,8 @@ const MAX_QUEUE_SIZE = 10_000;
 const RECONCILIATION_SIGNATURE_PAGE_LIMIT = 50;
 const RECONCILIATION_SIGNATURE_SCAN_LIMIT = 200;
 const RECONCILIATION_FAILURE_THRESHOLD = 3;
+const RECONCILIATION_STATE_ROW_ID = "websocket-reconciliation-tip";
+const RECONCILIATION_STATE_SOURCE = "websocket-reconciliation";
 const RECENT_OBSERVED_SIGNATURE_LIMIT = MAX_QUEUE_SIZE * 2;
 const SLOT_START_TX_INDEX = -1;
 
@@ -85,6 +88,12 @@ type ResolvedLogOrder = {
 
 type ResolvedLogNotification = BufferedLogNotification & {
   order: ResolvedLogOrder;
+};
+
+type ReconciliationSignatureScan = {
+  signatures: ConfirmedSignatureInfo[];
+  scanComplete: boolean;
+  scanLimitReached: boolean;
 };
 
 type IdentityLockEnrichment = {
@@ -477,6 +486,8 @@ export class WebSocketIndexer {
     }
     logger.info({ programId: this.programId.toBase58() }, "Starting WebSocket indexer");
 
+    await this.initializeReconciliationTip();
+
     if (this.wsUrl) {
       const logsSupport = await probeRawLogsSubscribe(this.wsUrl, this.programId.toBase58());
       if (logsSupport !== "supported") {
@@ -807,9 +818,112 @@ export class WebSocketIndexer {
     );
   }
 
-  private async fetchReconciliationSignatures(until: string): Promise<ConfirmedSignatureInfo[]> {
+  private async loadReconciliationTipSignature(): Promise<string | null> {
+    if (this.prisma) {
+      const rows = await this.prisma.indexerState.findMany({
+        where: { id: RECONCILIATION_STATE_ROW_ID },
+        select: { lastSignature: true },
+        take: 1,
+      });
+      return rows[0]?.lastSignature ?? null;
+    }
+
+    const db = getPool();
+    const result = await db.query(
+      `SELECT last_signature
+       FROM indexer_state
+       WHERE id = $1
+       LIMIT 1`,
+      [RECONCILIATION_STATE_ROW_ID]
+    );
+    return result.rows[0]?.last_signature ?? null;
+  }
+
+  private async saveReconciliationTipSignature(signature: string): Promise<void> {
+    if (this.prisma) {
+      await this.prisma.indexerState.upsert({
+        where: { id: RECONCILIATION_STATE_ROW_ID },
+        create: {
+          id: RECONCILIATION_STATE_ROW_ID,
+          lastSignature: signature,
+          lastSlot: null,
+          lastTxIndex: null,
+          source: RECONCILIATION_STATE_SOURCE,
+        },
+        update: {
+          lastSignature: signature,
+          lastSlot: null,
+          lastTxIndex: null,
+          source: RECONCILIATION_STATE_SOURCE,
+        },
+      });
+      return;
+    }
+
+    const db = getPool();
+    await db.query(
+      `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+       VALUES ($1, $2, NULL, NULL, $3, $4)
+       ON CONFLICT (id) DO UPDATE SET
+         last_signature = EXCLUDED.last_signature,
+         last_slot = EXCLUDED.last_slot,
+         last_tx_index = EXCLUDED.last_tx_index,
+         source = EXCLUDED.source,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        RECONCILIATION_STATE_ROW_ID,
+        signature,
+        RECONCILIATION_STATE_SOURCE,
+        new Date().toISOString(),
+      ]
+    );
+  }
+
+  private async initializeReconciliationTip(): Promise<void> {
+    const cursor = this.sessionStartCursor;
+    if (!cursor?.signature) {
+      return;
+    }
+
+    try {
+      const storedTip = await this.loadReconciliationTipSignature();
+      const canReuseStoredTip = Boolean(storedTip) && cursor.source !== "poller" && cursor.source !== "substreams";
+      const tip = canReuseStoredTip ? storedTip! : cursor.signature;
+      this.reconciliationTipSignature = tip;
+      if (!canReuseStoredTip) {
+        await this.saveReconciliationTipSignature(tip);
+      }
+    } catch (error) {
+      this.reconciliationTipSignature = cursor.signature;
+      logger.warn(
+        {
+          error: error instanceof Error ? error.message : String(error),
+          signature: cursor.signature,
+        },
+        "Failed to initialize durable WebSocket reconciliation tip"
+      );
+    }
+  }
+
+  private async persistReconciliationTip(signature: string): Promise<void> {
+    try {
+      await this.saveReconciliationTipSignature(signature);
+      this.reconciliationTipSignature = signature;
+    } catch (error) {
+      logger.warn(
+        {
+          error: error instanceof Error ? error.message : String(error),
+          signature,
+        },
+        "Failed to persist WebSocket reconciliation tip"
+      );
+    }
+  }
+
+  private async fetchReconciliationSignatures(until: string): Promise<ReconciliationSignatureScan> {
     const signatures: ConfirmedSignatureInfo[] = [];
     let before: string | undefined;
+    let scanComplete = false;
 
     while (signatures.length < RECONCILIATION_SIGNATURE_SCAN_LIMIT) {
       const limit = Math.min(
@@ -823,11 +937,13 @@ export class WebSocketIndexer {
 
       const batch = await this.connection.getSignaturesForAddress(this.programId, options);
       if (batch.length === 0) {
+        scanComplete = true;
         break;
       }
 
       signatures.push(...batch);
       if (batch.length < limit || batch.some((signature) => signature.signature === until)) {
+        scanComplete = true;
         break;
       }
 
@@ -837,7 +953,11 @@ export class WebSocketIndexer {
       }
     }
 
-    return signatures;
+    return {
+      signatures,
+      scanComplete,
+      scanLimitReached: signatures.length >= RECONCILIATION_SIGNATURE_SCAN_LIMIT && !scanComplete,
+    };
   }
 
   private async resolveReconciliationTxIndex(signature: ConfirmedSignatureInfo): Promise<number | null> {
@@ -907,6 +1027,20 @@ export class WebSocketIndexer {
     return null;
   }
 
+  private async scanReachedDurableCoverageBoundary(
+    signatures: ConfirmedSignatureInfo[],
+    durableCursor: CurrentCursorSnapshot | null
+  ): Promise<boolean> {
+    if (durableCursor?.source !== "poller" && durableCursor?.source !== "substreams") {
+      return false;
+    }
+    const oldestScanned = signatures[signatures.length - 1];
+    if (!oldestScanned) {
+      return false;
+    }
+    return await this.signatureIsCoveredByDurableCursor(oldestScanned, durableCursor);
+  }
+
   private async runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
     if (!this.isRunning || this.stopRequested || this.isReconciling) {
       return false;
@@ -919,16 +1053,38 @@ export class WebSocketIndexer {
     this.isReconciling = true;
     try {
       const previousTip = this.reconciliationTipSignature ?? cursor.signature;
-      const signatures = await this.fetchReconciliationSignatures(previousTip);
+      const scan = await this.fetchReconciliationSignatures(previousTip);
       this.reconciliationFailureCount = 0;
       if (!this.isRunning || this.stopRequested) {
         return false;
       }
 
       const durableCursor = await this.loadCurrentCursorSnapshot();
-      const missed = await this.findUnobservedSuccessfulSignature(signatures, durableCursor);
-      this.reconciliationTipSignature = signatures[0]?.signature ?? previousTip;
+      const missed = await this.findUnobservedSuccessfulSignature(scan.signatures, durableCursor);
       if (!missed) {
+        const reachedDurableCoverage = await this.scanReachedDurableCoverageBoundary(scan.signatures, durableCursor);
+        if (scan.scanLimitReached && !reachedDurableCoverage) {
+          this.errorCount++;
+          this.restoreSessionStartCursorOnFailSafe();
+          this.scheduleFailSafeStop(
+            "WebSocket reconciliation scan reached its signature limit before the previous tip; entering fail-safe stop so polling catch-up can verify continuity",
+            {
+              reason,
+              previousTip,
+              scannedSignatures: scan.signatures.length,
+              lastScannedSignature: scan.signatures[scan.signatures.length - 1]?.signature ?? null,
+              cursorSignature: cursor.signature,
+              cursorSlot: cursor.slot.toString(),
+              cursorTxIndex: cursor.txIndex,
+              errorCount: this.errorCount,
+            }
+          );
+          return true;
+        }
+
+        if ((scan.scanComplete || reachedDurableCoverage) && scan.signatures[0]?.signature) {
+          await this.persistReconciliationTip(scan.signatures[0].signature);
+        }
         return false;
       }
 

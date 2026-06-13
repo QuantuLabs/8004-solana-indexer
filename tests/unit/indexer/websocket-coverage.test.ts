@@ -155,6 +155,9 @@ vi.mock("@solana/web3.js", async () => {
 
 // Mock supabase for saveIndexerState
 vi.mock("../../../src/db/supabase.js", () => ({
+  getPool: vi.fn().mockReturnValue({
+    query: vi.fn().mockResolvedValue({ rows: [] }),
+  }),
   saveIndexerState: vi.fn().mockResolvedValue(undefined),
   loadIndexerStateSnapshot: vi.fn().mockResolvedValue(null),
   restoreIndexerStateSnapshot: vi.fn().mockResolvedValue(undefined),
