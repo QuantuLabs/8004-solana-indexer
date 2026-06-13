@@ -91,8 +91,8 @@ function compareCursorCtx(
     return a.slot < b.slot ? -1 : 1;
   }
 
-  const aTxIndex = a.txIndex ?? -1;
-  const bTxIndex = b.txIndex ?? -1;
+  const aTxIndex = a.txIndex ?? Number.MAX_SAFE_INTEGER;
+  const bTxIndex = b.txIndex ?? Number.MAX_SAFE_INTEGER;
   if (aTxIndex !== bTxIndex) {
     return aTxIndex - bTxIndex;
   }

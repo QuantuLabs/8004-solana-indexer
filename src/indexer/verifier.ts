@@ -1886,11 +1886,11 @@ export class DataVerifier {
         if (!left) return right;
         if (!right) return left;
         if (left.slot !== right.slot) return left.slot > right.slot ? left : right;
-        const leftTxIndex = left.txIndex ?? -1;
-        const rightTxIndex = right.txIndex ?? -1;
+        const leftTxIndex = left.txIndex ?? Number.MAX_SAFE_INTEGER;
+        const rightTxIndex = right.txIndex ?? Number.MAX_SAFE_INTEGER;
         if (leftTxIndex !== rightTxIndex) return leftTxIndex > rightTxIndex ? left : right;
-        const leftOrdinal = left.eventOrdinal ?? -1;
-        const rightOrdinal = right.eventOrdinal ?? -1;
+        const leftOrdinal = left.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const rightOrdinal = right.eventOrdinal ?? Number.MAX_SAFE_INTEGER;
         if (leftOrdinal !== rightOrdinal) return leftOrdinal > rightOrdinal ? left : right;
         const leftSignature = left.signature ?? "";
         const rightSignature = right.signature ?? "";

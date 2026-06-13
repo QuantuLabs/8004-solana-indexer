@@ -486,6 +486,36 @@ describe("EventBuffer", () => {
       ]);
     });
 
+    it("should treat null tx index as the end of a slot for cursor-only progress", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      buffer.noteCursor({
+        signature: "concrete-index-sig",
+        slot: 777n,
+        blockTime: new Date("2026-03-06T12:00:00.000Z"),
+        txIndex: 4,
+      });
+      buffer.noteCursor({
+        signature: "null-index-sig",
+        slot: 777n,
+        blockTime: new Date("2026-03-06T12:00:01.000Z"),
+        txIndex: null,
+      });
+
+      await buffer.flush();
+
+      const client = mockPool._client;
+      const cursorCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
+      );
+      expect(cursorCall).toBeDefined();
+      expect(cursorCall[1]).toEqual([
+        "null-index-sig",
+        "777",
+        null,
+        "2026-03-06T12:00:01.000Z",
+      ]);
+    });
+
     it("should not double-flush (flushInProgress guard)", async () => {
       const client = mockPool._client;
       let firstQueryCalled = false;
