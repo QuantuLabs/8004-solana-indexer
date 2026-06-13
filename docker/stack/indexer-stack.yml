@@ -5,6 +5,15 @@ services:
     image: ${INDEXER_IMAGE:-ghcr.io/quantulabs/8004-indexer:latest}
     container_name: 8004-indexer
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 2g
+    pids_limit: 256
     ports:
       - "127.0.0.1:${API_PORT:-3001}:${API_PORT:-3001}"
     environment:

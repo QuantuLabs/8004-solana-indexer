@@ -14,6 +14,15 @@ services:
     image: ${POSTGREST_IMAGE:-postgrest/postgrest:v12.2.8}
     container_name: 8004-postgrest
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    pids_limit: 128
     ports:
       - "127.0.0.1:${POSTGREST_PORT:-3002}:3000"
     environment:
