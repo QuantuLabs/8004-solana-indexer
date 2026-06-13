@@ -222,6 +222,70 @@ describe('API Server (GraphQL-only)', () => {
     process.env = suiteEnv;
   });
 
+  it('overrides client credentials when forwarding Supabase REST proxy requests', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'rest',
+      ENABLE_GRAPHQL: 'false',
+      SUPABASE_URL: 'https://proxy-test.supabase.co',
+      SUPABASE_KEY: 'server-service-key',
+    };
+
+    const nativeFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('http://127.0.0.1:')) {
+        return await nativeFetch(input, init);
+      }
+
+      expect(url).toBe('https://proxy-test.supabase.co/rest/v1/agents?select=asset&status=neq.ORPHANED');
+      const headers = new Headers(init?.headers);
+      expect(headers.get('apikey')).toBe('server-service-key');
+      expect(headers.get('authorization')).toBe('Bearer server-service-key');
+      expect(headers.get('x-client-trace')).toBe('kept');
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchSpy as typeof fetch);
+
+    try {
+      ({ createApiServer } = await import('../../../src/api/server.js'));
+      const proxyApp = createApiServer({ pool: {} as any, prisma: null });
+
+      await new Promise<void>((resolve, reject) => {
+        server = proxyApp.listen(0, '127.0.0.1', () => {
+          const addr = server.address() as AddressInfo;
+          baseUrl = `http://127.0.0.1:${addr.port}`;
+          resolve();
+        });
+        server.on('error', reject);
+      });
+
+      const res = await nativeFetch(`${baseUrl}/rest/v1/agents?select=asset`, {
+        headers: {
+          apikey: 'client-key',
+          authorization: 'Bearer client-token',
+          'x-client-trace': 'kept',
+        },
+      });
+
+      expect(res.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+      if (server?.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      }
+      server = undefined as unknown as Server;
+      process.env = suiteEnv;
+    }
+  });
+
   it('throws when no API backend is available', () => {
     expect(() => createApiServer({ pool: null as any, prisma: null as any })).toThrow(
       'GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)'

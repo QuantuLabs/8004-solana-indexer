@@ -1418,6 +1418,8 @@ const PROXY_RESPONSE_HEADER_ALLOWLIST = [
 ] as const;
 
 const PROXY_REQUEST_HEADER_BLOCKLIST = new Set([
+  'apikey',
+  'authorization',
   'host',
   'content-length',
   'connection',
@@ -1603,10 +1605,8 @@ function buildSupabaseProxyHeaders(req: Request): Headers {
     }
   }
 
-  if (!upstreamHeaders.has('apikey') && config.supabaseKey) {
+  if (config.supabaseKey) {
     upstreamHeaders.set('apikey', config.supabaseKey);
-  }
-  if (!upstreamHeaders.has('authorization') && config.supabaseKey) {
     upstreamHeaders.set('authorization', `Bearer ${config.supabaseKey}`);
   }
 
