@@ -1126,6 +1126,40 @@ describe("Poller Coverage", () => {
       expect(signatures).not.toContain("sig-old-slot");
     });
 
+    it("should replay the persisted slot when startup marked a cursor as slot-start", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+        pollingInterval: 100,
+        batchSize: 10,
+      });
+      (poller as any).isRunning = true;
+      (poller as any).lastSignature = "sig-z";
+      (poller as any).lastSlot = 500n;
+      (poller as any).lastTxIndex = -1;
+
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([
+        createMockSignatureInfo("sig-z", 500),
+        createMockSignatureInfo("sig-a", 500),
+        createMockSignatureInfo("sig-old-slot", 499),
+      ]);
+      (mockConnection as any).getBlock = vi.fn().mockResolvedValue({
+        blockTime: 1234567890,
+        transactions: [
+          { transaction: { signatures: ["sig-z"] } },
+          { transaction: { signatures: ["sig-a"] } },
+        ],
+      });
+
+      const result = await (poller as any).fetchSignatures();
+      const signatures = result.map((s: any) => s.signature);
+
+      expect(signatures).toContain("sig-z");
+      expect(signatures).toContain("sig-a");
+      expect(signatures).not.toContain("sig-old-slot");
+    });
+
     it("should stop at the saved slot boundary when stop signature is missing from RPC pagination", async () => {
       poller = new Poller({
         connection: mockConnection as any,

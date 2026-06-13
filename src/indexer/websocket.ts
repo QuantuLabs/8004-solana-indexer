@@ -44,6 +44,7 @@ const RECONCILIATION_SIGNATURE_PAGE_LIMIT = 50;
 const RECONCILIATION_SIGNATURE_SCAN_LIMIT = 200;
 const RECONCILIATION_FAILURE_THRESHOLD = 3;
 const RECENT_OBSERVED_SIGNATURE_LIMIT = MAX_QUEUE_SIZE * 2;
+const SLOT_START_TX_INDEX = -1;
 
 export interface WebSocketIndexerOptions {
   connection: Connection;
@@ -341,6 +342,60 @@ export class WebSocketIndexer {
     this.canonicalBufferMs = Math.max(0, options.canonicalBufferMs ?? config.wsCanonicalBufferMs);
   }
 
+  private async resolveSnapshotCursorTxIndex(
+    signature: string,
+    slot: bigint,
+    txIndex: number | null | undefined,
+    source: string | null
+  ): Promise<number | null> {
+    if (txIndex !== null && txIndex !== undefined) {
+      return txIndex;
+    }
+
+    try {
+      const block = await this.connection.getBlock(Number(slot), {
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        transactionDetails: "full",
+      });
+      const resolvedTxIndex = block?.transactions?.findIndex(
+        (tx) => tx.transaction.signatures[0] === signature
+      ) ?? -1;
+      if (resolvedTxIndex >= 0) {
+        logger.info(
+          {
+            signature,
+            slot: slot.toString(),
+            txIndex: resolvedTxIndex,
+            source,
+          },
+          "Resolved legacy websocket cursor tx_index from block"
+        );
+        return resolvedTxIndex;
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          signature,
+          slot: slot.toString(),
+          source,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Failed to resolve legacy websocket cursor tx_index from block"
+      );
+    }
+
+    logger.warn(
+      {
+        signature,
+        slot: slot.toString(),
+        source,
+        txIndex: SLOT_START_TX_INDEX,
+      },
+      "Treating legacy websocket cursor as slot-start"
+    );
+    return SLOT_START_TX_INDEX;
+  }
+
   async start(): Promise<void> {
     if (this.isRunning) {
       logger.warn("WebSocket indexer already running");
@@ -378,10 +433,17 @@ export class WebSocketIndexer {
           },
         });
         if (current?.lastSignature && current.lastSlot !== null) {
+          const slot = typeof current.lastSlot === "bigint" ? current.lastSlot : BigInt(current.lastSlot);
+          const txIndex = await this.resolveSnapshotCursorTxIndex(
+            current.lastSignature,
+            slot,
+            current.lastTxIndex,
+            current.source ?? null
+          );
           this.lastPersistedCursor = {
             signature: current.lastSignature,
-            slot: BigInt(current.lastSlot),
-            txIndex: current.lastTxIndex ?? null,
+            slot,
+            txIndex,
             source: current.source ?? null,
             updatedAt: current.updatedAt ?? new Date(),
           };
@@ -394,10 +456,16 @@ export class WebSocketIndexer {
       try {
         const current = await loadIndexerStateSnapshot();
         if (current?.lastSignature && current.lastSlot !== null) {
+          const txIndex = await this.resolveSnapshotCursorTxIndex(
+            current.lastSignature,
+            current.lastSlot,
+            current.lastTxIndex,
+            current.source
+          );
           this.lastPersistedCursor = {
             signature: current.lastSignature,
             slot: current.lastSlot,
-            txIndex: current.lastTxIndex ?? null,
+            txIndex,
             source: current.source ?? null,
             updatedAt: current.updatedAt,
           };

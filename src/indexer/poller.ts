@@ -36,6 +36,7 @@ const logger = createChildLogger("poller");
 const USE_BATCH_DB = config.dbMode === "supabase";
 const MISSING_COLLECTION_ID_SCHEMA_FATAL_MESSAGE =
   "Missing collection_id schema in local database. Apply Prisma migrations (prisma migrate deploy) before starting the indexer.";
+const SLOT_START_TX_INDEX = -1;
 
 export interface PollerOptions {
   connection: Connection;
@@ -2210,19 +2211,86 @@ export class Poller {
     return true;
   }
 
+  private async resolveLoadedCursorTxIndex(
+    signature: string,
+    slot: bigint | null,
+    txIndex: number | null | undefined,
+    source: "local" | "supabase"
+  ): Promise<number | null> {
+    if (txIndex !== null && txIndex !== undefined) {
+      return txIndex;
+    }
+    if (slot === null) {
+      return null;
+    }
+
+    const cursorSignature: ConfirmedSignatureInfo = {
+      signature,
+      slot: Number(slot),
+      err: null,
+      memo: null,
+      blockTime: null,
+      confirmationStatus: "finalized",
+    };
+
+    try {
+      const txIndexMap = await this.getTxIndexMap(Number(slot), [cursorSignature]);
+      const resolvedTxIndex = txIndexMap.get(signature);
+      if (resolvedTxIndex !== null && resolvedTxIndex !== undefined) {
+        logger.info(
+          {
+            source,
+            signature,
+            slot: slot.toString(),
+            txIndex: resolvedTxIndex,
+          },
+          "Resolved legacy cursor tx_index from block"
+        );
+        return resolvedTxIndex;
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          source,
+          signature,
+          slot: slot.toString(),
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Failed to resolve legacy cursor tx_index from block"
+      );
+    }
+
+    logger.warn(
+      {
+        source,
+        signature,
+        slot: slot.toString(),
+        txIndex: SLOT_START_TX_INDEX,
+      },
+      "Treating legacy cursor as slot-start"
+    );
+    return SLOT_START_TX_INDEX;
+  }
+
   private async loadState(): Promise<void> {
     // Supabase mode - load from Supabase
     if (!this.prisma) {
       const state = await loadIndexerState();
       if (state.lastSignature) {
+        const loadedTxIndex = await this.resolveLoadedCursorTxIndex(
+          state.lastSignature,
+          state.lastSlot,
+          state.lastTxIndex,
+          "supabase"
+        );
         this.lastSignature = state.lastSignature;
         this.lastSlot = state.lastSlot;
-        this.lastTxIndex = state.lastTxIndex;
+        this.lastTxIndex = loadedTxIndex;
         logger.info(
           {
             lastSignature: this.lastSignature,
             lastSlot: state.lastSlot?.toString(),
-            lastTxIndex: state.lastTxIndex,
+            lastTxIndex: loadedTxIndex,
           },
           "Supabase mode: resuming from signature"
         );
@@ -2260,14 +2328,20 @@ export class Poller {
     });
 
     if (state?.lastSignature) {
+      const loadedTxIndex = await this.resolveLoadedCursorTxIndex(
+        state.lastSignature,
+        state.lastSlot ?? null,
+        state.lastTxIndex,
+        "local"
+      );
       this.lastSignature = state.lastSignature;
       this.lastSlot = state.lastSlot ?? null;
-      this.lastTxIndex = state.lastTxIndex ?? null;
+      this.lastTxIndex = loadedTxIndex;
       logger.info(
         {
           lastSignature: this.lastSignature,
           lastSlot: state.lastSlot?.toString() ?? null,
-          lastTxIndex: state.lastTxIndex ?? null,
+          lastTxIndex: loadedTxIndex,
         },
         "Resuming from signature"
       );
@@ -2658,14 +2732,15 @@ export class Poller {
             const sig = batch[i];
             if (sig.signature === stopSignature) {
               const stopSlot = sig.slot;
+              const replayFromSlotStart = this.lastTxIndex === SLOT_START_TX_INDEX;
               const priorSameSlot = allSignatures.filter((existing) => existing.slot === stopSlot);
               const keepDifferentSlot = allSignatures.filter((existing) => existing.slot !== stopSlot);
-              const sameSlotCandidates = [...priorSameSlot];
+              const sameSlotCandidates = replayFromSlotStart ? [...priorSameSlot, sig] : [...priorSameSlot];
               const seenSameSlot = new Set(sameSlotCandidates.map((entry) => entry.signature));
               const pushSameSlotCandidate = (candidate: ConfirmedSignatureInfo): void => {
                 if (candidate.slot !== stopSlot) return;
                 if (candidate.err !== null) return;
-                if (candidate.signature === stopSignature) return;
+                if (!replayFromSlotStart && candidate.signature === stopSignature) return;
                 if (seenSameSlot.has(candidate.signature)) return;
                 seenSameSlot.add(candidate.signature);
                 sameSlotCandidates.push(candidate);
@@ -2695,14 +2770,14 @@ export class Poller {
                 sameSlotBefore = nextBefore;
                 if (!(await this.waitForDelay(100))) break;
               }
-              let stopTxIndex = this.lastTxIndex ?? null;
+              let stopTxIndex = replayFromSlotStart ? SLOT_START_TX_INDEX : this.lastTxIndex ?? null;
               const sameSlotCursorEntries = [sig, ...sameSlotCandidates];
               try {
                 const sameSlotTxIndexMap = await this.getTxIndexMap(stopSlot, sameSlotCursorEntries);
                 if (hasUnresolvedTxIndex(sameSlotTxIndexMap, sameSlotCursorEntries)) {
                   throw new Error(`Deterministic tx_index unavailable for pagination stop slot ${stopSlot}`);
                 }
-                if (sameSlotTxIndexMap.has(stopSignature)) {
+                if (!replayFromSlotStart && sameSlotTxIndexMap.has(stopSignature)) {
                   stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
                 }
                 sameSlotCandidates.sort((a, b) =>
@@ -2755,6 +2830,7 @@ export class Poller {
             );
             if (crossedBelowPersistedSlot) {
               const stopSlot = Number(persistedStopSlot);
+              const replayFromSlotStart = this.lastTxIndex === SLOT_START_TX_INDEX;
               const keepNewerSlots = allSignatures.filter(
                 (existing) => BigInt(existing.slot) > persistedStopSlot
               );
@@ -2766,7 +2842,7 @@ export class Poller {
               const pushSameSlotCandidate = (candidate: ConfirmedSignatureInfo): void => {
                 if (BigInt(candidate.slot) !== persistedStopSlot) return;
                 if (candidate.err !== null) return;
-                if (candidate.signature === stopSignature) return;
+                if (!replayFromSlotStart && candidate.signature === stopSignature) return;
                 if (seenSameSlot.has(candidate.signature)) return;
                 seenSameSlot.add(candidate.signature);
                 sameSlotCandidates.push(candidate);
@@ -2794,7 +2870,7 @@ export class Poller {
                 sameSlotBefore = nextBefore;
                 if (!(await this.waitForDelay(100))) break;
               }
-              let stopTxIndex = this.lastTxIndex ?? null;
+              let stopTxIndex = replayFromSlotStart ? SLOT_START_TX_INDEX : this.lastTxIndex ?? null;
               const stopCursorSignature: ConfirmedSignatureInfo = {
                 signature: stopSignature,
                 slot: stopSlot,
@@ -2809,7 +2885,7 @@ export class Poller {
                 if (hasUnresolvedTxIndex(sameSlotTxIndexMap, sameSlotCursorEntries)) {
                   throw new Error(`Deterministic tx_index unavailable for pagination slot boundary ${stopSlot}`);
                 }
-                if (sameSlotTxIndexMap.has(stopSignature)) {
+                if (!replayFromSlotStart && sameSlotTxIndexMap.has(stopSignature)) {
                   stopTxIndex = sameSlotTxIndexMap.get(stopSignature) ?? null;
                 }
                 sameSlotCandidates.sort((a, b) =>

@@ -121,6 +121,45 @@ describe("Poller", () => {
       expect(mockPrisma.indexerState.findUnique).toHaveBeenCalled();
     });
 
+    it("should resolve a persisted null tx index at startup", async () => {
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "legacy-cursor",
+        lastSlot: 500n,
+        lastTxIndex: null,
+      });
+      (mockConnection.getBlock as any).mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["older"] } },
+          { transaction: { signatures: ["legacy-cursor"] } },
+        ],
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await poller.start();
+
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        500,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      expect((poller as any).lastTxIndex).toBe(1);
+    });
+
+    it("should treat a persisted null tx index as slot-start when startup resolution fails", async () => {
+      (mockPrisma.indexerState.findUnique as any).mockResolvedValue({
+        id: "main",
+        lastSignature: "legacy-cursor",
+        lastSlot: 500n,
+        lastTxIndex: null,
+      });
+      vi.spyOn(poller as any, "getTxIndexMap").mockRejectedValueOnce(new Error("block unavailable"));
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValue([]);
+
+      await poller.start();
+
+      expect((poller as any).lastTxIndex).toBe(-1);
+    });
+
     it("should retry historical catch-up after a retryable pause and resume from persisted cursor", async () => {
       (config as any).indexerStartSignature = "cursor-stop";
       const loadStateSpy = vi.spyOn(poller as any, "loadState").mockImplementation(async () => {

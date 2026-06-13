@@ -239,6 +239,48 @@ describe("WebSocketIndexer", () => {
       );
     });
 
+    it("should resolve a legacy null snapshot tx index at startup", async () => {
+      mockPrisma.indexerState.findUnique.mockResolvedValueOnce({
+        lastSignature: "legacy-ws-cursor",
+        lastSlot: 500n,
+        lastTxIndex: null,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      } as any);
+      (mockConnection.getBlock as any).mockResolvedValueOnce({
+        blockTime: 123,
+        transactions: [
+          { transaction: { signatures: ["older"] } },
+          { transaction: { signatures: ["legacy-ws-cursor"] } },
+        ],
+      });
+
+      await wsIndexer.start();
+
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        500,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      expect((wsIndexer as any).lastPersistedCursor.txIndex).toBe(1);
+      expect((wsIndexer as any).sessionStartCursor.txIndex).toBe(1);
+    });
+
+    it("should treat a legacy null snapshot tx index as slot-start when resolution fails", async () => {
+      mockPrisma.indexerState.findUnique.mockResolvedValueOnce({
+        lastSignature: "legacy-ws-cursor",
+        lastSlot: 500n,
+        lastTxIndex: null,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      } as any);
+      (mockConnection.getBlock as any).mockRejectedValueOnce(new Error("block unavailable"));
+
+      await wsIndexer.start();
+
+      expect((wsIndexer as any).lastPersistedCursor.txIndex).toBe(-1);
+      expect((wsIndexer as any).sessionStartCursor.txIndex).toBe(-1);
+    });
+
     it("should not start twice", async () => {
       await wsIndexer.start();
       await wsIndexer.start();
