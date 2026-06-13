@@ -527,7 +527,6 @@ export class EventBuffer {
     }
 
     this.buffer.push(event);
-    this.noteCursor(event.ctx);
     this.stats.eventsBuffered++;
 
     // Start flush timer if not already running

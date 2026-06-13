@@ -446,6 +446,52 @@ describe("EventBuffer", () => {
       expect(mockPool.connect).toHaveBeenCalled();
     });
 
+    it("should not persist a cursor from a cap flush before the transaction boundary", async () => {
+      const buffer = new EventBuffer(mockPool, null);
+      const blockTime = new Date("2026-03-06T12:00:00.000Z");
+
+      for (let i = 0; i < 500; i++) {
+        await buffer.addEvent(makeEvent(
+          "AgentRegistered",
+          {
+            asset: `partial-asset-${i}`,
+            owner: `owner-${i}`,
+            collection: `collection-${i}`,
+          },
+          {
+            signature: "partial-transaction",
+            slot: 888n,
+            txIndex: 6,
+            eventOrdinal: i,
+            blockTime,
+          }
+        ));
+      }
+
+      const client = mockPool._client;
+      expect(client.query.mock.calls.some(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
+      )).toBe(false);
+
+      buffer.noteCursor({
+        signature: "partial-transaction",
+        slot: 888n,
+        txIndex: 6,
+        blockTime,
+      });
+      await buffer.flush();
+
+      const cursorCall = client.query.mock.calls.find(
+        (call: any[]) => typeof call[0] === "string" && call[0].includes("indexer_state")
+      );
+      expect(cursorCall?.[1]).toEqual([
+        "partial-transaction",
+        "888",
+        6,
+        "2026-03-06T12:00:00.000Z",
+      ]);
+    });
+
     it("should auto-flush on timer", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(makeEvent("AgentRegistered"));
@@ -1573,7 +1619,7 @@ describe("EventBuffer", () => {
       expect(client.query).toHaveBeenCalledWith("COMMIT");
     });
 
-    it("should update cursor with last event context", async () => {
+    it("should update cursor with the noted transaction context", async () => {
       const buffer = new EventBuffer(mockPool, null);
       await buffer.addEvent(
         makeEvent("AgentRegistered", { asset: "a1", owner: "o1", collection: "c1" }, {
@@ -1581,6 +1627,11 @@ describe("EventBuffer", () => {
           slot: 99999n,
         })
       );
+      buffer.noteCursor({
+        signature: "last-sig",
+        slot: 99999n,
+        blockTime: new Date("2024-01-15T10:00:00Z"),
+      });
       await buffer.flush();
 
       const client = mockPool._client;
