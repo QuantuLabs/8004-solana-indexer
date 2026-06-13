@@ -365,6 +365,7 @@ export const config = {
   apiMode: parseApiMode(process.env.API_MODE),
   // GraphQL requires Supabase pool and is enabled by default
   enableGraphql: parseBoolean(process.env.ENABLE_GRAPHQL, true),
+  graphqlDebugEnabled: parseBoolean(process.env.GRAPHQL_DEBUG_ENABLED, false),
   // Optional extras
   enableProofPass: parseBoolean(process.env.ENABLE_PROOFPASS, false),
   // Cache TTL for expensive GraphQL aggregated stats queries

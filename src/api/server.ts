@@ -2021,6 +2021,15 @@ export function createApiServer(options: ApiServerOptions): Express {
   app.set('trust proxy', parseTrustProxyValue(process.env.TRUST_PROXY));
 
   app.use(express.json({ limit: '100kb' }));
+  app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+    const status = (error as { status?: unknown }).status;
+    const type = (error as { type?: unknown }).type;
+    if (status === 413 || type === 'entity.too.large') {
+      res.status(413).json({ error: 'Payload too large' });
+      return;
+    }
+    next(error);
+  });
 
   // CORS - allow configurable origins
   const parsedAllowedOrigins = process.env.CORS_ORIGINS
@@ -2092,13 +2101,6 @@ export function createApiServer(options: ApiServerOptions): Express {
     res.json({ status: 'ready', phase, state: details });
   });
 
-  if (config.metricsEndpointEnabled) {
-    app.get('/metrics', (_req: Request, res: Response) => {
-      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-      res.send(renderIntegrityMetrics());
-    });
-  }
-
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (req.path === '/health' || req.path === '/ready' || req.path === '/metrics') {
       next();
@@ -2131,6 +2133,13 @@ export function createApiServer(options: ApiServerOptions): Express {
     skip: (req) => req.path === '/graphql' || req.path === '/v2/graphql',
   });
   app.use(limiter);
+
+  if (config.metricsEndpointEnabled) {
+    app.get('/metrics', (_req: Request, res: Response) => {
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.send(renderIntegrityMetrics());
+    });
+  }
 
   // Dedicated rate limiter for replay verification (expensive endpoint)
   const replayLimiter = rateLimit({
@@ -4798,11 +4807,15 @@ export function createApiServer(options: ApiServerOptions): Express {
         ? body.p_collection.trim()
         : null;
       const includeOrphaned = body.p_include_orphaned === true || body.p_include_orphaned === 'true';
-      const cursorSortKey = typeof body.p_cursor_sort_key === 'string' && body.p_cursor_sort_key.trim().length > 0
-        ? BigInt(body.p_cursor_sort_key)
-        : body.p_cursor_sort_key === null || body.p_cursor_sort_key === undefined
-          ? null
-          : BigInt(String(body.p_cursor_sort_key));
+      let cursorSortKey: bigint | null = null;
+      if (body.p_cursor_sort_key !== null && body.p_cursor_sort_key !== undefined) {
+        const cursorSortKeyText = String(body.p_cursor_sort_key).trim();
+        if (!/^-?\d+$/.test(cursorSortKeyText)) {
+          res.status(400).json({ error: 'Invalid p_cursor_sort_key: must be a valid integer' });
+          return;
+        }
+        cursorSortKey = BigInt(cursorSortKeyText);
+      }
 
       if (!prisma) {
         if (!options.pool) {
@@ -5537,6 +5550,15 @@ export function createApiServer(options: ApiServerOptions): Express {
     graphqlState.mounted = true;
     logger.info('GraphQL endpoint mounted at /v2/graphql (legacy alias /graphql)');
   }
+
+  app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+    logger.error({ error }, 'Unhandled API request error');
+    if (res.headersSent) {
+      next(error);
+      return;
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  });
 
   return app;
 }

@@ -92,4 +92,19 @@ describe("metrics endpoint", () => {
     expect(body).toContain("integrity_last_verified_slot 456");
     expect(body).toContain("integrity_verifier_active 1");
   });
+
+  it("applies the global rate limiter when metrics are enabled", async () => {
+    process.env.METRICS_ENDPOINT_ENABLED = "true";
+    process.env.RATE_LIMIT_MAX_REQUESTS = "1";
+
+    const { createApiServer } = await import("../../../src/api/server.js");
+    const app = createApiServer({ pool: {} as any, prisma: null });
+    await listen(app);
+
+    const first = await fetch(`${baseUrl}/metrics`);
+    const second = await fetch(`${baseUrl}/metrics`);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+  });
 });

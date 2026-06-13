@@ -286,6 +286,89 @@ describe('API Server (GraphQL-only)', () => {
     }
   });
 
+  it('returns 400 for invalid get_leaderboard cursor sort keys', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'rest',
+      ENABLE_GRAPHQL: 'false',
+    };
+
+    try {
+      ({ createApiServer } = await import('../../../src/api/server.js'));
+      const localApp = createApiServer({ pool: null, prisma: {} as any });
+
+      await new Promise<void>((resolve, reject) => {
+        server = localApp.listen(0, '127.0.0.1', () => {
+          const addr = server.address() as AddressInfo;
+          baseUrl = `http://127.0.0.1:${addr.port}`;
+          resolve();
+        });
+        server.on('error', reject);
+      });
+
+      const res = await fetch(`${baseUrl}/rest/v1/rpc/get_leaderboard`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p_cursor_sort_key: 'not-a-number' }),
+      });
+
+      expect(res.status).toBe(400);
+      await expect(res.json()).resolves.toEqual({
+        error: 'Invalid p_cursor_sort_key: must be a valid integer',
+      });
+    } finally {
+      if (server?.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      }
+      server = undefined as unknown as Server;
+      process.env = suiteEnv;
+    }
+  });
+
+  it('returns a generic terminal 500 response for unhandled route errors', async () => {
+    vi.resetModules();
+    process.env = {
+      ...originalEnv,
+      API_MODE: 'rest',
+      ENABLE_GRAPHQL: 'false',
+    };
+
+    try {
+      ({ createApiServer } = await import('../../../src/api/server.js'));
+      const localApp = createApiServer({
+        pool: null,
+        prisma: {} as any,
+        checkRestProxyReady: async () => {
+          throw new Error('sensitive backend failure');
+        },
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        server = localApp.listen(0, '127.0.0.1', () => {
+          const addr = server.address() as AddressInfo;
+          baseUrl = `http://127.0.0.1:${addr.port}`;
+          resolve();
+        });
+        server.on('error', reject);
+      });
+
+      const res = await fetch(`${baseUrl}/ready`);
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'Internal server error' });
+    } finally {
+      if (server?.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      }
+      server = undefined as unknown as Server;
+      process.env = suiteEnv;
+    }
+  });
+
   it('throws when no API backend is available', () => {
     expect(() => createApiServer({ pool: null as any, prisma: null as any })).toThrow(
       'GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)'

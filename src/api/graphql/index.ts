@@ -12,6 +12,7 @@ import { analyzeQuery } from './plugins/complexity.js';
 import { analyzeDepth } from './plugins/depth-limit.js';
 import { createBadUserInputError } from './utils/errors.js';
 import { createChildLogger } from '../../logger.js';
+import { config } from '../../config.js';
 import type { DocumentNode } from 'graphql';
 
 const logger = createChildLogger('graphql');
@@ -36,14 +37,14 @@ export function createGraphQLHandler(options: GraphQLHandlerOptions) {
     prisma: options.prisma,
   });
 
-  const isProduction = process.env.NODE_ENV === 'production';
+  const graphqlDebugEnabled = config.graphqlDebugEnabled;
 
   const yoga = createYoga({
     schema,
     context: contextFactory,
-    graphiql: !isProduction,
+    graphiql: graphqlDebugEnabled,
     landingPage: false,
-    maskedErrors: isProduction,
+    maskedErrors: !graphqlDebugEnabled,
     logging: {
       debug: (...args: unknown[]) => logger.debug(args[0], 'GraphQL debug'),
       info: (...args: unknown[]) => logger.info(args[0], 'GraphQL info'),
@@ -86,6 +87,6 @@ export function createGraphQLHandler(options: GraphQLHandlerOptions) {
     ],
   });
 
-  logger.info({ graphiql: !isProduction }, 'GraphQL handler created');
+  logger.info({ graphiql: graphqlDebugEnabled, maskedErrors: !graphqlDebugEnabled }, 'GraphQL handler created');
   return yoga;
 }

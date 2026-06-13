@@ -36,6 +36,7 @@ describe("Config", () => {
       delete process.env.PROGRAM_ID;
       delete process.env.SOLANA_NETWORK;
       delete process.env.GRAPHQL_STATS_CACHE_TTL_MS;
+      delete process.env.GRAPHQL_DEBUG_ENABLED;
       delete process.env.IPFS_GATEWAY_BASE;
       delete process.env.URI_DIGEST_TRUSTED_HOSTS;
       delete process.env.INDEXER_START_SIGNATURE;
@@ -80,6 +81,7 @@ describe("Config", () => {
       expect(config.wsReconciliationIntervalMs).toBe(600000);
       expect(config.logLevel).toBe("info");
       expect(config.apiMode).toBe("both");
+      expect(config.graphqlDebugEnabled).toBe(false);
       expect(config.graphqlStatsCacheTtlMs).toBe(60000);
       expect(config.ipfsGatewayBase).toBe("https://ipfs.io");
       expect(config.uriDigestTrustedHosts).toEqual([]);
@@ -112,6 +114,7 @@ describe("Config", () => {
       process.env.WS_RECONCILIATION_INTERVAL_MS = "120000";
       process.env.LOG_LEVEL = "debug";
       process.env.API_MODE = "rest";
+      process.env.GRAPHQL_DEBUG_ENABLED = "true";
       process.env.GRAPHQL_STATS_CACHE_TTL_MS = "45000";
       process.env.IPFS_GATEWAY_BASE = "https://gateway.example.com/";
       process.env.URI_DIGEST_TRUSTED_HOSTS = " localhost,127.0.0.1 ";
@@ -152,6 +155,7 @@ describe("Config", () => {
       expect(config.wsReconciliationIntervalMs).toBe(120000);
       expect(config.logLevel).toBe("debug");
       expect(config.apiMode).toBe("rest");
+      expect(config.graphqlDebugEnabled).toBe(true);
       expect(config.graphqlStatsCacheTtlMs).toBe(45000);
       expect(config.ipfsGatewayBase).toBe("https://gateway.example.com");
       expect(config.uriDigestTrustedHosts).toEqual(["localhost", "127.0.0.1"]);
