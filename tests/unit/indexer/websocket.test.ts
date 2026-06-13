@@ -550,6 +550,49 @@ describe("WebSocketIndexer", () => {
       expect(advancedToInFlightSignature).toBe(false);
     });
 
+    it("should not advance the cursor if advancement freezes immediately before save", async () => {
+      let logsHandler: (logs: any, ctx: any) => void;
+
+      (mockConnection.onLogs as any).mockImplementation(
+        (_: any, handler: any) => {
+          logsHandler = handler;
+          return 1;
+        }
+      );
+      (mockConnection.getBlock as any).mockResolvedValue({
+        blockTime: 123,
+        transactions: [{ transaction: { signatures: [TEST_SIGNATURE] } }],
+      });
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          lastSlot: 1n,
+          lastTxIndex: 0,
+          get lastSignature() {
+            (wsIndexer as any).freezeCursorAdvancement = true;
+            return "old-signature";
+          },
+        } as any);
+
+      await wsIndexer.start();
+
+      const logs = createEventLogs("AgentRegistered", {
+        asset: TEST_ASSET,
+        collection: TEST_COLLECTION,
+        owner: TEST_OWNER,
+        atomEnabled: true,
+        agentUri: "ipfs://QmFreezeBeforeSave",
+      });
+
+      logsHandler!({ signature: TEST_SIGNATURE, err: null, logs }, { slot: Number(TEST_SLOT) });
+      await ((wsIndexer as any).logQueue).onIdle();
+
+      const advancedToFrozenSignature = mockPrisma.indexerState.upsert.mock.calls.some(([args]) => (
+        args?.update?.lastSignature === TEST_SIGNATURE || args?.create?.lastSignature === TEST_SIGNATURE
+      ));
+      expect(advancedToFrozenSignature).toBe(false);
+    });
+
     it("should restore the last safe cursor if shutdown starts while the local SQL cursor write is in flight", async () => {
       let logsHandler: (logs: any, ctx: any) => void;
       let releaseSqlWrite!: () => void;

@@ -1669,6 +1669,13 @@ export class WebSocketIndexer {
                 "WS cursor update skipped — monotonic guard"
               );
             } else {
+              if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) {
+                logger.info(
+                  { signature: logs.signature, slot: ctx.slot },
+                  "Skipping cursor save before websocket persistence during shutdown/fail-safe stop"
+                );
+                return;
+              }
               if (!(await trySaveLocalIndexerStateWithSql(this.prisma, {
                 signature: logs.signature,
                 slot: newSlot,
@@ -1709,7 +1716,13 @@ export class WebSocketIndexer {
               );
             }
           } else {
-            // Supabase mode — saveIndexerState already has SQL-level monotonic guard
+            if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) {
+              logger.info(
+                { signature: logs.signature, slot: ctx.slot },
+                "Skipping Supabase cursor save before websocket persistence during shutdown/fail-safe stop"
+              );
+              return;
+            }
             await saveIndexerState(logs.signature, newSlot, txIndex ?? null, "websocket", blockTime);
             this.rememberPersistedCursor(
               logs.signature,
