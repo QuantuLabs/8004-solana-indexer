@@ -999,6 +999,85 @@ describe("WebSocketIndexer", () => {
       expect(wsIndexer.isActive()).toBe(false);
     });
 
+    it("should rewind the durable cursor after a reconciliation miss with no in-flight work", async () => {
+      const sessionStartCursor = {
+        lastSignature: "session-start",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      const advancedCursor = {
+        lastSignature: "advanced-cursor",
+        lastSlot: 200n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+      };
+      let currentCursor = sessionStartCursor;
+      let durableTip: string | null = null;
+
+      mockPrisma.indexerState.findUnique.mockImplementation(async (args: any) => (
+        args?.where?.id === "main" ? currentCursor as any : null
+      ));
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => (
+        args?.where?.id === "websocket-reconciliation-tip" && durableTip
+          ? [{ lastSignature: durableTip }]
+          : []
+      ));
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        if (args?.where?.id === "websocket-reconciliation-tip") {
+          durableTip = args.update?.lastSignature ?? args.create?.lastSignature ?? null;
+        }
+        if (args?.where?.id === "main") {
+          const update = args.update ?? args.create;
+          currentCursor = {
+            lastSignature: update.lastSignature,
+            lastSlot: update.lastSlot,
+            lastTxIndex: update.lastTxIndex,
+            source: update.source,
+            updatedAt: update.updatedAt,
+          };
+        }
+        return args.update ?? args.create;
+      });
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        createMockSignatureInfo("missed-behind-advanced-cursor", 150, null),
+      ]);
+
+      await wsIndexer.start();
+      currentCursor = advancedCursor;
+      (wsIndexer as any).lastPersistedCursor = {
+        signature: advancedCursor.lastSignature,
+        slot: advancedCursor.lastSlot,
+        txIndex: advancedCursor.lastTxIndex,
+        source: advancedCursor.source,
+        updatedAt: advancedCursor.updatedAt,
+      };
+
+      expect(((wsIndexer as any).logQueue).size).toBe(0);
+      expect(((wsIndexer as any).logQueue).pending).toBe(0);
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await ((wsIndexer as any).stopPromise ?? Promise.resolve());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(triggered).toBe(true);
+      expect(currentCursor).toEqual(sessionStartCursor);
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "main" },
+          update: expect.objectContaining({
+            lastSignature: "session-start",
+            lastSlot: 100n,
+            lastTxIndex: 0,
+            source: "websocket",
+          }),
+        })
+      );
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
     it("should persist the newest scanned signature after a complete clean reconciliation scan", async () => {
       const cursorRow = {
         lastSignature: "cursor-sig",

@@ -587,7 +587,7 @@ export class WebSocketIndexer {
       await this.logQueue.onIdle();
     }
 
-    if (restoreCursorSnapshot && (clearedQueuedLogs > 0 || hadInFlightWork)) {
+    if (restoreCursorSnapshot && (allowIntentionalRewind || clearedQueuedLogs > 0 || hadInFlightWork)) {
       try {
         await this.restoreSafeCursorSnapshotAfterStop(restoreCursorSnapshot, allowIntentionalRewind);
       } catch (error) {
