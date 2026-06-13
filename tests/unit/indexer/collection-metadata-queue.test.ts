@@ -85,6 +85,7 @@ function resetQueueState() {
     deferredQueued: 0,
     deferredPromoted: 0,
     deferredReplaced: 0,
+    deferredDropped: 0,
     errors: 0,
   };
   capturedTasks.length = 0;
@@ -136,19 +137,27 @@ describe("CollectionMetadataQueue", () => {
     (config as any).collectionMetadataIndexEnabled = true;
   });
 
-  it("should defer tasks when queue is at capacity", () => {
+  it("should drop deferred tasks when total queue cap is full", () => {
     mockPQueueInstance.size = 5000;
     collectionMetadataQueue.add("asset-full", "c1:full");
 
     const stats = collectionMetadataQueue.getStats();
     expect(stats.queued).toBe(0);
     expect(stats.deferredQueued).toBe(1);
-    expect(stats.deferredCount).toBe(1);
+    expect(stats.deferredDropped).toBe(1);
+    expect(stats.deferredCount).toBe(0);
+    expect(stats.totalQueueLoad).toBe(5000);
   });
 
   it("should promote deferred tasks when capacity returns", () => {
-    mockPQueueInstance.size = 5000;
-    collectionMetadataQueue.add("asset-deferred", "c1:deferred");
+    const q = collectionMetadataQueue as any;
+    const deferred = {
+      assetId: "asset-deferred",
+      col: "c1:deferred",
+      addedAt: Date.now(),
+    };
+    q.pending.set("asset-deferred", deferred);
+    q.deferred.set("asset-deferred", deferred);
     expect(collectionMetadataQueue.getStats().deferredCount).toBe(1);
 
     mockPQueueInstance.size = 0;
@@ -162,16 +171,45 @@ describe("CollectionMetadataQueue", () => {
   });
 
   it("should keep only latest deferred task per asset", () => {
-    mockPQueueInstance.size = 5000;
-    collectionMetadataQueue.add("asset-latest", "c1:old");
+    const q = collectionMetadataQueue as any;
+    const oldTask = {
+      assetId: "asset-latest",
+      col: "c1:old",
+      addedAt: Date.now(),
+    };
+    mockPQueueInstance.size = 4998;
+    q.pending.set("asset-latest", oldTask);
+    q.deferred.set("asset-latest", oldTask);
     collectionMetadataQueue.add("asset-latest", "c1:new");
 
-    const q = collectionMetadataQueue as any;
     expect(q.deferred.get("asset-latest")?.col).toBe("c1:new");
 
     const stats = collectionMetadataQueue.getStats();
     expect(stats.deferredReplaced).toBeGreaterThanOrEqual(1);
     expect(stats.deferredCount).toBe(1);
+    expect(stats.deferredDropped).toBe(0);
+  });
+
+  it("should evict the oldest deferred task when a newer deferred task needs room", () => {
+    const q = collectionMetadataQueue as any;
+    const oldTask = {
+      assetId: "asset-old",
+      col: "c1:old",
+      addedAt: Date.now(),
+    };
+    mockPQueueInstance.size = 4998;
+    q.pending.set("asset-old", oldTask);
+    q.deferred.set("asset-old", oldTask);
+
+    collectionMetadataQueue.add("asset-new", "c1:new");
+
+    const stats = collectionMetadataQueue.getStats();
+    expect(q.deferred.has("asset-old")).toBe(false);
+    expect(q.pending.has("asset-old")).toBe(false);
+    expect(q.deferred.get("asset-new")?.col).toBe("c1:new");
+    expect(stats.deferredDropped).toBe(1);
+    expect(stats.deferredCount).toBe(1);
+    expect(stats.totalQueueLoad).toBe(5000);
   });
 
   it("should process queued task with freshness check", async () => {

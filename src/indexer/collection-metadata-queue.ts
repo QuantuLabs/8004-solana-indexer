@@ -35,6 +35,7 @@ class CollectionMetadataQueue {
     deferredQueued: 0,
     deferredPromoted: 0,
     deferredReplaced: 0,
+    deferredDropped: 0,
     errors: 0,
   };
   private queueFullSignals = 0;
@@ -178,7 +179,7 @@ class CollectionMetadataQueue {
   }
 
   private enqueueOrDefer(task: CollectionMetadataTask): void {
-    if (this.queue.size + this.queue.pending >= MAX_QUEUE_SIZE) {
+    if (this.totalQueueLoad() >= MAX_QUEUE_SIZE) {
       this.deferTask(task);
       return;
     }
@@ -200,6 +201,7 @@ class CollectionMetadataQueue {
     this.deferred.set(task.assetId, task);
     this.stats.deferredQueued++;
     this.queueFullSignals++;
+    this.enforceTotalQueueCap();
 
     if (this.queueFullSignals % 10 === 1) {
       logger.warn(
@@ -207,8 +209,11 @@ class CollectionMetadataQueue {
           assetId: task.assetId,
           queueSize: this.queue.size,
           inFlight: this.queue.pending,
+          pendingCount: this.pending.size,
           deferredCount: this.deferred.size,
+          totalQueueLoad: this.totalQueueLoad(),
           deferredQueued: this.stats.deferredQueued,
+          deferredDropped: this.stats.deferredDropped,
         },
         "Collection metadata queue at capacity, deferred latest task"
       );
@@ -216,7 +221,7 @@ class CollectionMetadataQueue {
   }
 
   private promoteDeferredIfCapacity(): void {
-    while (this.deferred.size > 0 && this.queue.size + this.queue.pending < MAX_QUEUE_SIZE) {
+    while (this.deferred.size > 0 && this.totalQueueLoad() < MAX_QUEUE_SIZE) {
       const next = this.deferred.entries().next().value as [string, CollectionMetadataTask] | undefined;
       if (!next) return;
 
@@ -227,12 +232,47 @@ class CollectionMetadataQueue {
     }
   }
 
+  private totalQueueLoad(): number {
+    return this.queue.size + this.queue.pending + this.pending.size + this.deferred.size;
+  }
+
+  private enforceTotalQueueCap(): void {
+    let dropped = 0;
+    while (this.totalQueueLoad() > MAX_QUEUE_SIZE) {
+      const next = this.deferred.entries().next().value as [string, CollectionMetadataTask] | undefined;
+      if (!next) break;
+      const [assetId, task] = next;
+      this.deferred.delete(assetId);
+      if (this.pending.get(assetId) === task) {
+        this.pending.delete(assetId);
+      }
+      this.stats.deferredDropped++;
+      dropped++;
+    }
+
+    if (dropped > 0) {
+      logger.warn(
+        {
+          dropped,
+          queueSize: this.queue.size,
+          inFlight: this.queue.pending,
+          pendingCount: this.pending.size,
+          deferredCount: this.deferred.size,
+          totalQueueLoad: this.totalQueueLoad(),
+          deferredDropped: this.stats.deferredDropped,
+        },
+        "Collection metadata queue dropped deferred tasks at capacity"
+      );
+    }
+  }
+
   getStats() {
     return {
       ...this.stats,
       queueSize: this.queue.size,
       pendingCount: this.pending.size,
       deferredCount: this.deferred.size,
+      totalQueueLoad: this.totalQueueLoad(),
     };
   }
 
