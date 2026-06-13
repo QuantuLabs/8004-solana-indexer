@@ -12,6 +12,7 @@ import { PrismaClient, Prisma, Agent as PrismaAgent, Collection as PrismaCollect
 import { logger } from '../logger.js';
 import { computeKeyHash } from '../utils/pda.js';
 import { createGraphQLHandler } from './graphql/index.js';
+import { MAX_IN_FILTER_VALUES } from './graphql/utils/filters.js';
 import {
   fetchReplayDataFromPool,
   getLatestCheckpointsFromPool,
@@ -460,6 +461,7 @@ function safeBigIntArray(value: unknown): bigint[] | undefined {
   const str = safeQueryString(value);
   if (!str) return undefined;
   const parts = str.split(',').map(s => s.trim());
+  if (parts.length > MAX_IN_FILTER_VALUES) return undefined;
   const result: bigint[] = [];
   for (const part of parts) {
     if (!/^-?\d+$/.test(part)) return undefined;

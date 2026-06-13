@@ -103,7 +103,7 @@ const OPERATOR_SQL: Record<string, string> = {
 };
 
 const ID_FIELDS = new Set(['id', 'agent']);
-const MAX_IN_FILTER_VALUES = 250;
+export const MAX_IN_FILTER_VALUES = 250;
 
 export interface WhereClause {
   sql: string;

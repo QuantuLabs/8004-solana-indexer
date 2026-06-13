@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
 import type { Express } from "express";
+import { MAX_IN_FILTER_VALUES } from "../../../src/api/graphql/utils/filters.js";
 
 const originalEnv = process.env;
 
@@ -192,6 +193,38 @@ describe("REST feedback deterministic ordering", () => {
           skip: 0,
         })
       );
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  it.each([
+    ["/rest/v1/feedbacks", "feedback_index", "feedback"],
+    ["/rest/v1/responses", "feedback_index", "feedbackResponse"],
+    ["/rest/v1/revocations", "revoke_count", "revocation"],
+  ])("rejects over-limit %s %s IN filters", async (path, field, model) => {
+    const prisma = {
+      feedback: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+      feedbackResponse: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+      revocation: {
+        findMany: vi.fn().mockResolvedValue([]),
+        count: vi.fn().mockResolvedValue(0),
+      },
+    };
+    const values = Array.from({ length: MAX_IN_FILTER_VALUES + 1 }, (_, index) => index).join(",");
+    const inFilter = encodeURIComponent(`in.(${values})`);
+
+    const { server, baseUrl } = await startServer(prisma);
+    try {
+      const res = await fetch(`${baseUrl}${path}?${field}=${inFilter}`);
+      expect(res.status).toBe(400);
+      expect((prisma as any)[model].findMany).not.toHaveBeenCalled();
     } finally {
       await stopServer(server);
     }
