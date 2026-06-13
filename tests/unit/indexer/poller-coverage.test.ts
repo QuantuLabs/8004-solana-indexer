@@ -2964,6 +2964,7 @@ describe("Poller Coverage", () => {
       expect(processTransactionSpy).toHaveBeenCalledWith(withinStopSlot, 0);
       expect(saveStateSpy).toHaveBeenCalledTimes(1);
       expect((poller as any).isRunning).toBe(false);
+      expect(poller.getExitReason()).toBe("stoppedAtStopSlot");
     });
 
     it("should process checkpoints in reverse order (oldest first) during Phase 2", async () => {

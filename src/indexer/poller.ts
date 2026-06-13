@@ -448,6 +448,7 @@ export class Poller {
   private stopSlotPaginationContinuation: string | null = null;
   private pendingHistoricalResume = false;
   private hasReachedLiveFrontier = false;
+  private exitReason: string | null = null;
 
   // Batch processing components (Supabase mode only)
   private useBatchRpc: boolean;
@@ -587,6 +588,7 @@ export class Poller {
       lastTxIndex: this.lastTxIndex,
     }, "INDEXER_STOP_SLOT reached, stopping poller before processing newer slots");
 
+    this.exitReason = "stoppedAtStopSlot";
     this.isRunning = false;
     return true;
   }
@@ -719,6 +721,7 @@ export class Poller {
     }
 
     this.isRunning = true;
+    this.exitReason = null;
     this.hasReachedLiveFrontier = false;
     logger.info({ programId: this.programId.toBase58() }, "Starting poller");
 
@@ -743,6 +746,7 @@ export class Poller {
     }
 
     this.isRunning = true;
+    this.exitReason = null;
     this.hasReachedLiveFrontier = false;
     this.suppressEventLogWrites = Boolean(options?.suppressEventLogWrites);
     logger.info({ programId: this.programId.toBase58() }, "Bootstrapping poller catch-up");
@@ -2119,6 +2123,10 @@ export class Poller {
 
   isActive(): boolean {
     return this.isRunning;
+  }
+
+  getExitReason(): string | null {
+    return this.exitReason;
   }
 
   private logNoSavedCursorWarning(source: "local" | "supabase"): void {

@@ -14,6 +14,7 @@ const {
     stop: vi.fn(),
     isActive: vi.fn(),
     isCaughtUp: vi.fn(),
+    getExitReason: vi.fn(),
   },
   mockWsIndexerInstance: {
     start: vi.fn(),
@@ -37,6 +38,7 @@ const createPollerMock = () => ({
   stop: vi.fn(),
   isActive: vi.fn().mockReturnValue(true),
   isCaughtUp: vi.fn().mockReturnValue(false),
+  getExitReason: vi.fn().mockReturnValue(null),
 });
 
 const createWsIndexerMock = () => ({
@@ -153,6 +155,7 @@ describe("Processor", () => {
     mockPollerInstance.stop.mockResolvedValue(undefined);
     mockPollerInstance.isActive.mockReturnValue(true);
     mockPollerInstance.isCaughtUp.mockReturnValue(false);
+    mockPollerInstance.getExitReason.mockReturnValue(null);
     mockWsIndexerInstance.start.mockResolvedValue(undefined);
     mockWsIndexerInstance.stop.mockResolvedValue(undefined);
     mockWsIndexerInstance.isActive.mockReturnValue(true);
@@ -600,6 +603,28 @@ describe("Processor", () => {
       expect(mockTestWebSocketConnection).toHaveBeenCalled();
       expect(mockPollerInstance.stop).toHaveBeenCalledTimes(1);
       expect(mockWsIndexerInstance.start).toHaveBeenCalledTimes(1);
+
+      await processor.stop();
+      vi.useRealTimers();
+    });
+
+    it("should not restart polling after poller exits at the stop slot in auto mode", async () => {
+      vi.useFakeTimers();
+      mockTestWebSocketConnection.mockResolvedValue(false);
+
+      const processor = new Processor(mockPrisma, null, { mode: "auto" });
+      await processor.start();
+      vi.clearAllMocks();
+
+      mockPollerInstance.isActive.mockReturnValue(false);
+      mockPollerInstance.getExitReason.mockReturnValue("stoppedAtStopSlot");
+
+      await vi.advanceTimersByTimeAsync(10000);
+
+      expect(Poller).not.toHaveBeenCalled();
+      expect(mockPollerInstance.start).not.toHaveBeenCalled();
+      expect((processor as any).poller).toBe(mockPollerInstance);
+      expect(processor.getStatus().pollerActive).toBe(false);
 
       await processor.stop();
       vi.useRealTimers();

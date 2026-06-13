@@ -380,6 +380,11 @@ export class Processor {
 
     const runToken = this.runToken;
     if (this.poller && !this.poller.isActive()) {
+      if (this.poller.getExitReason() === "stoppedAtStopSlot") {
+        logger.info("Poller stopped at configured stop slot; leaving polling stopped");
+        this.scheduleNextWsCheck();
+        return;
+      }
       logger.warn("Poller run loop is inactive; clearing stale poller reference");
       this.poller = null;
     }
