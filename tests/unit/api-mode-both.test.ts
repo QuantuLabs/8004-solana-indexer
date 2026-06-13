@@ -908,7 +908,7 @@ describe("API_MODE=both behavior", () => {
       expect(upstreamInit?.method).toBe("GET");
       const forwardedHeaders = new Headers(upstreamInit?.headers);
       expect(forwardedHeaders.get("prefer")).toBe("count=exact");
-      expect(forwardedHeaders.get("authorization")).toBe("Bearer test-token");
+      expect(forwardedHeaders.get("authorization")).toBe("Bearer service-role-key");
       expect(forwardedHeaders.get("apikey")).toBe("service-role-key");
 
       const includeOrphanedCallStart = fetchSpy.mock.calls.length;

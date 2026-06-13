@@ -1715,9 +1715,27 @@ function isMissingGlobalStatsRelationError(status: number, payload: Uint8Array, 
   }
 }
 
+function resolveRuntimeApiMode(): typeof config.apiMode {
+  const rawMode = (process.env.API_MODE || config.apiMode).trim().toLowerCase();
+  if (rawMode === 'graph') return 'graphql';
+  if (rawMode === 'hybrid') return 'both';
+  if (rawMode === 'graphql' || rawMode === 'rest' || rawMode === 'both') return rawMode;
+  return config.apiMode;
+}
+
+function resolveRuntimeBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value || value.trim() === '') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
 export function createApiServer(options: ApiServerOptions): Express {
-  const wantsRest = config.apiMode !== 'graphql';
-  const wantsGraphql = config.apiMode !== 'rest' && config.enableGraphql;
+  const apiMode = resolveRuntimeApiMode();
+  const enableGraphql = resolveRuntimeBoolean(process.env.ENABLE_GRAPHQL, config.enableGraphql);
+  const wantsRest = apiMode !== 'graphql';
+  const wantsGraphql = apiMode !== 'rest' && enableGraphql;
   const supabaseRestBaseUrl = resolveSupabaseRestBaseUrl();
   const hasSupabaseKey = typeof config.supabaseKey === 'string' && config.supabaseKey.trim().length > 0;
   const restProxyMissingKey = wantsRest && !options.prisma && !!options.pool && !!supabaseRestBaseUrl && !hasSupabaseKey;
@@ -1725,12 +1743,12 @@ export function createApiServer(options: ApiServerOptions): Express {
   const restEnabled = wantsRest && (!!options.prisma || restProxyEnabled);
   const graphqlEnabled = wantsGraphql && !!options.pool;
 
-  if (config.apiMode === 'rest' && !restEnabled) {
+  if (apiMode === 'rest' && !restEnabled) {
     throw new Error(
       'REST mode requires local Prisma client or Supabase PostgREST proxy auth (SUPABASE_URL + SUPABASE_KEY, or POSTGREST_URL + POSTGREST_TOKEN)'
     );
   }
-  if (config.apiMode === 'graphql' && !options.pool) {
+  if (wantsGraphql && !options.pool && !restEnabled) {
     throw new Error('GraphQL mode requires Supabase PostgreSQL pool (DB_MODE=supabase)');
   }
   if (!restEnabled && !graphqlEnabled) {
