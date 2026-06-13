@@ -59,6 +59,7 @@ describe("Config", () => {
       delete process.env.METADATA_PER_HOST_FETCH_CONCURRENCY;
       delete process.env.ALLOW_INSECURE_URI;
       delete process.env.ENABLE_PROOFPASS;
+      delete process.env.TRUST_PROXY;
 
       const { config } = await import("../../src/config.js");
 
@@ -486,6 +487,30 @@ describe("Config", () => {
       expect(() => validateConfig()).toThrow(
         "API_MODE=graphql requires ENABLE_GRAPHQL=true"
       );
+    });
+
+    it("should reject arbitrary TRUST_PROXY values", async () => {
+      process.env.TRUST_PROXY = "trust-all-proxies";
+
+      const { validateConfig } = await import("../../src/config.js");
+
+      expect(() => validateConfig()).toThrow(/Invalid TRUST_PROXY value/);
+    });
+
+    it("should allow constrained TRUST_PROXY values", async () => {
+      process.env.TRUST_PROXY = "1";
+
+      let imported = await import("../../src/config.js");
+      expect(imported.parseTrustProxyValue(process.env.TRUST_PROXY)).toBe(1);
+      expect(() => imported.validateConfig()).not.toThrow();
+
+      vi.resetModules();
+      process.env = { ...originalEnv, TRUST_PROXY: "loopback,10.0.0.0/8,::1/128" };
+      imported = await import("../../src/config.js");
+
+      expect(imported.parseTrustProxyValue("true")).toBe(false);
+      expect(imported.parseTrustProxyValue(process.env.TRUST_PROXY)).toBe("loopback,10.0.0.0/8,::1/128");
+      expect(() => imported.validateConfig()).not.toThrow();
     });
 
     it("should throw when VERIFY_INTERVAL_MS is below 5000", async () => {

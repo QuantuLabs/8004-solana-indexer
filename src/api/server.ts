@@ -23,7 +23,7 @@ import {
 } from '../services/replay-verifier.js';
 import cors from 'cors';
 import type { Pool } from 'pg';
-import { config } from '../config.js';
+import { config, parseTrustProxyValue } from '../config.js';
 import { renderIntegrityMetrics } from '../observability/integrity-metrics.js';
 import { VERIFICATION_STATS_SQL } from './verification-stats-sql.js';
 
@@ -2018,15 +2018,7 @@ export function createApiServer(options: ApiServerOptions): Express {
     return await readyDetailsState.inFlight;
   };
 
-  const trustProxyRaw = process.env.TRUST_PROXY;
-  let trustProxy: string | number | boolean = false;
-  if (trustProxyRaw !== undefined) {
-    if (trustProxyRaw === 'true') trustProxy = true;
-    else if (trustProxyRaw === 'false') trustProxy = false;
-    else if (/^\d+$/.test(trustProxyRaw)) trustProxy = Number(trustProxyRaw);
-    else trustProxy = trustProxyRaw;
-  }
-  app.set('trust proxy', trustProxy);
+  app.set('trust proxy', parseTrustProxyValue(process.env.TRUST_PROXY));
 
   app.use(express.json({ limit: '100kb' }));
 

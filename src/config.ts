@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { isIP } from "node:net";
 
 export type IndexerMode = "auto" | "polling" | "websocket";
 export type DbMode = "local" | "supabase";
@@ -22,6 +23,7 @@ const PUBLIC_RPC_HOSTS_WITH_LIMITED_HISTORY = new Set([
   "api.mainnet-beta.solana.com",
   "api.testnet.solana.com",
 ]);
+const TRUST_PROXY_NAMES = new Set(["loopback", "linklocal", "uniquelocal"]);
 
 function resolvePreferredEnv(primaryKey: string, aliasKey: string): string | undefined {
   const primaryValue = process.env[primaryKey];
@@ -171,6 +173,46 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
     return fallback;
   }
   return parsed;
+}
+
+function isValidIpOrCidr(value: string): boolean {
+  const parts = value.split("/");
+  if (parts.length > 2) return false;
+
+  const version = isIP(parts[0]);
+  if (version === 0) return false;
+  if (parts.length === 1) return true;
+  if (!/^\d+$/.test(parts[1])) return false;
+
+  const prefix = Number(parts[1]);
+  const maxPrefix = version === 4 ? 32 : 128;
+  return prefix >= 0 && prefix <= maxPrefix;
+}
+
+function isValidTrustProxyList(value: string): boolean {
+  const entries = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  return entries.length > 0 && entries.every((entry) => {
+    const lowered = entry.toLowerCase();
+    return TRUST_PROXY_NAMES.has(lowered) || isValidIpOrCidr(entry);
+  });
+}
+
+export function parseTrustProxyValue(value: string | undefined): string | number | boolean {
+  const trimmed = value?.trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "false" || normalized === "true") return false;
+  if (/^\d+$/.test(normalized)) return Number(normalized);
+  if (isValidTrustProxyList(trimmed)) return trimmed;
+
+  throw new Error(
+    "Invalid TRUST_PROXY value. Use false, a non-negative hop count, loopback/linklocal/uniquelocal, or an IP/CIDR list."
+  );
 }
 
 function parseOptionalString(value: string | undefined): string | null {
@@ -402,6 +444,8 @@ export function validateConfig(): void {
   if (config.apiMode === "graphql" && !config.enableGraphql) {
     throw new Error("API_MODE=graphql requires ENABLE_GRAPHQL=true");
   }
+
+  parseTrustProxyValue(process.env.TRUST_PROXY);
 
   // Warn about disabled SSL verification
   if (!config.supabaseSslVerify) {
