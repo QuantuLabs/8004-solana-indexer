@@ -56,6 +56,7 @@ describe("Config", () => {
       delete process.env.INDEX_VALIDATIONS;
       delete process.env.METADATA_MAX_BYTES;
       delete process.env.METADATA_MAX_VALUE_BYTES;
+      delete process.env.METADATA_PER_HOST_FETCH_CONCURRENCY;
       delete process.env.ALLOW_INSECURE_URI;
       delete process.env.ENABLE_PROOFPASS;
 
@@ -94,6 +95,7 @@ describe("Config", () => {
       expect(config.validationIndexEnabled).toBe(true);
       expect(config.metadataMaxBytes).toBe(262144);
       expect(config.metadataMaxValueBytes).toBe(10000);
+      expect(config.metadataPerHostFetchConcurrency).toBe(2);
       expect(config.enableProofPass).toBe(false);
     });
 
@@ -128,6 +130,7 @@ describe("Config", () => {
       process.env.INDEX_VALIDATIONS = "true";
       process.env.METADATA_MAX_BYTES = "123456";
       process.env.METADATA_MAX_VALUE_BYTES = "2048";
+      process.env.METADATA_PER_HOST_FETCH_CONCURRENCY = "3";
       process.env.ENABLE_PROOFPASS = "true";
 
       const { config } = await import("../../src/config.js");
@@ -164,7 +167,18 @@ describe("Config", () => {
       expect(config.validationIndexEnabled).toBe(true);
       expect(config.metadataMaxBytes).toBe(123456);
       expect(config.metadataMaxValueBytes).toBe(2048);
+      expect(config.metadataPerHostFetchConcurrency).toBe(3);
       expect(config.enableProofPass).toBe(true);
+    });
+
+    it("should clamp metadata byte limits", async () => {
+      process.env.METADATA_MAX_BYTES = "1";
+      process.env.METADATA_MAX_VALUE_BYTES = "99999999";
+
+      const { config } = await import("../../src/config.js");
+
+      expect(config.metadataMaxBytes).toBe(1024);
+      expect(config.metadataMaxValueBytes).toBe(10 * 1024 * 1024);
     });
 
     it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {

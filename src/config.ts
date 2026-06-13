@@ -157,6 +157,11 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function parseClampedPositiveInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = parsePositiveInt(value, fallback);
+  return Math.max(min, Math.min(max, parsed));
+}
+
 function parseNonNegativeInt(value: string | undefined, fallback: number): number {
   if (!value || value.trim() === "") {
     return fallback;
@@ -356,9 +361,11 @@ export const config = {
   // Keep ingestion off by default in runtime, on during tests for coverage.
   validationIndexEnabled: parseBoolean(process.env.INDEX_VALIDATIONS, process.env.NODE_ENV === "test" || process.env.VITEST !== undefined),
   // Maximum bytes to fetch from URI (prevents memory exhaustion)
-  metadataMaxBytes: parseInt(process.env.METADATA_MAX_BYTES || "262144", 10), // 256KB
+  metadataMaxBytes: parseClampedPositiveInt(process.env.METADATA_MAX_BYTES, 262144, 1024, 10 * 1024 * 1024), // 256KB
   // Maximum bytes per field value (prevents single oversize field)
-  metadataMaxValueBytes: parseInt(process.env.METADATA_MAX_VALUE_BYTES || "10000", 10), // 10KB
+  metadataMaxValueBytes: parseClampedPositiveInt(process.env.METADATA_MAX_VALUE_BYTES, 10000, 1024, 10 * 1024 * 1024), // 10KB
+  // Per-resolved-host cap for outbound metadata fetches
+  metadataPerHostFetchConcurrency: parsePositiveInt(process.env.METADATA_PER_HOST_FETCH_CONCURRENCY, 2),
   // Fixed timeout for URI fetch (security: no user-configurable timeout)
   metadataTimeoutMs: 5000,
   // Base URL for resolving ipfs:// and /ipfs/* metadata documents
