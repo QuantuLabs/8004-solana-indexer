@@ -851,13 +851,16 @@ describe("WebSocketIndexer", () => {
 
   describe("reconciliation", () => {
     it("should enter fail-safe stop when a successful signature newer than the cursor was not observed by the pipeline", async () => {
-      mockPrisma.indexerState.findUnique.mockResolvedValueOnce({
+      const cursorRow = {
         lastSignature: "cursor-sig",
         lastSlot: 100n,
         lastTxIndex: 0,
         source: "websocket",
         updatedAt: new Date("2026-03-14T00:00:00.000Z"),
-      } as any);
+      };
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(cursorRow as any)
+        .mockResolvedValueOnce(cursorRow as any);
       (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
         createMockSignatureInfo("missed-sig", 101, null),
         createMockSignatureInfo("failed-sig", 102, { InstructionError: [0, "Custom"] }),
@@ -871,9 +874,162 @@ describe("WebSocketIndexer", () => {
       expect(triggered).toBe(true);
       expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
         TEST_PROGRAM_ID,
-        { until: "cursor-sig", limit: 25 }
+        { until: "cursor-sig", limit: 50 }
       );
       expect(mockPrisma.agent.upsert).not.toHaveBeenCalled();
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
+    it("should paginate reconciliation checks up to a missed successful signature", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      const firstPage = Array.from({ length: 50 }, (_, index) =>
+        createMockSignatureInfo(`observed-${index}`, 150 - index, null)
+      );
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(cursorRow as any)
+        .mockResolvedValueOnce(cursorRow as any);
+      (mockConnection.getSignaturesForAddress as any)
+        .mockResolvedValueOnce(firstPage)
+        .mockResolvedValueOnce([
+          createMockSignatureInfo("missed-second-page", 101, null),
+        ]);
+
+      await wsIndexer.start();
+      firstPage.forEach((signature) => {
+        (wsIndexer as any).observedSignatures.add(signature.signature);
+      });
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(triggered).toBe(true);
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenNthCalledWith(
+        1,
+        TEST_PROGRAM_ID,
+        { until: "cursor-sig", limit: 50 }
+      );
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenNthCalledWith(
+        2,
+        TEST_PROGRAM_ID,
+        { until: "cursor-sig", limit: 50, before: "observed-49" }
+      );
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
+    it("should keep scanning from the previous reconciliation tip when the websocket cursor advances", async () => {
+      const initialCursor = {
+        lastSignature: "initial-cursor",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      const advancedCursor = {
+        lastSignature: "advanced-cursor",
+        lastSlot: 200n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+      };
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(initialCursor as any)
+        .mockResolvedValueOnce(initialCursor as any)
+        .mockResolvedValueOnce(advancedCursor as any);
+      (mockConnection.getSignaturesForAddress as any)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          createMockSignatureInfo("missed-behind-ws-cursor", 150, null),
+        ]);
+
+      await wsIndexer.start();
+
+      await (wsIndexer as any).runReconciliationCheck("periodic");
+      (wsIndexer as any).lastPersistedCursor = {
+        signature: "advanced-cursor",
+        slot: 200n,
+        txIndex: 0,
+        source: "websocket",
+        updatedAt: advancedCursor.updatedAt,
+      };
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenNthCalledWith(
+        2,
+        TEST_PROGRAM_ID,
+        { until: "initial-cursor", limit: 50 }
+      );
+      expect(triggered).toBe(true);
+      expect(wsIndexer.isActive()).toBe(false);
+    });
+
+    it("should not fail-safe for signatures covered by a durable poller cursor", async () => {
+      const startCursor = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      const durableCursor = {
+        lastSignature: "poller-cursor",
+        lastSlot: 120n,
+        lastTxIndex: 2,
+        source: "poller",
+        updatedAt: new Date("2026-03-14T00:01:00.000Z"),
+      };
+      mockPrisma.indexerState.findUnique
+        .mockResolvedValueOnce(startCursor as any)
+        .mockResolvedValueOnce(durableCursor as any);
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce([
+        createMockSignatureInfo("poller-covered-sig", 120, null),
+      ]);
+      (mockConnection.getBlock as any).mockResolvedValueOnce({
+        blockTime: 123,
+        transactions: [
+          { transaction: { signatures: ["before-covered"] } },
+          { transaction: { signatures: ["poller-covered-sig"] } },
+          { transaction: { signatures: ["poller-cursor"] } },
+        ],
+      });
+
+      await wsIndexer.start();
+
+      const triggered = await (wsIndexer as any).runReconciliationCheck("periodic");
+
+      expect(triggered).toBe(false);
+      expect(mockConnection.getBlock).toHaveBeenCalledWith(
+        120,
+        expect.objectContaining({ transactionDetails: "full" })
+      );
+      expect(wsIndexer.isActive()).toBe(true);
+    });
+
+    it("should enter fail-safe stop after three reconciliation RPC failures", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      };
+      mockPrisma.indexerState.findUnique.mockResolvedValueOnce(cursorRow as any);
+      (mockConnection.getSignaturesForAddress as any).mockRejectedValue(new Error("rpc down"));
+
+      await wsIndexer.start();
+
+      expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(false);
+      expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(false);
+      expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledTimes(3);
       expect(wsIndexer.isActive()).toBe(false);
     });
   });

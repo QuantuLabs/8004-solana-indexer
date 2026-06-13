@@ -376,7 +376,7 @@ describe("WebSocketIndexer Coverage", () => {
       expect(mockConnection.removeOnLogsListener).toHaveBeenCalledWith(1);
       expect(mockConnection.getSignaturesForAddress).toHaveBeenCalledWith(
         TEST_PROGRAM_ID,
-        { until: "cursor-sig", limit: 25 }
+        { until: "cursor-sig", limit: 50 }
       );
     });
 

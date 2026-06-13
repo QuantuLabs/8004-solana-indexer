@@ -40,7 +40,9 @@ const STALE_THRESHOLD = 120_000;
 // Keep websocket tx handling sequential so cursor advancement remains prefix-safe.
 const MAX_CONCURRENT_HANDLERS = 1;
 const MAX_QUEUE_SIZE = 10_000;
-const RECONCILIATION_SIGNATURE_LIMIT = 25;
+const RECONCILIATION_SIGNATURE_PAGE_LIMIT = 50;
+const RECONCILIATION_SIGNATURE_SCAN_LIMIT = 200;
+const RECONCILIATION_FAILURE_THRESHOLD = 3;
 const RECENT_OBSERVED_SIGNATURE_LIMIT = MAX_QUEUE_SIZE * 2;
 
 export interface WebSocketIndexerOptions {
@@ -318,6 +320,8 @@ export class WebSocketIndexer {
   private observedSignatureOrder: string[] = [];
   private reconciliationTimer: NodeJS.Timeout | null = null;
   private isReconciling = false;
+  private reconciliationTipSignature: string | null = null;
+  private reconciliationFailureCount = 0;
   private stopPromise: Promise<void> | null = null;
 
   constructor(options: WebSocketIndexerOptions) {
@@ -351,6 +355,8 @@ export class WebSocketIndexer {
     this.notificationSequence = 0;
     this.observedSignatures.clear();
     this.observedSignatureOrder = [];
+    this.reconciliationTipSignature = null;
+    this.reconciliationFailureCount = 0;
     this.stopReconciliationCheck();
     this.logQueue.start();
     this.lastActivityTime = Date.now();
@@ -728,10 +734,104 @@ export class WebSocketIndexer {
     );
   }
 
-  private findUnobservedSuccessfulSignature(signatures: ConfirmedSignatureInfo[]): ConfirmedSignatureInfo | null {
-    return signatures.find((signature) =>
-      signature.err === null && !this.signatureIsKnownToPipeline(signature.signature)
-    ) ?? null;
+  private async fetchReconciliationSignatures(until: string): Promise<ConfirmedSignatureInfo[]> {
+    const signatures: ConfirmedSignatureInfo[] = [];
+    let before: string | undefined;
+
+    while (signatures.length < RECONCILIATION_SIGNATURE_SCAN_LIMIT) {
+      const limit = Math.min(
+        RECONCILIATION_SIGNATURE_PAGE_LIMIT,
+        RECONCILIATION_SIGNATURE_SCAN_LIMIT - signatures.length
+      );
+      const options: { until: string; before?: string; limit: number } = { until, limit };
+      if (before) {
+        options.before = before;
+      }
+
+      const batch = await this.connection.getSignaturesForAddress(this.programId, options);
+      if (batch.length === 0) {
+        break;
+      }
+
+      signatures.push(...batch);
+      if (batch.length < limit || batch.some((signature) => signature.signature === until)) {
+        break;
+      }
+
+      before = batch[batch.length - 1]?.signature;
+      if (!before) {
+        break;
+      }
+    }
+
+    return signatures;
+  }
+
+  private async resolveReconciliationTxIndex(signature: ConfirmedSignatureInfo): Promise<number | null> {
+    try {
+      const block = await this.connection.getBlock(signature.slot, {
+        maxSupportedTransactionVersion: config.maxSupportedTransactionVersion,
+        transactionDetails: "full",
+      });
+      const index = block?.transactions?.findIndex(
+        (tx) => tx.transaction.signatures[0] === signature.signature
+      ) ?? -1;
+      return index >= 0 ? index : null;
+    } catch (error) {
+      logger.warn(
+        {
+          signature: signature.signature,
+          slot: signature.slot,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Failed to resolve reconciliation tx_index"
+      );
+      return null;
+    }
+  }
+
+  private async signatureIsCoveredByDurableCursor(
+    signature: ConfirmedSignatureInfo,
+    durableCursor: CurrentCursorSnapshot | null
+  ): Promise<boolean> {
+    if (!durableCursor?.lastSignature || durableCursor.lastSlot === null || durableCursor.lastSlot === undefined) {
+      return false;
+    }
+    if (durableCursor.source !== "poller" && durableCursor.source !== "substreams") {
+      return false;
+    }
+
+    const signatureSlot = BigInt(signature.slot);
+    let txIndex: number | null = null;
+    if (signatureSlot === durableCursor.lastSlot) {
+      txIndex = await this.resolveReconciliationTxIndex(signature);
+    }
+
+    return compareCanonicalTransactionOrder(
+      { slot: signatureSlot, txIndex, signature: signature.signature },
+      {
+        slot: durableCursor.lastSlot,
+        txIndex: durableCursor.lastTxIndex,
+        signature: durableCursor.lastSignature,
+      }
+    ) <= 0;
+  }
+
+  private async findUnobservedSuccessfulSignature(
+    signatures: ConfirmedSignatureInfo[],
+    durableCursor: CurrentCursorSnapshot | null
+  ): Promise<ConfirmedSignatureInfo | null> {
+    for (const signature of signatures) {
+      if (
+        signature.err === null
+        && !this.signatureIsKnownToPipeline(signature.signature)
+        && !(await this.signatureIsCoveredByDurableCursor(signature, durableCursor))
+      ) {
+        return signature;
+      }
+    }
+
+    return null;
   }
 
   private async runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
@@ -745,15 +845,16 @@ export class WebSocketIndexer {
 
     this.isReconciling = true;
     try {
-      const signatures = await this.connection.getSignaturesForAddress(this.programId, {
-        until: cursor.signature,
-        limit: RECONCILIATION_SIGNATURE_LIMIT,
-      });
+      const previousTip = this.reconciliationTipSignature ?? cursor.signature;
+      const signatures = await this.fetchReconciliationSignatures(previousTip);
+      this.reconciliationFailureCount = 0;
       if (!this.isRunning || this.stopRequested) {
         return false;
       }
 
-      const missed = this.findUnobservedSuccessfulSignature(signatures);
+      const durableCursor = await this.loadCurrentCursorSnapshot();
+      const missed = await this.findUnobservedSuccessfulSignature(signatures, durableCursor);
+      this.reconciliationTipSignature = signatures[0]?.signature ?? previousTip;
       if (!missed) {
         return false;
       }
@@ -773,6 +874,36 @@ export class WebSocketIndexer {
         }
       );
       return true;
+    } catch (error) {
+      this.reconciliationFailureCount++;
+      if (
+        this.reconciliationFailureCount >= RECONCILIATION_FAILURE_THRESHOLD
+        && this.isRunning
+        && !this.stopRequested
+      ) {
+        this.errorCount++;
+        this.restoreSessionStartCursorOnFailSafe();
+        this.scheduleFailSafeStop(
+          "WebSocket reconciliation failed repeatedly; entering fail-safe stop so polling catch-up can verify continuity",
+          {
+            reason,
+            error: error instanceof Error ? error.message : String(error),
+            reconciliationFailureCount: this.reconciliationFailureCount,
+            errorCount: this.errorCount,
+          }
+        );
+        return true;
+      }
+
+      logger.warn(
+        {
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+          reconciliationFailureCount: this.reconciliationFailureCount,
+        },
+        "WebSocket reconciliation check failed"
+      );
+      return false;
     } finally {
       this.isReconciling = false;
     }
