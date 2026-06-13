@@ -194,6 +194,9 @@ describe("supabase schema revocations bootstrap parity", () => {
     expect(schemaSql).toContain("a.canonical_col = cp.col");
     expect(schemaSql).toContain("a.creator = cp.creator");
     expect(schemaSql).toContain("WHERE cp.collection_id = $1");
+    expect(schemaSql).toContain("LIMIT LEAST(GREATEST(COALESCE(p_limit, 50), 1), 1000);");
+    expect(schemaSql).toContain("LIMIT LEAST(GREATEST(COALESCE($2, 20), 1), 1000)");
+    expect(schemaSql).toContain("OFFSET LEAST(GREATEST(COALESCE($3, 0), 0), 10000);");
     expect(schemaSql).toContain("GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO anon;");
     expect(schemaSql).toContain("GRANT EXECUTE ON FUNCTION get_collection_agents(BIGINT, INT, INT) TO authenticated;");
   });

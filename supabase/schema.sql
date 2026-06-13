@@ -1032,7 +1032,7 @@ BEGIN
     AND a.status != 'ORPHANED'
     AND (p_cursor_sort_key IS NULL OR a.sort_key < p_cursor_sort_key)
   ORDER BY a.sort_key DESC, a.asset ASC
-  LIMIT p_limit;
+  LIMIT LEAST(GREATEST(COALESCE(p_limit, 50), 1), 1000);
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -1115,8 +1115,8 @@ RETURNS TABLE (
   WHERE cp.collection_id = $1
     AND a.status != 'ORPHANED'
   ORDER BY a.created_at DESC, a.asset DESC
-  LIMIT GREATEST($2, 0)
-  OFFSET GREATEST($3, 0);
+  LIMIT LEAST(GREATEST(COALESCE($2, 20), 1), 1000)
+  OFFSET LEAST(GREATEST(COALESCE($3, 0), 0), 10000);
 $$ LANGUAGE sql STABLE;
 
 -- Get agent with full details
