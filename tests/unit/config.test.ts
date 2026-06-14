@@ -393,6 +393,18 @@ describe("Config", () => {
       warnSpy.mockRestore();
     });
 
+    it("should allow SUPABASE_SSL_VERIFY false for docker-network service-name and private-IP DSN hosts", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      for (const host of ["postgres", "8004-postgres", "10.0.0.5", "172.18.0.2", "192.168.1.10"]) {
+        vi.resetModules();
+        process.env.SUPABASE_SSL_VERIFY = "false";
+        process.env.SUPABASE_DSN = `postgresql://postgres:postgres@${host}:5432/postgres?sslmode=disable`;
+        const { validateConfig } = await import("../../src/config.js");
+        expect(() => validateConfig(), `host ${host} should be allowed`).not.toThrow();
+      }
+      warnSpy.mockRestore();
+    });
+
     it("should warn when mainnet-beta uses default devnet PROGRAM_ID", async () => {
       process.env.SOLANA_NETWORK = "mainnet-beta";
       delete process.env.PROGRAM_ID;

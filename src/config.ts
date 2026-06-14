@@ -229,7 +229,17 @@ function parseSupabaseDsnHost(dsn: string | undefined): string | null {
 
 function isLocalDatabaseHost(host: string | null): boolean {
   if (!host) return false;
-  return LOCAL_DATABASE_HOSTS.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (LOCAL_DATABASE_HOSTS.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) {
+    return true;
+  }
+  if (!host.includes(".") && !host.includes(":")) {
+    return true;
+  }
+  return (
+    /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+    || /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)
+    || /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(host)
+  );
 }
 
 function parseOptionalString(value: string | undefined): string | null {
