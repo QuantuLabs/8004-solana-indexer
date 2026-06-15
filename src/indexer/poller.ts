@@ -56,8 +56,15 @@ interface ProcessNewTransactionsResult {
   haltedOnError: boolean;
 }
 
+export interface ReplayProcessedCursor {
+  signature: string;
+  slot: bigint;
+  txIndex: number | null;
+  blockTime: Date;
+}
+
 interface ProcessSignatureBatchOptions {
-  onTransactionProcessed?: (sig: ConfirmedSignatureInfo) => Promise<void>;
+  onTransactionProcessed?: (sig: ConfirmedSignatureInfo, cursor: ReplayProcessedCursor) => Promise<void>;
   advanceCursor?: boolean;
 }
 
@@ -1884,7 +1891,7 @@ export class Poller {
     signatures: ConfirmedSignatureInfo[],
     previousCount: number,
     totalEstimate: number,
-    options: ProcessSignatureBatchOptions | ((sig: ConfirmedSignatureInfo) => Promise<void>) = {}
+    options: ProcessSignatureBatchOptions | ((sig: ConfirmedSignatureInfo, cursor: ReplayProcessedCursor) => Promise<void>) = {}
   ): Promise<number> {
     const startTime = Date.now();
     const batchOptions = typeof options === "function"
@@ -1967,8 +1974,14 @@ export class Poller {
               await this.saveState(sig.signature, BigInt(sig.slot), txIndex ?? null, blockTime);
             }
           }
+          const processedCursor: ReplayProcessedCursor = {
+            signature: sig.signature,
+            slot: BigInt(sig.slot),
+            txIndex: txIndex ?? null,
+            blockTime,
+          };
           if (onTransactionProcessed) {
-            await onTransactionProcessed(sig);
+            await onTransactionProcessed(sig, processedCursor);
           }
           processed++;
           this.processedCount++;
@@ -2124,7 +2137,11 @@ export class Poller {
 
   async replaySignatures(
     signatures: ConfirmedSignatureInfo[],
-    options: { suppressEventLogWrites?: boolean; advanceCursor?: boolean } = {}
+    options: {
+      suppressEventLogWrites?: boolean;
+      advanceCursor?: boolean;
+      onTransactionProcessed?: (sig: ConfirmedSignatureInfo, cursor: ReplayProcessedCursor) => Promise<void>;
+    } = {}
   ): Promise<number> {
     const wasRunning = this.isRunning;
     const previousSuppressEventLogWrites = this.suppressEventLogWrites;
@@ -2135,7 +2152,10 @@ export class Poller {
         signatures,
         0,
         signatures.length,
-        { advanceCursor: options.advanceCursor ?? false }
+        {
+          advanceCursor: options.advanceCursor ?? false,
+          onTransactionProcessed: options.onTransactionProcessed,
+        }
       );
     } finally {
       this.suppressEventLogWrites = previousSuppressEventLogWrites;

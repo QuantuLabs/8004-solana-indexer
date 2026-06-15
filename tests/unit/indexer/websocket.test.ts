@@ -1192,6 +1192,17 @@ describe("WebSocketIndexer", () => {
           }),
         })
       );
+      expect(mockPrisma.indexerState.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "main" },
+          update: expect.objectContaining({
+            lastSignature: "observed-newest",
+            lastSlot: 101n,
+            lastTxIndex: 0,
+            source: "websocket-reconciliation",
+          }),
+        })
+      );
       expect(wsIndexer.isActive()).toBe(true);
     });
 

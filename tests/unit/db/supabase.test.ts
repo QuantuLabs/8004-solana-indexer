@@ -284,8 +284,9 @@ describe("supabase.ts", () => {
         expect(insertCall).toBeDefined();
         expect(insertCall![0]).toContain("created_at, updated_at");
         expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-        expect(insertCall![0]).toContain("block_slot = EXCLUDED.block_slot");
-        expect(insertCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(insertCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
+        expect(insertCall![0]).toContain("agents.mutation_order_key");
+        expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
         expect(insertCall![1]).toContain(TEST_ASSET.toBase58());
         expect(insertCall![1]).toContain("ipfs://QmTest");
       });
@@ -580,8 +581,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET owner = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1]).toContain(TEST_NEW_OWNER.toBase58());
       });
 
@@ -615,8 +618,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("atom_enabled = true")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
       });
 
       it("should catch query error", async () => {
@@ -644,8 +649,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET agent_uri = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1][0]).toBe("ipfs://QmNewUri");
       });
 
@@ -691,8 +698,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1][0]).toBe(TEST_WALLET.toBase58());
       });
 
@@ -710,8 +719,10 @@ describe("supabase.ts", () => {
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("agent_wallet")
         );
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1][0]).toBeNull();
       });
 
@@ -741,8 +752,10 @@ describe("supabase.ts", () => {
             && c[0].includes("agent_wallet = $2")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
       });
 
       it("should not rewrite block_slot on CollectionPointerSet", async () => {
@@ -760,8 +773,9 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).toContain("last_seen_tx_index");
         expect(updateCall![0]).toContain("WHERE EXISTS (SELECT 1 FROM updated)");
         expect(updateCall![0]).toContain("COALESCE($7, -1) > COALESCE(cp.last_seen_tx_index, -1)");
@@ -783,8 +797,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
         );
         expect(updateCall).toBeDefined();
-        expect(updateCall![0]).toContain("block_slot");
-        expect(updateCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+        expect(updateCall![0]).toContain("mutation_order_key =");
+        expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).not.toContain("block_slot =");
+        expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1]).toHaveLength(9);
       });
     });
@@ -809,7 +825,8 @@ describe("supabase.ts", () => {
           expect(insertCall![0]).toContain("status, deleted");
           expect(insertCall![0]).toContain("deleted = false");
           expect(insertCall![0]).toContain("WHERE (NOT metadata.immutable OR metadata.deleted)");
-          expect(insertCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(insertCall![0]).toContain("metadata.mutation_order_key");
+          expect(insertCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
           expect(insertCall![1][10]).toBe(ctx.blockTime.toISOString());
           expect(mockCompressForStorage).toHaveBeenCalled();
         });
@@ -873,7 +890,8 @@ describe("supabase.ts", () => {
           expect(deleteCall).toBeDefined();
           expect(deleteCall![0]).toContain("deleted = true");
           expect(deleteCall![0]).toContain("immutable = false");
-          expect(deleteCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(deleteCall![0]).toContain("metadata.mutation_order_key");
+          expect(deleteCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
           expect(deleteCall![1][1]).toBe(TEST_ASSET.toBase58());
           expect(deleteCall![1][2]).toBe("website");
           expect(deleteCall![1][5]).toBe(ctx.slot.toString());
@@ -1965,7 +1983,8 @@ describe("supabase.ts", () => {
           expect(deleteCall).toBeDefined();
           expect(deleteCall![0]).toContain("deleted = true");
           expect(deleteCall![0]).toContain("immutable = false");
-          expect(deleteCall![0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+          expect(deleteCall![0]).toContain("metadata.mutation_order_key");
+          expect(deleteCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
           expect(deleteCall![1][1]).toBe(TEST_ASSET.toBase58());
           expect(deleteCall![1][2]).toBe("website");
           expect(deleteCall![1][5]).toBe(ctx.slot.toString());

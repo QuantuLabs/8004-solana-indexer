@@ -646,7 +646,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -663,7 +663,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -680,7 +680,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ uri: "https://example.com/updated.json", updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ uri: "https://example.com/updated.json", updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -697,7 +697,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: TEST_WALLET.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ wallet: TEST_WALLET.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -713,7 +713,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -926,7 +926,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
 
@@ -944,7 +944,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2199,7 +2199,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2220,7 +2220,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, createdSlot: ctx.slot }),
+        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2721,7 +2721,7 @@ describe("DB Handlers Coverage", () => {
           owner: TEST_NEW_OWNER.toBase58(),
           wallet: null,
           updatedAt: ctx.blockTime,
-          createdSlot: ctx.slot,
+          mutationOrderKey: expect.any(String),
         }),
       }));
     });
@@ -2762,7 +2762,7 @@ describe("DB Handlers Coverage", () => {
             creator: immutableCreator,
             colLocked: true,
             updatedAt: ctx.blockTime,
-            createdSlot: ctx.slot,
+            mutationOrderKey: expect.any(String),
           }),
         })
       );
@@ -3279,7 +3279,7 @@ describe("DB Handlers Coverage", () => {
           parentCreator: TEST_OWNER.toBase58(),
           parentLocked: true,
           updatedAt: ctx.blockTime,
-          createdSlot: ctx.slot,
+          mutationOrderKey: expect.any(String),
         }),
       }));
     });

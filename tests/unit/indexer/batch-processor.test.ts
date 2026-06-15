@@ -652,8 +652,9 @@ describe("EventBuffer", () => {
       expect(insertCall).toBeDefined();
       expect(insertCall![0]).toContain("created_at, updated_at, status");
       expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-      expect(insertCall![0]).toContain("block_slot = EXCLUDED.block_slot");
-      expect(insertCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(insertCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
+      expect(insertCall![0]).toContain("agents.mutation_order_key");
+      expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
 
       const collectionCallIndex = client.query.mock.calls.findIndex((c: any[]) =>
         typeof c[0] === "string" && c[0].includes("INSERT INTO collections")
@@ -1552,7 +1553,8 @@ describe("EventBuffer", () => {
         expect(metadataInsertCall).toBeDefined();
         expect(metadataInsertCall[0]).toContain("created_at, updated_at, status, deleted");
         expect(metadataInsertCall[0]).toContain("deleted = false");
-        expect(metadataInsertCall[0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+        expect(metadataInsertCall[0]).toContain("metadata.mutation_order_key");
+        expect(metadataInsertCall[0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
         expect(metadataInsertCall[0]).toContain("updated_at = EXCLUDED.updated_at");
         expect(metadataInsertCall[0]).toContain("tx_signature = EXCLUDED.tx_signature");
         expect(metadataInsertCall[1][10]).toBe(metadataInsertCall[1][11]);
@@ -1618,7 +1620,8 @@ describe("EventBuffer", () => {
       expect(metadataDeleteCall).toBeDefined();
       expect(metadataDeleteCall[0]).toContain("deleted = true");
       expect(metadataDeleteCall[0]).toContain("immutable = false");
-      expect(metadataDeleteCall[0]).toContain("COALESCE(metadata.tx_index, 2147483647)");
+      expect(metadataDeleteCall[0]).toContain("metadata.mutation_order_key");
+      expect(metadataDeleteCall[0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
       expect(metadataDeleteCall[1][1]).toBe("asset1");
       expect(metadataDeleteCall[1][2]).toBe("capabilities");
     });
@@ -2663,8 +2666,10 @@ describe("EventBuffer", () => {
         typeof c[0] === "string" && c[0].includes("SET owner = $1")
       );
       expect(ownerCall).toBeDefined();
-      expect(ownerCall![0]).toContain("block_slot");
-      expect(ownerCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(ownerCall![0]).toContain("mutation_order_key =");
+      expect(ownerCall![0]).toContain("agents.mutation_order_key");
+      expect(ownerCall![0]).not.toContain("block_slot =");
+      expect(ownerCall![0]).not.toContain("tx_signature =");
 
       client.query.mockClear();
       await buffer.updateWalletResetOnOwnerSyncSupabase(
@@ -2677,8 +2682,10 @@ describe("EventBuffer", () => {
           && c[0].includes("agent_wallet = $2")
       );
       expect(walletResetCall).toBeDefined();
-      expect(walletResetCall![0]).toContain("block_slot");
-      expect(walletResetCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(walletResetCall![0]).toContain("mutation_order_key =");
+      expect(walletResetCall![0]).toContain("agents.mutation_order_key");
+      expect(walletResetCall![0]).not.toContain("block_slot =");
+      expect(walletResetCall![0]).not.toContain("tx_signature =");
 
       client.query.mockClear();
       await buffer.updateCollectionPointerSupabase(
@@ -2690,8 +2697,9 @@ describe("EventBuffer", () => {
         typeof c[0] === "string" && c[0].includes("SET canonical_col = $2")
       );
       expect(collectionCall).toBeDefined();
-      expect(collectionCall![0]).toContain("block_slot");
-      expect(collectionCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(collectionCall![0]).toContain("mutation_order_key =");
+      expect(collectionCall![0]).toContain("agents.mutation_order_key");
+      expect(collectionCall![0]).not.toContain("block_slot =");
 
       client.query.mockClear();
       await buffer.updateParentAssetSupabase(
@@ -2703,8 +2711,10 @@ describe("EventBuffer", () => {
         typeof c[0] === "string" && c[0].includes("SET parent_asset = $1")
       );
       expect(parentCall).toBeDefined();
-      expect(parentCall![0]).toContain("block_slot");
-      expect(parentCall![0]).toContain("COALESCE(agents.tx_index, 2147483647)");
+      expect(parentCall![0]).toContain("mutation_order_key =");
+      expect(parentCall![0]).toContain("agents.mutation_order_key");
+      expect(parentCall![0]).not.toContain("block_slot =");
+      expect(parentCall![0]).not.toContain("tx_signature =");
       expect(parentCall![1]).toHaveLength(9);
     });
   });

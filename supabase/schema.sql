@@ -190,6 +190,7 @@ CREATE TABLE agents (
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
   verified_slot BIGINT,
+  mutation_order_key TEXT,
   CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)
 );
 
@@ -328,6 +329,7 @@ CREATE TABLE metadata (
   status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'FINALIZED', 'ORPHANED')),
   verified_at TIMESTAMPTZ,
   deleted BOOLEAN NOT NULL DEFAULT FALSE,
+  mutation_order_key TEXT,
   UNIQUE(asset, key_hash)
 );
 

@@ -8,7 +8,7 @@ import { config } from "../config.js";
 import { matchProofPassFeedbacks } from "../extras/proofpass.js";
 import { upsertProofPassMatches } from "../db/proofpass.js";
 import type { NewFeedback, ProgramEvent } from "../parser/types.js";
-import { Poller } from "./poller.js";
+import { Poller, type ReplayProcessedCursor } from "./poller.js";
 
 export function hasProgramDataLogsForProgram(logs: string[], programId: string): boolean {
   const invokeStack: string[] = [];
@@ -71,9 +71,9 @@ export async function recoverMissingProgramSignatures(params: {
   programId: PublicKey;
   signatures: ConfirmedSignatureInfo[];
   isActive: () => boolean;
-}): Promise<number> {
+}): Promise<{ processed: number; newestCursor: ReplayProcessedCursor | null }> {
   if (!params.isActive()) {
-    return 0;
+    return { processed: 0, newestCursor: null };
   }
   const poller = new Poller({
     connection: params.connection,
@@ -82,8 +82,16 @@ export async function recoverMissingProgramSignatures(params: {
     pollingInterval: config.pollingInterval,
     batchSize: Math.max(1, params.signatures.length),
   });
-  return await poller.replaySignatures(
+  let newestCursor: ReplayProcessedCursor | null = null;
+  const processed = await poller.replaySignatures(
     params.signatures.filter((signature) => signature.err === null),
-    { advanceCursor: false, suppressEventLogWrites: true }
+    {
+      advanceCursor: false,
+      suppressEventLogWrites: true,
+      onTransactionProcessed: async (_sig, cursor) => {
+        newestCursor = cursor;
+      },
+    }
   );
+  return { processed, newestCursor };
 }

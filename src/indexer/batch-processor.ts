@@ -46,31 +46,19 @@ function canonicalOrderGuardSql(
   txIndexExpr: string,
   eventOrdinalExpr: string,
   signatureExpr: string,
-  slotColumn = "block_slot",
-  txIndexColumn = "tx_index",
-  eventOrdinalColumn = "event_ordinal",
-  signatureColumn = "tx_signature"
+  anchorColumn = "mutation_order_key"
 ): string {
-  return `(
-    ${tableRef}.${slotColumn} IS NULL
-    OR ${tableRef}.${slotColumn} < ${slotExpr}
-    OR (
-      ${tableRef}.${slotColumn} = ${slotExpr}
-      AND (
-        COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) < COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
-        OR (
-          COALESCE(${tableRef}.${txIndexColumn}, ${NULLS_LAST_SQL_TX_INDEX}) = COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})
-          AND (
-            COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) < COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
-            OR (
-              COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) = COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})
-              AND COALESCE(${tableRef}.${signatureColumn}, '') COLLATE "C" <= ${signatureExpr} COLLATE "C"
-            )
-          )
-        )
-      )
-    )
-  )`;
+  const anchorExpr = canonicalOrderAnchorSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
+  return `(${tableRef}.${anchorColumn} IS NULL OR ${tableRef}.${anchorColumn} COLLATE "C" <= ${anchorExpr} COLLATE "C")`;
+}
+
+function canonicalOrderAnchorSql(
+  slotExpr: string,
+  txIndexExpr: string,
+  eventOrdinalExpr: string,
+  signatureExpr: string
+): string {
+  return `(LPAD((${slotExpr})::text, 20, '0') || ':' || LPAD(COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})::text, 10, '0') || ':' || LPAD(COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})::text, 10, '0') || ':' || COALESCE(${signatureExpr}, ''))`;
 }
 
 function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
@@ -880,17 +868,14 @@ export class EventBuffer {
     `, [collection, "BASE", ctx.blockTime.toISOString()]);
 
     await client.query(`
-      INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'PENDING')
+      INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, mutation_order_key)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'PENDING', ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
       ON CONFLICT (asset) DO UPDATE SET
         owner = EXCLUDED.owner,
         creator = COALESCE(agents.creator, EXCLUDED.creator),
         agent_uri = EXCLUDED.agent_uri,
         atom_enabled = EXCLUDED.atom_enabled,
-        block_slot = EXCLUDED.block_slot,
-        tx_index = EXCLUDED.tx_index,
-        event_ordinal = EXCLUDED.event_ordinal,
-        tx_signature = EXCLUDED.tx_signature,
+        mutation_order_key = EXCLUDED.mutation_order_key,
         updated_at = EXCLUDED.updated_at
       WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}
     `, [
@@ -1490,10 +1475,7 @@ export class EventBuffer {
       UPDATE agents
       SET agent_uri = $1,
           updated_at = $2,
-          block_slot = $4,
-          tx_index = $5,
-          event_ordinal = $6,
-          tx_signature = $7
+          mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
       WHERE asset = $3
         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
     `, [data.newUri || null, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
@@ -1507,10 +1489,7 @@ export class EventBuffer {
       UPDATE agents
       SET agent_wallet = $1,
           updated_at = $2,
-          block_slot = $4,
-          tx_index = $5,
-          event_ordinal = $6,
-          tx_signature = $7
+          mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
       WHERE asset = $3
         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
     `, [wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
@@ -1526,10 +1505,7 @@ export class EventBuffer {
        SET owner = $1,
            agent_wallet = $2,
            updated_at = $3,
-           block_slot = $5,
-           tx_index = $6,
-           event_ordinal = $7,
-           tx_signature = $8
+           mutation_order_key = ${canonicalOrderAnchorSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}
        WHERE asset = $4
          AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
       [ownerAfterSync, wallet, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
@@ -1569,10 +1545,7 @@ export class EventBuffer {
              creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
              updated_at = $5,
              col_locked = COALESCE($8, col_locked),
-             block_slot = $4,
-             tx_index = $7,
-             event_ordinal = $9,
-             tx_signature = $6
+             mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
          WHERE asset = $1
            AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
          RETURNING 1
@@ -1721,10 +1694,7 @@ export class EventBuffer {
            parent_creator = $2,
            updated_at = $3,
            parent_locked = COALESCE($5, parent_locked),
-           block_slot = $6,
-           tx_index = $7,
-           event_ordinal = $8,
-           tx_signature = $9
+           mutation_order_key = ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}
        WHERE asset = $4
          AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
       [parentAsset, parentCreator, ctx.blockTime.toISOString(), asset, lock, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
@@ -1737,10 +1707,7 @@ export class EventBuffer {
       UPDATE agents
       SET atom_enabled = true,
           updated_at = $1,
-          block_slot = $3,
-          tx_index = $4,
-          event_ordinal = $5,
-          tx_signature = $6
+          mutation_order_key = ${canonicalOrderAnchorSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}
       WHERE asset = $2
         AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}
     `, [ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]);
@@ -1765,8 +1732,8 @@ export class EventBuffer {
     const id = `${asset}:${keyHash}`;
 
     await client.query(`
-      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, deleted)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING', false)
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, deleted, mutation_order_key)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'PENDING', false, ${canonicalOrderAnchorSql("$7::bigint", "$8::integer", "$9::integer", "$10::text")})
       ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
         immutable = CASE WHEN metadata.deleted THEN EXCLUDED.immutable ELSE metadata.immutable OR EXCLUDED.immutable END,
@@ -1775,6 +1742,7 @@ export class EventBuffer {
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
+        mutation_order_key = EXCLUDED.mutation_order_key,
         created_at = CASE WHEN metadata.deleted THEN EXCLUDED.created_at ELSE metadata.created_at END,
         status = CASE WHEN metadata.deleted THEN EXCLUDED.status ELSE metadata.status END,
         verified_at = CASE WHEN metadata.deleted THEN NULL ELSE metadata.verified_at END,
@@ -1792,8 +1760,8 @@ export class EventBuffer {
     const keyHash = createHash("sha256").update(key).digest().slice(0, 16).toString("hex");
     const id = `${asset}:${keyHash}`;
     await client.query(`
-      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, verified_at)
-      VALUES ($1, $2, $3, $4, $5, false, true, $6, $7, $8, $9, $10, $10, 'PENDING', NULL)
+      INSERT INTO metadata (id, asset, key, key_hash, value, immutable, deleted, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, verified_at, mutation_order_key)
+      VALUES ($1, $2, $3, $4, $5, false, true, $6, $7, $8, $9, $10, $10, 'PENDING', NULL, ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")})
       ON CONFLICT (id) DO UPDATE SET
         value = EXCLUDED.value,
         immutable = false,
@@ -1802,6 +1770,7 @@ export class EventBuffer {
         tx_index = EXCLUDED.tx_index,
         event_ordinal = EXCLUDED.event_ordinal,
         tx_signature = EXCLUDED.tx_signature,
+        mutation_order_key = EXCLUDED.mutation_order_key,
         created_at = EXCLUDED.created_at,
         updated_at = EXCLUDED.updated_at,
         status = EXCLUDED.status,
@@ -1817,10 +1786,7 @@ export class EventBuffer {
       `UPDATE agents
        SET owner = $1,
            updated_at = $2,
-           block_slot = $4,
-           tx_index = $5,
-           event_ordinal = $6,
-           tx_signature = $7
+           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
        WHERE asset = $3
          AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
       [newOwner, ctx.blockTime.toISOString(), asset, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]

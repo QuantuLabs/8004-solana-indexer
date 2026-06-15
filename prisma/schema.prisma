@@ -45,6 +45,7 @@ model Agent {
   txIndex            Int?     // Transaction index within block (deterministic ordering)
   eventOrdinal       Int?     // Event index within transaction (deterministic intra-tx ordering)
   agentId           BigInt?  @map("agent_id") // Sequential registration ID (auto-assigned, permanent)
+  mutationOrderKey   String?  @map("mutation_order_key")
 
   // Verification status (reorg resilience)
   status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED
@@ -121,6 +122,7 @@ model AgentMetadata {
   slot        BigInt?
   txIndex     Int?
   eventOrdinal Int?
+  mutationOrderKey String? @map("mutation_order_key")
 
   // Verification status (reorg resilience)
   status     String    @default("PENDING") // PENDING | FINALIZED | ORPHANED

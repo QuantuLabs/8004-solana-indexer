@@ -44,12 +44,14 @@ describe("canonical mutable-write ordering", () => {
   it("threads event ordinal through Supabase and batch SQL guards before signature", () => {
     for (const file of ["src/db/supabase.ts", "src/indexer/batch-processor.ts"]) {
       const source = readFileSync(resolve(process.cwd(), file), "utf8");
-      const ordinalCompare = "COALESCE(${tableRef}.${eventOrdinalColumn}, ${NULLS_LAST_SQL_EVENT_ORDINAL}) < COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})";
-      const signatureCompare = "COALESCE(${tableRef}.${signatureColumn}, '') COLLATE \"C\" <= ${signatureExpr} COLLATE \"C\"";
+      const ordinalAnchor = "LPAD(COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})::text, 10, '0')";
+      const signatureAnchor = "COALESCE(${signatureExpr}, '')";
 
       expect(source).toContain("eventOrdinalExpr: string");
-      expect(source).toContain(ordinalCompare);
-      expect(source.indexOf(ordinalCompare)).toBeLessThan(source.indexOf(signatureCompare));
+      expect(source).toContain("anchorColumn = \"mutation_order_key\"");
+      expect(source).toContain("${tableRef}.${anchorColumn}");
+      expect(source).toContain(ordinalAnchor);
+      expect(source.indexOf(ordinalAnchor)).toBeLessThan(source.indexOf(signatureAnchor));
       expect(source).not.toContain('agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")');
       expect(source).not.toContain('metadataOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.tx_signature")');
     }

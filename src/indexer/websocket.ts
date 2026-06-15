@@ -33,6 +33,7 @@ import {
   maybeUpsertProofPassMatchesForLogs,
   recoverMissingProgramSignatures,
 } from "./websocket-recovery.js";
+import type { ReplayProcessedCursor } from "./poller.js";
 import type { ProgramEvent } from "../parser/types.js";
 
 const logger = createChildLogger("websocket");
@@ -676,6 +677,91 @@ export class WebSocketIndexer {
     };
   }
 
+  private canAdvanceMainCursor(
+    currentSignature: string | null | undefined,
+    currentSlot: bigint | number | null | undefined,
+    currentTxIndex: number | null | undefined,
+    next: ReplayProcessedCursor
+  ): boolean {
+    if (currentSlot === null || currentSlot === undefined) return true;
+    if (!currentSignature) return true;
+    const slot = typeof currentSlot === "bigint" ? currentSlot : BigInt(currentSlot);
+    return compareCanonicalTransactionOrder(
+      { slot, txIndex: currentTxIndex ?? null, signature: currentSignature },
+      { slot: next.slot, txIndex: next.txIndex, signature: next.signature }
+    ) <= 0;
+  }
+
+  private async saveReconciledMainCursor(cursor: ReplayProcessedCursor): Promise<boolean> {
+    if (!this.isRunning || this.stopRequested || this.freezeCursorAdvancement) {
+      return false;
+    }
+
+    if (this.prisma) {
+      const current = await this.prisma.indexerState.findUnique({
+        where: { id: "main" },
+        select: { lastSignature: true, lastSlot: true, lastTxIndex: true },
+      });
+      if (!this.canAdvanceMainCursor(current?.lastSignature, current?.lastSlot, current?.lastTxIndex ?? null, cursor)) {
+        return false;
+      }
+      if (!(await trySaveLocalIndexerStateWithSql(this.prisma, {
+        signature: cursor.signature,
+        slot: cursor.slot,
+        txIndex: cursor.txIndex,
+        source: RECONCILIATION_STATE_SOURCE,
+        updatedAt: cursor.blockTime,
+      }))) {
+        await this.prisma.indexerState.upsert({
+          where: { id: "main" },
+          create: {
+            id: "main",
+            lastSignature: cursor.signature,
+            lastSlot: cursor.slot,
+            lastTxIndex: cursor.txIndex,
+            source: RECONCILIATION_STATE_SOURCE,
+            updatedAt: cursor.blockTime,
+          },
+          update: {
+            lastSignature: cursor.signature,
+            lastSlot: cursor.slot,
+            lastTxIndex: cursor.txIndex,
+            source: RECONCILIATION_STATE_SOURCE,
+            updatedAt: cursor.blockTime,
+          },
+        });
+      }
+    } else {
+      const current = await loadIndexerStateSnapshot();
+      if (!this.canAdvanceMainCursor(current?.lastSignature, current?.lastSlot, current?.lastTxIndex ?? null, cursor)) {
+        return false;
+      }
+      await saveIndexerState(
+        cursor.signature,
+        cursor.slot,
+        cursor.txIndex,
+        RECONCILIATION_STATE_SOURCE,
+        cursor.blockTime
+      );
+    }
+
+    if (this.canAdvanceMainCursor(
+      this.lastPersistedCursor?.signature,
+      this.lastPersistedCursor?.slot,
+      this.lastPersistedCursor?.txIndex ?? null,
+      cursor
+    )) {
+      this.rememberPersistedCursor(
+        cursor.signature,
+        cursor.slot,
+        cursor.txIndex,
+        RECONCILIATION_STATE_SOURCE,
+        cursor.blockTime
+      );
+    }
+    return true;
+  }
+
   private startHealthCheck(): void {
     this.stopHealthCheck();
 
@@ -944,18 +1030,25 @@ export class WebSocketIndexer {
       const replayWindow = scan.signatures.filter((signature) => signature.err === null);
       if (replayWindow.length > 0) {
         try {
-          const replayed = await recoverMissingProgramSignatures({
+          const replayResult = await recoverMissingProgramSignatures({
             connection: this.connection,
             prisma: this.prisma,
             programId: this.programId,
             signatures: replayWindow,
             isActive: () => this.isRunning && !this.stopRequested,
           });
-          this.processedCount += replayed;
+          this.processedCount += replayResult.processed;
+          const advancedCursor = scan.scanComplete && replayResult.newestCursor
+            ? await this.saveReconciledMainCursor(replayResult.newestCursor)
+            : false;
           logger.warn(
             {
               reason,
-              replayed,
+              replayed: replayResult.processed,
+              advancedCursor,
+              cursorSignature: replayResult.newestCursor?.signature ?? null,
+              cursorSlot: replayResult.newestCursor?.slot.toString() ?? null,
+              cursorTxIndex: replayResult.newestCursor?.txIndex ?? null,
               signatures: replayWindow.map((signature) => signature.signature),
               errorCount: this.errorCount,
             },
