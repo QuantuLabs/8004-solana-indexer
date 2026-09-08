@@ -4104,7 +4104,7 @@ export function createApiServer(options: ApiServerOptions): Express {
           authority: string | null;
           agent_count: string | number | null;
           total_feedbacks: string | number | null;
-          avg_score: number | null;
+          avg_score: string | number | null;
         };
 
         const activeCollectionsClause = includeOrphaned ? '' : `WHERE c.status != 'ORPHANED'`;
@@ -4148,7 +4148,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             authority: row.authority,
             agent_count: Number(row.agent_count ?? 0),
             total_feedbacks: Number(row.total_feedbacks ?? 0),
-            avg_score: row.avg_score,
+            avg_score: numericValue(row.avg_score),
           }));
         } else {
           const rows = await options.pool.query<PoolCollectionStatsRow>(
@@ -4185,7 +4185,7 @@ export function createApiServer(options: ApiServerOptions): Express {
             authority: row.authority,
             agent_count: Number(row.agent_count ?? 0),
             total_feedbacks: Number(row.total_feedbacks ?? 0),
-            avg_score: row.avg_score,
+            avg_score: numericValue(row.avg_score),
           }));
         }
       } else {

@@ -35,7 +35,7 @@ describePostgres('pooled collection stats on PostgreSQL', () => {
         collection text PRIMARY KEY, registry_type text, authority text, created_at timestamptz, status text
       );
       CREATE TEMP TABLE agents (asset text PRIMARY KEY, collection text, status text);
-      CREATE TEMP TABLE feedbacks (id bigint PRIMARY KEY, asset text, score integer, status text);
+      CREATE TEMP TABLE feedbacks (id bigint PRIMARY KEY, asset text, score smallint, status text);
       INSERT INTO collections VALUES
         ('active', 'BASE', 'authority', NOW(), 'FINALIZED'),
         ('empty', 'USER', NULL, NOW() - INTERVAL '1 second', 'FINALIZED'),
@@ -82,13 +82,13 @@ describePostgres('pooled collection stats on PostgreSQL', () => {
     expect(active).toEqual(expect.objectContaining({
       collection: 'active', agent_count: 1, total_feedbacks: 1,
     }));
-    expect(Number(active.avg_score)).toBe(80);
+    expect(active.avg_score).toBe(80);
 
     const [activeWithOrphans] = await request('collection=eq.active&includeOrphaned=true');
     expect(activeWithOrphans).toEqual(expect.objectContaining({
       collection: 'active', agent_count: 2, total_feedbacks: 3,
     }));
-    expect(Number(activeWithOrphans.avg_score)).toBeCloseTo(140 / 3);
+    expect(activeWithOrphans.avg_score).toBeCloseTo(140 / 3);
     await expect(request('collection=eq.empty')).resolves.toEqual([expect.objectContaining({
       collection: 'empty', agent_count: 0, total_feedbacks: 0, avg_score: null,
     })]);
