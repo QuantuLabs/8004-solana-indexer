@@ -83,15 +83,20 @@ export async function recoverMissingProgramSignatures(params: {
     batchSize: Math.max(1, params.signatures.length),
   });
   let newestCursor: ReplayProcessedCursor | null = null;
-  const processed = await poller.replaySignatures(
-    params.signatures.filter((signature) => signature.err === null),
-    {
-      advanceCursor: false,
-      suppressEventLogWrites: true,
-      onTransactionProcessed: async (_sig, cursor) => {
-        newestCursor = cursor;
-      },
-    }
-  );
-  return { processed, newestCursor };
+  try {
+    const processed = await poller.replaySignatures(
+      params.signatures.filter((signature) => signature.err === null),
+      {
+        advanceCursor: false,
+        suppressEventLogWrites: true,
+        isActive: params.isActive,
+        onTransactionProcessed: async (_sig, cursor) => {
+          newestCursor = cursor;
+        },
+      }
+    );
+    return { processed, newestCursor };
+  } finally {
+    await poller.stop();
+  }
 }

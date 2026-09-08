@@ -1148,6 +1148,81 @@ describe("WebSocketIndexer", () => {
       expect(wsIndexer.isActive()).toBe(true);
     });
 
+    it("should drain an accepted reconciliation write before stop returns and start no later write", async () => {
+      const cursorRow = {
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+      };
+      let durableTip: string | null = "cursor-sig";
+      mockPrisma.indexerState.findUnique.mockResolvedValue(cursorRow as any);
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => (
+        args?.where?.id === "websocket-reconciliation-tip" && durableTip
+          ? [{ lastSignature: durableTip }]
+          : []
+      ));
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        if (args?.where?.id === "websocket-reconciliation-tip") {
+          durableTip = args.update?.lastSignature ?? args.create?.lastSignature ?? null;
+        }
+        return args.update ?? args.create;
+      });
+      const replaySignatures = [
+        createMockSignatureInfo("later-replay", 102, null),
+        createMockSignatureInfo("accepted-replay", 101, null),
+      ];
+      (mockConnection.getSignaturesForAddress as any).mockResolvedValueOnce(replaySignatures);
+      mockPollerReplay(replaySignatures);
+
+      let releaseAccepted!: () => void;
+      let acceptedStarted!: () => void;
+      const acceptedStartedPromise = new Promise<void>((resolve) => {
+        acceptedStarted = resolve;
+      });
+      const acceptedGate = new Promise<void>((resolve) => {
+        releaseAccepted = resolve;
+      });
+      const writeOrder: string[] = [];
+      mockPrisma.agent.upsert.mockImplementation(async (args: any) => {
+        const signature = args.create.createdTxSignature;
+        writeOrder.push(`start:${signature}`);
+        if (signature === "accepted-replay") {
+          acceptedStarted();
+          await acceptedGate;
+        }
+        writeOrder.push(`finish:${signature}`);
+        return args.create;
+      });
+
+      await wsIndexer.start();
+      const reconciliationPromise = (wsIndexer as any).runReconciliationCheck("periodic");
+      await acceptedStartedPromise;
+
+      let stopSettled = false;
+      const stopPromise = wsIndexer.stop().then(() => {
+        stopSettled = true;
+        writeOrder.push("start:main-poller");
+      });
+      await Promise.resolve();
+
+      expect(stopSettled).toBe(false);
+      expect(writeOrder).toEqual(["start:accepted-replay"]);
+
+      releaseAccepted();
+      await stopPromise;
+      await expect(reconciliationPromise).resolves.toBe(false);
+
+      expect(writeOrder).toEqual([
+        "start:accepted-replay",
+        "finish:accepted-replay",
+        "start:main-poller",
+      ]);
+      expect((wsIndexer as any).processedCount).toBe(1);
+      expect(durableTip).toBe("cursor-sig");
+    });
+
     it("should persist the newest scanned signature after a complete clean reconciliation scan", async () => {
       const cursorRow = {
         lastSignature: "cursor-sig",

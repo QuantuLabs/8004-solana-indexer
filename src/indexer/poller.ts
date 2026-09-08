@@ -66,6 +66,7 @@ export interface ReplayProcessedCursor {
 interface ProcessSignatureBatchOptions {
   onTransactionProcessed?: (sig: ConfirmedSignatureInfo, cursor: ReplayProcessedCursor) => Promise<void>;
   advanceCursor?: boolean;
+  isActive?: () => boolean;
 }
 
 function shouldAdvanceCursor(
@@ -1899,6 +1900,7 @@ export class Poller {
       : options;
     const onTransactionProcessed = batchOptions.onTransactionProcessed;
     const advanceCursor = batchOptions.advanceCursor ?? true;
+    const isActive = batchOptions.isActive ?? (() => true);
 
     // BATCH RPC: Fetch all transactions in batch first (with fallback)
     let txCache: Map<string, ParsedTransactionWithMeta> | null = null;
@@ -1921,7 +1923,7 @@ export class Poller {
     const sortedSlots = Array.from(bySlot.keys()).sort((a, b) => a - b);
 
     for (const slot of sortedSlots) {
-      if (!this.isRunning) break;
+      if (!this.isRunning || !isActive()) break;
       if (this.stopBeforeNewerSlot(slot, "backfill")) break;
 
       const sigs = bySlot.get(slot)!;
@@ -1947,7 +1949,7 @@ export class Poller {
       );
 
       for (const { sig, txIndex } of sigsWithIndex) {
-        if (!this.isRunning) break;
+        if (!this.isRunning || !isActive()) break;
 
         try {
           // Use cached transaction from batch RPC if available
@@ -2140,6 +2142,7 @@ export class Poller {
     options: {
       suppressEventLogWrites?: boolean;
       advanceCursor?: boolean;
+      isActive?: () => boolean;
       onTransactionProcessed?: (sig: ConfirmedSignatureInfo, cursor: ReplayProcessedCursor) => Promise<void>;
     } = {}
   ): Promise<number> {
@@ -2154,6 +2157,7 @@ export class Poller {
         signatures.length,
         {
           advanceCursor: options.advanceCursor ?? false,
+          isActive: options.isActive,
           onTransactionProcessed: options.onTransactionProcessed,
         }
       );

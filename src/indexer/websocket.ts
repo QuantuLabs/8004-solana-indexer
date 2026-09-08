@@ -279,6 +279,7 @@ export class WebSocketIndexer {
   private processingHoldCount = 0;
   private reconciliationTimer: NodeJS.Timeout | null = null;
   private isReconciling = false;
+  private activeReconciliationPromise: Promise<boolean> | null = null;
   private reconciliationTipSignature: string | null = null;
   private reconciliationFailureCount = 0;
   private stopPromise: Promise<void> | null = null;
@@ -488,6 +489,11 @@ export class WebSocketIndexer {
     this.stopHealthCheck();
     this.stopReconciliationCheck();
     this.clearReconnectDelay();
+
+    const activeReconciliationPromise = this.activeReconciliationPromise;
+    if (activeReconciliationPromise) {
+      await Promise.allSettled([activeReconciliationPromise]);
+    }
 
     this.clearCanonicalFlushTimer();
     const clearedBufferedLogs = this.pendingLogNotifications.size;
@@ -959,16 +965,31 @@ export class WebSocketIndexer {
     };
   }
 
-  private async runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
+  private runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
     if (!this.isRunning || this.stopRequested || this.isReconciling) {
-      return false;
+      return Promise.resolve(false);
     }
     const cursor = this.lastPersistedCursor;
     if (!cursor?.signature) {
-      return false;
+      return Promise.resolve(false);
     }
 
     this.isReconciling = true;
+    const reconciliationPromise = this.performReconciliationCheck(reason, cursor);
+    this.activeReconciliationPromise = reconciliationPromise;
+    const clearActiveReconciliation = () => {
+      if (this.activeReconciliationPromise === reconciliationPromise) {
+        this.activeReconciliationPromise = null;
+      }
+    };
+    void reconciliationPromise.then(clearActiveReconciliation, clearActiveReconciliation);
+    return reconciliationPromise;
+  }
+
+  private async performReconciliationCheck(
+    reason: "periodic" | "stale-health",
+    cursor: PersistedCursorSnapshot
+  ): Promise<boolean> {
     try {
       const previousTip = this.reconciliationTipSignature ?? cursor.signature;
       let scan: ReconciliationSignatureScan;
@@ -1028,6 +1049,7 @@ export class WebSocketIndexer {
       }
 
       const replayWindow = scan.signatures.filter((signature) => signature.err === null);
+      let replayComplete = true;
       if (replayWindow.length > 0) {
         try {
           const replayResult = await recoverMissingProgramSignatures({
@@ -1037,6 +1059,7 @@ export class WebSocketIndexer {
             signatures: replayWindow,
             isActive: () => this.isRunning && !this.stopRequested,
           });
+          replayComplete = replayResult.processed === replayWindow.length;
           this.processedCount += replayResult.processed;
           const advancedCursor = scan.scanComplete && replayResult.newestCursor
             ? await this.saveReconciledMainCursor(replayResult.newestCursor)
@@ -1069,7 +1092,7 @@ export class WebSocketIndexer {
         }
       }
 
-      if (scan.scanComplete && scan.signatures[0]?.signature) {
+      if (scan.scanComplete && replayComplete && scan.signatures[0]?.signature) {
         await this.persistReconciliationTip(scan.signatures[0].signature);
       }
       return false;

@@ -699,6 +699,79 @@ describe("Poller Coverage", () => {
   });
 
   describe("processSignatureBatch - slot grouping and tx_index", () => {
+    it("should not start replay work when the caller is already inactive", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+      });
+      const processTransaction = vi.spyOn(poller as any, "processTransaction");
+
+      const processed = await poller.replaySignatures(
+        [createMockSignatureInfo("inactive-replay", 199)],
+        { isActive: () => false }
+      );
+
+      expect(processed).toBe(0);
+      expect(processTransaction).not.toHaveBeenCalled();
+      expect(mockConnection.getBlock).not.toHaveBeenCalled();
+    });
+
+    it("should finish an accepted replay transaction and callback before honoring cancellation", async () => {
+      poller = new Poller({
+        connection: mockConnection as any,
+        prisma: mockPrisma,
+        programId: TEST_PROGRAM_ID,
+      });
+      (poller as any).useBatchRpc = false;
+      (mockConnection.getBlock as any).mockResolvedValue({
+        transactions: [
+          { transaction: { signatures: ["accepted-replay"] } },
+          { transaction: { signatures: ["cancelled-replay"] } },
+        ],
+      });
+      let active = true;
+      let releaseAccepted!: () => void;
+      let acceptedStarted!: () => void;
+      const acceptedStartedPromise = new Promise<void>((resolve) => {
+        acceptedStarted = resolve;
+      });
+      const acceptedGate = new Promise<void>((resolve) => {
+        releaseAccepted = resolve;
+      });
+      const transactionOrder: string[] = [];
+      vi.spyOn(poller as any, "processTransaction").mockImplementation(async (sig: any) => {
+        transactionOrder.push(`write:${sig.signature}`);
+        acceptedStarted();
+        await acceptedGate;
+        return new Date("2026-09-08T00:00:00.000Z");
+      });
+      const cursorOrder: string[] = [];
+
+      const replayPromise = poller.replaySignatures(
+        [
+          createMockSignatureInfo("accepted-replay", 200),
+          createMockSignatureInfo("cancelled-replay", 200),
+        ],
+        {
+          isActive: () => active,
+          onTransactionProcessed: async (sig) => {
+            cursorOrder.push(sig.signature);
+          },
+        }
+      );
+      await acceptedStartedPromise;
+      active = false;
+
+      expect(transactionOrder).toEqual(["write:accepted-replay"]);
+      expect(cursorOrder).toEqual([]);
+
+      releaseAccepted();
+      await expect(replayPromise).resolves.toBe(1);
+      expect(transactionOrder).toEqual(["write:accepted-replay"]);
+      expect(cursorOrder).toEqual(["accepted-replay"]);
+    });
+
     it("should group by slot and call getBlock for multiple txs in same slot", async () => {
       poller = new Poller({
         connection: mockConnection as any,
