@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.4] - Unreleased
+
+### Changed
+- Accept legacy, V0, and V1 RPC transactions by default using pinned `@solana/web3.js@1.99.0-beta.0`; explicit version cap `0` remains supported.
+- Existing PostgreSQL databases upgrade atomically without reindexing or changing current public IDs, counters, cursors, or historical business values. See `docs/upgrade-v1.8.4.md` before restarting writers.
+
+### Fixed
+- Preserve transaction ordering and committed cursor boundaries across polling, websocket recovery, and replay.
+- Guard canonical database writes, ordinal-distinct response identity, and metadata deletion against stale replay.
+- Bound metadata fetches and API pagination, and align readiness reporting with recovery state.
+- Complete the documented legacy SQLite upgrade bundle without rewriting historical empty-string values.
+
 ## [1.8.3] - 2026-03-18
 
 ### Added

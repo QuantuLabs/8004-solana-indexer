@@ -726,7 +726,7 @@ describe("Poller Coverage", () => {
       await (poller as any).processSignatureBatch([sig1, sig2], 0, 2);
 
       expect((mockConnection as any).getBlock).toHaveBeenCalledWith(200, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
         transactionDetails: "full",
       });
     });
@@ -779,7 +779,7 @@ describe("Poller Coverage", () => {
       await (poller as any).processSignatureBatch([sig1], 0, 1);
 
       expect((mockConnection as any).getBlock).toHaveBeenCalledWith(400, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
         transactionDetails: "full",
       });
       expect(handleEventAtomic).not.toHaveBeenCalled();
@@ -1726,7 +1726,7 @@ describe("Poller Coverage", () => {
 
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith(
         sig.signature,
-        { maxSupportedTransactionVersion: 0 }
+        { maxSupportedTransactionVersion: 1 }
       );
     });
 
@@ -3562,7 +3562,7 @@ describe("Poller Coverage", () => {
       await (poller as any).processNewTransactions();
 
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith("live-null-1", {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1,
       });
       expect((poller as any).processedCount).toBe(0);
       expect((poller as any).lastSignature).toBe("prev-sig-batch-null");

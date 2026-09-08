@@ -88,7 +88,7 @@ describe("Config", () => {
       expect(config.indexerStartSignature).toBeNull();
       expect(config.indexerStartSlot).toBeNull();
       expect(config.indexerStopSlot).toBeNull();
-      expect(config.maxSupportedTransactionVersion).toBe(0);
+      expect(config.maxSupportedTransactionVersion).toBe(1);
       expect(config.pollerBatchRpcEnabled).toBe(true);
       expect(config.pollerRpcChunkSize).toBe(100);
       expect(config.pollerRpcChunkConcurrency).toBe(3);
@@ -184,6 +184,14 @@ describe("Config", () => {
 
       expect(config.metadataMaxBytes).toBe(1024);
       expect(config.metadataMaxValueBytes).toBe(10 * 1024 * 1024);
+    });
+
+    it("should preserve an explicit transaction version 0 cap", async () => {
+      process.env.MAX_SUPPORTED_TRANSACTION_VERSION = "0";
+
+      const { config } = await import("../../src/config.js");
+
+      expect(config.maxSupportedTransactionVersion).toBe(0);
     });
 
     it("should support POSTGREST_URL/POSTGREST_TOKEN aliases for REST proxy config", async () => {

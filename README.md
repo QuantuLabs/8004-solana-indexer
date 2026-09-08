@@ -25,6 +25,8 @@ If you are upgrading from `v1.7.7`, read:
 
 ## Upgrade
 
+For the v1.8.3 → v1.8.4 PostgreSQL upgrade, use the stopped-writer, atomic procedure in [docs/upgrade-v1.8.4.md](docs/upgrade-v1.8.4.md). It preserves current data, public IDs, counters, and cursors; do not run the fresh schema or reindex.
+
 ### Existing PostgreSQL / Supabase
 
 - Back up the database.
@@ -285,7 +287,7 @@ Notes:
 - `API_MODE=both` is best-effort dual mode and disables whichever side has no matching DB backend.
 - `TRUST_PROXY` defaults to `false`; set it explicitly (for example `1`) only when running behind a trusted reverse proxy.
 - `SOLANA_NETWORK` drives default RPC/WS endpoints when `RPC_URL`/`WS_URL` are unset.
-- `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `0`).
+- `MAX_SUPPORTED_TRANSACTION_VERSION` controls parsed transaction version support for RPC fetches (default `1`, covering legacy, V0, and V1). This local candidate intentionally pins the prerelease `@solana/web3.js@1.99.0-beta.0` reader because stable `1.98.4` cannot decode V1. Existing deployments that explicitly set `MAX_SUPPORTED_TRANSACTION_VERSION=0` must change it to `1` when upgrading; no reindex or cursor reset is required.
 - Optional startup cursor: `INDEXER_START_SIGNATURE` is applied when no persisted `indexer_state` exists.
 - If `INDEXER_START_SIGNATURE` + `INDEXER_START_SLOT` are configured and persisted state exists but is older than that slot, the poller fast-forwards persisted state to the configured cursor.
 - `INDEXER_START_SLOT` requires `INDEXER_START_SIGNATURE`.

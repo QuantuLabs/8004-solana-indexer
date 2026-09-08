@@ -365,7 +365,7 @@ export const config = {
   // Highest Solana transaction version accepted by RPC parsers.
   maxSupportedTransactionVersion: parseNonNegativeInt(
     process.env.MAX_SUPPORTED_TRANSACTION_VERSION,
-    0
+    1
   ),
 
   // Program ID from SDK (source of truth)

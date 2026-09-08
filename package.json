@@ -1,6 +1,6 @@
 {
   "name": "8004-solana-indexer",
-  "version": "1.8.3",
+  "version": "1.8.4",
   "description": "Custom Solana indexer for 8004 Agent Registry v0.4.0",
   "type": "module",
   "main": "dist/index.js",
@@ -67,7 +67,7 @@
     "@mongodb-js/zstd": "^7.0.0",
     "@noble/hashes": "^2.0.1",
     "@prisma/client": "^6.19.2",
-    "@solana/web3.js": "^1.98.0",
+    "@solana/web3.js": "1.99.0-beta.0",
     "@supabase/supabase-js": "^2.49.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
@@ -102,6 +102,9 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "overrides": {
+    "@solana/web3.js": "1.99.0-beta.0"
   },
   "packageManager": "bun@1.2.12"
 }
