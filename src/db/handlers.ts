@@ -1038,10 +1038,12 @@ async function syncAgentFeedbackStatsTx(
     rawAvgScore: toRoundedScore(avgScore),
   };
 
-  await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, atomPatch ? { ...baseData, ...atomPatch } : baseData),
-  });
+  await tx.agent.updateMany({ where: { id: assetId }, data: baseData });
+  if (atomPatch) {
+    await updateLocalAgentGroup(tx, assetId, ctx, "atomStatsOrderKey", { ...atomPatch });
+  } else {
+    await advanceLocalAgentAnchor(tx, assetId, ctx);
+  }
 }
 
 async function syncAgentFeedbackStats(
@@ -1066,10 +1068,12 @@ async function syncAgentFeedbackStats(
     rawAvgScore: toRoundedScore(avgScore),
   };
 
-  await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, atomPatch ? { ...baseData, ...atomPatch } : baseData),
-  });
+  await prisma.agent.updateMany({ where: { id: assetId }, data: baseData });
+  if (atomPatch) {
+    await updateLocalAgentGroup(prisma, assetId, ctx, "atomStatsOrderKey", { ...atomPatch });
+  } else {
+    await advanceLocalAgentAnchor(prisma, assetId, ctx);
+  }
 }
 
 export interface EventContext {
@@ -1120,26 +1124,65 @@ function isCanonicalOrderKeyNewerOrEqual(currentKey: string | null | undefined, 
   return !currentKey || currentKey <= canonicalOrderKey(ctx);
 }
 
-function localAgentMutationWhere(assetId: string, ctx: EventContext): any {
-  const mutationOrderKey = canonicalOrderKey(ctx);
+type AgentOrderKey =
+  | "ownerOrderKey"
+  | "walletOrderKey"
+  | "uriOrderKey"
+  | "atomEnabledOrderKey"
+  | "collectionOrderKey"
+  | "parentOrderKey"
+  | "atomStatsOrderKey";
+
+function localAgentOrderWhere(assetId: string, ctx: EventContext, orderKey: AgentOrderKey): any {
+  const eventOrderKey = canonicalOrderKey(ctx);
   return {
     id: assetId,
     OR: [
-      { mutationOrderKey: null },
-      { mutationOrderKey: { lte: mutationOrderKey } },
+      { [orderKey]: null },
+      { [orderKey]: { lte: eventOrderKey } },
     ],
   };
 }
 
-function localAgentMutationData(
+function localAgentOrderData(
   ctx: EventContext,
+  orderKey: AgentOrderKey,
   data: Record<string, unknown>
 ): any {
   return {
     ...data,
-    mutationOrderKey: canonicalOrderKey(ctx),
-    updatedAt: ctx.blockTime,
+    [orderKey]: canonicalOrderKey(ctx),
   };
+}
+
+async function advanceLocalAgentAnchor(
+  client: PrismaClientOrTx,
+  assetId: string,
+  ctx: EventContext
+): Promise<void> {
+  const mutationOrderKey = canonicalOrderKey(ctx);
+  await client.agent.updateMany({
+    where: {
+      id: assetId,
+      OR: [{ mutationOrderKey: null }, { mutationOrderKey: { lt: mutationOrderKey } }],
+    },
+    data: { mutationOrderKey, updatedAt: ctx.blockTime },
+  });
+}
+
+async function updateLocalAgentGroup(
+  client: PrismaClientOrTx,
+  assetId: string,
+  ctx: EventContext,
+  orderKey: AgentOrderKey,
+  data: Record<string, unknown>
+): Promise<number> {
+  const result = await client.agent.updateMany({
+    where: localAgentOrderWhere(assetId, ctx, orderKey),
+    data: localAgentOrderData(ctx, orderKey, data),
+  });
+  if (result.count > 0) await advanceLocalAgentAnchor(client, assetId, ctx);
+  return result.count;
 }
 
 function localMetadataOrderWhere(assetId: string, key: string, ctx: EventContext): any {
@@ -1509,7 +1552,6 @@ async function handleAgentRegisteredCore(
       select: {
         agentId: true,
         creator: true,
-        mutationOrderKey: true,
       },
     });
     const ownerBase58 = data.owner.toBase58();
@@ -1522,10 +1564,8 @@ async function handleAgentRegisteredCore(
         })()
       : ownerBase58;
 
-    const canMutateExisting = !existingAgent || isCanonicalOrderKeyNewerOrEqual(existingAgent.mutationOrderKey, ctx);
-
     let assignedAgentId: bigint | undefined;
-    if ((!existingAgent || existingAgent.agentId === null) && canMutateExisting) {
+    if (!existingAgent || existingAgent.agentId === null) {
       const highestAssigned = await client.agent.findMany({
         where: { agentId: { not: null } },
         select: { agentId: true },
@@ -1555,41 +1595,36 @@ async function handleAgentRegisteredCore(
           txIndex: ctx.txIndex ?? null,
           eventOrdinal: ctx.eventOrdinal ?? null,
           mutationOrderKey: canonicalOrderKey(ctx),
+          ownerOrderKey: canonicalOrderKey(ctx),
+          walletOrderKey: canonicalOrderKey(ctx),
+          uriOrderKey: canonicalOrderKey(ctx),
+          atomEnabledOrderKey: canonicalOrderKey(ctx),
+          collectionOrderKey: canonicalOrderKey(ctx),
+          parentOrderKey: canonicalOrderKey(ctx),
+          atomStatsOrderKey: canonicalOrderKey(ctx),
           agentId: assignedAgentId ?? null,
           status: DEFAULT_STATUS,
           createdAt: ctx.blockTime,
           updatedAt: ctx.blockTime,
         },
-        update: localAgentMutationData(ctx, {
-          collection: collectionId,
-          registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
-          atomEnabled: data.atomEnabled,
-          uri: agentUri,
-          creator: canonicalCreator,
-          ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
-        }),
+        update: assignedAgentId !== undefined ? { agentId: assignedAgentId } : {},
       });
       logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
       return true;
     }
 
-    const result = await client.agent.updateMany({
-      where: localAgentMutationWhere(assetId, ctx),
-      data: localAgentMutationData(ctx, {
+    await client.agent.update({
+      where: { id: assetId },
+      data: {
         collection: collectionId,
         registry: collectionId, // v0.6.0: registry = collection (single-collection arch)
-        atomEnabled: data.atomEnabled,
-        uri: agentUri,
-        creator: canonicalCreator,
         ...(assignedAgentId !== undefined ? { agentId: assignedAgentId } : {}),
-      }),
+      },
     });
-    if (result.count === 0) {
-      logger.warn({ assetId }, "Agent registration skipped, event may be out of order");
-      return false;
-    }
+    const uriApplied = await updateLocalAgentGroup(client, assetId, ctx, "uriOrderKey", { uri: agentUri });
+    await updateLocalAgentGroup(client, assetId, ctx, "atomEnabledOrderKey", { atomEnabled: data.atomEnabled });
     logger.info({ assetId, owner: data.owner.toBase58(), uri: agentUri }, "Agent registered");
-    return true;
+    return uriApplied > 0;
   });
 }
 
@@ -1655,8 +1690,7 @@ async function handleAgentRegisteredTx(
   data: AgentRegistered,
   ctx: EventContext
 ): Promise<void> {
-  const applied = await handleAgentRegisteredCore(tx, data, ctx);
-  if (!applied) return;
+  await handleAgentRegisteredCore(tx, data, ctx);
   const assetId = data.asset.toBase58();
   await reconcileOrphanFeedbacksTx(tx, assetId);
 }
@@ -1668,13 +1702,12 @@ async function handleAgentRegistered(
   ctx: EventContext
 ): Promise<void> {
   const applied = await handleAgentRegisteredCore(prisma, data, ctx);
-  if (!applied) return;
   const assetId = data.asset.toBase58();
   await reconcileOrphanFeedbacks(prisma, assetId);
   const agentUri = data.agentUri || "";
 
   // Trigger URI metadata extraction if configured and URI is present
-  if (agentUri && config.metadataIndexMode !== "off") {
+  if (applied && agentUri && config.metadataIndexMode !== "off") {
     scheduleUriDigest(prisma, assetId, agentUri, ctx.blockTime);
   }
 }
@@ -1685,11 +1718,7 @@ async function handleAgentOwnerSyncedTx(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, { owner: data.newOwner.toBase58() }),
-  });
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(tx, assetId, ctx, "ownerOrderKey", { owner: data.newOwner.toBase58() }) === 0) {
     logger.warn({ assetId }, "Agent not found for owner sync, event may be out of order");
     return;
   }
@@ -1704,14 +1733,7 @@ async function handleAgentOwnerSynced(
   const assetId = data.asset.toBase58();
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      owner: data.newOwner.toBase58(),
-    }),
-  });
-
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(prisma, assetId, ctx, "ownerOrderKey", { owner: data.newOwner.toBase58() }) === 0) {
     logger.warn({ assetId }, "Agent not found for owner sync, event may be out of order");
     return;
   }
@@ -1732,11 +1754,7 @@ async function handleAtomEnabledTx(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, { atomEnabled: true }),
-  });
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(tx, assetId, ctx, "atomEnabledOrderKey", { atomEnabled: true }) === 0) {
     logger.warn({ assetId }, "Agent not found for ATOM enable, event may be out of order");
     return;
   }
@@ -1751,14 +1769,7 @@ async function handleAtomEnabled(
   const assetId = data.asset.toBase58();
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      atomEnabled: true,
-    }),
-  });
-
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(prisma, assetId, ctx, "atomEnabledOrderKey", { atomEnabled: true }) === 0) {
     logger.warn({ assetId }, "Agent not found for ATOM enable, event may be out of order");
     return;
   }
@@ -1773,11 +1784,7 @@ async function handleUriUpdatedTx(
 ): Promise<void> {
   const assetId = data.asset.toBase58();
   const newUri = data.newUri || "";
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, { uri: newUri }),
-  });
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(tx, assetId, ctx, "uriOrderKey", { uri: newUri }) === 0) {
     logger.warn({ assetId }, "Agent not found for URI update, event may be out of order");
     return;
   }
@@ -1793,14 +1800,7 @@ async function handleUriUpdated(
   const newUri = data.newUri || "";
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      uri: newUri,
-    }),
-  });
-
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(prisma, assetId, ctx, "uriOrderKey", { uri: newUri }) === 0) {
     logger.warn({ assetId }, "Agent not found for URI update, event may be out of order");
     return;
   }
@@ -1821,11 +1821,7 @@ async function handleWalletUpdatedTx(
   const assetId = data.asset.toBase58();
   const newWalletRaw = data.newWallet.toBase58();
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, { wallet: newWallet }),
-  });
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(tx, assetId, ctx, "walletOrderKey", { wallet: newWallet }) === 0) {
     logger.warn({ assetId }, "Agent not found for wallet update, event may be out of order");
     return;
   }
@@ -1843,14 +1839,7 @@ async function handleWalletUpdated(
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
 
   // Use updateMany to avoid P2025 error if agent doesn't exist yet (out-of-order events)
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      wallet: newWallet,
-    }),
-  });
-
-  if (result.count === 0) {
+  if (await updateLocalAgentGroup(prisma, assetId, ctx, "walletOrderKey", { wallet: newWallet }) === 0) {
     logger.warn({ assetId }, "Agent not found for wallet update, event may be out of order");
     return;
   }
@@ -1861,8 +1850,8 @@ async function handleWalletUpdated(
   );
 }
 
-async function handleWalletResetOnOwnerSyncTx(
-  tx: PrismaTransactionClient,
+async function handleWalletResetOnOwnerSyncCore(
+  client: PrismaClientOrTx,
   data: WalletResetOnOwnerSync,
   ctx: EventContext
 ): Promise<void> {
@@ -1871,15 +1860,10 @@ async function handleWalletResetOnOwnerSyncTx(
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
   const ownerAfterSync = data.ownerAfterSync.toBase58();
 
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      owner: ownerAfterSync,
-      wallet: newWallet,
-    }),
-  });
+  const ownerCount = await updateLocalAgentGroup(client, assetId, ctx, "ownerOrderKey", { owner: ownerAfterSync });
+  const walletCount = await updateLocalAgentGroup(client, assetId, ctx, "walletOrderKey", { wallet: newWallet });
 
-  if (result.count === 0) {
+  if (ownerCount === 0 && walletCount === 0) {
     logger.warn({ assetId }, "Agent not found for wallet reset on owner sync, event may be out of order");
     return;
   }
@@ -1887,30 +1871,22 @@ async function handleWalletResetOnOwnerSyncTx(
   logger.info({ assetId, ownerAfterSync, newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
 }
 
+async function handleWalletResetOnOwnerSyncTx(
+  tx: PrismaTransactionClient,
+  data: WalletResetOnOwnerSync,
+  ctx: EventContext
+): Promise<void> {
+  await handleWalletResetOnOwnerSyncCore(tx, data, ctx);
+}
+
 async function handleWalletResetOnOwnerSync(
   prisma: PrismaClient,
   data: WalletResetOnOwnerSync,
   ctx: EventContext
 ): Promise<void> {
-  const assetId = data.asset.toBase58();
-  const newWalletRaw = data.newWallet.toBase58();
-  const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
-  const ownerAfterSync = data.ownerAfterSync.toBase58();
-
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
-      owner: ownerAfterSync,
-      wallet: newWallet,
-    }),
+  await prisma.$transaction(async (tx) => {
+    await handleWalletResetOnOwnerSyncCore(tx as PrismaTransactionClient, data, ctx);
   });
-
-  if (result.count === 0) {
-    logger.warn({ assetId }, "Agent not found for wallet reset on owner sync, event may be out of order");
-    return;
-  }
-
-  logger.info({ assetId, ownerAfterSync, newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
 }
 
 async function handleCollectionPointerSetTx(
@@ -1927,14 +1903,11 @@ async function handleCollectionPointerSetTx(
   });
   const creator = existing?.creator ?? setBy;
 
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
+  const result = { count: await updateLocalAgentGroup(tx, assetId, ctx, "collectionOrderKey", {
       collectionPointer: pointer,
       creator,
       ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
-    }),
-  });
+    }) };
 
   if (result.count > 0) {
     await withCollectionIdAssignmentLock(async () => {
@@ -1994,14 +1967,11 @@ async function handleCollectionPointerSet(
   });
   const creator = existing?.creator ?? setBy;
 
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
+  const result = { count: await updateLocalAgentGroup(prisma, assetId, ctx, "collectionOrderKey", {
       collectionPointer: pointer,
       creator,
       ...(typeof data.lock === "boolean" ? { colLocked: data.lock } : {}),
-    }),
-  });
+    }) };
 
   if (result.count > 0) {
     await withCollectionIdAssignmentLock(async () => {
@@ -2057,14 +2027,11 @@ async function handleParentAssetSetTx(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  const result = await tx.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
+  const result = { count: await updateLocalAgentGroup(tx, assetId, ctx, "parentOrderKey", {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
       ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
-    }),
-  });
+    }) };
 
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for parent asset set, event may be out of order");
@@ -2085,14 +2052,11 @@ async function handleParentAssetSet(
   ctx: EventContext
 ): Promise<void> {
   const assetId = data.asset.toBase58();
-  const result = await prisma.agent.updateMany({
-    where: localAgentMutationWhere(assetId, ctx),
-    data: localAgentMutationData(ctx, {
+  const result = { count: await updateLocalAgentGroup(prisma, assetId, ctx, "parentOrderKey", {
       parentAsset: data.parentAsset.toBase58(),
       parentCreator: data.parentCreator.toBase58(),
       ...(typeof data.lock === "boolean" ? { parentLocked: data.lock } : {}),
-    }),
-  });
+    }) };
 
   if (result.count === 0) {
     logger.warn({ assetId }, "Agent not found for parent asset set, event may be out of order");

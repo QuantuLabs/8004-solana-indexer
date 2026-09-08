@@ -646,7 +646,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), ownerOrderKey: expect.any(String) }),
       }));
     });
 
@@ -663,7 +663,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ atomEnabled: true, atomEnabledOrderKey: expect.any(String) }),
       }));
     });
 
@@ -680,7 +680,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ uri: "https://example.com/updated.json", updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ uri: "https://example.com/updated.json", uriOrderKey: expect.any(String) }),
       }));
     });
 
@@ -697,7 +697,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: TEST_WALLET.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ wallet: TEST_WALLET.toBase58(), walletOrderKey: expect.any(String) }),
       }));
     });
 
@@ -713,7 +713,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ atomEnabled: true, atomEnabledOrderKey: expect.any(String) }),
       }));
     });
 
@@ -926,7 +926,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ wallet: null, walletOrderKey: expect.any(String) }),
       }));
     });
 
@@ -944,7 +944,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ wallet: null, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ wallet: null, walletOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2199,7 +2199,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ owner: TEST_NEW_OWNER.toBase58(), ownerOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2220,7 +2220,7 @@ describe("DB Handlers Coverage", () => {
 
       expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
-        data: expect.objectContaining({ atomEnabled: true, updatedAt: ctx.blockTime, mutationOrderKey: expect.any(String) }),
+        data: expect.objectContaining({ atomEnabled: true, atomEnabledOrderKey: expect.any(String) }),
       }));
     });
   });
@@ -2719,9 +2719,14 @@ describe("DB Handlers Coverage", () => {
         where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
         data: expect.objectContaining({
           owner: TEST_NEW_OWNER.toBase58(),
+          ownerOrderKey: expect.any(String),
+        }),
+      }));
+      expect(prisma.agent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ id: TEST_ASSET.toBase58() }),
+        data: expect.objectContaining({
           wallet: null,
-          updatedAt: ctx.blockTime,
-          mutationOrderKey: expect.any(String),
+          walletOrderKey: expect.any(String),
         }),
       }));
     });
@@ -2761,8 +2766,7 @@ describe("DB Handlers Coverage", () => {
             collectionPointer: "c1:new-pointer",
             creator: immutableCreator,
             colLocked: true,
-            updatedAt: ctx.blockTime,
-            mutationOrderKey: expect.any(String),
+            collectionOrderKey: expect.any(String),
           }),
         })
       );
@@ -3228,7 +3232,9 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      const updateCall = (prisma.agent.updateMany as any).mock.calls.at(-1)?.[0];
+      const updateCall = (prisma.agent.updateMany as any).mock.calls
+        .map((call: any[]) => call[0])
+        .find((call: any) => call.data.collectionPointer === "c1:next");
       expect(updateCall?.data.collectionPointer).toBe("c1:next");
       expect(updateCall?.data.creator).toBe(TEST_OWNER.toBase58());
       expect("colLocked" in updateCall?.data).toBe(false);
@@ -3278,8 +3284,7 @@ describe("DB Handlers Coverage", () => {
           parentAsset: TEST_COLLECTION.toBase58(),
           parentCreator: TEST_OWNER.toBase58(),
           parentLocked: true,
-          updatedAt: ctx.blockTime,
-          mutationOrderKey: expect.any(String),
+          parentOrderKey: expect.any(String),
         }),
       }));
     });
@@ -3299,7 +3304,9 @@ describe("DB Handlers Coverage", () => {
 
       await handleEvent(prisma, event, ctx);
 
-      const updateCall = (prisma.agent.updateMany as any).mock.calls.at(-1)?.[0];
+      const updateCall = (prisma.agent.updateMany as any).mock.calls
+        .map((call: any[]) => call[0])
+        .find((call: any) => call.data.parentAsset === TEST_COLLECTION.toBase58());
       expect(updateCall?.data.parentAsset).toBe(TEST_COLLECTION.toBase58());
       expect(updateCall?.data.parentCreator).toBe(TEST_OWNER.toBase58());
       expect("parentLocked" in updateCall?.data).toBe(false);

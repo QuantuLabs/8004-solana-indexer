@@ -60,8 +60,73 @@ function canonicalOrderAnchorSql(
   return `(LPAD((${slotExpr})::text, 20, '0') || ':' || LPAD(COALESCE(${txIndexExpr}, ${NULLS_LAST_SQL_TX_INDEX})::text, 10, '0') || ':' || LPAD(COALESCE(${eventOrdinalExpr}, ${NULLS_LAST_SQL_EVENT_ORDINAL})::text, 10, '0') || ':' || COALESCE(${signatureExpr}, ''))`;
 }
 
-function agentOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
-  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
+function agentOrderGuardSql(
+  slotExpr: string,
+  txIndexExpr: string,
+  eventOrdinalExpr: string,
+  signatureExpr: string,
+  anchorColumn: string
+): string {
+  return canonicalOrderGuardSql("agents", slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr, anchorColumn);
+}
+
+function agentActivityAssignmentsSql(
+  slotExpr: string,
+  txIndexExpr: string,
+  eventOrdinalExpr: string,
+  signatureExpr: string,
+  updatedAtExpr: string
+): string {
+  const incoming = canonicalOrderAnchorSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
+  const advances = `(agents.mutation_order_key IS NULL OR agents.mutation_order_key COLLATE "C" < ${incoming} COLLATE "C")`;
+  return `mutation_order_key = CASE WHEN ${advances} THEN ${incoming} ELSE agents.mutation_order_key END,
+          updated_at = CASE WHEN ${advances} THEN ${updatedAtExpr} ELSE agents.updated_at END`;
+}
+
+function agentRegistrationConflictSql(): string {
+  const args = ["EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature"] as const;
+  const ownerFresh = agentOrderGuardSql(...args, "owner_order_key");
+  const uriFresh = agentOrderGuardSql(...args, "uri_order_key");
+  const atomFresh = agentOrderGuardSql(...args, "atom_enabled_order_key");
+  return `owner = CASE WHEN ${ownerFresh} THEN EXCLUDED.owner ELSE agents.owner END,
+          owner_order_key = CASE WHEN ${ownerFresh} THEN EXCLUDED.owner_order_key ELSE agents.owner_order_key END,
+          creator = COALESCE(agents.creator, EXCLUDED.creator),
+          agent_uri = CASE WHEN ${uriFresh} THEN EXCLUDED.agent_uri ELSE agents.agent_uri END,
+          uri_order_key = CASE WHEN ${uriFresh} THEN EXCLUDED.uri_order_key ELSE agents.uri_order_key END,
+          atom_enabled = CASE WHEN ${atomFresh} THEN EXCLUDED.atom_enabled ELSE agents.atom_enabled END,
+          atom_enabled_order_key = CASE WHEN ${atomFresh} THEN EXCLUDED.atom_enabled_order_key ELSE agents.atom_enabled_order_key END,
+          ${agentActivityAssignmentsSql(...args, "EXCLUDED.updated_at")}`;
+}
+
+function agentOwnerWalletResetSql(
+  slotExpr: string,
+  txIndexExpr: string,
+  eventOrdinalExpr: string,
+  signatureExpr: string,
+  updatedAtExpr: string
+): string {
+  const ownerFresh = agentOrderGuardSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr, "owner_order_key");
+  const walletFresh = agentOrderGuardSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr, "wallet_order_key");
+  const key = canonicalOrderAnchorSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr);
+  return `owner = CASE WHEN ${ownerFresh} THEN $1 ELSE agents.owner END,
+          agent_wallet = CASE WHEN ${walletFresh} THEN $2 ELSE agents.agent_wallet END,
+          owner_order_key = CASE WHEN ${ownerFresh} THEN ${key} ELSE agents.owner_order_key END,
+          wallet_order_key = CASE WHEN ${walletFresh} THEN ${key} ELSE agents.wallet_order_key END,
+          ${agentActivityAssignmentsSql(slotExpr, txIndexExpr, eventOrdinalExpr, signatureExpr, updatedAtExpr)}`;
+}
+
+function agentFeedbackAssignmentsSql(atomFields: ReadonlyArray<readonly [string, string]>): string {
+  const args = ["$8::bigint", "$9::integer", "$10::integer", "$11::text"] as const;
+  const atomFresh = agentOrderGuardSql(...args, "atom_stats_order_key");
+  const key = canonicalOrderAnchorSql(...args);
+  const atomAssignments = atomFields.length === 0 ? "" : `${atomFields
+    .map(([column, value]) => `${column} = CASE WHEN ${atomFresh} THEN ${value} ELSE agents.${column} END`)
+    .join(",\n          ")},
+          atom_stats_order_key = CASE WHEN ${atomFresh} THEN ${key} ELSE agents.atom_stats_order_key END,`;
+  return `feedback_count = COALESCE((SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked), 0),
+          raw_avg_score = COALESCE((SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked), 0),
+          ${atomAssignments}
+          ${agentActivityAssignmentsSql(...args, "$1")}`;
 }
 
 function metadataOrderGuardSql(slotExpr: string, txIndexExpr: string, eventOrdinalExpr: string, signatureExpr: string): string {
@@ -455,50 +520,18 @@ async function replayOrphanFeedbacksForAsset(
     );
 
     if ((insertResult.rowCount ?? 0) > 0) {
-      const baseUpdate = `
-        feedback_count = COALESCE((
-          SELECT COUNT(*)::int
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        raw_avg_score = COALESCE((
-          SELECT ROUND(AVG(score))::smallint
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        updated_at = $1
-      `;
       const updatedAt = row.created_at instanceof Date
         ? row.created_at.toISOString()
         : new Date(row.created_at).toISOString();
-      if (row.atom_enabled) {
-        await db.query(
-          `UPDATE agents SET
-             trust_tier = $3,
-             quality_score = $4,
-             confidence = $5,
-             risk_score = $6,
-             diversity_ratio = $7,
-             ${baseUpdate}
-           WHERE asset = $2`,
-          [
-            updatedAt,
-            row.asset,
-            row.new_trust_tier ?? 0,
-            row.new_quality_score ?? 0,
-            row.new_confidence ?? 0,
-            row.new_risk_score ?? 0,
-            row.new_diversity_ratio ?? 0,
-          ]
-        );
-      } else {
-        await db.query(
-          `UPDATE agents SET
-             ${baseUpdate}
-           WHERE asset = $2`,
-          [updatedAt, row.asset]
-        );
-      }
+      const atomFields = row.atom_enabled
+        ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+        : [];
+      await db.query(
+        `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
+        [updatedAt, row.asset, row.new_trust_tier ?? 0, row.new_quality_score ?? 0,
+         row.new_confidence ?? 0, row.new_risk_score ?? 0, row.new_diversity_ratio ?? 0,
+         row.block_slot, row.tx_index, row.event_ordinal, row.tx_signature]
+      );
     }
 
     await replayOrphanResponsesForFeedback(
@@ -920,16 +953,10 @@ async function handleAgentRegisteredTx(
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection, ctx.blockTime, collectionsToMarkSeen);
   await client.query(
-    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, mutation_order_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
+    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
      ON CONFLICT (asset) DO UPDATE SET
-       owner = EXCLUDED.owner,
-       creator = COALESCE(agents.creator, EXCLUDED.creator),
-       agent_uri = EXCLUDED.agent_uri,
-       atom_enabled = EXCLUDED.atom_enabled,
-       mutation_order_key = EXCLUDED.mutation_order_key,
-       updated_at = EXCLUDED.updated_at
-     WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
+       ${agentRegistrationConflictSql()}`,
     [
       assetId,
       data.owner.toBase58(),
@@ -968,10 +995,10 @@ async function handleAgentOwnerSyncedTx(
   await client.query(
     `UPDATE agents
      SET owner = $1,
-         updated_at = $2,
-         mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+         owner_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+         ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "owner_order_key")}`,
     [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
@@ -986,10 +1013,10 @@ async function handleAtomEnabledTx(
   await client.query(
     `UPDATE agents
      SET atom_enabled = true,
-         updated_at = $1,
-         mutation_order_key = ${canonicalOrderAnchorSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}
+         atom_enabled_order_key = ${canonicalOrderAnchorSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")},
+         ${agentActivityAssignmentsSql("$3::bigint", "$4::integer", "$5::integer", "$6::text", "$1")}
      WHERE asset = $2
-       AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}`,
+       AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text", "atom_enabled_order_key")}`,
     [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
@@ -1005,10 +1032,10 @@ async function handleUriUpdatedTx(
   await client.query(
     `UPDATE agents
      SET agent_uri = $1,
-         updated_at = $2,
-         mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+         uri_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+         ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "uri_order_key")}`,
     [newUri, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, newUri }, "Agent URI updated");
@@ -1030,10 +1057,10 @@ async function handleWalletUpdatedTx(
   await client.query(
     `UPDATE agents
      SET agent_wallet = $1,
-         updated_at = $2,
-         mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+         wallet_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+         ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
      WHERE asset = $3
-       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+       AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "wallet_order_key")}`,
     [newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
@@ -1049,12 +1076,10 @@ async function handleWalletResetOnOwnerSyncTx(
   const newWallet = newWalletRaw === DEFAULT_PUBKEY ? null : newWalletRaw;
   await client.query(
     `UPDATE agents
-     SET owner = $1,
-         agent_wallet = $2,
-         updated_at = $3,
-         mutation_order_key = ${canonicalOrderAnchorSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}
+     SET ${agentOwnerWalletResetSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "$3")}
      WHERE asset = $4
-       AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
+       AND (${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "owner_order_key")}
+         OR ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "wallet_order_key")})`,
     [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
   );
   logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
@@ -1094,11 +1119,11 @@ async function handleCollectionPointerSetTx(
        UPDATE agents
        SET canonical_col = $2,
            creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
-           updated_at = $5,
            col_locked = COALESCE($8, col_locked),
-           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
+           collection_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")},
+           ${agentActivityAssignmentsSql("$4::bigint", "$7::integer", "$9::integer", "$6::text", "$5")}
        WHERE asset = $1
-         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
+         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text", "collection_order_key")}
        RETURNING 1
      ),
      inserted AS (
@@ -1231,11 +1256,11 @@ async function handleParentAssetSetTx(
     `UPDATE agents
      SET parent_asset = $1,
          parent_creator = $2,
-         updated_at = $3,
          parent_locked = COALESCE($5, parent_locked),
-         mutation_order_key = ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}
+         parent_order_key = ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")},
+         ${agentActivityAssignmentsSql("$6::bigint", "$7::integer", "$8::integer", "$9::text", "$3")}
      WHERE asset = $4
-       AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
+       AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text", "parent_order_key")}`,
     [
       data.parentAsset.toBase58(),
       data.parentCreator.toBase58(),
@@ -1382,47 +1407,15 @@ async function handleNewFeedbackTx(
   if (insertResult.rowCount !== 1) {
     logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
   }
-  const baseUpdate = `
-    feedback_count = COALESCE((
-      SELECT COUNT(*)::int
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    raw_avg_score = COALESCE((
-      SELECT ROUND(AVG(score))::smallint
-      FROM feedbacks
-      WHERE asset = $2 AND NOT is_revoked
-    ), 0),
-    updated_at = $1
-  `;
-  if (data.atomEnabled) {
-    await client.query(
-      `UPDATE agents SET
-         trust_tier = $3,
-         quality_score = $4,
-         confidence = $5,
-         risk_score = $6,
-         diversity_ratio = $7,
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [
-        ctx.blockTime.toISOString(),
-        assetId,
-        data.newTrustTier,
-        data.newQualityScore,
-        data.newConfidence,
-        data.newRiskScore,
-        data.newDiversityRatio,
-      ]
-    );
-  } else {
-    await client.query(
-      `UPDATE agents SET
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId]
-    );
-  }
+  const atomFields = data.atomEnabled
+    ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+    : [];
+  await client.query(
+    `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
+    [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
+     data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.slot.toString(),
+     ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
+  );
   await replayOrphanResponsesForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
   await reconcileOrphanRevocationForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
@@ -1497,36 +1490,15 @@ async function handleFeedbackRevokedTx(
        WHERE id = $2`,
       [ctx.blockTime.toISOString(), id]
     );
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
+    const atomFields = data.atomEnabled && data.hadImpact
+      ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"]] as const
+      : [];
     await client.query(
-      `UPDATE agents SET
-         ${baseUpdate}
-       WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId]
+      `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
+      [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
+       data.newConfidence, null, null, ctx.slot.toString(), ctx.txIndex ?? null,
+       ctx.eventOrdinal ?? null, ctx.signature]
     );
-    if (data.atomEnabled && data.hadImpact) {
-      await client.query(
-        `UPDATE agents SET
-           trust_tier = $3,
-           quality_score = $4,
-           confidence = $5,
-           updated_at = $1
-         WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
-      );
-    }
   }
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
 }
@@ -1680,16 +1652,10 @@ async function handleAgentRegistered(
       return;
     }
     await db.query(
-      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, mutation_order_key)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
+      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
        ON CONFLICT (asset) DO UPDATE SET
-         owner = EXCLUDED.owner,
-         creator = COALESCE(agents.creator, EXCLUDED.creator),
-         agent_uri = EXCLUDED.agent_uri,
-         atom_enabled = EXCLUDED.atom_enabled,
-         mutation_order_key = EXCLUDED.mutation_order_key,
-         updated_at = EXCLUDED.updated_at
-       WHERE ${agentOrderGuardSql("EXCLUDED.block_slot", "EXCLUDED.tx_index", "EXCLUDED.event_ordinal", "EXCLUDED.tx_signature")}`,
+         ${agentRegistrationConflictSql()}`,
       [
         assetId,
         data.owner.toBase58(),
@@ -1732,10 +1698,10 @@ async function handleAgentOwnerSynced(
     await db.query(
         `UPDATE agents
        SET owner = $1,
-           updated_at = $2,
-           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+           owner_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+           ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "owner_order_key")}`,
       [data.newOwner.toBase58(), ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, oldOwner: data.oldOwner.toBase58(), newOwner: data.newOwner.toBase58() }, "Agent owner synced");
@@ -1755,10 +1721,10 @@ async function handleAtomEnabled(
     await db.query(
         `UPDATE agents
        SET atom_enabled = true,
-           updated_at = $1,
-           mutation_order_key = ${canonicalOrderAnchorSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}
+           atom_enabled_order_key = ${canonicalOrderAnchorSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")},
+           ${agentActivityAssignmentsSql("$3::bigint", "$4::integer", "$5::integer", "$6::text", "$1")}
        WHERE asset = $2
-         AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text")}`,
+         AND ${agentOrderGuardSql("$3::bigint", "$4::integer", "$5::integer", "$6::text", "atom_enabled_order_key")}`,
       [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, enabledBy: data.enabledBy.toBase58() }, "ATOM enabled");
@@ -1779,10 +1745,10 @@ async function handleUriUpdated(
     await db.query(
         `UPDATE agents
        SET agent_uri = $1,
-           updated_at = $2,
-           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+           uri_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+           ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "uri_order_key")}`,
       [newUri, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, newUri }, "Agent URI updated");
@@ -1810,10 +1776,10 @@ async function handleWalletUpdated(
     await db.query(
         `UPDATE agents
        SET agent_wallet = $1,
-           updated_at = $2,
-           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}
+           wallet_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")},
+           ${agentActivityAssignmentsSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "$2")}
        WHERE asset = $3
-         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text")}`,
+         AND ${agentOrderGuardSql("$4::bigint", "$5::integer", "$6::integer", "$7::text", "wallet_order_key")}`,
       [newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, newWallet: newWallet ?? "(reset)" }, "Agent wallet updated");
@@ -1834,12 +1800,10 @@ async function handleWalletResetOnOwnerSync(
   try {
     await db.query(
       `UPDATE agents
-       SET owner = $1,
-           agent_wallet = $2,
-           updated_at = $3,
-           mutation_order_key = ${canonicalOrderAnchorSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}
+       SET ${agentOwnerWalletResetSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "$3")}
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text")}`,
+         AND (${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "owner_order_key")}
+           OR ${agentOrderGuardSql("$5::bigint", "$6::integer", "$7::integer", "$8::text", "wallet_order_key")})`,
       [data.ownerAfterSync.toBase58(), newWallet, ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
     );
     logger.info({ assetId, ownerAfterSync: data.ownerAfterSync.toBase58(), newWallet: newWallet ?? "(reset)" }, "Wallet reset on owner sync");
@@ -1885,11 +1849,11 @@ async function handleCollectionPointerSet(
        UPDATE agents
        SET canonical_col = $2,
            creator = COALESCE(creator, (SELECT creator_key FROM resolved)),
-           updated_at = $5,
            col_locked = COALESCE($8, col_locked),
-           mutation_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
+           collection_order_key = ${canonicalOrderAnchorSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")},
+           ${agentActivityAssignmentsSql("$4::bigint", "$7::integer", "$9::integer", "$6::text", "$5")}
        WHERE asset = $1
-         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text")}
+         AND ${agentOrderGuardSql("$4::bigint", "$7::integer", "$9::integer", "$6::text", "collection_order_key")}
        RETURNING 1
      ),
        inserted AS (
@@ -2027,11 +1991,11 @@ async function handleParentAssetSet(
       `UPDATE agents
        SET parent_asset = $1,
            parent_creator = $2,
-           updated_at = $3,
            parent_locked = COALESCE($5, parent_locked),
-           mutation_order_key = ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}
+           parent_order_key = ${canonicalOrderAnchorSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")},
+           ${agentActivityAssignmentsSql("$6::bigint", "$7::integer", "$8::integer", "$9::text", "$3")}
        WHERE asset = $4
-         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text")}`,
+         AND ${agentOrderGuardSql("$6::bigint", "$7::integer", "$8::integer", "$9::text", "parent_order_key")}`,
       [
         data.parentAsset.toBase58(),
         data.parentCreator.toBase58(),
@@ -2220,48 +2184,15 @@ async function handleNewFeedback(
     if (insertResult.rowCount !== 1) {
       logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
     }
-    const baseUpdate = `
-      feedback_count = COALESCE((
-        SELECT COUNT(*)::int
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      raw_avg_score = COALESCE((
-        SELECT ROUND(AVG(score))::smallint
-        FROM feedbacks
-        WHERE asset = $2 AND NOT is_revoked
-      ), 0),
-      updated_at = $1
-    `;
-
-    if (data.atomEnabled) {
-      await db.query(
-        `UPDATE agents SET
-           trust_tier = $3,
-           quality_score = $4,
-           confidence = $5,
-           risk_score = $6,
-           diversity_ratio = $7,
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [
-          ctx.blockTime.toISOString(),
-          assetId,
-          data.newTrustTier,
-          data.newQualityScore,
-          data.newConfidence,
-          data.newRiskScore,
-          data.newDiversityRatio,
-        ]
-      );
-    } else {
-      await db.query(
-        `UPDATE agents SET
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId]
-      );
-    }
+    const atomFields = data.atomEnabled
+      ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+      : [];
+    await db.query(
+      `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
+      [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
+       data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.slot.toString(),
+       ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
+    );
     await replayOrphanResponsesForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
     await reconcileOrphanRevocationForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), score: data.score, trustTier: data.newTrustTier }, "New feedback");
@@ -2339,38 +2270,15 @@ async function handleFeedbackRevoked(
          WHERE id = $2`,
         [ctx.blockTime.toISOString(), id]
       );
-      const baseUpdate = `
-        feedback_count = COALESCE((
-          SELECT COUNT(*)::int
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        raw_avg_score = COALESCE((
-          SELECT ROUND(AVG(score))::smallint
-          FROM feedbacks
-          WHERE asset = $2 AND NOT is_revoked
-        ), 0),
-        updated_at = $1
-      `;
-
+      const atomFields = data.atomEnabled && data.hadImpact
+        ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"]] as const
+        : [];
       await db.query(
-        `UPDATE agents SET
-           ${baseUpdate}
-         WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId]
+        `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
+        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
+         data.newConfidence, null, null, ctx.slot.toString(), ctx.txIndex ?? null,
+         ctx.eventOrdinal ?? null, ctx.signature]
       );
-
-      if (data.atomEnabled && data.hadImpact) {
-        await db.query(
-          `UPDATE agents SET
-             trust_tier = $3,
-             quality_score = $4,
-             confidence = $5,
-             updated_at = $1
-           WHERE asset = $2`,
-          [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore, data.newConfidence]
-        );
-      }
     }
 
     logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");

@@ -191,6 +191,13 @@ CREATE TABLE agents (
   verified_at TIMESTAMPTZ,
   verified_slot BIGINT,
   mutation_order_key TEXT,
+  owner_order_key TEXT,
+  wallet_order_key TEXT,
+  uri_order_key TEXT,
+  atom_enabled_order_key TEXT,
+  collection_order_key TEXT,
+  parent_order_key TEXT,
+  atom_stats_order_key TEXT,
   CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)
 );
 

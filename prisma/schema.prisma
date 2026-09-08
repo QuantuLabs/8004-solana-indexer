@@ -46,6 +46,13 @@ model Agent {
   eventOrdinal       Int?     // Event index within transaction (deterministic intra-tx ordering)
   agentId           BigInt?  @map("agent_id") // Sequential registration ID (auto-assigned, permanent)
   mutationOrderKey   String?  @map("mutation_order_key")
+  ownerOrderKey      String?  @map("owner_order_key")
+  walletOrderKey     String?  @map("wallet_order_key")
+  uriOrderKey        String?  @map("uri_order_key")
+  atomEnabledOrderKey String? @map("atom_enabled_order_key")
+  collectionOrderKey String?  @map("collection_order_key")
+  parentOrderKey     String?  @map("parent_order_key")
+  atomStatsOrderKey  String?  @map("atom_stats_order_key")
 
   // Verification status (reorg resilience)
   status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED

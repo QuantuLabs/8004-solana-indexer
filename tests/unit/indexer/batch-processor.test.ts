@@ -651,8 +651,9 @@ describe("EventBuffer", () => {
       );
       expect(insertCall).toBeDefined();
       expect(insertCall![0]).toContain("created_at, updated_at, status");
-      expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-      expect(insertCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
+      expect(insertCall![0]).toContain("updated_at = CASE WHEN");
+      expect(insertCall![0]).toContain("owner_order_key = CASE WHEN");
+      expect(insertCall![0]).toContain("uri_order_key = CASE WHEN");
       expect(insertCall![0]).toContain("agents.mutation_order_key");
       expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
 
@@ -2668,6 +2669,8 @@ describe("EventBuffer", () => {
       expect(ownerCall).toBeDefined();
       expect(ownerCall![0]).toContain("mutation_order_key =");
       expect(ownerCall![0]).toContain("agents.mutation_order_key");
+      expect(ownerCall![0]).toContain("owner_order_key =");
+      expect(ownerCall![0]).toContain("agents.owner_order_key");
       expect(ownerCall![0]).not.toContain("block_slot =");
       expect(ownerCall![0]).not.toContain("tx_signature =");
 
@@ -2678,12 +2681,14 @@ describe("EventBuffer", () => {
         ctx
       );
       const walletResetCall = client.query.mock.calls.find((c: any[]) =>
-        typeof c[0] === "string" && c[0].includes("SET owner = $1")
-          && c[0].includes("agent_wallet = $2")
+        typeof c[0] === "string" && c[0].includes("owner = CASE WHEN")
+          && c[0].includes("agent_wallet = CASE WHEN")
       );
       expect(walletResetCall).toBeDefined();
       expect(walletResetCall![0]).toContain("mutation_order_key =");
       expect(walletResetCall![0]).toContain("agents.mutation_order_key");
+      expect(walletResetCall![0]).toContain("owner_order_key = CASE WHEN");
+      expect(walletResetCall![0]).toContain("wallet_order_key = CASE WHEN");
       expect(walletResetCall![0]).not.toContain("block_slot =");
       expect(walletResetCall![0]).not.toContain("tx_signature =");
 
@@ -2699,6 +2704,8 @@ describe("EventBuffer", () => {
       expect(collectionCall).toBeDefined();
       expect(collectionCall![0]).toContain("mutation_order_key =");
       expect(collectionCall![0]).toContain("agents.mutation_order_key");
+      expect(collectionCall![0]).toContain("collection_order_key =");
+      expect(collectionCall![0]).toContain("agents.collection_order_key");
       expect(collectionCall![0]).not.toContain("block_slot =");
 
       client.query.mockClear();
@@ -2713,6 +2720,8 @@ describe("EventBuffer", () => {
       expect(parentCall).toBeDefined();
       expect(parentCall![0]).toContain("mutation_order_key =");
       expect(parentCall![0]).toContain("agents.mutation_order_key");
+      expect(parentCall![0]).toContain("parent_order_key =");
+      expect(parentCall![0]).toContain("agents.parent_order_key");
       expect(parentCall![0]).not.toContain("block_slot =");
       expect(parentCall![0]).not.toContain("tx_signature =");
       expect(parentCall![1]).toHaveLength(9);

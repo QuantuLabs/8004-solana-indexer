@@ -6,8 +6,28 @@ import { describe, expect, it } from "vitest";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const schemaSql = readFileSync(resolve(__dirname, "../../../supabase/schema.sql"), "utf8");
+const agentFieldOrderMigration = readFileSync(
+  resolve(__dirname, "../../../supabase/migrations/20260908160000_agent_field_order_keys.sql"),
+  "utf8"
+);
 
 describe("supabase schema revocations bootstrap parity", () => {
+  it("defines all seven internal agent field-order clocks", () => {
+    for (const column of [
+      "owner_order_key", "wallet_order_key", "uri_order_key", "atom_enabled_order_key",
+      "collection_order_key", "parent_order_key", "atom_stats_order_key",
+    ]) {
+      expect(schemaSql).toContain(`${column} TEXT`);
+    }
+  });
+
+  it("uses the additive fixed cutover floor without overwriting existing clocks", () => {
+    expect(agentFieldOrderMigration).toContain("COALESCE(a.owner_order_key, f.value)");
+    expect(agentFieldOrderMigration).toContain("SELECT asset, mutation_order_key");
+    expect(agentFieldOrderMigration).toContain("JOIN indexer_state s ON s.id = 'main'");
+    expect(agentFieldOrderMigration).toContain("COALESCE(s.last_tx_index, 2147483647)");
+    expect(agentFieldOrderMigration).toContain("':2147483647:' || s.last_signature");
+  });
   it("drops and recreates revocations on clean bootstrap", () => {
     expect(schemaSql).toContain("DROP TABLE IF EXISTS revocations CASCADE;");
     expect(schemaSql).toMatch(/CREATE TABLE revocations\s*\(/);

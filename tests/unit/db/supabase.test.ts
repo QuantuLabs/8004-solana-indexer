@@ -283,8 +283,9 @@ describe("supabase.ts", () => {
         );
         expect(insertCall).toBeDefined();
         expect(insertCall![0]).toContain("created_at, updated_at");
-        expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
-        expect(insertCall![0]).toContain("mutation_order_key = EXCLUDED.mutation_order_key");
+        expect(insertCall![0]).toContain("updated_at = CASE WHEN");
+        expect(insertCall![0]).toContain("owner_order_key = CASE WHEN");
+        expect(insertCall![0]).toContain("uri_order_key = CASE WHEN");
         expect(insertCall![0]).toContain("agents.mutation_order_key");
         expect(insertCall![0]).not.toContain("block_slot = EXCLUDED.block_slot");
         expect(insertCall![1]).toContain(TEST_ASSET.toBase58());
@@ -583,6 +584,8 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).toContain("mutation_order_key =");
         expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).toContain("owner_order_key =");
+        expect(updateCall![0]).toContain("agents.owner_order_key");
         expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1]).toContain(TEST_NEW_OWNER.toBase58());
@@ -620,6 +623,8 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).toContain("mutation_order_key =");
         expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).toContain("atom_enabled_order_key =");
+        expect(updateCall![0]).toContain("agents.atom_enabled_order_key");
         expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).not.toContain("tx_signature =");
       });
@@ -651,6 +656,8 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).toContain("mutation_order_key =");
         expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).toContain("uri_order_key =");
+        expect(updateCall![0]).toContain("agents.uri_order_key");
         expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1][0]).toBe("ipfs://QmNewUri");
@@ -700,6 +707,8 @@ describe("supabase.ts", () => {
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).toContain("mutation_order_key =");
         expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).toContain("wallet_order_key =");
+        expect(updateCall![0]).toContain("agents.wallet_order_key");
         expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).not.toContain("tx_signature =");
         expect(updateCall![1][0]).toBe(TEST_WALLET.toBase58());
@@ -748,12 +757,14 @@ describe("supabase.ts", () => {
         };
         await handleEvent(event, ctx);
         const updateCall = mockPoolInstance.query.mock.calls.find((c: any[]) =>
-          typeof c[0] === "string" && c[0].includes("SET owner = $1")
-            && c[0].includes("agent_wallet = $2")
+          typeof c[0] === "string" && c[0].includes("owner = CASE WHEN")
+            && c[0].includes("agent_wallet = CASE WHEN")
         );
         expect(updateCall).toBeDefined();
         expect(updateCall![0]).toContain("mutation_order_key =");
         expect(updateCall![0]).toContain("agents.mutation_order_key");
+        expect(updateCall![0]).toContain("owner_order_key = CASE WHEN");
+        expect(updateCall![0]).toContain("wallet_order_key = CASE WHEN");
         expect(updateCall![0]).not.toContain("block_slot =");
         expect(updateCall![0]).not.toContain("tx_signature =");
       });
@@ -1790,7 +1801,7 @@ describe("supabase.ts", () => {
         );
         expect(insertCall).toBeDefined();
         expect(insertCall![0]).toContain("created_at, updated_at");
-        expect(insertCall![0]).toContain("updated_at = EXCLUDED.updated_at");
+        expect(insertCall![0]).toContain("updated_at = CASE WHEN");
       });
 
       it("AgentRegistered with metadataIndexMode on queues metadata", async () => {
