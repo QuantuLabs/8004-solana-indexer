@@ -145,7 +145,7 @@ Migration-only is the supported path when:
 
 Shipped upgrade migrations are intended to fill missing runtime data needed by the newer code without a full reindex.
 With `ENABLE_PROOFPASS=true` on PostgreSQL / Supabase, startup + verifier can also backfill missing `extra_proofpass_feedbacks` rows from already indexed feedback transactions without a full reindex.
-For local SQLite databases created by the affected drifted releases, the startup repair may deterministically rewrite `agents.agent_id` to the canonical order so the upgraded DB matches a fresh local/pool rebuild.
+SQLite startup preserves every assigned `agents.agent_id`, including IDs on orphaned rows. It deterministically allocates only missing IDs above the existing monotonic counter; historical assignments are not rewritten to match a fresh rebuild.
 Do not treat a successful in-place upgrade on a historically drifted database as proof that every legacy runtime/status field will match a fresh rebuild row-for-row.
 Do not treat a successful in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
 
@@ -178,7 +178,7 @@ After upgrade:
 ## Sequential IDs and cross-engine comparisons
 
 - Public sequential IDs are part of the API surface.
-- Supported in-place upgrades preserve canonical public IDs. For affected local SQLite drift, startup repair may rewrite previously wrong `agents.agent_id` values to their canonical order without requiring a reindex.
+- Supported in-place upgrades and SQLite restarts preserve assigned public IDs. Missing IDs are allocated without renumbering existing rows or resetting the monotonic counter.
 - Strict PostgreSQL-vs-SQLite parity is a separate validation problem from in-place upgrade support.
 - If you need strict cross-engine parity, bootstrap each backend from the same canonical chain window and verify them at the same cutoff.
 

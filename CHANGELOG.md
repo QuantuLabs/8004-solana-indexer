@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 - Guard canonical database writes, ordinal-distinct response identity, and metadata deletion against stale replay.
 - Bound metadata fetches and API pagination, and align readiness reporting with recovery state.
 - Complete the documented legacy SQLite upgrade bundle without rewriting historical empty-string values.
+- Preserve assigned SQLite agent IDs across startup repair, including orphaned rows, and allocate missing IDs above the existing counter.
+- Keep malformed request bodies in the HTTP 4xx class while masking internal error details.
 
 ## [1.8.3] - 2026-03-18
 

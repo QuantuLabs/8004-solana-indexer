@@ -92,7 +92,7 @@ The extra only gates ProofPass storage/backfill on PostgreSQL / Supabase; the Gr
 - This is the supported path when you keep the same network/program/history and upgrade an already indexed database through the shipped migrations only.
 - Shipped upgrade migrations are intended to fill missing runtime data needed by the newer runtime without a full reindex.
 - With `ENABLE_PROOFPASS=true` on PostgreSQL / Supabase, startup + verifier can backfill missing `extra_proofpass_feedbacks` rows from already indexed feedback transactions without a full reindex.
-- For affected local SQLite drift, startup repair may rewrite previously wrong `agents.agent_id` values to their canonical order without requiring a reindex.
+- SQLite startup preserves every assigned `agents.agent_id` and allocates only missing IDs above the existing monotonic counter; it does not renumber historical rows.
 - Do not treat an in-place upgrade on a historically drifted database as proof that every public sequential ID will match a fresh rebuild row-for-row.
 - Do not treat an in-place upgrade on a historically drifted PostgreSQL database as proof that historical hash-chain statuses or orphan staging layout will match a fresh rebuild exactly.
 
