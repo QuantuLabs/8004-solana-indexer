@@ -15,6 +15,9 @@ All notable changes to this project will be documented in this file.
 - Complete the documented legacy SQLite upgrade bundle without rewriting historical empty-string values.
 - Preserve assigned SQLite agent IDs across startup repair, including orphaned rows, and allocate missing IDs above the existing counter.
 - Keep malformed request bodies in the HTTP 4xx class while masking internal error details.
+- Order partial ATOM snapshots independently so a revocation cannot suppress delayed risk/diversity updates.
+- Promote legacy SQLite orphan responses with null ordinals without duplicating their public response IDs.
+- Serialize websocket reconciliation with live ingestion, honor bootstrap holds, and recover older gaps beyond the bounded reconciliation scan.
 
 ## [1.8.3] - 2026-03-18
 
