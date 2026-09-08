@@ -14,45 +14,48 @@ const REFRESH_AGENT_COUNTER_SQL = `
       WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."nextValue"
       ELSE "IdCounter"."nextValue"
     END,
-    "updatedAt" = CURRENT_TIMESTAMP
+    "updatedAt" = CASE
+      WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."updatedAt"
+      ELSE "IdCounter"."updatedAt"
+    END
 `;
 
 const REPAIR_AGENT_IDS_SQL = `
-  WITH "agent_ranked" AS (
-    SELECT
-      a."id" AS "id",
-      CAST(
-        ROW_NUMBER() OVER (
-          ORDER BY
-            COALESCE(a."createdSlot", 9223372036854775807) ASC,
-            COALESCE(a."txIndex", 2147483647) ASC,
-            COALESCE(a."eventOrdinal", 2147483647) ASC,
-            CASE WHEN a."createdTxSignature" IS NULL THEN 1 ELSE 0 END ASC,
-            COALESCE(a."createdTxSignature", '') ASC,
-            a."id" ASC
-        ) AS BIGINT
-      ) AS "assignedId"
-    FROM "Agent" a
-    WHERE a."status" IS NULL OR a."status" != 'ORPHANED'
+  WITH "agent_seed" AS (
+    SELECT MAX(
+      COALESCE((SELECT MAX("agent_id") FROM "Agent"), 0),
+      COALESCE((
+        SELECT "nextValue" - 1
+        FROM "IdCounter"
+        WHERE "scope" = 'agent:global'
+      ), 0)
+    ) AS "max_id"
   ),
-  "agent_updates" AS (
+  "agent_ranked" AS (
     SELECT
       a."id" AS "id",
-      ranked."assignedId" AS "assignedId"
+      ROW_NUMBER() OVER (
+        ORDER BY
+          COALESCE(a."createdSlot", 9223372036854775807) ASC,
+          COALESCE(a."txIndex", 2147483647) ASC,
+          COALESCE(a."eventOrdinal", 2147483647) ASC,
+          CASE WHEN a."createdTxSignature" IS NULL THEN 1 ELSE 0 END ASC,
+          COALESCE(a."createdTxSignature", '') ASC,
+          a."id" ASC
+      ) AS "rn"
     FROM "Agent" a
-    INNER JOIN "agent_ranked" ranked ON ranked."id" = a."id"
-    WHERE a."agent_id" IS NULL
-       OR CAST(a."agent_id" AS BIGINT) != ranked."assignedId"
+    WHERE (a."status" IS NULL OR a."status" != 'ORPHANED')
+      AND a."agent_id" IS NULL
   )
   UPDATE "Agent"
   SET "agent_id" = (
-    SELECT u."assignedId"
-    FROM "agent_updates" u
-    WHERE u."id" = "Agent"."id"
+    SELECT CAST((SELECT "max_id" FROM "agent_seed") + ranked."rn" AS BIGINT)
+    FROM "agent_ranked" ranked
+    WHERE ranked."id" = "Agent"."id"
   )
   WHERE "Agent"."id" IN (
-    SELECT u."id"
-    FROM "agent_updates" u
+    SELECT ranked."id"
+    FROM "agent_ranked" ranked
   )
 `;
 
@@ -79,7 +82,10 @@ const LOCAL_COLLECTION_ID_SCHEMA_REPAIR_STATEMENTS = [
         WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."nextValue"
         ELSE "IdCounter"."nextValue"
       END,
-      "updatedAt" = CURRENT_TIMESTAMP
+      "updatedAt" = CASE
+        WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."updatedAt"
+        ELSE "IdCounter"."updatedAt"
+      END
   `,
   `
     INSERT INTO "IdCounter" ("scope", "nextValue", "updatedAt")
@@ -93,7 +99,10 @@ const LOCAL_COLLECTION_ID_SCHEMA_REPAIR_STATEMENTS = [
         WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."nextValue"
         ELSE "IdCounter"."nextValue"
       END,
-      "updatedAt" = CURRENT_TIMESTAMP
+      "updatedAt" = CASE
+        WHEN excluded."nextValue" > "IdCounter"."nextValue" THEN excluded."updatedAt"
+        ELSE "IdCounter"."updatedAt"
+      END
   `,
   `DROP TRIGGER IF EXISTS "CollectionPointer_assign_collection_id_after_insert"`,
   `DROP TRIGGER IF EXISTS "CollectionPointer_assign_collection_id_after_update"`,
