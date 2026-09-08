@@ -25,32 +25,15 @@ If you are upgrading from `v1.7.7`, read:
 
 ## Upgrade
 
-For the v1.8.3 → v1.8.4 PostgreSQL upgrade, use the stopped-writer, atomic procedure in [docs/upgrade-v1.8.4.md](docs/upgrade-v1.8.4.md). It preserves current data, public IDs, counters, and cursors; do not run the fresh schema or reindex.
+For PostgreSQL upgrades from the proven `v1.7.7` baseline or later, use the stopped-writer atomic procedure in [docs/upgrade-v1.8.4.md](docs/upgrade-v1.8.4.md). Do not run the fresh schema or reindex. Earlier versions need a separately verified bridge and remain unsupported by this procedure.
 
 ### Existing PostgreSQL / Supabase
 
 - Back up the database.
-- Apply the SQL files in `supabase/migrations/` in lexicographic order after the last migration you already applied.
-- If you are upgrading specifically from `v1.7.7`, apply these files in order:
-  - `20260303160000_add_collection_sequential_id.sql`
-  - `20260305220000_align_global_stats_with_graphql_status.sql`
-  - `20260305235500_add_orphan_feedbacks.sql`
-  - `20260306164000_add_indexer_state_last_tx_index.sql`
-  - `20260306210000_add_orphan_responses.sql`
-  - `20260306223000_reorder_canonical_indexes.sql`
-  - `20260306230000_align_global_stats_collection_pointers.sql`
-  - `20260307111500_deterministic_id_counter_timestamps.sql`
-  - `20260307123000_backfill_legacy_orphan_responses.sql`
-  - `20260309190000_add_agent_reputation_proxy_objects.sql`
-  - `20260311173000_add_collection_pointer_last_seen_tx_index.sql`
-  - `20260312123000_align_proxy_views_and_leaderboard_grant.sql`
-  - `20260313193000_add_feedback_response_seal_hash.sql`
-  - `20260314150000_include_staging_orphans_in_verification_stats.sql`
-  - `20260315193000_add_validations_to_verification_stats.sql`
-  - `20260315195500_fix_recovered_orphan_agent_id_assignment.sql`
+- Record the exact basename of the last migration already applied, then run `node scripts/upgrade-postgres.mjs --after <exact-last-applied-filename>`. It validates every pending file before connecting and applies the complete pending chain with `psql --single-transaction` using libpq's standard `PG*` environment variables.
 - Restart the indexer on the same database.
 - Do not run `supabase/schema.sql` on an existing database.
-- Keep an operator record of the last migration filename you applied; the repo does not maintain a PG migration-tracking table for you.
+- Keep an operator record of the last applied migration filename; the repo does not maintain a PostgreSQL migration-tracking table.
 
 Optional PostgreSQL / Supabase enrichment extras:
 
@@ -82,9 +65,13 @@ The extra only gates ProofPass storage/backfill on PostgreSQL / Supabase; the Gr
   - `20260312110000_add_local_collection_id_counter`
   - `20260313193000_add_feedback_response_seal_hash`
 - If the file comes from the known `v1.7.7` local/Docker `prisma db push` flow without a valid `_prisma_migrations` baseline, do not run a blind `prisma migrate deploy`. Apply the shipped legacy bundle against that same file:
-  - `sqlite3 /path/to/indexer.db < prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql`
+  ```sh
+  { printf 'BEGIN IMMEDIATE;\n'; cat prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql; printf '\nCOMMIT;\n'; } \
+    | sqlite3 -bail /path/to/indexer.db
+  ```
 - That bundle is intentionally scoped to the proven `v1.7.7` db-push shape and already excludes the two duplicate-column migrations that fail on that legacy schema.
-- For older/unknown local SQLite files outside that proven `v1.7.7` db-push shape, the simple supported path is still reindex into a fresh SQLite database unless you deliberately baseline and verify the schema yourself.
+- After success, validate relationships and the preserved public IDs, counters, and `IndexerState` cursor. The bundle retains SQLite's current foreign-key/table-copy behavior and runs on one connection.
+- For older/unknown local SQLite files outside that proven `v1.7.7` db-push shape, stop before writing; they need a separately verified baseline.
 - Restart the indexer with the same database file.
 - Do not use `prisma db push` on an existing indexed SQLite database.
 
@@ -92,12 +79,12 @@ The extra only gates ProofPass storage/backfill on PostgreSQL / Supabase; the Gr
 
 - Upgrading the image alone is not enough for persisted databases.
 - Container startup does not run upgrade migrations automatically.
-- If the container uses PostgreSQL / Supabase, apply the pending `supabase/migrations/*.sql` to that persisted database, then restart the container.
+- If the container uses PostgreSQL / Supabase, run `scripts/upgrade-postgres.mjs --after ...` outside the runtime container against that persisted database, then restart the container.
 - If `ENABLE_PROOFPASS=true`, make sure `20260309192500_add_extra_proofpass_feedbacks.sql` has been applied before restart; startup now fails fast if that schema is missing.
 - If the container uses local SQLite, run `prisma migrate deploy` against the same persisted SQLite file, then restart the container.
 - The runtime image defaults local SQLite to `file:/app/data/indexer.db`; if you mount a different path, point both the runtime `DATABASE_URL` and your manual `prisma migrate deploy` command at that exact same file.
 - If that SQLite file came from the known `v1.7.7` Docker `db push` flow without a valid `_prisma_migrations` baseline, apply `prisma/legacy-upgrades/v1.7.7-dbpush-to-current.sql` with `sqlite3` against the mounted file, then restart the container.
-- If the file is older/unknown and does not match that proven shape, do not force a blind migrate; reindex into a fresh SQLite file unless you are deliberately doing a manual baseline.
+- If the file is older/unknown and does not match that proven shape, stop before writing and establish a separately verified baseline.
 - Restart the container with the same volume/env after the backend-specific upgrade step completes.
 
 ### When Migration + Restart Is Enough

@@ -4,16 +4,17 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import pg from "pg";
+import { collectPendingSql } from "./upgrade-postgres.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const migrations = ["193000_fix_feedback_id_recovery_determinism", "201500_reassert_recovered_orphan_agent_id_assignment", "203000_add_metadata_tombstones", "204500_response_event_ordinal_identity", "210000_rpc_limit_offset_caps", "213000_add_mutation_order_anchors"]
-  .map((name) => resolve(root, `supabase/migrations/20260318${name}.sql`));
+const pending = collectPendingSql("20260315195500_fix_recovered_orphan_agent_id_assignment.sql");
 const connection = {
   host: process.env.PGHOST,
   port: Number(process.env.PGPORT || 5432),
   user: process.env.PGUSER || "postgres",
 };
 const cohorts = ["devnet", "mainnet", "mainnet2"];
+const targetPrefix = process.env.UPGRADE_TEST_PREFIX || `migration_fix_${process.pid}`;
 const qi = (value) => `"${value.replaceAll('"', '""')}"`;
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
@@ -85,12 +86,11 @@ async function schemaHash(database) {
 
 function psql(database, injectFailure = false) {
   const args = ["-X", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-d", database];
-  for (const migration of migrations) args.push("-f", migration);
-  if (injectFailure) args.push("-c", "SELECT 1/0;");
   return spawnSync(process.env.PSQL || "psql", args, {
+    input: `${pending.sql}${injectFailure ? "\nSELECT 1/0;\n" : ""}`,
     cwd: root,
     env: { ...process.env, PGHOST: connection.host, PGPORT: String(connection.port), PGUSER: connection.user },
-    stdio: "inherit",
+    stdio: ["pipe", "inherit", "inherit"],
   }).status;
 }
 
@@ -105,7 +105,7 @@ async function clone(source, target) {
 for (const cohort of cohorts) {
   const startedAt = new Date().toISOString();
   const source = `baseline_${cohort}`;
-  const target = `upgrade_${cohort}`;
+  const target = `${targetPrefix}_${cohort}`;
   await clone(source, target);
   const before = await snapshot(source);
   if (psql(target) !== 0) throw new Error(`${target}: first upgrade failed`);
@@ -119,12 +119,13 @@ for (const cohort of cohorts) {
 }
 
 const rollbackStartedAt = new Date().toISOString();
-await clone("baseline_devnet", "upgrade_rollback");
-const rollbackData = await snapshot("upgrade_rollback");
-const rollbackSchema = await schemaHash("upgrade_rollback");
-if (psql("upgrade_rollback", true) === 0) throw new Error("forced-failure batch unexpectedly succeeded");
-const rolledBack = await snapshot("upgrade_rollback", rollbackData.layout);
-if (JSON.stringify(rolledBack.tables) !== JSON.stringify(rollbackData.tables) || await schemaHash("upgrade_rollback") !== rollbackSchema) {
+const rollbackTarget = `${targetPrefix}_rollback`;
+await clone("baseline_devnet", rollbackTarget);
+const rollbackData = await snapshot(rollbackTarget);
+const rollbackSchema = await schemaHash(rollbackTarget);
+if (psql(rollbackTarget, true) === 0) throw new Error("forced-failure batch unexpectedly succeeded");
+const rolledBack = await snapshot(rollbackTarget, rollbackData.layout);
+if (JSON.stringify(rolledBack.tables) !== JSON.stringify(rollbackData.tables) || await schemaHash(rollbackTarget) !== rollbackSchema) {
   throw new Error("forced-failure batch did not fully roll back");
 }
-console.log(JSON.stringify({ database: "upgrade_rollback", startedAt: rollbackStartedAt, finishedAt: new Date().toISOString(), atomicRollback: true }));
+console.log(JSON.stringify({ database: rollbackTarget, startedAt: rollbackStartedAt, finishedAt: new Date().toISOString(), atomicRollback: true }));

@@ -561,7 +561,7 @@ describe("WebSocketIndexer Coverage", () => {
 
       expect(mockConnection.getParsedTransaction).toHaveBeenCalledWith(
         TEST_SIGNATURE,
-        { maxSupportedTransactionVersion: 0 }
+        { maxSupportedTransactionVersion: 1 }
       );
       expect(handleEventAtomic).toHaveBeenCalledWith(
         expect.anything(),

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -78,8 +78,25 @@ describe("legacy SQLite v1.7.7 db-push upgrade bundle", () => {
         { name: "OrphanResponse_agentId_client_feedbackIndex_responder_txSignature_eventOrdinal_key" },
       ]);
     expect(() => db.exec(bundleSql)).toThrow(/duplicate column name: collection_id/);
+
+    db.prepare(`UPDATE "IdCounter" SET "updatedAt" = '2000-01-01 00:00:00' WHERE scope = 'collection:global'`).run();
+    const raw = spawnSync("sqlite3", [dbPath], { input: bundleSql, encoding: "utf8" });
+    expect(raw.status).not.toBe(0);
+    expect(db.prepare(`SELECT "updatedAt" FROM "IdCounter" WHERE scope = 'collection:global'`).get())
+      .not.toEqual({ updatedAt: "2000-01-01 00:00:00" });
+
+    db.prepare(`UPDATE "IdCounter" SET "updatedAt" = '2000-01-01 00:00:00' WHERE scope = 'collection:global'`).run();
+    const guarded = spawnSync("sqlite3", ["-bail", dbPath], {
+      input: `BEGIN IMMEDIATE;\n${bundleSql}\nCOMMIT;\n`,
+      encoding: "utf8",
+    });
+    expect(guarded.status).not.toBe(0);
+    expect(db.prepare(`SELECT "updatedAt" FROM "IdCounter" WHERE scope = 'collection:global'`).get())
+      .toEqual({ updatedAt: "2000-01-01 00:00:00" });
+    expect(db.prepare(`SELECT agent_id FROM "Agent" WHERE id = 'asset-1'`).get())
+      .toEqual({ agent_id: 77 });
     db.close();
-  });
+  }, 120_000);
 
   it("does not contain the deferred historical payload rewrite", () => {
     expect(bundleSql).not.toContain('SET "requestUri" = NULL');
