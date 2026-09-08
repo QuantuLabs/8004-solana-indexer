@@ -102,6 +102,7 @@ describe("DB Handlers Coverage", () => {
   beforeEach(() => {
     resetLocalDerivedDigestsForTests(true);
     prisma = createMockPrismaClient();
+    (prisma.feedbackResponse as any).findFirst = vi.fn().mockResolvedValue(null);
     ctx = {
       signature: TEST_SIGNATURE,
       slot: TEST_SLOT,
@@ -2276,9 +2277,9 @@ describe("DB Handlers Coverage", () => {
       const event: ProgramEvent = { type: "NewFeedback", data: newFeedbackData };
       await handleEventAtomic(prisma, event, ctx);
 
-      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+      expect(prisma.feedbackResponse.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({
+          data: expect.objectContaining({
             feedbackId: "fb-new-id",
             responder: TEST_OWNER.toBase58(),
           }),
@@ -2308,9 +2309,9 @@ describe("DB Handlers Coverage", () => {
       const event: ProgramEvent = { type: "NewFeedback", data: newFeedbackData };
       await handleEvent(prisma, event, ctx);
 
-      expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+      expect(prisma.feedbackResponse.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: expect.objectContaining({
+          data: expect.objectContaining({
             feedbackId: "fb-non-atomic-id",
             responder: TEST_OWNER.toBase58(),
           }),

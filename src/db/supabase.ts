@@ -117,15 +117,21 @@ function agentOwnerWalletResetSql(
 
 function agentFeedbackAssignmentsSql(atomFields: ReadonlyArray<readonly [string, string]>): string {
   const args = ["$3::bigint", "$4::integer", "$5::integer", "$6::text"] as const;
-  const atomFresh = agentOrderGuardSql(...args, "atom_stats_order_key");
   const key = canonicalOrderAnchorSql(...args);
-  const atomAssignments = atomFields.length === 0 ? "" : `${atomFields
-    .map(([column, value]) => `${column} = CASE WHEN ${atomFresh} THEN ${value} ELSE agents.${column} END`)
-    .join(",\n          ")},
-          atom_stats_order_key = CASE WHEN ${atomFresh} THEN ${key} ELSE agents.atom_stats_order_key END,`;
+  const assignments = (fields: typeof atomFields, orderColumn: string): string => {
+    if (fields.length === 0) return "";
+    const fresh = agentOrderGuardSql(...args, orderColumn);
+    return `${fields
+      .map(([column, value]) => `${column} = CASE WHEN ${fresh} THEN ${value} ELSE agents.${column} END`)
+      .join(",\n          ")},
+          ${orderColumn} = CASE WHEN ${fresh} THEN ${key} ELSE agents.${orderColumn} END,`;
+  };
+  const statsFields = atomFields.filter(([column]) => column !== "risk_score" && column !== "diversity_ratio");
+  const auxFields = atomFields.filter(([column]) => column === "risk_score" || column === "diversity_ratio");
   return `feedback_count = COALESCE((SELECT COUNT(*)::int FROM feedbacks WHERE asset = $2 AND NOT is_revoked), 0),
           raw_avg_score = COALESCE((SELECT ROUND(AVG(score))::smallint FROM feedbacks WHERE asset = $2 AND NOT is_revoked), 0),
-          ${atomAssignments}
+          ${assignments(statsFields, "atom_stats_order_key")}
+          ${assignments(auxFields, "atom_aux_order_key")}
           ${agentActivityAssignmentsSql(...args, "$1")}`;
 }
 
@@ -953,8 +959,8 @@ async function handleAgentRegisteredTx(
   const agentUri = data.agentUri || null;
   await ensureCollectionTx(client, collection, ctx.blockTime, collectionsToMarkSeen);
   await client.query(
-    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
+    `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, status, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key, atom_aux_order_key)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
      ON CONFLICT (asset) DO UPDATE SET
        ${agentRegistrationConflictSql()}`,
     [
@@ -1654,8 +1660,8 @@ async function handleAgentRegistered(
       return;
     }
     await db.query(
-      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
+      `INSERT INTO agents (asset, owner, creator, agent_uri, collection, canonical_col, col_locked, parent_asset, parent_creator, parent_locked, atom_enabled, block_slot, tx_index, event_ordinal, tx_signature, created_at, updated_at, mutation_order_key, owner_order_key, wallet_order_key, uri_order_key, atom_enabled_order_key, collection_order_key, parent_order_key, atom_stats_order_key, atom_aux_order_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")}, ${canonicalOrderAnchorSql("$12::bigint", "$13::integer", "$14::integer", "$15::text")})
        ON CONFLICT (asset) DO UPDATE SET
          ${agentRegistrationConflictSql()}`,
       [

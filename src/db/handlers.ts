@@ -141,6 +141,122 @@ function feedbackResponseIdentityWhere(
   };
 }
 
+async function findFeedbackResponseForPromotion(
+  client: PrismaClientOrTx,
+  feedbackId: string,
+  responder: string,
+  txSignature: string,
+  eventOrdinal: number | null | undefined
+): Promise<{ id: string; responseId: bigint | null } | null> {
+  const select = { id: true, responseId: true } as const;
+  if (eventOrdinal == null) {
+    return client.feedbackResponse.findFirst({
+      where: { feedbackId, responder, txSignature, eventOrdinal: null },
+      select,
+    });
+  }
+  return client.feedbackResponse.findUnique({
+    where: feedbackResponseIdentityWhere(feedbackId, responder, txSignature, eventOrdinal),
+    select,
+  });
+}
+
+async function writeFeedbackResponseForPromotion(
+  client: PrismaClientOrTx,
+  feedbackId: string,
+  responder: string,
+  txSignature: string,
+  eventOrdinal: number | null | undefined,
+  existingId: string | undefined,
+  create: Record<string, unknown>,
+  update: Record<string, unknown>
+): Promise<void> {
+  if (eventOrdinal == null) {
+    if (existingId) {
+      await client.feedbackResponse.update({ where: { id: existingId }, data: update });
+    } else {
+      await client.feedbackResponse.create({ data: create as any });
+    }
+    return;
+  }
+  await client.feedbackResponse.upsert({
+    where: feedbackResponseIdentityWhere(feedbackId, responder, txSignature, eventOrdinal),
+    create: create as any,
+    update,
+  });
+}
+
+async function promoteOrphanFeedbackResponse(
+  client: PrismaClientOrTx,
+  feedbackId: string,
+  orphan: any,
+  status: string
+): Promise<void> {
+  const txSignature = orphan.txSignature ?? "";
+  const existing = await findFeedbackResponseForPromotion(
+    client,
+    feedbackId,
+    orphan.responder,
+    txSignature,
+    orphan.eventOrdinal
+  );
+  let assignedResponseId: bigint | undefined;
+  if (status !== "ORPHANED" && (!existing || existing.responseId === null)) {
+    const highestAssigned = await client.feedbackResponse.findMany({
+      where: { feedbackId, responseId: { not: null } },
+      select: { responseId: true },
+      orderBy: { responseId: "desc" },
+      take: 1,
+    });
+    assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
+  }
+
+  const create = {
+    id: orphan.id,
+    feedbackId,
+    responder: orphan.responder,
+    responseUri: orphan.responseUri,
+    responseHash: orphan.responseHash,
+    sealHash: orphan.sealHash,
+    runningDigest: orphan.runningDigest,
+    responseCount: orphan.responseCount,
+    txSignature: orphan.txSignature,
+    slot: orphan.slot,
+    txIndex: orphan.txIndex,
+    eventOrdinal: orphan.eventOrdinal,
+    responseId: status === "ORPHANED" ? null : (assignedResponseId ?? null),
+    status,
+    createdAt: orphan.createdAt,
+  };
+  const update = {
+    responseUri: orphan.responseUri,
+    responseHash: orphan.responseHash,
+    sealHash: orphan.sealHash,
+    runningDigest: orphan.runningDigest,
+    responseCount: orphan.responseCount,
+    txSignature: orphan.txSignature,
+    slot: orphan.slot,
+    txIndex: orphan.txIndex,
+    eventOrdinal: orphan.eventOrdinal,
+    createdAt: orphan.createdAt,
+    ...(status === "ORPHANED"
+      ? { status }
+      : assignedResponseId !== undefined
+        ? { responseId: assignedResponseId, status }
+        : { status }),
+  };
+  await writeFeedbackResponseForPromotion(
+    client,
+    feedbackId,
+    orphan.responder,
+    txSignature,
+    orphan.eventOrdinal,
+    existing?.id,
+    create,
+    update
+  );
+}
+
 function orphanResponseIdentityWhere(
   agentId: string,
   client: string,
@@ -1040,7 +1156,13 @@ async function syncAgentFeedbackStatsTx(
 
   await tx.agent.updateMany({ where: { id: assetId }, data: baseData });
   if (atomPatch) {
-    await updateLocalAgentGroup(tx, assetId, ctx, "atomStatsOrderKey", { ...atomPatch });
+    const { riskScore, diversityRatio, ...statsPatch } = atomPatch;
+    if (Object.keys(statsPatch).length > 0) {
+      await updateLocalAgentGroup(tx, assetId, ctx, "atomStatsOrderKey", statsPatch);
+    }
+    if (riskScore !== undefined || diversityRatio !== undefined) {
+      await updateLocalAgentGroup(tx, assetId, ctx, "atomAuxOrderKey", { riskScore, diversityRatio });
+    }
   } else {
     await advanceLocalAgentAnchor(tx, assetId, ctx);
   }
@@ -1070,7 +1192,13 @@ async function syncAgentFeedbackStats(
 
   await prisma.agent.updateMany({ where: { id: assetId }, data: baseData });
   if (atomPatch) {
-    await updateLocalAgentGroup(prisma, assetId, ctx, "atomStatsOrderKey", { ...atomPatch });
+    const { riskScore, diversityRatio, ...statsPatch } = atomPatch;
+    if (Object.keys(statsPatch).length > 0) {
+      await updateLocalAgentGroup(prisma, assetId, ctx, "atomStatsOrderKey", statsPatch);
+    }
+    if (riskScore !== undefined || diversityRatio !== undefined) {
+      await updateLocalAgentGroup(prisma, assetId, ctx, "atomAuxOrderKey", { riskScore, diversityRatio });
+    }
   } else {
     await advanceLocalAgentAnchor(prisma, assetId, ctx);
   }
@@ -1131,7 +1259,8 @@ type AgentOrderKey =
   | "atomEnabledOrderKey"
   | "collectionOrderKey"
   | "parentOrderKey"
-  | "atomStatsOrderKey";
+  | "atomStatsOrderKey"
+  | "atomAuxOrderKey";
 
 function localAgentOrderWhere(assetId: string, ctx: EventContext, orderKey: AgentOrderKey): any {
   const eventOrderKey = canonicalOrderKey(ctx);
@@ -1602,6 +1731,7 @@ async function handleAgentRegisteredCore(
           collectionOrderKey: canonicalOrderKey(ctx),
           parentOrderKey: canonicalOrderKey(ctx),
           atomStatsOrderKey: canonicalOrderKey(ctx),
+          atomAuxOrderKey: canonicalOrderKey(ctx),
           agentId: assignedAgentId ?? null,
           status: DEFAULT_STATUS,
           createdAt: ctx.blockTime,
@@ -2455,62 +2585,7 @@ async function handleNewFeedbackTx(
 
     const orphanResponseStatus = classifyResponseStatus(true, sealMismatch);
     await withResponseIdAssignmentLock(async () => {
-      const orphanTxSignature = orphan.txSignature ?? "";
-      const existingResponse = await tx.feedbackResponse.findUnique({
-        where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
-        select: { responseId: true },
-      });
-
-      let assignedResponseId: bigint | undefined;
-      if (
-        orphanResponseStatus !== "ORPHANED" &&
-        (!existingResponse || existingResponse.responseId === null)
-      ) {
-        const highestAssigned = await tx.feedbackResponse.findMany({
-          where: { feedbackId: feedback.id, responseId: { not: null } },
-          select: { responseId: true },
-          orderBy: { responseId: "desc" },
-          take: 1,
-        });
-        assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
-      }
-
-      await tx.feedbackResponse.upsert({
-        where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
-        create: {
-          feedbackId: feedback.id,
-          responder: orphan.responder,
-          responseUri: orphan.responseUri,
-          responseHash: orphan.responseHash,
-          sealHash: orphan.sealHash,
-          runningDigest: orphan.runningDigest,
-          responseCount: orphan.responseCount,
-          txSignature: orphan.txSignature,
-          slot: orphan.slot,
-          txIndex: orphan.txIndex,
-          eventOrdinal: orphan.eventOrdinal,
-          responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
-          status: orphanResponseStatus,
-          createdAt: orphan.createdAt,
-        },
-        update: {
-          responseUri: orphan.responseUri,
-          responseHash: orphan.responseHash,
-          sealHash: orphan.sealHash,
-          runningDigest: orphan.runningDigest,
-          responseCount: orphan.responseCount,
-          txSignature: orphan.txSignature,
-          slot: orphan.slot,
-          txIndex: orphan.txIndex,
-          eventOrdinal: orphan.eventOrdinal,
-          createdAt: orphan.createdAt,
-          ...(orphanResponseStatus === "ORPHANED"
-            ? { status: orphanResponseStatus }
-            : assignedResponseId !== undefined
-              ? { responseId: assignedResponseId, status: orphanResponseStatus }
-              : { status: orphanResponseStatus }),
-        },
-      });
+      await promoteOrphanFeedbackResponse(tx, feedback.id, orphan, orphanResponseStatus);
     });
     await tx.orphanResponse.delete({ where: { id: orphan.id } });
   }
@@ -2691,62 +2766,7 @@ async function handleNewFeedback(
     const orphanResponseStatus = classifyResponseStatus(true, sealMismatch);
     await prisma.$transaction(async (tx) => {
       await withResponseIdAssignmentLock(async () => {
-        const orphanTxSignature = orphan.txSignature ?? "";
-        const existingResponse = await tx.feedbackResponse.findUnique({
-          where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
-          select: { responseId: true },
-        });
-
-        let assignedResponseId: bigint | undefined;
-        if (
-          orphanResponseStatus !== "ORPHANED" &&
-          (!existingResponse || existingResponse.responseId === null)
-        ) {
-          const highestAssigned = await tx.feedbackResponse.findMany({
-            where: { feedbackId: feedback.id, responseId: { not: null } },
-            select: { responseId: true },
-            orderBy: { responseId: "desc" },
-            take: 1,
-          });
-          assignedResponseId = asBigInt(highestAssigned[0]?.responseId) + 1n;
-        }
-
-        await tx.feedbackResponse.upsert({
-          where: feedbackResponseIdentityWhere(feedback.id, orphan.responder, orphanTxSignature, orphan.eventOrdinal),
-          create: {
-            feedbackId: feedback.id,
-            responder: orphan.responder,
-            responseUri: orphan.responseUri,
-            responseHash: orphan.responseHash,
-            sealHash: orphan.sealHash,
-            runningDigest: orphan.runningDigest,
-            responseCount: orphan.responseCount,
-            txSignature: orphan.txSignature,
-            slot: orphan.slot,
-            txIndex: orphan.txIndex,
-            eventOrdinal: orphan.eventOrdinal,
-            responseId: orphanResponseStatus === "ORPHANED" ? null : (assignedResponseId ?? null),
-            status: orphanResponseStatus,
-            createdAt: orphan.createdAt,
-          },
-          update: {
-            responseUri: orphan.responseUri,
-            responseHash: orphan.responseHash,
-            sealHash: orphan.sealHash,
-            runningDigest: orphan.runningDigest,
-            responseCount: orphan.responseCount,
-            txSignature: orphan.txSignature,
-            slot: orphan.slot,
-            txIndex: orphan.txIndex,
-            eventOrdinal: orphan.eventOrdinal,
-            createdAt: orphan.createdAt,
-            ...(orphanResponseStatus === "ORPHANED"
-              ? { status: orphanResponseStatus }
-              : assignedResponseId !== undefined
-                ? { responseId: assignedResponseId, status: orphanResponseStatus }
-                : { status: orphanResponseStatus }),
-          },
-        });
+        await promoteOrphanFeedbackResponse(tx, feedback.id, orphan, orphanResponseStatus);
         await tx.orphanResponse.delete({ where: { id: orphan.id } });
       });
     });

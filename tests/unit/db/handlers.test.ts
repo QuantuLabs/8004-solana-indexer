@@ -25,6 +25,7 @@ describe("DB Handlers", () => {
 
   beforeEach(() => {
     prisma = createMockPrismaClient();
+    (prisma.feedbackResponse as any).findFirst = vi.fn().mockResolvedValue(null);
     ctx = {
       signature: TEST_SIGNATURE,
       slot: TEST_SLOT,
@@ -422,7 +423,7 @@ describe("DB Handlers", () => {
             slot: 123456n,
           },
         ]);
-        (prisma.feedbackResponse.findUnique as any).mockResolvedValue({ responseId: null });
+        (prisma.feedbackResponse as any).findFirst.mockResolvedValue({ id: "legacy-response-id", responseId: null });
         (prisma.feedbackResponse.findMany as any).mockResolvedValue([{ responseId: 2n }]);
 
         const event: ProgramEvent = {
@@ -471,14 +472,10 @@ describe("DB Handlers", () => {
             ],
           })
         );
-        expect(prisma.feedbackResponse.upsert).toHaveBeenCalledWith(
+        expect(prisma.feedbackResponse.update).toHaveBeenCalledWith(
           expect.objectContaining({
-            create: expect.objectContaining({
-              feedbackId,
-              responseCount: 3n,
-              responseId: 3n,
-            }),
-            update: expect.objectContaining({
+            where: { id: "legacy-response-id" },
+            data: expect.objectContaining({
               responseCount: 3n,
               responseId: 3n,
             }),

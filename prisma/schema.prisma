@@ -53,6 +53,7 @@ model Agent {
   collectionOrderKey String?  @map("collection_order_key")
   parentOrderKey     String?  @map("parent_order_key")
   atomStatsOrderKey  String?  @map("atom_stats_order_key")
+  atomAuxOrderKey    String?  @map("atom_aux_order_key")
 
   // Verification status (reorg resilience)
   status       String    @default("PENDING") // PENDING | FINALIZED | ORPHANED

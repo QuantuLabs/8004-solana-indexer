@@ -198,6 +198,7 @@ CREATE TABLE agents (
   collection_order_key TEXT,
   parent_order_key TEXT,
   atom_stats_order_key TEXT,
+  atom_aux_order_key TEXT,
   CHECK (status = 'ORPHANED' OR agent_id IS NOT NULL)
 );
 
