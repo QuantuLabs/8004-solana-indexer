@@ -1576,7 +1576,7 @@ async function handleResponseAppendedTx(
   await client.query(
     `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-     ON CONFLICT (id) DO UPDATE SET
+     ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1))) DO UPDATE SET
        response_uri = EXCLUDED.response_uri,
        response_hash = EXCLUDED.response_hash,
        seal_hash = EXCLUDED.seal_hash,
@@ -2424,9 +2424,9 @@ async function handleResponseAppended(
       );
     }
     await db.query(
-      `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-       ON CONFLICT (id) DO UPDATE SET
+    `INSERT INTO feedback_responses (id, response_id, asset, client_address, feedback_index, responder, response_uri, response_hash, seal_hash, running_digest, response_count, block_slot, tx_index, event_ordinal, tx_signature, created_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+     ON CONFLICT (asset, client_address, feedback_index, responder, tx_signature, (COALESCE(event_ordinal, -1))) DO UPDATE SET
          response_uri = EXCLUDED.response_uri,
          response_hash = EXCLUDED.response_hash,
          seal_hash = EXCLUDED.seal_hash,
