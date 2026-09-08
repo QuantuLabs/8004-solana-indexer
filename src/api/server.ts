@@ -4124,13 +4124,13 @@ export function createApiServer(options: ApiServerOptions): Express {
                feedback_stats.avg_score
              FROM collections c
              LEFT JOIN (
-               SELECT collection, COUNT(*)::text AS agent_count
+               SELECT collection, COUNT(*) AS agent_count
                FROM agents
                ${activeAgentFilter}
                GROUP BY collection
              ) agent_stats ON agent_stats.collection = c.collection
              LEFT JOIN (
-               SELECT a.collection, COUNT(f.id)::text AS total_feedbacks, AVG(f.score) AS avg_score
+               SELECT a.collection, COUNT(f.id) AS total_feedbacks, AVG(f.score) AS avg_score
                FROM feedbacks f
                JOIN agents a ON a.asset = f.asset
                ${activeFeedbackFilter}
@@ -4161,13 +4161,13 @@ export function createApiServer(options: ApiServerOptions): Express {
                feedback_stats.avg_score
              FROM collections c
              LEFT JOIN (
-               SELECT collection, COUNT(*)::text AS agent_count
+               SELECT collection, COUNT(*) AS agent_count
                FROM agents
                ${activeAgentFilter}
                GROUP BY collection
              ) agent_stats ON agent_stats.collection = c.collection
              LEFT JOIN (
-               SELECT a.collection, COUNT(f.id)::text AS total_feedbacks, AVG(f.score) AS avg_score
+               SELECT a.collection, COUNT(f.id) AS total_feedbacks, AVG(f.score) AS avg_score
                FROM feedbacks f
                JOIN agents a ON a.asset = f.asset
                ${activeFeedbackFilter}
