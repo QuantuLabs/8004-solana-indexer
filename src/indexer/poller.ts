@@ -279,6 +279,8 @@ async function maybeUpsertProofPassMatchesForTx(params: {
 const HISTORICAL_SCAN_ROW_PREFIX = "historical-scan:";
 const HISTORICAL_SCAN_PROGRESS_ROW_PREFIX = "historical-scan-progress:";
 const HISTORICAL_SCAN_STATE_ROW_PREFIX = "historical-scan-state:";
+export const WEBSOCKET_RECONCILIATION_STATE_ROW_ID = "websocket-reconciliation-tip";
+export const WEBSOCKET_RECONCILIATION_STATE_SOURCE = "websocket-reconciliation";
 
 interface HistoricalScanPageState {
   pageIndex: number;
@@ -797,14 +799,44 @@ export class Poller {
   private async initializeCursor(): Promise<void> {
     while (this.isRunning) {
       await this.loadState();
-      const activeHistoricalScan = await this.loadActiveHistoricalScanState(this.lastSignature);
+      const mainSignature = this.lastSignature;
+      const reconciliationTip = mainSignature
+        ? await this.loadWebSocketReconciliationTipSignature()
+        : null;
+      const recoveryStopSignature = reconciliationTip && reconciliationTip !== mainSignature
+        ? reconciliationTip
+        : null;
+      const activeHistoricalScan = await this.loadActiveHistoricalScanState(
+        recoveryStopSignature ?? mainSignature
+      );
 
       if (activeHistoricalScan) {
+        const historicalCatchUpComplete = recoveryStopSignature
+          ? await this.catchUpHistoricalGap(
+              activeHistoricalScan.stopSignature,
+              activeHistoricalScan.pages,
+              false
+            )
+          : await this.catchUpHistoricalGap(
+              activeHistoricalScan.stopSignature,
+              activeHistoricalScan.pages
+            );
+        if (historicalCatchUpComplete) {
+          if (recoveryStopSignature && mainSignature) {
+            await this.saveWebSocketReconciliationTipSignature(mainSignature);
+          }
+          this.pendingHistoricalResume = false;
+          return;
+        }
+        this.pendingHistoricalResume = true;
+      } else if (recoveryStopSignature && mainSignature) {
         const historicalCatchUpComplete = await this.catchUpHistoricalGap(
-          activeHistoricalScan.stopSignature,
-          activeHistoricalScan.pages
+          recoveryStopSignature,
+          undefined,
+          false
         );
         if (historicalCatchUpComplete) {
+          await this.saveWebSocketReconciliationTipSignature(mainSignature);
           this.pendingHistoricalResume = false;
           return;
         }
@@ -967,7 +999,8 @@ export class Poller {
    */
   private async catchUpHistoricalGap(
     stopSignatureOverride?: string,
-    persistedPagesOverride?: HistoricalScanPageState[]
+    persistedPagesOverride?: HistoricalScanPageState[],
+    advanceCursor = true
   ): Promise<boolean> {
     const stopSignature = stopSignatureOverride ?? this.lastSignature;
     if (!stopSignature) return true;
@@ -1136,11 +1169,14 @@ export class Poller {
           replayBatch,
           processed,
           totalEstimate,
-          async (sig) => {
-            lastReplayedSignature = sig.signature;
-            if (!USE_BATCH_DB) {
-              await this.saveHistoricalScanProgress(stopSignature, i, sig.signature);
-            }
+          {
+            advanceCursor,
+            onTransactionProcessed: async (sig) => {
+              lastReplayedSignature = sig.signature;
+              if (!USE_BATCH_DB) {
+                await this.saveHistoricalScanProgress(stopSignature, i, sig.signature);
+              }
+            },
           }
         );
         processed += replayedCount;
@@ -1256,6 +1292,66 @@ export class Poller {
         };
       })
       .filter((row): row is HistoricalScanPageState => row !== null);
+  }
+
+  private async loadWebSocketReconciliationTipSignature(): Promise<string | null> {
+    if (!this.prisma) {
+      const db = getPool();
+      const result = await db.query(
+        `SELECT last_signature
+           FROM indexer_state
+          WHERE id = $1
+          LIMIT 1`,
+        [WEBSOCKET_RECONCILIATION_STATE_ROW_ID]
+      );
+      return result.rows[0]?.last_signature ?? null;
+    }
+
+    const row = await this.prisma.indexerState.findUnique({
+      where: { id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID },
+      select: { lastSignature: true },
+    });
+    return row?.lastSignature ?? null;
+  }
+
+  private async saveWebSocketReconciliationTipSignature(signature: string): Promise<void> {
+    if (!this.prisma) {
+      const db = getPool();
+      await db.query(
+        `INSERT INTO indexer_state (id, last_signature, last_slot, last_tx_index, source, updated_at)
+         VALUES ($1, $2, NULL, NULL, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET
+           last_signature = EXCLUDED.last_signature,
+           last_slot = NULL,
+           last_tx_index = NULL,
+           source = EXCLUDED.source,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          WEBSOCKET_RECONCILIATION_STATE_ROW_ID,
+          signature,
+          WEBSOCKET_RECONCILIATION_STATE_SOURCE,
+          new Date().toISOString(),
+        ]
+      );
+      return;
+    }
+
+    await this.prisma.indexerState.upsert({
+      where: { id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID },
+      create: {
+        id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID,
+        lastSignature: signature,
+        lastSlot: null,
+        lastTxIndex: null,
+        source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
+      },
+      update: {
+        lastSignature: signature,
+        lastSlot: null,
+        lastTxIndex: null,
+        source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
+      },
+    });
   }
 
   private async loadHistoricalScanState(stopSignature: string): Promise<HistoricalScanState | null> {

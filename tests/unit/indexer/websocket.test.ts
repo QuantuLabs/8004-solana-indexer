@@ -171,6 +171,7 @@ import {
   WebSocketIndexer,
   testWebSocketConnection,
 } from "../../../src/indexer/websocket.js";
+import { Poller } from "../../../src/indexer/poller.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
   createMockConnection,
@@ -187,6 +188,16 @@ import {
   TEST_CLIENT,
   TEST_REGISTRY,
 } from "../../mocks/solana.js";
+
+const createDeferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
 
 describe("WebSocketIndexer", () => {
   let wsIndexer: WebSocketIndexer;
@@ -1148,6 +1159,77 @@ describe("WebSocketIndexer", () => {
       expect(wsIndexer.isActive()).toBe(true);
     });
 
+    it("serializes accepted replay A before a later websocket notification B", async () => {
+      mockPrisma.indexerState.findUnique.mockResolvedValue({
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+      } as any);
+      await wsIndexer.start();
+      (wsIndexer as any).canonicalBufferMs = 0;
+
+      const replayStarted = createDeferred();
+      const releaseReplay = createDeferred();
+      const order: string[] = [];
+      let activeWriters = 0;
+      let maxActiveWriters = 0;
+      vi.spyOn(wsIndexer as any, "performReconciliationCheck").mockImplementation(async () => {
+        activeWriters += 1;
+        maxActiveWriters = Math.max(maxActiveWriters, activeWriters);
+        order.push("start:A");
+        replayStarted.resolve();
+        await releaseReplay.promise;
+        order.push("commit:A");
+        activeWriters -= 1;
+        return false;
+      });
+      vi.spyOn(wsIndexer as any, "processLogNotificationBatch").mockImplementation(async () => {
+        activeWriters += 1;
+        maxActiveWriters = Math.max(maxActiveWriters, activeWriters);
+        order.push("commit:B");
+        activeWriters -= 1;
+      });
+
+      const reconciliation = (wsIndexer as any).runReconciliationCheck("periodic");
+      await replayStarted.promise;
+      (wsIndexer as any).enqueueLogNotification(
+        { signature: "newer-B", err: null, logs: ["Program log: B"] },
+        { slot: 102 }
+      );
+
+      expect(order).toEqual(["start:A"]);
+      releaseReplay.resolve();
+      await reconciliation;
+      await (wsIndexer as any).logQueue.onIdle();
+
+      expect(order).toEqual(["start:A", "commit:A", "commit:B"]);
+      expect(maxActiveWriters).toBe(1);
+    });
+
+    it("admits no reconciliation write while bootstrap processing is held", async () => {
+      mockPrisma.indexerState.findUnique.mockResolvedValue({
+        lastSignature: "cursor-sig",
+        lastSlot: 100n,
+        lastTxIndex: 0,
+        source: "websocket",
+        updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+      } as any);
+      wsIndexer.holdProcessing();
+      await wsIndexer.start();
+      const replay = vi
+        .spyOn(wsIndexer as any, "performReconciliationCheck")
+        .mockResolvedValue(false);
+
+      expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(false);
+      expect(replay).not.toHaveBeenCalled();
+
+      wsIndexer.releaseProcessing();
+      expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(false);
+      expect(replay).toHaveBeenCalledTimes(1);
+    });
+
     it("should drain an accepted reconciliation write before stop returns and start no later write", async () => {
       const cursorRow = {
         lastSignature: "cursor-sig",
@@ -1327,6 +1409,127 @@ describe("WebSocketIndexer", () => {
         { until: "anchor-sig", limit: 50, before: "observed-149" }
       );
       expect(wsIndexer.isActive()).toBe(false);
+    });
+
+    it("recovers a simulated DB omission beyond 200 through fail-safe polling and restarts healthy", async () => {
+      const previousPageLimit = config.historicalScanSignaturePageLimit;
+      const previousMaxPages = config.historicalScanMaxPagesPerPass;
+      (config as any).historicalScanSignaturePageLimit = 50;
+      (config as any).historicalScanMaxPagesPerPass = 10;
+
+      const history = [
+        ...Array.from({ length: 201 }, (_, index) =>
+          createMockSignatureInfo(`sig-${201 - index}`, 301 - index, null)
+        ),
+        createMockSignatureInfo("durable-anchor", 100, null),
+      ];
+      const state = new Map<string, any>([
+        ["main", {
+          id: "main",
+          lastSignature: "sig-201",
+          lastSlot: 301n,
+          lastTxIndex: 0,
+          source: "websocket",
+          updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+        }],
+        ["websocket-reconciliation-tip", {
+          id: "websocket-reconciliation-tip",
+          lastSignature: "durable-anchor",
+          lastSlot: null,
+          lastTxIndex: null,
+          source: "websocket-reconciliation",
+          updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+        }],
+      ]);
+      mockPrisma.indexerState.findUnique.mockImplementation(async (args: any) => (
+        state.get(args.where.id) ?? null
+      ));
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => {
+        const exactId = typeof args?.where?.id === "string" ? args.where.id : null;
+        if (exactId) return state.has(exactId) ? [state.get(exactId)] : [];
+        const prefix = args?.where?.id?.startsWith;
+        if (!prefix) return [];
+        return [...state.values()]
+          .filter((row) => row.id.startsWith(prefix))
+          .sort((a, b) => (a.lastTxIndex ?? 0) - (b.lastTxIndex ?? 0));
+      });
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        const existing = state.get(args.where.id);
+        const next = { ...(existing ?? args.create), ...(existing ? args.update : {}) };
+        state.set(args.where.id, next);
+        return next;
+      });
+      mockPrisma.indexerState.deleteMany.mockImplementation(async (args: any) => {
+        const id = args?.where?.id;
+        const prefix = id?.startsWith;
+        for (const key of [...state.keys()]) {
+          if (key === id || (prefix && key.startsWith(prefix))) state.delete(key);
+        }
+        return { count: 1 };
+      });
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(
+        async (_programId: unknown, options: { before?: string; until?: string; limit: number }) => {
+          const start = options.before
+            ? history.findIndex((entry) => entry.signature === options.before) + 1
+            : 0;
+          const untilIndex = options.until
+            ? history.findIndex((entry) => entry.signature === options.until)
+            : history.length;
+          return history.slice(start, Math.min(start + options.limit, untilIndex));
+        }
+      );
+      (mockConnection.getBlock as any).mockImplementation(async (slot: number) => {
+        const signature = history.find((entry) => entry.slot === slot)?.signature;
+        return {
+          transactions: signature ? [{ transaction: { signatures: [signature] } }] : [],
+        };
+      });
+
+      try {
+        await wsIndexer.start();
+        expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(true);
+        await wsIndexer.stop();
+
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("durable-anchor");
+        expect(state.get("main")?.lastSignature).toBe("sig-201");
+
+        const simulatedRows = new Set<string>();
+        const recoveryPoller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 50,
+        });
+        (recoveryPoller as any).useBatchRpc = false;
+        (recoveryPoller as any).batchFetcher = null;
+        vi.spyOn(recoveryPoller as any, "processTransaction").mockImplementation(async (sig: any) => {
+          simulatedRows.add(sig.signature);
+          return new Date("2026-09-08T00:00:00.000Z");
+        });
+
+        await recoveryPoller.bootstrap();
+        await recoveryPoller.stop();
+
+        expect(simulatedRows.has("sig-1")).toBe(true);
+        expect(state.get("main")?.lastSignature).toBe("sig-201");
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("sig-201");
+
+        wsIndexer = new WebSocketIndexer({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          reconnectInterval: 100,
+          maxRetries: 3,
+        });
+        await wsIndexer.start();
+        expect(await (wsIndexer as any).runReconciliationCheck("periodic")).toBe(false);
+        expect(wsIndexer.isActive()).toBe(true);
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("sig-201");
+      } finally {
+        (config as any).historicalScanSignaturePageLimit = previousPageLimit;
+        (config as any).historicalScanMaxPagesPerPass = previousMaxPages;
+      }
     });
 
     it("should replay a successful signature not present in indexed rows", async () => {

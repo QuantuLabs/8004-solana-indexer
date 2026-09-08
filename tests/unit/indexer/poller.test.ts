@@ -4,6 +4,7 @@ import { config } from "../../../src/config.js";
 import { matchProofPassFeedbacks } from "../../../src/extras/proofpass.js";
 import { upsertProofPassMatches } from "../../../src/db/proofpass.js";
 import { Poller } from "../../../src/indexer/poller.js";
+import { getPool } from "../../../src/db/supabase.js";
 import { createMockPrismaClient } from "../../mocks/prisma.js";
 import {
   createMockConnection,
@@ -25,6 +26,16 @@ vi.mock("../../../src/extras/proofpass.js", () => ({
 
 vi.mock("../../../src/db/proofpass.js", () => ({
   upsertProofPassMatches: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../../../src/db/supabase.js", () => ({
+  getPool: vi.fn(),
+  loadIndexerState: vi.fn().mockResolvedValue({
+    lastSignature: null,
+    lastSlot: null,
+    lastTxIndex: null,
+  }),
+  saveIndexerState: vi.fn().mockResolvedValue(undefined),
 }));
 
 const createDeferred = <T = void>() => {
@@ -350,6 +361,161 @@ describe("Poller", () => {
       expect(result).toBeNull();
       expect(loadHistoricalScanPagesSpy).toHaveBeenCalledWith("current-main");
       expect(prismaFindManySpy).not.toHaveBeenCalled();
+    });
+
+    it("replays a simulated SQLite gap beyond 200 from the durable tip without rewinding main", async () => {
+      const previousPageLimit = config.historicalScanSignaturePageLimit;
+      const previousMaxPages = config.historicalScanMaxPagesPerPass;
+      (config as any).historicalScanSignaturePageLimit = 50;
+      (config as any).historicalScanMaxPagesPerPass = 10;
+
+      const history = [
+        ...Array.from({ length: 201 }, (_, index) =>
+          createMockSignatureInfo(`sig-${201 - index}`, 301 - index, null)
+        ),
+        createMockSignatureInfo("durable-anchor", 100, null),
+      ];
+      const state = new Map<string, any>([
+        ["main", {
+          id: "main",
+          lastSignature: "sig-201",
+          lastSlot: 301n,
+          lastTxIndex: 0,
+          source: "websocket",
+          updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+        }],
+        ["websocket-reconciliation-tip", {
+          id: "websocket-reconciliation-tip",
+          lastSignature: "durable-anchor",
+          lastSlot: null,
+          lastTxIndex: null,
+          source: "websocket-reconciliation",
+          updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+        }],
+      ]);
+
+      mockPrisma.indexerState.findUnique.mockImplementation(async (args: any) => (
+        state.get(args.where.id) ?? null
+      ));
+      mockPrisma.indexerState.findMany.mockImplementation(async (args: any) => {
+        const prefix = args?.where?.id?.startsWith;
+        if (!prefix) return [];
+        return [...state.values()]
+          .filter((row) => row.id.startsWith(prefix))
+          .sort((a, b) => (a.lastTxIndex ?? 0) - (b.lastTxIndex ?? 0));
+      });
+      mockPrisma.indexerState.upsert.mockImplementation(async (args: any) => {
+        const existing = state.get(args.where.id);
+        const next = { ...(existing ?? args.create), ...(existing ? args.update : {}) };
+        state.set(args.where.id, next);
+        return next;
+      });
+      mockPrisma.indexerState.deleteMany.mockImplementation(async (args: any) => {
+        const id = args?.where?.id;
+        const prefix = id?.startsWith;
+        for (const key of [...state.keys()]) {
+          if (key === id || (prefix && key.startsWith(prefix))) state.delete(key);
+        }
+        return { count: 1 };
+      });
+      (mockConnection.getSignaturesForAddress as any).mockImplementation(
+        async (_programId: unknown, options: { before?: string; limit: number }) => {
+          const start = options.before
+            ? history.findIndex((entry) => entry.signature === options.before) + 1
+            : 0;
+          return history.slice(start, start + options.limit);
+        }
+      );
+      (mockConnection.getBlock as any).mockImplementation(async (slot: number) => {
+        const signature = history.find((entry) => entry.slot === slot)?.signature;
+        return {
+          transactions: signature ? [{ transaction: { signatures: [signature] } }] : [],
+        };
+      });
+
+      const oldestStarted = createDeferred();
+      const releaseOldest = createDeferred();
+      const observed: string[] = [];
+      (poller as any).useBatchRpc = false;
+      (poller as any).batchFetcher = null;
+      vi.spyOn(poller as any, "processTransaction").mockImplementation(async (sig: any) => {
+        observed.push(sig.signature);
+        if (sig.signature === "sig-1") {
+          oldestStarted.resolve();
+          await releaseOldest.promise;
+        }
+        return new Date("2026-09-08T00:00:00.000Z");
+      });
+
+      try {
+        const recovery = poller.bootstrap();
+        await oldestStarted.promise;
+
+        expect(state.get("main")?.lastSignature).toBe("sig-201");
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("durable-anchor");
+
+        releaseOldest.resolve();
+        await recovery;
+
+        expect(observed).toHaveLength(201);
+        expect(observed[0]).toBe("sig-1");
+        expect(observed).toContain("sig-1");
+        expect(state.get("main")?.lastSignature).toBe("sig-201");
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("sig-201");
+
+        const secondPoller = new Poller({
+          connection: mockConnection as any,
+          prisma: mockPrisma,
+          programId: TEST_PROGRAM_ID,
+          pollingInterval: 100,
+          batchSize: 50,
+        });
+        poller = secondPoller;
+        (secondPoller as any).useBatchRpc = false;
+        (secondPoller as any).batchFetcher = null;
+        const secondReplay = vi.spyOn(secondPoller as any, "processTransaction");
+
+        await secondPoller.bootstrap();
+
+        expect(secondReplay).not.toHaveBeenCalled();
+        expect(state.get("main")?.lastSignature).toBe("sig-201");
+        expect(state.get("websocket-reconciliation-tip")?.lastSignature).toBe("sig-201");
+      } finally {
+        (config as any).historicalScanSignaturePageLimit = previousPageLimit;
+        (config as any).historicalScanMaxPagesPerPass = previousMaxPages;
+      }
+    });
+
+    it("uses the simulated PostgreSQL state path for the recovery tip", async () => {
+      const query = vi.fn()
+        .mockResolvedValueOnce({ rows: [{ last_signature: "pg-anchor" }] })
+        .mockResolvedValueOnce({ rows: [] });
+      vi.mocked(getPool).mockReturnValue({ query } as any);
+      const pgPoller = new Poller({
+        connection: mockConnection as any,
+        prisma: null,
+        programId: TEST_PROGRAM_ID,
+      });
+
+      expect(await (pgPoller as any).loadWebSocketReconciliationTipSignature()).toBe("pg-anchor");
+      await (pgPoller as any).saveWebSocketReconciliationTipSignature("pg-main");
+
+      expect(query).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining("SELECT last_signature"),
+        ["websocket-reconciliation-tip"]
+      );
+      expect(query).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining("ON CONFLICT (id) DO UPDATE"),
+        [
+          "websocket-reconciliation-tip",
+          "pg-main",
+          "websocket-reconciliation",
+          expect.any(String),
+        ]
+      );
+      await pgPoller.stop();
     });
   });
 

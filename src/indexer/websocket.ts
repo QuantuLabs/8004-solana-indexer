@@ -33,7 +33,11 @@ import {
   maybeUpsertProofPassMatchesForLogs,
   recoverMissingProgramSignatures,
 } from "./websocket-recovery.js";
-import type { ReplayProcessedCursor } from "./poller.js";
+import {
+  WEBSOCKET_RECONCILIATION_STATE_ROW_ID,
+  WEBSOCKET_RECONCILIATION_STATE_SOURCE,
+  type ReplayProcessedCursor,
+} from "./poller.js";
 import type { ProgramEvent } from "../parser/types.js";
 
 const logger = createChildLogger("websocket");
@@ -48,8 +52,6 @@ const MAX_QUEUE_SIZE = 10_000;
 const RECONCILIATION_SIGNATURE_PAGE_LIMIT = 50;
 const RECONCILIATION_SIGNATURE_SCAN_LIMIT = 200;
 const RECONCILIATION_FAILURE_THRESHOLD = 3;
-const RECONCILIATION_STATE_ROW_ID = "websocket-reconciliation-tip";
-const RECONCILIATION_STATE_SOURCE = "websocket-reconciliation";
 const SLOT_START_TX_INDEX = -1;
 
 export interface WebSocketIndexerOptions {
@@ -715,7 +717,7 @@ export class WebSocketIndexer {
         signature: cursor.signature,
         slot: cursor.slot,
         txIndex: cursor.txIndex,
-        source: RECONCILIATION_STATE_SOURCE,
+        source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         updatedAt: cursor.blockTime,
       }))) {
         await this.prisma.indexerState.upsert({
@@ -725,14 +727,14 @@ export class WebSocketIndexer {
             lastSignature: cursor.signature,
             lastSlot: cursor.slot,
             lastTxIndex: cursor.txIndex,
-            source: RECONCILIATION_STATE_SOURCE,
+            source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
             updatedAt: cursor.blockTime,
           },
           update: {
             lastSignature: cursor.signature,
             lastSlot: cursor.slot,
             lastTxIndex: cursor.txIndex,
-            source: RECONCILIATION_STATE_SOURCE,
+            source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
             updatedAt: cursor.blockTime,
           },
         });
@@ -746,7 +748,7 @@ export class WebSocketIndexer {
         cursor.signature,
         cursor.slot,
         cursor.txIndex,
-        RECONCILIATION_STATE_SOURCE,
+        WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         cursor.blockTime
       );
     }
@@ -761,7 +763,7 @@ export class WebSocketIndexer {
         cursor.signature,
         cursor.slot,
         cursor.txIndex,
-        RECONCILIATION_STATE_SOURCE,
+        WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         cursor.blockTime
       );
     }
@@ -826,7 +828,7 @@ export class WebSocketIndexer {
   private async loadReconciliationTipSignature(): Promise<string | null> {
     if (this.prisma) {
       const rows = await this.prisma.indexerState.findMany({
-        where: { id: RECONCILIATION_STATE_ROW_ID },
+        where: { id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID },
         select: { lastSignature: true },
         take: 1,
       });
@@ -839,7 +841,7 @@ export class WebSocketIndexer {
        FROM indexer_state
        WHERE id = $1
        LIMIT 1`,
-      [RECONCILIATION_STATE_ROW_ID]
+      [WEBSOCKET_RECONCILIATION_STATE_ROW_ID]
     );
     return result.rows[0]?.last_signature ?? null;
   }
@@ -847,19 +849,19 @@ export class WebSocketIndexer {
   private async saveReconciliationTipSignature(signature: string): Promise<void> {
     if (this.prisma) {
       await this.prisma.indexerState.upsert({
-        where: { id: RECONCILIATION_STATE_ROW_ID },
+        where: { id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID },
         create: {
-          id: RECONCILIATION_STATE_ROW_ID,
+          id: WEBSOCKET_RECONCILIATION_STATE_ROW_ID,
           lastSignature: signature,
           lastSlot: null,
           lastTxIndex: null,
-          source: RECONCILIATION_STATE_SOURCE,
+          source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         },
         update: {
           lastSignature: signature,
           lastSlot: null,
           lastTxIndex: null,
-          source: RECONCILIATION_STATE_SOURCE,
+          source: WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         },
       });
       return;
@@ -876,9 +878,9 @@ export class WebSocketIndexer {
          source = EXCLUDED.source,
          updated_at = EXCLUDED.updated_at`,
       [
-        RECONCILIATION_STATE_ROW_ID,
+        WEBSOCKET_RECONCILIATION_STATE_ROW_ID,
         signature,
-        RECONCILIATION_STATE_SOURCE,
+        WEBSOCKET_RECONCILIATION_STATE_SOURCE,
         new Date().toISOString(),
       ]
     );
@@ -966,7 +968,12 @@ export class WebSocketIndexer {
   }
 
   private runReconciliationCheck(reason: "periodic" | "stale-health"): Promise<boolean> {
-    if (!this.isRunning || this.stopRequested || this.isReconciling) {
+    if (
+      !this.isRunning
+      || this.stopRequested
+      || this.isReconciling
+      || this.processingHoldCount > 0
+    ) {
       return Promise.resolve(false);
     }
     const cursor = this.lastPersistedCursor;
@@ -975,7 +982,9 @@ export class WebSocketIndexer {
     }
 
     this.isReconciling = true;
-    const reconciliationPromise = this.performReconciliationCheck(reason, cursor);
+    const reconciliationPromise = this.logQueue
+      .add(() => this.performReconciliationCheck(reason, cursor))
+      .then((result) => result ?? false);
     this.activeReconciliationPromise = reconciliationPromise;
     const clearActiveReconciliation = () => {
       if (this.activeReconciliationPromise === reconciliationPromise) {
