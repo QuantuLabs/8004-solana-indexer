@@ -116,7 +116,7 @@ function agentOwnerWalletResetSql(
 }
 
 function agentFeedbackAssignmentsSql(atomFields: ReadonlyArray<readonly [string, string]>): string {
-  const args = ["$8::bigint", "$9::integer", "$10::integer", "$11::text"] as const;
+  const args = ["$3::bigint", "$4::integer", "$5::integer", "$6::text"] as const;
   const atomFresh = agentOrderGuardSql(...args, "atom_stats_order_key");
   const key = canonicalOrderAnchorSql(...args);
   const atomAssignments = atomFields.length === 0 ? "" : `${atomFields
@@ -524,13 +524,13 @@ async function replayOrphanFeedbacksForAsset(
         ? row.created_at.toISOString()
         : new Date(row.created_at).toISOString();
       const atomFields = row.atom_enabled
-        ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+        ? [["trust_tier", "$7"], ["quality_score", "$8"], ["confidence", "$9"], ["risk_score", "$10"], ["diversity_ratio", "$11"]] as const
         : [];
       await db.query(
         `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
-        [updatedAt, row.asset, row.new_trust_tier ?? 0, row.new_quality_score ?? 0,
-         row.new_confidence ?? 0, row.new_risk_score ?? 0, row.new_diversity_ratio ?? 0,
-         row.block_slot, row.tx_index, row.event_ordinal, row.tx_signature]
+        [updatedAt, row.asset, row.block_slot, row.tx_index, row.event_ordinal, row.tx_signature,
+         ...(row.atom_enabled ? [row.new_trust_tier ?? 0, row.new_quality_score ?? 0,
+           row.new_confidence ?? 0, row.new_risk_score ?? 0, row.new_diversity_ratio ?? 0] : [])]
       );
     }
 
@@ -1408,13 +1408,14 @@ async function handleNewFeedbackTx(
     logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
   }
   const atomFields = data.atomEnabled
-    ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+    ? [["trust_tier", "$7"], ["quality_score", "$8"], ["confidence", "$9"], ["risk_score", "$10"], ["diversity_ratio", "$11"]] as const
     : [];
   await client.query(
     `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
-    [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
-     data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.slot.toString(),
-     ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
+    [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null,
+     ctx.eventOrdinal ?? null, ctx.signature, ...(data.atomEnabled
+       ? [data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio]
+       : [])]
   );
   await replayOrphanResponsesForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
   await reconcileOrphanRevocationForFeedback(client, assetId, clientAddress, data.feedbackIndex, feedbackHash);
@@ -1491,13 +1492,14 @@ async function handleFeedbackRevokedTx(
       [ctx.blockTime.toISOString(), id]
     );
     const atomFields = data.atomEnabled && data.hadImpact
-      ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"]] as const
+      ? [["trust_tier", "$7"], ["quality_score", "$8"], ["confidence", "$9"]] as const
       : [];
     await client.query(
       `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
-       data.newConfidence, null, null, ctx.slot.toString(), ctx.txIndex ?? null,
-       ctx.eventOrdinal ?? null, ctx.signature]
+      [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null,
+       ctx.eventOrdinal ?? null, ctx.signature, ...(data.atomEnabled && data.hadImpact
+         ? [data.newTrustTier, data.newQualityScore, data.newConfidence]
+         : [])]
     );
   }
   logger.info({ assetId, feedbackIndex: data.feedbackIndex.toString(), hadImpact: data.hadImpact, orphan: isOrphan }, "Feedback revoked");
@@ -2185,13 +2187,14 @@ async function handleNewFeedback(
       logger.warn({ assetId, feedbackIndex: data.feedbackIndex.toString(), rowCount: insertResult.rowCount }, "Unexpected feedback upsert result");
     }
     const atomFields = data.atomEnabled
-      ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"], ["risk_score", "$6"], ["diversity_ratio", "$7"]] as const
+      ? [["trust_tier", "$7"], ["quality_score", "$8"], ["confidence", "$9"], ["risk_score", "$10"], ["diversity_ratio", "$11"]] as const
       : [];
     await db.query(
       `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
-      [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
-       data.newConfidence, data.newRiskScore, data.newDiversityRatio, ctx.slot.toString(),
-       ctx.txIndex ?? null, ctx.eventOrdinal ?? null, ctx.signature]
+      [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null,
+       ctx.eventOrdinal ?? null, ctx.signature, ...(data.atomEnabled
+         ? [data.newTrustTier, data.newQualityScore, data.newConfidence, data.newRiskScore, data.newDiversityRatio]
+         : [])]
     );
     await replayOrphanResponsesForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
     await reconcileOrphanRevocationForFeedback(db, assetId, clientAddress, data.feedbackIndex, feedbackHash);
@@ -2271,13 +2274,14 @@ async function handleFeedbackRevoked(
         [ctx.blockTime.toISOString(), id]
       );
       const atomFields = data.atomEnabled && data.hadImpact
-        ? [["trust_tier", "$3"], ["quality_score", "$4"], ["confidence", "$5"]] as const
+        ? [["trust_tier", "$7"], ["quality_score", "$8"], ["confidence", "$9"]] as const
         : [];
       await db.query(
         `UPDATE agents SET ${agentFeedbackAssignmentsSql(atomFields)} WHERE asset = $2`,
-        [ctx.blockTime.toISOString(), assetId, data.newTrustTier, data.newQualityScore,
-         data.newConfidence, null, null, ctx.slot.toString(), ctx.txIndex ?? null,
-         ctx.eventOrdinal ?? null, ctx.signature]
+        [ctx.blockTime.toISOString(), assetId, ctx.slot.toString(), ctx.txIndex ?? null,
+         ctx.eventOrdinal ?? null, ctx.signature, ...(data.atomEnabled && data.hadImpact
+           ? [data.newTrustTier, data.newQualityScore, data.newConfidence]
+           : [])]
       );
     }
 

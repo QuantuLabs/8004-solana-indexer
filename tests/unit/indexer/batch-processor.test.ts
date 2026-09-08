@@ -123,6 +123,14 @@ function makeEvent(
   };
 }
 
+function expectDenseBinds(call: any[], expectedArgs: any[]): void {
+  const placeholders = [...call[0].matchAll(/\$(\d+)/g)].map((match) => Number(match[1]));
+  expect([...new Set(placeholders)].sort((a, b) => a - b)).toEqual(
+    Array.from({ length: expectedArgs.length }, (_, index) => index + 1)
+  );
+  expect(call[1]).toEqual(expectedArgs);
+}
+
 describe("BatchRpcFetcher", () => {
   let mockConnection: ReturnType<typeof createMockConnection>;
 
@@ -793,6 +801,12 @@ describe("EventBuffer", () => {
       expect(client.query.mock.calls.some((call: any[]) =>
         typeof call[0] === "string" && call[0].includes("DELETE FROM orphan_feedbacks")
       )).toBe(true);
+      const agentUpdate = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("feedback_count = COALESCE")
+      );
+      expectDenseBinds(agentUpdate!, [
+        "2026-03-06T00:00:00.000Z", "assetKey123456789012345678901234", "100", 2, 0, "feedback-sig",
+      ]);
     });
 
     it("should queue URI metadata on AgentRegistered with URI", async () => {
@@ -875,6 +889,13 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const agentUpdate = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("feedback_count = COALESCE")
+      );
+      expectDenseBinds(agentUpdate!, [
+        "2024-01-15T10:00:00.000Z", "asset1", "12345", 0, null, expect.any(String),
+        2, 8500, 7000, 10, 200,
+      ]);
     });
 
     it("should preserve empty feedbackUri as empty string (not null)", async () => {
@@ -918,6 +939,12 @@ describe("EventBuffer", () => {
 
       const client = mockPool._client;
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const agentUpdate = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("feedback_count = COALESCE")
+      );
+      expectDenseBinds(agentUpdate!, [
+        "2024-01-15T10:00:00.000Z", "asset1", "12345", 0, null, expect.any(String),
+      ]);
     });
 
     it("should preserve all-zero sealHash bytes for feedback inserts", async () => {
@@ -973,6 +1000,9 @@ describe("EventBuffer", () => {
         if (typeof sql === 'string' && sql.includes("SELECT id, feedback_hash FROM feedbacks")) {
           return { rows: [{ id: "f1", feedback_hash: "ab".repeat(32) }], rowCount: 1 };
         }
+        if (typeof sql === "string" && sql.includes("INSERT INTO revocations")) {
+          return { rows: [], rowCount: 1 };
+        }
         return { rows: [], rowCount: 0 };
       });
 
@@ -996,6 +1026,13 @@ describe("EventBuffer", () => {
       await buffer.flush();
 
       expect(client.query).toHaveBeenCalledWith("COMMIT");
+      const agentUpdate = client.query.mock.calls.find((call: any[]) =>
+        typeof call[0] === "string" && call[0].includes("feedback_count = COALESCE")
+      );
+      expectDenseBinds(agentUpdate!, [
+        "2024-01-15T10:00:00.000Z", "asset1", "12345", 0, null, expect.any(String),
+        1, 7000, 5000,
+      ]);
     });
 
     it("should handle revocation of non-existing feedback (orphan)", async () => {

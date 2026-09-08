@@ -22,6 +22,14 @@ const TEST_SIGNATURE = "5wHu1qwD7q2ggbJqCPtxnHZ2TrLQfEV9B7NqcBYBqzXh9J6vQQYc4Kdb
 const TEST_SLOT = 12345678n;
 const TEST_BLOCK_TIME = new Date("2024-01-15T10:00:00Z");
 
+function expectDenseBinds(call: any[], expectedArgs: any[]): void {
+  const placeholders = [...call[0].matchAll(/\$(\d+)/g)].map((match) => Number(match[1]));
+  expect([...new Set(placeholders)].sort((a, b) => a - b)).toEqual(
+    Array.from({ length: expectedArgs.length }, (_, index) => index + 1)
+  );
+  expect(call[1]).toEqual(expectedArgs);
+}
+
 // ─── Mock pg Pool + PoolClient ───────────────────────────────────────────────
 
 const { mockPoolInstance, mockClientInstance } = vi.hoisted(() => {
@@ -412,6 +420,12 @@ describe("supabase.ts", () => {
         expect(mockPoolInstance.query.mock.calls.some((c: any[]) =>
           typeof c[0] === "string" && c[0].includes("UPDATE revocations")
         )).toBe(true);
+        const agentUpdate = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("feedback_count = COALESCE")
+        );
+        expectDenseBinds(agentUpdate!, [
+          ctx.blockTime.toISOString(), TEST_ASSET.toBase58(), "123456", 2, 0, "feedback-sig",
+        ]);
         expect(mockPoolInstance.connect).toHaveBeenCalled();
         expect(mockClientInstance.query).toHaveBeenCalledWith("BEGIN");
         expect(mockClientInstance.query).toHaveBeenCalledWith("COMMIT");
@@ -989,6 +1003,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("trust_tier")
         );
         expect(atomUpdateCall).toBeDefined();
+        expectDenseBinds(atomUpdateCall!, [
+          ctx.blockTime.toISOString(), TEST_ASSET.toBase58(), TEST_SLOT.toString(), 0, null, TEST_SIGNATURE,
+          1, 8500, 100, 0, 10000,
+        ]);
       });
 
       it("should replay staged orphan responses when feedback arrives", async () => {
@@ -1145,6 +1163,9 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("UPDATE agents SET") && !c[0].includes("trust_tier")
         );
         expect(updateCall).toBeDefined();
+        expectDenseBinds(updateCall!, [
+          ctx.blockTime.toISOString(), TEST_ASSET.toBase58(), TEST_SLOT.toString(), 0, null, TEST_SIGNATURE,
+        ]);
       });
 
       it("should preserve empty feedbackUri as empty string (not null)", async () => {
@@ -1381,6 +1402,10 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("trust_tier") && c[0].includes("quality_score") && c[0].includes("confidence")
         );
         expect(atomUpdate).toBeDefined();
+        expectDenseBinds(atomUpdate!, [
+          ctx.blockTime.toISOString(), TEST_ASSET.toBase58(), TEST_SLOT.toString(), 0, null, TEST_SIGNATURE,
+          0, 7000, 90,
+        ]);
       });
 
       it("should skip ATOM update when hadImpact=false", async () => {
@@ -1398,6 +1423,12 @@ describe("supabase.ts", () => {
           typeof c[0] === "string" && c[0].includes("trust_tier") && c[0].includes("quality_score") && c[0].includes("confidence")
         );
         expect(atomUpdate).toBeUndefined();
+        const aggregateUpdate = mockPoolInstance.query.mock.calls.find((c: any[]) =>
+          typeof c[0] === "string" && c[0].includes("feedback_count = COALESCE")
+        );
+        expectDenseBinds(aggregateUpdate!, [
+          ctx.blockTime.toISOString(), TEST_ASSET.toBase58(), TEST_SLOT.toString(), 0, null, TEST_SIGNATURE,
+        ]);
       });
 
       it("should catch query error", async () => {

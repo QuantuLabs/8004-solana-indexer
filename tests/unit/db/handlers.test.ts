@@ -75,16 +75,22 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+        expect(prisma.agent.updateMany).toHaveBeenNthCalledWith(1,
           expect.objectContaining({
             where: expect.objectContaining({
               id: TEST_ASSET.toBase58(),
               OR: expect.any(Array),
             }),
             data: expect.objectContaining({
-            owner: TEST_NEW_OWNER.toBase58(),
-            updatedAt: ctx.blockTime,
+              owner: TEST_NEW_OWNER.toBase58(),
+              ownerOrderKey: expect.any(String),
             }),
+          })
+        );
+        expect(prisma.agent.updateMany).toHaveBeenNthCalledWith(2,
+          expect.objectContaining({
+            where: expect.objectContaining({ id: TEST_ASSET.toBase58(), OR: expect.any(Array) }),
+            data: expect.objectContaining({ mutationOrderKey: expect.any(String), updatedAt: ctx.blockTime }),
           })
         );
       });
@@ -104,7 +110,7 @@ describe("DB Handlers", () => {
 
         await handleEvent(prisma, event, ctx);
 
-        expect(prisma.agent.updateMany).toHaveBeenCalledWith(
+        expect(prisma.agent.updateMany).toHaveBeenNthCalledWith(1,
           expect.objectContaining({
             where: expect.objectContaining({
               id: TEST_ASSET.toBase58(),
@@ -139,9 +145,15 @@ describe("DB Handlers", () => {
               OR: expect.any(Array),
             }),
             data: expect.objectContaining({
-            wallet: TEST_WALLET.toBase58(),
-            updatedAt: ctx.blockTime,
+              wallet: TEST_WALLET.toBase58(),
+              walletOrderKey: expect.any(String),
             }),
+          })
+        );
+        expect(prisma.agent.updateMany).toHaveBeenNthCalledWith(2,
+          expect.objectContaining({
+            where: expect.objectContaining({ id: TEST_ASSET.toBase58(), OR: expect.any(Array) }),
+            data: expect.objectContaining({ mutationOrderKey: expect.any(String), updatedAt: ctx.blockTime }),
           })
         );
       });
