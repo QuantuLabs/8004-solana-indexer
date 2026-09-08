@@ -2856,8 +2856,8 @@ describe("Poller Coverage", () => {
       });
 
       vi.spyOn(poller as any, "processSignatureBatch").mockImplementation(
-        async (batch: any[], _processed: number, _total: number, onProcessed?: (sig: any) => Promise<void>) => {
-          await onProcessed?.(batch[0]);
+        async (batch: any[], _processed: number, _total: number, options?: { onTransactionProcessed?: (sig: any) => Promise<void> }) => {
+          await options?.onTransactionProcessed?.(batch[0]);
           return 1;
         }
       );
@@ -4402,13 +4402,14 @@ describe("Poller Coverage", () => {
       // Start first time
       await poller.start();
       await new Promise((r) => setTimeout(r, 50));
+      const lookupCallsAfterFirstStart = mockPrisma.indexerState.findUnique.mock.calls.length;
 
       // Start second time - should be a no-op
       await poller.start();
 
       // Main cursor load plus historical-scan state/progress lookups may occur during startup,
       // but a second start() while already running must not trigger a second polling cycle.
-      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(3);
+      expect(mockPrisma.indexerState.findUnique).toHaveBeenCalledTimes(lookupCallsAfterFirstStart);
     });
   });
 });

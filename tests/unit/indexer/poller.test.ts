@@ -486,6 +486,81 @@ describe("Poller", () => {
       }
     });
 
+    it("preserves incomplete recovery when stopped before replay and completes it on restart", async () => {
+      const pages = [{
+        pageIndex: 0,
+        beforeSignature: null,
+        nextBeforeSignature: null,
+        signatures: [
+          createMockSignatureInfo("missing-2", 102, null),
+          createMockSignatureInfo("missing-1", 101, null),
+        ],
+      }];
+      const progressLoaded = createDeferred();
+      const releaseProgress = createDeferred<null>();
+      let durableTip = "durable-anchor";
+
+      vi.spyOn(poller as any, "loadHistoricalScanState").mockResolvedValue({
+        nextBeforeSignature: null,
+        scanComplete: true,
+      });
+      vi.spyOn(poller as any, "loadHistoricalScanProgress")
+        .mockImplementationOnce(async () => {
+          progressLoaded.resolve();
+          return releaseProgress.promise;
+        })
+        .mockResolvedValueOnce(null);
+      const processSignatureBatchSpy = vi
+        .spyOn(poller as any, "processSignatureBatch")
+        .mockResolvedValue(2);
+      const clearPageSpy = vi.spyOn(poller as any, "clearHistoricalScanPage").mockResolvedValue(undefined);
+      const clearProgressSpy = vi.spyOn(poller as any, "clearHistoricalScanProgress").mockResolvedValue(undefined);
+      const clearStateSpy = vi.spyOn(poller as any, "clearHistoricalScanState").mockResolvedValue(undefined);
+      vi.spyOn(poller as any, "loadState").mockImplementation(async () => {
+        (poller as any).lastSignature = "current-main";
+      });
+      vi.spyOn(poller as any, "loadWebSocketReconciliationTipSignature")
+        .mockImplementation(async () => durableTip);
+      vi.spyOn(poller as any, "loadActiveHistoricalScanState").mockResolvedValue({
+        stopSignature: "durable-anchor",
+        pages,
+      });
+      const saveTipSpy = vi
+        .spyOn(poller as any, "saveWebSocketReconciliationTipSignature")
+        .mockImplementation(async (signature: string) => {
+          durableTip = signature;
+        });
+
+      (poller as any).isRunning = true;
+      const interruptedRecovery = (poller as any).catchUpHistoricalGap(
+        "durable-anchor",
+        pages,
+        false
+      );
+      await progressLoaded.promise;
+      await poller.stop();
+      releaseProgress.resolve(null);
+
+      await expect(interruptedRecovery).resolves.toBe(false);
+      expect(processSignatureBatchSpy).not.toHaveBeenCalled();
+      expect(clearPageSpy).not.toHaveBeenCalled();
+      expect(clearProgressSpy).not.toHaveBeenCalled();
+      expect(clearStateSpy).not.toHaveBeenCalled();
+      expect(saveTipSpy).not.toHaveBeenCalled();
+      expect(durableTip).toBe("durable-anchor");
+
+      (poller as any).isRunning = true;
+      await (poller as any).initializeCursor();
+
+      expect(processSignatureBatchSpy).toHaveBeenCalledTimes(1);
+      expect(processSignatureBatchSpy.mock.calls[0][0]).toHaveLength(2);
+      expect(clearPageSpy).toHaveBeenCalledWith("durable-anchor", 0);
+      expect(clearProgressSpy).toHaveBeenCalledWith("durable-anchor");
+      expect(clearStateSpy).toHaveBeenCalledWith("durable-anchor");
+      expect(saveTipSpy).toHaveBeenCalledWith("current-main");
+      expect(durableTip).toBe("current-main");
+    });
+
     it("uses the simulated PostgreSQL state path for the recovery tip", async () => {
       const query = vi.fn()
         .mockResolvedValueOnce({ rows: [{ last_signature: "pg-anchor" }] })

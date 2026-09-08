@@ -1227,6 +1227,10 @@ export class Poller {
       );
     }
 
+    if (!this.isRunning) {
+      return false;
+    }
+
     if (lastPageIndexToReplay >= 0) {
       logger.info(
         {

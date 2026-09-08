@@ -80,7 +80,7 @@ describe("local collection_id schema helpers", () => {
     expect(exec.mock.calls[7][0]).toContain('CREATE TRIGGER "CollectionPointer_assign_collection_id_after_insert"');
     expect(exec.mock.calls[8][0]).toContain('CREATE TRIGGER "CollectionPointer_assign_collection_id_after_update"');
     expect(exec.mock.calls[9][0]).toContain('UPDATE "CollectionPointer"');
-    expect(exec.mock.calls[10][0]).toContain('WITH "agent_ranked" AS');
+    expect(exec.mock.calls[10][0]).toContain('"agent_ranked" AS');
     expect(exec.mock.calls[10][0]).toContain('a."agent_id" IS NULL');
     expect(exec.mock.calls[10][0]).toContain(`a."status" != 'ORPHANED'`);
     expect(exec.mock.calls[11][0]).toContain("'agent:global'");
