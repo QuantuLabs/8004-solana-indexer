@@ -2046,6 +2046,10 @@ export function createApiServer(options: ApiServerOptions): Express {
       res.status(413).json({ error: 'Payload too large' });
       return;
     }
+    if (typeof status === 'number' && Number.isInteger(status) && status >= 400 && status < 500) {
+      res.status(status).json({ error: 'Invalid request body' });
+      return;
+    }
     next(error);
   });
 

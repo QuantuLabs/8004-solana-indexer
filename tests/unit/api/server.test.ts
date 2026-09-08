@@ -54,6 +54,19 @@ describe('API Server (GraphQL-only)', () => {
     }
   });
 
+  it('preserves body-parser client errors while masking their details', async () => {
+    const malformed = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{',
+    });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toEqual({ error: 'Invalid request body' });
+    const oversized = await fetch(`${baseUrl}/v2/graphql`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: 'a'.repeat(110_000) }),
+    });
+    expect(oversized.status).toBe(413);
+    expect(await oversized.json()).toEqual({ error: 'Payload too large' });
+  });
+
   it('returns health status', async () => {
     const res = await fetch(`${baseUrl}/health`);
     expect(res.status).toBe(200);
