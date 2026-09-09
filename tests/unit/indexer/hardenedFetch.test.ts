@@ -81,6 +81,8 @@ describe("hardenedFetch", () => {
     const body = Buffer.from("{\"name\":\"Pinned\"}");
     const lookupResults: Array<{ hostname: string; error: Error | null; address: unknown; family: number | undefined }> = [];
     const requestOptions: any[] = [];
+    const discardedResponses: Readable[] = [];
+    let redirectDestroyedBeforeNextRequest = false;
 
     mockLookup
       .mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }])
@@ -88,6 +90,9 @@ describe("hardenedFetch", () => {
 
     const requestSpy = vi.spyOn(https, "request").mockImplementation((options: any, callback: any) => {
       requestOptions.push(options);
+      if (requestOptions.length === 2) {
+        redirectDestroyedBeforeNextRequest = discardedResponses[0]?.destroyed ?? false;
+      }
       const request = new EventEmitter() as EventEmitter & {
         destroy: (error?: Error) => void;
         end: () => void;
@@ -102,15 +107,18 @@ describe("hardenedFetch", () => {
           lookupResults.push({ hostname: options.hostname, error, address, family });
         });
 
-        const responseBody = requestOptions.length === 1 ? Buffer.alloc(0) : body;
-        const response = Readable.from(responseBody.length > 0 ? [responseBody] : []) as Readable & {
+        const isRedirect = requestOptions.length === 1;
+        const response = (isRedirect
+          ? new Readable({ read() {} })
+          : Readable.from([body], { autoDestroy: false })) as Readable & {
           statusCode: number;
           headers: Record<string, string>;
         };
-        response.statusCode = requestOptions.length === 1 ? 302 : 200;
-        response.headers = requestOptions.length === 1
+        response.statusCode = isRedirect ? 302 : 200;
+        response.headers = isRedirect
           ? { location: "https://cdn.example/agent.json" }
           : { "content-length": String(body.length) };
+        if (isRedirect) discardedResponses.push(response);
         callback(response);
         request.emit("close");
       };
@@ -126,7 +134,10 @@ describe("hardenedFetch", () => {
       });
 
       expect(result.status).toBe("ok");
+      expect(result.status === "ok" && result.body).toEqual(body);
       expect(requestSpy).toHaveBeenCalledTimes(2);
+      expect(redirectDestroyedBeforeNextRequest).toBe(true);
+      expect(discardedResponses[0]?.destroyed).toBe(true);
       expect(requestOptions.map((options) => options.hostname)).toEqual(["metadata.example", "cdn.example"]);
       expect(requestOptions.map((options) => options.servername)).toEqual(["metadata.example", "cdn.example"]);
       expect(requestOptions.every((options) => options.rejectUnauthorized !== false)).toBe(true);
@@ -145,6 +156,52 @@ describe("hardenedFetch", () => {
         },
       ]);
     } finally {
+      requestSpy.mockRestore();
+      if (originalVitest === undefined) {
+        delete process.env.VITEST;
+      } else {
+        process.env.VITEST = originalVitest;
+      }
+    }
+  });
+
+  it("destroys a discarded HTTP error response before the fetch settles", async () => {
+    const originalVitest = process.env.VITEST;
+    let response: Readable | undefined;
+
+    mockLookup.mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }]);
+
+    const requestSpy = vi.spyOn(https, "request").mockImplementation((_options: any, callback: any) => {
+      const request = new EventEmitter() as EventEmitter & {
+        destroy: (error?: Error) => void;
+        end: () => void;
+      };
+
+      request.destroy = (error?: Error): void => {
+        if (error) request.emit("error", error);
+        request.emit("close");
+      };
+      request.end = (): void => {
+        response = new Readable({ read() {} });
+        Object.assign(response, { statusCode: 503, headers: {} });
+        callback(response);
+        request.emit("close");
+      };
+
+      return request as any;
+    });
+
+    delete process.env.VITEST;
+    try {
+      const result = await hardenedFetchBuffer("https://metadata.example/agent.json", {
+        maxBytes: 1024,
+        timeoutMs: 1000,
+      });
+
+      expect(result).toEqual({ status: "error", error: "HTTP 503" });
+      expect(response?.destroyed).toBe(true);
+    } finally {
+      requestSpy.mockRestore();
       if (originalVitest === undefined) {
         delete process.env.VITEST;
       } else {

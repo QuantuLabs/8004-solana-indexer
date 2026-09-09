@@ -611,7 +611,7 @@ function nodeTransport(request: HardenedTransportRequest): Promise<HardenedTrans
         const statusCode = res.statusCode ?? 0;
         const headers = normalizeNodeHeaders(res.headers);
         if (isRedirectStatus(statusCode) || statusCode < 200 || statusCode >= 300) {
-          res.resume();
+          res.destroy();
           resolve({ statusCode, headers, body: Buffer.alloc(0), bytes: 0 });
           return;
         }
