@@ -211,6 +211,53 @@ describe("hardenedFetch", () => {
     }
   });
 
+  it("destroys a malformed compressed response before the fetch settles", async () => {
+    const originalVitest = process.env.VITEST;
+    let response: Readable | undefined;
+
+    mockLookup.mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 }]);
+
+    const requestSpy = vi.spyOn(https, "request").mockImplementation((_options: any, callback: any) => {
+      const request = new EventEmitter() as EventEmitter & {
+        destroy: (error?: Error) => void;
+        end: () => void;
+      };
+
+      request.destroy = (error?: Error): void => {
+        if (error) request.emit("error", error);
+        request.emit("close");
+      };
+      request.end = (): void => {
+        response = new Readable({ read() {} });
+        Object.assign(response, { statusCode: 200, headers: { "content-encoding": "gzip" } });
+        callback(response);
+        response.push(Buffer.from("not gzip"));
+        request.emit("close");
+      };
+
+      return request as any;
+    });
+
+    delete process.env.VITEST;
+    try {
+      const result = await hardenedFetchBuffer("https://metadata.example/agent.json", {
+        maxBytes: 1024,
+        timeoutMs: 1000,
+      }).then((value) => ({ value, responseDestroyed: response?.destroyed }));
+
+      expect(result.value.status).toBe("error");
+      expect(result.responseDestroyed).toBe(true);
+    } finally {
+      response?.destroy();
+      requestSpy.mockRestore();
+      if (originalVitest === undefined) {
+        delete process.env.VITEST;
+      } else {
+        process.env.VITEST = originalVitest;
+      }
+    }
+  });
+
   it("expires queued requests without dispatching and preserves the next waiter", async () => {
     vi.useFakeTimers();
     mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);

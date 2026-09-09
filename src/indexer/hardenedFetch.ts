@@ -634,6 +634,7 @@ function nodeTransport(request: HardenedTransportRequest): Promise<HardenedTrans
           }
           resolve({ statusCode, headers, body: read.body, bytes: read.bytes });
         } catch (error) {
+          res.destroy();
           reject(error);
         }
       }
