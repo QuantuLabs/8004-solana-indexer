@@ -32,6 +32,7 @@ import {
   createPinnedLookup,
   hardenedFetchBuffer,
   resetHardenedFetchStateForTests,
+  setHardenedFetchTransportForTests,
 } from "../../../src/indexer/hardenedFetch.js";
 
 describe("hardenedFetch", () => {
@@ -207,6 +208,50 @@ describe("hardenedFetch", () => {
       } else {
         process.env.VITEST = originalVitest;
       }
+    }
+  });
+
+  it("expires queued requests without dispatching and preserves the next waiter", async () => {
+    vi.useFakeTimers();
+    mockLookup.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+    const releases: Array<() => void> = [];
+    const transport = vi.fn().mockImplementation(() => {
+      if (releases.length < 2) {
+        return new Promise((resolve) => {
+          releases.push(() => resolve({ statusCode: 200, headers: {}, body: Buffer.from("ok"), bytes: 2 }));
+        });
+      }
+      return Promise.resolve({ statusCode: 200, headers: {}, body: Buffer.from("ok"), bytes: 2 });
+    });
+    setHardenedFetchTransportForTests(transport);
+
+    const first = hardenedFetchBuffer("https://metadata.example/first", { timeoutMs: 1000 });
+    const second = hardenedFetchBuffer("https://metadata.example/second", { timeoutMs: 1000 });
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(2));
+
+    const expired = hardenedFetchBuffer("https://metadata.example/expired", { timeoutMs: 10 });
+    const next = hardenedFetchBuffer("https://metadata.example/next", { timeoutMs: 1000 });
+    await vi.waitFor(() => expect(mockLookup).toHaveBeenCalledTimes(4));
+
+    let expiredSettled = false;
+    const observedExpired = expired.then((result) => {
+      expiredSettled = true;
+      return result;
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    try {
+      expect(expiredSettled).toBe(true);
+      await expect(observedExpired).resolves.toEqual({ status: "timeout" });
+      expect(transport).toHaveBeenCalledTimes(2);
+
+      releases[0]();
+      await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(3));
+      await expect(next).resolves.toMatchObject({ status: "ok" });
+    } finally {
+      releases.forEach((release) => release());
+      await Promise.all([first, second, observedExpired, next]);
+      vi.useRealTimers();
     }
   });
 });

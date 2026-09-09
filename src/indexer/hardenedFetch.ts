@@ -589,6 +589,8 @@ async function fetchTransport(request: HardenedTransportRequest): Promise<Harden
 }
 
 function nodeTransport(request: HardenedTransportRequest): Promise<HardenedTransportResponse> {
+  if (request.signal.aborted) return Promise.reject(abortError());
+
   return new Promise((resolve, reject) => {
     const requestUrl = request.url;
     const client = requestUrl.protocol === "https:" ? https : http;
@@ -666,7 +668,9 @@ function hostLimitKey(hostname: string, resolved: HostResolution): string {
   return resolved.family === 0 ? hostname.toLowerCase() : resolved.ip;
 }
 
-function acquireHostSlot(key: string): Promise<() => void> {
+function acquireHostSlot(key: string, signal: AbortSignal): Promise<() => void> {
+  if (signal.aborted) return Promise.reject(abortError());
+
   const limit = hostLimit();
   let state = hostLimitStates.get(key);
   if (!state) {
@@ -679,11 +683,19 @@ function acquireHostSlot(key: string): Promise<() => void> {
     return Promise.resolve(() => releaseHostSlot(key));
   }
 
-  return new Promise((resolve) => {
-    state.waiters.push(() => {
+  return new Promise((resolve, reject) => {
+    const waiter = (): void => {
+      signal.removeEventListener("abort", onAbort);
       state.active++;
       resolve(() => releaseHostSlot(key));
-    });
+    };
+    const onAbort = (): void => {
+      const index = state.waiters.indexOf(waiter);
+      if (index !== -1) state.waiters.splice(index, 1);
+      reject(abortError());
+    };
+    state.waiters.push(waiter);
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -765,9 +777,12 @@ export async function hardenedFetchBuffer(fetchUrl: string, options: HardenedFet
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     const slotKey = hostLimitKey(currentUrl.hostname, validated.resolved);
-    const releaseSlot = await acquireHostSlot(slotKey);
+    let releaseSlot: (() => void) | undefined;
 
     try {
+      releaseSlot = await acquireHostSlot(slotKey, controller.signal);
+      if (controller.signal.aborted) throw abortError();
+
       const response = await getTransport()({
         url: currentUrl,
         resolved: validated.resolved,
@@ -824,7 +839,7 @@ export async function hardenedFetchBuffer(fetchUrl: string, options: HardenedFet
       }
       return { status: "error", error: String(error) };
     } finally {
-      releaseSlot();
+      releaseSlot?.();
       clearTimeout(timeoutId);
     }
   }
