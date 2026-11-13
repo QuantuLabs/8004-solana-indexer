@@ -77,6 +77,7 @@ function resetQueueState() {
   q.pending.clear();
   q.deferred.clear();
   q.recoveryRetryAt.clear();
+  q.recoveryCursor = ["", ""];
   q.queueFullSignals = 0;
   q.stats = {
     queued: 0,
@@ -259,15 +260,34 @@ describe("CollectionMetadataQueue", () => {
       expect(collectionMetadataQueue.getStats().queued).toBe(2);
     });
 
-    it("retries every failed status and excludes cooled-down pairs in SQL", async () => {
-      const rows = [{ asset: "a1", canonical_col: "c1:dead", creator: "cr" }];
-      mockPool.query.mockResolvedValue({ rows });
+    it("retries every failed status and wraps around a round-robin cursor", async () => {
+      mockPool.query.mockResolvedValue({
+        rows: [
+          { asset: "a1", canonical_col: "c1:a", creator: "cr" },
+          { asset: "a2", canonical_col: "c1:b", creator: "cr2" },
+        ],
+      });
       await sweep(1_000);
       await sweep(2_000);
-      const [sql, params] = mockPool.query.mock.calls[1] as [string, unknown[]];
+      const [sql, p0] = mockPool.query.mock.calls[0] as [string, unknown[]];
+      const p1 = mockPool.query.mock.calls[1][1] as unknown[];
       expect(sql).toContain("cp.metadata_status != 'ok'");
-      expect(sql).toContain("<> ALL($2::text[])");
-      expect(params[1]).toEqual(["c1:dead|cr"]);
+      expect(sql).toContain("ORDER BY ((p.canonical_col, p.creator) <= ($2::text, $3::text))");
+      expect(sql).not.toContain("ALL(");
+      expect(p0).toEqual([1000, "", ""]);
+      expect(p1).toEqual([1000, "c1:b", "cr2"]);
+    });
+
+    it("does not reserve the cooldown for a duplicate of a pending task", async () => {
+      const rows = [{ asset: "a1", canonical_col: "c1:dead", creator: "cr" }];
+      mockPool.query.mockResolvedValue({ rows });
+      collectionMetadataQueue.add("a1", "c1:dead");
+      await sweep(1_000);
+      expect(collectionMetadataQueue.getStats().queued).toBe(1);
+      expect((collectionMetadataQueue as any).recoveryRetryAt.has("c1:dead|cr")).toBe(false);
+      (collectionMetadataQueue as any).pending.clear();
+      await sweep(2_000);
+      expect(collectionMetadataQueue.getStats().queued).toBe(2);
     });
 
     it("keeps the cooldown after an extraction", async () => {

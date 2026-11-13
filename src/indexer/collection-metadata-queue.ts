@@ -16,14 +16,8 @@ const DEFAULT_RECOVERY_RETRY_MS = 15 * 60_000;
 const MIN_RECOVERY_RETRY_MS = 60_000;
 
 function parseRecoveryRetryMs(raw: string | undefined): number {
-  if (!raw || raw.trim() === "") {
-    return DEFAULT_RECOVERY_RETRY_MS;
-  }
-  const parsed = parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < MIN_RECOVERY_RETRY_MS) {
-    return DEFAULT_RECOVERY_RETRY_MS;
-  }
-  return parsed;
+  const parsed = parseInt(raw ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= MIN_RECOVERY_RETRY_MS ? parsed : DEFAULT_RECOVERY_RETRY_MS;
 }
 
 const RECOVERY_RETRY_MS = parseRecoveryRetryMs(process.env.METADATA_RECOVERY_RETRY_MS);
@@ -43,6 +37,7 @@ class CollectionMetadataQueue {
   private recoveryInterval: NodeJS.Timeout | null = null;
   private recoveryInFlight = false;
   private recoveryRetryAt = new Map<string, number>();
+  private recoveryCursor: [string, string] = ["", ""];
   private stats = {
     queued: 0,
     processed: 0,
@@ -72,9 +67,9 @@ class CollectionMetadataQueue {
     this.startRecoveryLoop();
   }
 
-  add(assetId: string, col: string): void {
+  add(assetId: string, col: string): boolean {
     if (!config.collectionMetadataIndexEnabled || !assetId || !col) {
-      return;
+      return false;
     }
 
     this.promoteDeferredIfCapacity();
@@ -82,7 +77,7 @@ class CollectionMetadataQueue {
     const existing = this.pending.get(assetId);
     if (existing && existing.col === col) {
       this.stats.skippedDuplicate++;
-      return;
+      return false;
     }
 
     const task: CollectionMetadataTask = {
@@ -92,7 +87,7 @@ class CollectionMetadataQueue {
     };
 
     this.pending.set(assetId, task);
-    this.enqueueOrDefer(task);
+    return this.enqueueOrDefer(task);
   }
 
   addBatch(tasks: Array<{ assetId: string; col: string }>): void {
@@ -194,10 +189,10 @@ class CollectionMetadataQueue {
     }
   }
 
-  private enqueueOrDefer(task: CollectionMetadataTask): void {
+  private enqueueOrDefer(task: CollectionMetadataTask): boolean {
     if (this.totalQueueLoad() >= MAX_QUEUE_SIZE) {
       this.deferTask(task);
-      return;
+      return this.deferred.get(task.assetId) === task;
     }
 
     this.stats.queued++;
@@ -205,6 +200,7 @@ class CollectionMetadataQueue {
       this.stats.errors++;
       logger.error({ assetId: task.assetId, col: task.col, error: err.message }, "Collection metadata queue task failed");
     });
+    return true;
   }
 
   private deferTask(task: CollectionMetadataTask): void {
@@ -302,6 +298,7 @@ class CollectionMetadataQueue {
       this.recoveryInterval = null;
     }
     this.recoveryRetryAt.clear();
+    this.recoveryCursor = ["", ""];
   }
 
   private logStats(): void {
@@ -316,33 +313,38 @@ class CollectionMetadataQueue {
     }
 
     const { rows } = await this.pool.query<{ asset: string; canonical_col: string; creator: string }>(
-      `SELECT DISTINCT ON (a.canonical_col, COALESCE(a.creator, a.owner))
-              a.asset, a.canonical_col, COALESCE(a.creator, a.owner) AS creator
-       FROM agents a
-       LEFT JOIN collection_pointers cp
-         ON cp.col = a.canonical_col
-        AND cp.creator = COALESCE(a.creator, a.owner)
-       WHERE a.canonical_col IS NOT NULL
-         AND a.canonical_col != ''
-         AND (
-           cp.col IS NULL
-           OR cp.metadata_status IS NULL
-           OR cp.metadata_status != 'ok'
-           OR cp.metadata_updated_at IS NULL
-           OR cp.metadata_updated_at < cp.last_seen_at
-         )
-         AND (a.canonical_col || '|' || COALESCE(a.creator, a.owner)) <> ALL($2::text[])
-       ORDER BY a.canonical_col, COALESCE(a.creator, a.owner), a.asset
+      `SELECT p.asset, p.canonical_col, p.creator FROM (
+         SELECT DISTINCT ON (a.canonical_col, COALESCE(a.creator, a.owner))
+                a.asset, a.canonical_col, COALESCE(a.creator, a.owner) AS creator
+         FROM agents a
+         LEFT JOIN collection_pointers cp
+           ON cp.col = a.canonical_col
+          AND cp.creator = COALESCE(a.creator, a.owner)
+         WHERE a.canonical_col != ''
+           AND (
+             cp.col IS NULL
+             OR cp.metadata_status IS NULL
+             OR cp.metadata_status != 'ok'
+             OR cp.metadata_updated_at IS NULL
+             OR cp.metadata_updated_at < cp.last_seen_at
+           )
+         ORDER BY a.canonical_col, COALESCE(a.creator, a.owner), a.asset
+       ) p
+       ORDER BY ((p.canonical_col, p.creator) <= ($2::text, $3::text)), p.canonical_col, p.creator
        LIMIT $1`,
-      [RECOVERY_BATCH_SIZE, [...this.recoveryRetryAt.keys()]]
+      [RECOVERY_BATCH_SIZE, ...this.recoveryCursor]
     );
+    if (rows.length > 0) {
+      const last = rows[rows.length - 1];
+      this.recoveryCursor = [last.canonical_col, last.creator];
+    }
 
     let recoveredCount = 0;
     for (const row of rows) {
       const key = `${row.canonical_col}|${row.creator}`;
       if (this.recoveryRetryAt.has(key)) continue;
+      if (!this.add(row.asset, row.canonical_col)) continue;
       this.recoveryRetryAt.set(key, nowMs + RECOVERY_RETRY_MS);
-      this.add(row.asset, row.canonical_col);
       recoveredCount++;
     }
     if (recoveredCount > 0) {
