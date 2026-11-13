@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.5] - 2026-11-13
+
+### Fixed
+- Collection metadata recovery retries each failing collection pointer at most once per `METADATA_RECOVERY_RETRY_MS` (default 15 minutes) instead of once per agent every minute, and walks failing pointers in round-robin order.
+
 ## [1.8.4] - Unreleased
 
 ### Changed
