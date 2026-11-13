@@ -184,7 +184,6 @@ class CollectionMetadataQueue {
         ]
       );
 
-      this.recoveryRetryAt.delete(`${col}|${creator}`);
       this.stats.processed++;
       logger.info({ assetId, col, creator }, "Collection metadata extracted");
     } catch (error: any) {
@@ -328,13 +327,14 @@ class CollectionMetadataQueue {
          AND (
            cp.col IS NULL
            OR cp.metadata_status IS NULL
-           OR cp.metadata_status NOT IN ('ok', 'oversize', 'invalid_json', 'blocked')
+           OR cp.metadata_status != 'ok'
            OR cp.metadata_updated_at IS NULL
            OR cp.metadata_updated_at < cp.last_seen_at
          )
+         AND (a.canonical_col || '|' || COALESCE(a.creator, a.owner)) <> ALL($2::text[])
        ORDER BY a.canonical_col, COALESCE(a.creator, a.owner), a.asset
        LIMIT $1`,
-      [RECOVERY_BATCH_SIZE]
+      [RECOVERY_BATCH_SIZE, [...this.recoveryRetryAt.keys()]]
     );
 
     let recoveredCount = 0;

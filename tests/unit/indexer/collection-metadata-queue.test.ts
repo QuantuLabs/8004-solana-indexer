@@ -259,21 +259,24 @@ describe("CollectionMetadataQueue", () => {
       expect(collectionMetadataQueue.getStats().queued).toBe(2);
     });
 
-    it("skips terminal statuses unless stale, retries timeout/error", async () => {
+    it("retries every failed status and excludes cooled-down pairs in SQL", async () => {
+      const rows = [{ asset: "a1", canonical_col: "c1:dead", creator: "cr" }];
+      mockPool.query.mockResolvedValue({ rows });
       await sweep(1_000);
-      const sql = mockPool.query.mock.calls[0][0] as string;
-      expect(sql).toContain("cp.metadata_status NOT IN ('ok', 'oversize', 'invalid_json', 'blocked')");
-      expect(sql).toContain("cp.metadata_updated_at < cp.last_seen_at");
-      expect(sql).not.toContain("cp.metadata_status != 'ok'");
+      await sweep(2_000);
+      const [sql, params] = mockPool.query.mock.calls[1] as [string, unknown[]];
+      expect(sql).toContain("cp.metadata_status != 'ok'");
+      expect(sql).toContain("<> ALL($2::text[])");
+      expect(params[1]).toEqual(["c1:dead|cr"]);
     });
 
-    it("clears the cooldown on successful extraction", async () => {
+    it("keeps the cooldown after an extraction", async () => {
       const q = collectionMetadataQueue as any;
       q.recoveryRetryAt.set("c1:ok|cr", Date.now() + RETRY_MS);
       mockPool.query.mockResolvedValueOnce({ rows: [{ canonical_col: "c1:ok", creator: "cr", owner: "cr" }] });
       collectionMetadataQueue.add("a1", "c1:ok");
       await runCapturedTasks();
-      expect(q.recoveryRetryAt.has("c1:ok|cr")).toBe(false);
+      expect(q.recoveryRetryAt.has("c1:ok|cr")).toBe(true);
     });
   });
 });
