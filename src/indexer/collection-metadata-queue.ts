@@ -12,6 +12,21 @@ const TIMEOUT_MS = 30000;
 const MAX_QUEUE_SIZE = 5000;
 const RECOVERY_BATCH_SIZE = 1000;
 const RECOVERY_INTERVAL_MS = 60_000;
+const DEFAULT_RECOVERY_RETRY_MS = 15 * 60_000;
+const MIN_RECOVERY_RETRY_MS = 60_000;
+
+function parseRecoveryRetryMs(raw: string | undefined): number {
+  if (!raw || raw.trim() === "") {
+    return DEFAULT_RECOVERY_RETRY_MS;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < MIN_RECOVERY_RETRY_MS) {
+    return DEFAULT_RECOVERY_RETRY_MS;
+  }
+  return parsed;
+}
+
+const RECOVERY_RETRY_MS = parseRecoveryRetryMs(process.env.METADATA_RECOVERY_RETRY_MS);
 
 export interface CollectionMetadataTask {
   assetId: string;
@@ -27,6 +42,7 @@ class CollectionMetadataQueue {
   private statsInterval: NodeJS.Timeout | null = null;
   private recoveryInterval: NodeJS.Timeout | null = null;
   private recoveryInFlight = false;
+  private recoveryRetryAt = new Map<string, number>();
   private stats = {
     queued: 0,
     processed: 0,
@@ -168,6 +184,7 @@ class CollectionMetadataQueue {
         ]
       );
 
+      this.recoveryRetryAt.delete(`${col}|${creator}`);
       this.stats.processed++;
       logger.info({ assetId, col, creator }, "Collection metadata extracted");
     } catch (error: any) {
@@ -285,11 +302,52 @@ class CollectionMetadataQueue {
       clearInterval(this.recoveryInterval);
       this.recoveryInterval = null;
     }
+    this.recoveryRetryAt.clear();
   }
 
   private logStats(): void {
     if (this.stats.queued === 0 && this.deferred.size === 0) return;
     logger.info(this.getStats(), "Collection metadata queue stats (60s)");
+  }
+
+  private async runRecoverySweep(nowMs: number): Promise<void> {
+    if (!this.pool) return;
+    for (const [key, retryAt] of this.recoveryRetryAt.entries()) {
+      if (retryAt <= nowMs) this.recoveryRetryAt.delete(key);
+    }
+
+    const { rows } = await this.pool.query<{ asset: string; canonical_col: string; creator: string }>(
+      `SELECT DISTINCT ON (a.canonical_col, COALESCE(a.creator, a.owner))
+              a.asset, a.canonical_col, COALESCE(a.creator, a.owner) AS creator
+       FROM agents a
+       LEFT JOIN collection_pointers cp
+         ON cp.col = a.canonical_col
+        AND cp.creator = COALESCE(a.creator, a.owner)
+       WHERE a.canonical_col IS NOT NULL
+         AND a.canonical_col != ''
+         AND (
+           cp.col IS NULL
+           OR cp.metadata_status IS NULL
+           OR cp.metadata_status NOT IN ('ok', 'oversize', 'invalid_json', 'blocked')
+           OR cp.metadata_updated_at IS NULL
+           OR cp.metadata_updated_at < cp.last_seen_at
+         )
+       ORDER BY a.canonical_col, COALESCE(a.creator, a.owner), a.asset
+       LIMIT $1`,
+      [RECOVERY_BATCH_SIZE]
+    );
+
+    let recoveredCount = 0;
+    for (const row of rows) {
+      const key = `${row.canonical_col}|${row.creator}`;
+      if (this.recoveryRetryAt.has(key)) continue;
+      this.recoveryRetryAt.set(key, nowMs + RECOVERY_RETRY_MS);
+      this.add(row.asset, row.canonical_col);
+      recoveredCount++;
+    }
+    if (recoveredCount > 0) {
+      logger.info({ recoveredCount }, "Recovered missing collection metadata tasks");
+    }
   }
 
   private startRecoveryLoop(): void {
@@ -303,31 +361,7 @@ class CollectionMetadataQueue {
       }
       this.recoveryInFlight = true;
       try {
-        const { rows } = await this.pool.query<{ asset: string; canonical_col: string }>(
-          `SELECT a.asset, a.canonical_col
-           FROM agents a
-           LEFT JOIN collection_pointers cp
-             ON cp.col = a.canonical_col
-            AND cp.creator = COALESCE(a.creator, a.owner)
-           WHERE a.canonical_col IS NOT NULL
-             AND a.canonical_col != ''
-             AND (
-               cp.col IS NULL
-               OR cp.metadata_status IS NULL
-               OR cp.metadata_status != 'ok'
-               OR cp.metadata_updated_at IS NULL
-               OR cp.metadata_updated_at < cp.last_seen_at
-             )
-           LIMIT $1`,
-          [RECOVERY_BATCH_SIZE]
-        );
-
-        if (rows.length > 0) {
-          for (const row of rows) {
-            this.add(row.asset, row.canonical_col);
-          }
-          logger.info({ recoveredCount: rows.length }, "Recovered missing collection metadata tasks");
-        }
+        await this.runRecoverySweep(Date.now());
       } catch (error: any) {
         logger.warn({ error: error.message }, "Collection metadata recovery sweep failed");
       } finally {
