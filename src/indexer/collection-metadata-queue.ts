@@ -341,7 +341,7 @@ class CollectionMetadataQueue {
 
     let recoveredCount = 0;
     for (const row of rows) {
-      const key = `${row.canonical_col}|${row.creator}`;
+      const key = JSON.stringify([row.canonical_col, row.creator]);
       if (this.recoveryRetryAt.has(key)) continue;
       if (!this.add(row.asset, row.canonical_col)) continue;
       this.recoveryRetryAt.set(key, nowMs + RECOVERY_RETRY_MS);

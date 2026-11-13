@@ -249,6 +249,17 @@ describe("CollectionMetadataQueue", () => {
       expect(collectionMetadataQueue.getStats().queued).toBe(1);
     });
 
+    it("keeps separate cooldowns for pairs whose joined text is identical", async () => {
+      mockPool.query.mockResolvedValueOnce({
+        rows: [
+          { asset: "a1", canonical_col: "c1:x", creator: "y|r" },
+          { asset: "a2", canonical_col: "c1:x|y", creator: "r" },
+        ],
+      });
+      await sweep(1_000);
+      expect(collectionMetadataQueue.getStats().queued).toBe(2);
+    });
+
     it("respects the cooldown between sweeps", async () => {
       const rows = [{ asset: "a1", canonical_col: "c1:dead", creator: "cr" }];
       mockPool.query.mockResolvedValue({ rows });
@@ -285,7 +296,7 @@ describe("CollectionMetadataQueue", () => {
       collectionMetadataQueue.add("a1", "c1:dead");
       await sweep(1_000);
       expect(collectionMetadataQueue.getStats().queued).toBe(1);
-      expect((collectionMetadataQueue as any).recoveryRetryAt.has("c1:dead|cr")).toBe(false);
+      expect((collectionMetadataQueue as any).recoveryRetryAt.has(JSON.stringify(["c1:dead", "cr"]))).toBe(false);
       (collectionMetadataQueue as any).pending.clear();
       await sweep(2_000);
       expect(collectionMetadataQueue.getStats().queued).toBe(2);
@@ -293,11 +304,11 @@ describe("CollectionMetadataQueue", () => {
 
     it("keeps the cooldown after an extraction", async () => {
       const q = collectionMetadataQueue as any;
-      q.recoveryRetryAt.set("c1:ok|cr", Date.now() + RETRY_MS);
+      q.recoveryRetryAt.set(JSON.stringify(["c1:ok", "cr"]), Date.now() + RETRY_MS);
       mockPool.query.mockResolvedValueOnce({ rows: [{ canonical_col: "c1:ok", creator: "cr", owner: "cr" }] });
       collectionMetadataQueue.add("a1", "c1:ok");
       await runCapturedTasks();
-      expect(q.recoveryRetryAt.has("c1:ok|cr")).toBe(true);
+      expect(q.recoveryRetryAt.has(JSON.stringify(["c1:ok", "cr"]))).toBe(true);
     });
   });
 });
