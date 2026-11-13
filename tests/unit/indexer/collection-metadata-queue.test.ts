@@ -274,6 +274,7 @@ describe("CollectionMetadataQueue", () => {
       expect(sql).toContain("cp.metadata_status != 'ok'");
       expect(sql).toContain("ORDER BY ((p.canonical_col, p.creator) <= ($2::text, $3::text))");
       expect(sql).not.toContain("ALL(");
+      expect(sql).toContain("a.asset != ''");
       expect(p0).toEqual([1000, "", ""]);
       expect(p1).toEqual([1000, "c1:b", "cr2"]);
     });

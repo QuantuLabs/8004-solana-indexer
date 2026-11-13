@@ -15,12 +15,11 @@ const RECOVERY_INTERVAL_MS = 60_000;
 const DEFAULT_RECOVERY_RETRY_MS = 15 * 60_000;
 const MIN_RECOVERY_RETRY_MS = 60_000;
 
-function parseRecoveryRetryMs(raw: string | undefined): number {
-  const parsed = parseInt(raw ?? "", 10);
-  return Number.isFinite(parsed) && parsed >= MIN_RECOVERY_RETRY_MS ? parsed : DEFAULT_RECOVERY_RETRY_MS;
-}
-
-const RECOVERY_RETRY_MS = parseRecoveryRetryMs(process.env.METADATA_RECOVERY_RETRY_MS);
+const parsedRecoveryRetryMs = parseInt(process.env.METADATA_RECOVERY_RETRY_MS ?? "", 10);
+const RECOVERY_RETRY_MS =
+  Number.isFinite(parsedRecoveryRetryMs) && parsedRecoveryRetryMs >= MIN_RECOVERY_RETRY_MS
+    ? parsedRecoveryRetryMs
+    : DEFAULT_RECOVERY_RETRY_MS;
 
 export interface CollectionMetadataTask {
   assetId: string;
@@ -321,6 +320,7 @@ class CollectionMetadataQueue {
            ON cp.col = a.canonical_col
           AND cp.creator = COALESCE(a.creator, a.owner)
          WHERE a.canonical_col != ''
+           AND a.asset != ''
            AND (
              cp.col IS NULL
              OR cp.metadata_status IS NULL
